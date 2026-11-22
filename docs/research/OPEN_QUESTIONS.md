@@ -28,10 +28,9 @@ Living list of unresolved technical, mathematical, hardware, and architectural q
 
 ## 4. REW Stereo Convolution & Channel Delay (`INV-05`)
 
-- **OQ-14:** What is the mathematically purest **order of operations** for upsampling + REW stereo convolution:
-  - Convolve at source rate then upsample?
-  - Upsample audio then convolve at target rate (352.8/384 kHz)?
-  - Combine the upsampling FIR and REW IR into a single mathematical convolution operation?
+- **OQ-14:** With **all DSP executing in floating point at ≥ 352.8/384 kHz** and **REW stereo convolution as a first-class core feature**:
+  - Should the internal DSP rate strictly match the native integer-multiple family of the source (`352.8 kHz` for 44.1/88.2/176.4 kHz; `384 kHz` for 48/96/192 kHz) — requiring **zero downsampling** into Gungnir 2 Unison 384 — OR is there any measurable benefit to processing at 16x (`705.6/768 kHz`) and decimating 2x back to `352.8/384 kHz`?
+  - Should upsampling and REW convolution execute sequentially at `352.8/384 kHz`, or be mathematically convolved into a single composite `float64` FIR kernel (within the 4M-tap cap)?
 - **OQ-15:** What sample rate(s) will the user's REW stereo WAV convolution file be exported at? If the user supplies a single REW WAV (e.g., at 48 kHz or 96 kHz), how should our engine handle mixed-rate playback (`44.1`, `48`, `96`, `192 kHz` → `352.8 / 384 kHz`) with zero quality loss?
 - **OQ-16:** Does REW export stereo IRs normalized to peak `0 dBFS` or unity passband gain (`0 dB` average)? How should our engine normalize/check REW IR gain automatically so stereo L/R balance is preserved and clipping is impossible?
 - **OQ-17:** Is pure integer-sample delay at 352.8/384 kHz (~2.6 µs / ~0.9 mm acoustic resolution) completely sufficient for non-symmetric room channel delay, eliminating any need for fractional-delay filters? How should delay be specified in configuration (milliseconds, microseconds, millimeters, or samples)?
