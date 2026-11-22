@@ -12,3 +12,4 @@ An extreme, headless, zero-compromise audiophile playback engine for Windows, ta
 - [docs/research/INVESTIGATION_PLAN.md](docs/research/INVESTIGATION_PLAN.md) — Ordered Phase 0 investigation plan, resource-scanning scope, and browser-PDF handoff protocol.
 - [docs/research/OPEN_QUESTIONS.md](docs/research/OPEN_QUESTIONS.md) — Tracked open technical, mathematical, hardware, and architectural questions.
 - [docs/research/00-landscape-and-sources.md](docs/research/00-landscape-and-sources.md) — Landscape survey of existing audiophile players, best practices, and curated reference sources.
+- [docs/research/02-audiophile-filter-survey.md](docs/research/02-audiophile-filter-survey.md) — Upsampling & noise-shaping algorithm sources, audiophile consensus, and list of inaccessible sources for user snippets.

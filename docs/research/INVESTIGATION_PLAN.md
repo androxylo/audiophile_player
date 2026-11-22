@@ -36,7 +36,7 @@
 | --- | --- | --- | --- |
 | **INV-00** | Landscape Survey, Existing Players & Master Source List | [00-landscape-and-sources.md](00-landscape-and-sources.md) | Done |
 | **INV-01** | Schiit Gungnir 2 DAC Architecture, NOS Mode & Unison 384 USB | `01-gungnir2-hardware.md` | Pending |
-| **INV-02** | Audiophile Filter Consensus Survey (Reviews & Message Boards) | `02-audiophile-filter-survey.md` | Pending |
+| **INV-02** | Audiophile Filter Consensus Survey (Reviews & Message Boards) | [02-audiophile-filter-survey.md](02-audiophile-filter-survey.md) | In Progress |
 | **INV-03** | Mathematical Filter Design, 4M-Tap Cap & Floating-Point Precision | `03-filter-math-and-precision.md` | Pending |
 | **INV-04** | Final DAC Quantization, Dither/Noise Shaping & `-3 dB` ISP Headroom | `04-quantization-dither-headroom.md` | Pending |
 | **INV-05** | REW Stereo Convolution, Processing Order & Channel Delay | `05-convolution-and-delay.md` | Pending |
