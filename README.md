@@ -13,6 +13,7 @@ audiophile_player/
 ├── poc/                        # Self-contained prototypes (Python / C++) before Rust port
 │   └── python/                 # Zero-mixer Windows transport & DSP prototypes
 └── tests/                      # Automated TDD test suite (zero copyrighted audio)
+    ├── fixtures/audio/         # Original algorithmically synthesized CC0 FLAC fixtures
     └── python/
 ```
 

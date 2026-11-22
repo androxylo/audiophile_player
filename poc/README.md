@@ -24,6 +24,6 @@ python -m venv .venv
 # 3. Probe WDM-KS and WASAPI Exclusive output devices & supported sample rates
 .\.venv\Scripts\python -m audiophile_poc probe
 
-# 4. Play a gentle -24 dBFS 440 Hz test tone via Kernel Streaming (WDM-KS)
-.\.venv\Scripts\python -m audiophile_poc test-tone --mode wdm-ks --device <ID> --rate 44100
+# 4. Play the original copyright-free 24/96 chamber-nocturne FLAC via Kernel Streaming (WDM-KS)
+.\.venv\Scripts\python -m audiophile_poc play-file --mode wdm-ks --device "Gungnir 2" tests/fixtures/audio/original_nocturne_24_96.flac
 ```

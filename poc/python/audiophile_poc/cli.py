@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import sys
 
+from .compose import write_nocturne_flac
+from .playback import play_flac_file
 from .synth import generate_test_tone_int32
 from .transport import (
     DEFAULT_PROBE_RATES,
@@ -77,6 +79,31 @@ def cmd_test_tone(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_play_file(args: argparse.Namespace) -> int:
+    mode = TransportMode(args.mode)
+    dev = resolve_device(args.device, mode=mode)
+    print(f"Loading '{args.file}' into RAM (full-memory int32)...")
+    print(f"Opening [{dev.index}] '{dev.name}' via {dev.mode.value} ({dev.hostapi_name})...")
+    info = play_flac_file(args.file, device=dev, latency=args.latency)
+    print(
+        f"Playback complete: {info['frames_played']} frames, "
+        f"rate={info['actual_samplerate']} Hz ({info['subtype']}), "
+        f"dtype={info['actual_dtype']}, latency={info['actual_latency_s'] * 1000:.1f} ms, "
+        f"underflows={info['underflows']}"
+    )
+    return 0
+
+
+def cmd_generate_fixture(args: argparse.Namespace) -> int:
+    out = write_nocturne_flac(
+        output_path=args.output,
+        sample_rate=args.rate,
+        target_peak_dbfs=args.level,
+    )
+    print(f"Generated copyright-free 24-bit/{args.rate} Hz FLAC fixture: {out}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="audiophile-poc",
@@ -128,6 +155,31 @@ def main(argv: list[str] | None = None) -> int:
     p_tone.add_argument("--duration", type=float, default=1.5, help="Duration seconds (default: 1.5).")
     p_tone.add_argument("--latency", type=float, default=0.1, help="Target latency seconds (default: 0.1).")
     p_tone.set_defaults(func=cmd_test_tone)
+
+    p_play = sub.add_parser("play-file", help="Play a FLAC file from RAM via WDM-KS or WASAPI Exclusive.")
+    p_play.add_argument("file", help="Path to FLAC file.")
+    p_play.add_argument(
+        "--mode",
+        choices=["wdm-ks", "wasapi-exclusive"],
+        default="wdm-ks",
+        help="Zero-mixer transport mode (default: wdm-ks).",
+    )
+    p_play.add_argument("--device", required=True, help="Device index or name substring.")
+    p_play.add_argument("--latency", type=float, default=0.1, help="Target latency seconds (default: 0.1).")
+    p_play.set_defaults(func=cmd_play_file)
+
+    p_gen = sub.add_parser(
+        "generate-fixture",
+        help="Generate the original copyright-free 24/96 chamber-nocturne FLAC fixture.",
+    )
+    p_gen.add_argument(
+        "--output",
+        default="tests/fixtures/audio/original_nocturne_24_96.flac",
+        help="Output FLAC file path.",
+    )
+    p_gen.add_argument("--rate", type=int, default=96000, help="Sample rate Hz (default: 96000).")
+    p_gen.add_argument("--level", type=float, default=-12.0, help="Peak level dBFS (default: -12.0).")
+    p_gen.set_defaults(func=cmd_generate_fixture)
 
     args = parser.parse_args(argv)
     return args.func(args)
