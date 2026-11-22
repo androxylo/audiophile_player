@@ -6,5 +6,4 @@ edition.workspace = true
 repository.workspace = true
 
 [dependencies]
-ap-core.workspace = true
 # Minimal std::net or lightweight localhost HTTP server finalized in INV-08.

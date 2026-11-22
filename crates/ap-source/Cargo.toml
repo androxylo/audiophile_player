@@ -7,4 +7,4 @@ repository.workspace = true
 
 [dependencies]
 ap-core.workspace = true
-# FLAC decoder crate (e.g. claxon / symphonia / libFLAC) finalized in INV-08.
+flac-codec = "1.3"

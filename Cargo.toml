@@ -23,7 +23,13 @@ repository = "https://github.com/androxylo/audiophile_player"
 
 [workspace.dependencies]
 ap-core = { path = "crates/ap-core" }
-ap-source = { path = "crates/ap-source" }
-ap-dsp = { path = "crates/ap-dsp" }
-ap-output-win = { path = "crates/ap-output-win" }
-ap-control = { path = "crates/ap-control" }
+# Uncomment as crates are wired into ap-cli in Milestone 1:
+# ap-source = { path = "crates/ap-source" }
+# ap-dsp = { path = "crates/ap-dsp" }
+# ap-output-win = { path = "crates/ap-output-win" }
+# ap-control = { path = "crates/ap-control" }
+
+# Optimize third-party codec/DSP dependencies even in dev/test builds so
+# decoding large 32-bit/384 kHz HiRes FLACs stays fast during `cargo test`.
+[profile.dev.package."*"]
+opt-level = 3
