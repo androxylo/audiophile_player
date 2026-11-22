@@ -19,8 +19,8 @@ use ap_core::format::DacWireFormat;
 use ap_output_win::hygiene::{MmcssGuard, OptimizationLevel};
 use ap_output_win::sink::ZeroMixerAudioSink;
 use ap_output_win::wdm_ks::{
-    KsPinConnectBlob, WaveRtFramePump, WdmKsSink, classify_ks_pin_error,
-    enumerate_wdm_ks_render_devices,
+    KsPinConnectBlob, KsRenderDevice, WaveRtFramePump, WdmKsSink, classify_ks_pin_error,
+    enumerate_wdm_ks_render_devices, select_wdm_ks_device,
 };
 
 static HARDWARE_LOCK: Mutex<()> = Mutex::new(());
@@ -140,6 +140,35 @@ fn busy_win32_codes_map_to_device_busy_with_audirvana_message() {
         assert!(msg.contains("Audirvana"), "missing Audirvana hint in: {msg}");
         assert!(msg.contains("Shared Mode fallback is strictly disabled"));
     }
+}
+
+#[test]
+fn auto_device_selector_prefers_usb_uac2_dac_over_hdmi_and_desktop_speakers() {
+    let devices = vec![
+        KsRenderDevice {
+            friendly_name: "AMD HD Audio HDMI out #3".to_string(),
+            device_path: r"\\?\hdaudio#func_01\e3hdmiout2wave".to_string(),
+            render_pin_id: 0,
+            supports_looped_wavert: true,
+        },
+        KsRenderDevice {
+            friendly_name: "Pebble V3".to_string(),
+            device_path: r"\\?\usb#vid_041e&pid_3272\global".to_string(),
+            render_pin_id: 0,
+            supports_looped_wavert: true,
+        },
+        KsRenderDevice {
+            friendly_name: "Gungnir 2 Unison 384".to_string(),
+            device_path: r"\\?\usb#vid_30be&pid_1022\msft_wave".to_string(),
+            render_pin_id: 1,
+            supports_looped_wavert: true,
+        },
+    ];
+    let best = select_wdm_ks_device(&devices, None).unwrap();
+    assert_eq!(best.friendly_name, "Gungnir 2 Unison 384");
+
+    let explicit = select_wdm_ks_device(&devices, Some("pebble")).unwrap();
+    assert_eq!(explicit.friendly_name, "Pebble V3");
 }
 
 #[test]

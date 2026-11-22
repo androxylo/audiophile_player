@@ -374,6 +374,64 @@ pub fn classify_ks_pin_error(
     }
 }
 
+/// Pure, unit-testable WDM-KS device selection policy.
+///
+/// - When `device_filter` is `Some(sub)`, selects the first device matching `sub` (case-insensitive).
+/// - When `device_filter` is `None` (zero-config default mode), prefers dedicated USB audiophile
+///   DACs (Schiit/Unison/Gungnir/USB UAC2 WaveRT endpoints) over monitor HDMI/DisplayPort audio,
+///   falling back gracefully to any available WDM-KS render device.
+pub fn select_wdm_ks_device(
+    devices: &[KsRenderDevice],
+    device_filter: Option<&str>,
+) -> Result<KsRenderDevice, OutputError> {
+    if devices.is_empty() {
+        return Err(OutputError::DeviceNotFound(
+            "no Windows WDM-KS audio render devices found".to_string(),
+        ));
+    }
+
+    if let Some(filter) = device_filter {
+        let needle = filter.to_lowercase();
+        return devices
+            .iter()
+            .find(|d| d.friendly_name.to_lowercase().contains(&needle))
+            .cloned()
+            .ok_or_else(|| {
+                OutputError::DeviceNotFound(format!(
+                    "no WDM-KS render device matching '{filter}'"
+                ))
+            });
+    }
+
+    let score = |d: &KsRenderDevice| -> i32 {
+        let name = d.friendly_name.to_lowercase();
+        let path = d.device_path.to_lowercase();
+        let mut s = 0;
+        if name.contains("gungnir") || name.contains("unison") || name.contains("schiit") {
+            s += 100;
+        }
+        if path.contains("\\usb#") {
+            s += 40;
+        }
+        if path.contains("msft_wave") {
+            s += 30; // Microsoft UAC2 usbaudio2.sys WaveRT driver
+        }
+        if d.supports_looped_wavert {
+            s += 20;
+        }
+        if name.contains("hdmi") || name.contains("displayport") || name.contains("nvidia") {
+            s -= 50;
+        }
+        s
+    };
+
+    devices
+        .iter()
+        .max_by_key(|d| score(d))
+        .cloned()
+        .ok_or_else(|| OutputError::DeviceNotFound("no WDM-KS render device available".to_string()))
+}
+
 /// Direct Windows Kernel Streaming (`WDM-KS`) WaveRT output sink.
 #[derive(Debug)]
 pub struct WdmKsSink {
@@ -392,17 +450,17 @@ impl WdmKsSink {
         device_filter: &str,
         optimization: OptimizationLevel,
     ) -> Result<Self, OutputError> {
-        let devices = enumerate_wdm_ks_render_devices()?;
-        let needle = device_filter.to_lowercase();
-        let found = devices
-            .into_iter()
-            .find(|d| d.friendly_name.to_lowercase().contains(&needle))
-            .ok_or_else(|| {
-                OutputError::DeviceNotFound(format!(
-                    "no WDM-KS render device matching '{device_filter}'"
-                ))
-            })?;
+        Self::open_best(Some(device_filter), optimization)
+    }
 
+    /// Open the requested WDM-KS device, or auto-select the highest-priority audiophile DAC
+    /// when `device_filter` is `None` (default zero-option mode).
+    pub fn open_best(
+        device_filter: Option<&str>,
+        optimization: OptimizationLevel,
+    ) -> Result<Self, OutputError> {
+        let devices = enumerate_wdm_ks_render_devices()?;
+        let found = select_wdm_ks_device(&devices, device_filter)?;
         Ok(Self {
             device: found,
             optimization,

@@ -11,7 +11,8 @@
 //! flushing output and releasing resources (future exclusive DAC pins) before returning.
 
 use std::fmt;
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 const CTRL_C_EVENT: u32 = 0;
@@ -62,13 +63,15 @@ impl fmt::Display for ShutdownSignal {
     }
 }
 
-/// Thread-safe shutdown coordinator that parks the main thread at 0% CPU until signaled.
+/// Thread-safe shutdown coordinator that parks the main thread at 0% CPU until signaled,
+/// and optionally flips an attached audio-sink stop flag immediately upon interrupt.
 #[derive(Debug, Default)]
 pub struct ShutdownController {
     signal: Mutex<Option<ShutdownSignal>>,
     signal_cv: Condvar,
     cleanup_done: Mutex<bool>,
     cleanup_cv: Condvar,
+    active_stop_flag: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 impl ShutdownController {
@@ -76,12 +79,42 @@ impl ShutdownController {
         Self::default()
     }
 
-    /// Record the first shutdown signal and wake the waiting main thread.
+    /// Attach an audio sink's `stop_handle()` so any interrupt signal triggers an immediate
+    /// click-free fade-out stop without waiting for the current track to finish.
+    pub fn attach_stop_flag(&self, flag: Arc<AtomicBool>) {
+        let already_signaled = self
+            .signal
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some();
+        if already_signaled {
+            flag.store(true, Ordering::SeqCst);
+        }
+        *self
+            .active_stop_flag
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(flag);
+    }
+
+    /// Check non-blockingly whether a shutdown signal has already been received.
+    pub fn current_signal(&self) -> Option<ShutdownSignal> {
+        *self.signal.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Record the first shutdown signal, trip any attached sink stop flag, and wake waiters.
     pub fn trigger(&self, sig: ShutdownSignal) {
         let mut guard = self.signal.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
             *guard = Some(sig);
             self.signal_cv.notify_all();
+        }
+        if let Some(flag) = self
+            .active_stop_flag
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            flag.store(true, Ordering::SeqCst);
         }
     }
 

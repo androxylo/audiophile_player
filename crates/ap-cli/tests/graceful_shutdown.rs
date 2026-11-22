@@ -21,6 +21,7 @@ mod windows_signal_test {
     fn binary_starts_stays_running_and_stops_gracefully_on_ctrl_break() {
         let exe = env!("CARGO_BIN_EXE_audiophile-player");
         let mut child = Command::new(exe)
+            .arg("--idle")
             .creation_flags(CREATE_NEW_PROCESS_GROUP)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

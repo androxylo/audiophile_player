@@ -1,19 +1,31 @@
 //! Headless `audiophile-player` binary entrypoint.
 //!
-//! Minimal runnable shell:
-//! - Prints startup banner.
-//! - Installs Windows console interrupt/termination handlers (`Ctrl+C`, `Ctrl+Break`,
-//!   console close, logoff, shutdown).
-//! - Parks cleanly at 0% CPU until signaled, then prints graceful stop output and exits `0`.
+//! Default mode (no command-line options): immediately starts playing random FLAC files
+//! from `~/Music` in highest-quality Windows Kernel Streaming (`WDM-KS` WaveRT) mode on
+//! the auto-selected best DAC. Any other mode requires explicit CLI options (`--help`).
 
+mod cli_args;
 mod engine;
 mod signals;
 
 use std::process::ExitCode;
 
-use engine::PlaybackEngine;
+use cli_args::{RunMode, help_text, parse_args};
 
 fn main() -> ExitCode {
+    let mode = match parse_args(std::env::args()) {
+        Ok(m) => m,
+        Err(err) => {
+            eprintln!("audiophile-player argument error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if mode == RunMode::Help {
+        print!("{}", help_text());
+        return ExitCode::SUCCESS;
+    }
+
     let controller = match signals::install_signal_handlers() {
         Ok(ctrl) => ctrl,
         Err(err) => {
@@ -22,12 +34,26 @@ fn main() -> ExitCode {
         }
     };
 
-    let mut player = PlaybackEngine::new_default();
-    player.start();
+    let result = match mode {
+        RunMode::Idle => {
+            engine::run_idle(controller);
+            Ok(())
+        }
+        RunMode::PlayRandom {
+            music_dir,
+            device_filter,
+            optimization,
+        } => engine::run_random_music_player(music_dir, device_filter, optimization, controller),
+        RunMode::Help => unreachable!(),
+    };
 
-    let signal = controller.wait_for_shutdown();
-    player.stop(signal);
     controller.mark_cleanup_complete();
 
-    ExitCode::SUCCESS
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("audiophile-player error: {err}");
+            ExitCode::FAILURE
+        }
+    }
 }

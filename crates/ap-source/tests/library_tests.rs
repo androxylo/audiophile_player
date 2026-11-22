@@ -1,11 +1,13 @@
-//! Offline TDD unit tests for recursive FLAC discovery and random track selection.
+//! Offline TDD unit tests for resilient O(depth) random subfolder-walk FLAC picker.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ap_source::library::{
-    default_user_music_dir, discover_flac_files, pick_random_flac, pick_random_flac_with_seed,
+    default_user_music_dir, discover_flac_files, pick_random_flac, pick_random_flac_walk,
+    pick_random_flac_walk_with_seed, pick_random_flac_with_seed,
 };
 
 fn make_temp_tree(tag: &str) -> PathBuf {
@@ -20,6 +22,88 @@ fn make_temp_tree(tag: &str) -> PathBuf {
     ));
     fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+#[test]
+fn walk_picker_handles_empty_and_non_flac_subfolders_resiliently() {
+    let root = make_temp_tree("walk_resilient");
+    // Empty subfolders & non-FLAC decoy folders (must backtrack cleanly)
+    fs::create_dir_all(root.join("EmptyA").join("NestedEmpty")).unwrap();
+    fs::create_dir_all(root.join("ArtworkOnly")).unwrap();
+    fs::write(root.join("ArtworkOnly").join("cover.jpg"), b"jpg").unwrap();
+    fs::write(root.join("ArtworkOnly").join("readme.txt"), b"txt").unwrap();
+
+    // Real nested FLAC albums
+    let album1 = root.join("Artist1").join("Album1");
+    let album2 = root.join("Artist2").join("Album2").join("Disc1");
+    fs::create_dir_all(&album1).unwrap();
+    fs::create_dir_all(&album2).unwrap();
+    fs::write(album1.join("01.flac"), b"").unwrap();
+    fs::write(album1.join("02.FLAC"), b"").unwrap();
+    fs::write(album2.join("03.flac"), b"").unwrap();
+
+    // Across 60 distinct seeds, every single pick must succeed and return a real FLAC
+    let mut seen = HashSet::new();
+    for seed in 0..60_u64 {
+        let picked = pick_random_flac_walk_with_seed(&root, seed)
+            .expect("walk picker must backtrack past empty/decoy folders and find a FLAC");
+        assert!(
+            picked
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("flac")),
+            "picked non-flac path: {}",
+            picked.display()
+        );
+        seen.insert(picked);
+    }
+    // Should reach both Artist1 and Artist2 across 60 seeds
+    assert_eq!(seen.len(), 3, "expected all 3 tracks reachable, saw: {seen:?}");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn walk_picker_reaches_both_root_flacs_and_subfolder_flacs_in_mixed_dir() {
+    let root = make_temp_tree("walk_mixed");
+    let sub = root.join("SubAlbum");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(root.join("loose.flac"), b"").unwrap();
+    fs::write(sub.join("nested.flac"), b"").unwrap();
+
+    let mut seen = HashSet::new();
+    for seed in 0..40_u64 {
+        seen.insert(pick_random_flac_walk_with_seed(&root, seed).unwrap());
+    }
+    assert!(seen.iter().any(|p| p.ends_with("loose.flac")));
+    assert!(seen.iter().any(|p| p.ends_with("nested.flac")));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn walk_picker_returns_error_when_no_flac_exists_anywhere() {
+    let root = make_temp_tree("walk_empty");
+    fs::create_dir_all(root.join("Empty1")).unwrap();
+    fs::create_dir_all(root.join("Empty2").join("Deep")).unwrap();
+    fs::write(root.join("Empty2").join("notes.txt"), b"hello").unwrap();
+
+    let err = pick_random_flac_walk_with_seed(&root, 7).unwrap_err();
+    assert!(err.to_lowercase().contains("no .flac"));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn walk_picker_wall_clock_helper_works_on_valid_tree() {
+    let root = make_temp_tree("walk_clock");
+    fs::create_dir_all(root.join("A")).unwrap();
+    fs::write(root.join("A").join("song.flac"), b"").unwrap();
+
+    let picked = pick_random_flac_walk(&root).unwrap();
+    assert!(picked.ends_with("song.flac"));
+
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]

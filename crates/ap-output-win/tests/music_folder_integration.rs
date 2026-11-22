@@ -1,7 +1,8 @@
-//! Full end-to-end integration test: pick a random FLAC recursively from `~/Music`
-//! (external to the repo; zero copyrighted music is ever stored in the repository)
-//! and play it for 10 seconds through native Rust Windows Kernel Streaming (`WDM-KS` WaveRT)
-//! on the Schiit Gungnir 2, then stop gracefully with a click-free fade-out.
+//! Full end-to-end integration test: pick a random FLAC from `~/Music` using the
+//! scalable O(depth) subfolder-walk picker (resilient to 20,000+ track libraries;
+//! zero copyrighted music is ever stored in the repository) and play it for 10 seconds
+//! through native Rust Windows Kernel Streaming (`WDM-KS` WaveRT) on the Schiit Gungnir 2,
+//! then stop gracefully with a click-free fade-out.
 
 #[cfg(windows)]
 mod random_music_folder_test {
@@ -13,7 +14,7 @@ mod random_music_folder_test {
     use ap_output_win::sink::ZeroMixerAudioSink;
     use ap_output_win::wdm_ks::WdmKsSink;
     use ap_source::flac::decode_flac_full_memory_int32;
-    use ap_source::library::{default_user_music_dir, discover_flac_files, pick_random_flac};
+    use ap_source::library::{default_user_music_dir, pick_random_flac_walk};
 
     #[test]
     fn plays_random_flac_from_user_music_for_10_seconds_via_wdm_ks() {
@@ -21,29 +22,21 @@ mod random_music_folder_test {
             println!("Skipping: could not resolve ~/Music directory.");
             return;
         };
-        let flacs = match discover_flac_files(&music_dir) {
-            Ok(list) if !list.is_empty() => list,
-            Ok(_) => {
-                println!(
-                    "Skipping: no .flac files found under '{}'.",
-                    music_dir.display()
-                );
-                return;
-            }
+        let pick_start = Instant::now();
+        let chosen = match pick_random_flac_walk(&music_dir) {
+            Ok(p) => p,
             Err(err) => {
                 println!("Skipping: {err}");
                 return;
             }
         };
-
-        let chosen = pick_random_flac(&flacs).expect("non-empty FLAC list");
+        let pick_ms = pick_start.elapsed().as_secs_f64() * 1000.0;
         println!(
-            "=== Random ~/Music Integration Test ({} FLACs discovered) ===",
-            flacs.len()
+            "=== Random ~/Music Integration Test (O(depth) walk picked in {pick_ms:.2} ms) ==="
         );
         println!("  Selected track: {}", chosen.display());
 
-        let decoded = decode_flac_full_memory_int32(chosen)
+        let decoded = decode_flac_full_memory_int32(&chosen)
             .expect("failed to decode random FLAC from ~/Music into RAM");
         let total_track_s =
             decoded.pcm.frames.len() as f64 / decoded.spec.sample_rate_hz as f64;
