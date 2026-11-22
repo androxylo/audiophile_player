@@ -1,0 +1,17 @@
+[package]
+name = "ap-cli"
+description = "Headless CLI binary wiring ap-source -> ap-dsp -> ap-output-win + rudimentary ap-control server"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "audiophile-player"
+path = "src/main.rs"
+
+[dependencies]
+ap-core.workspace = true
+ap-source.workspace = true
+ap-dsp.workspace = true
+ap-output-win.workspace = true
+ap-control.workspace = true

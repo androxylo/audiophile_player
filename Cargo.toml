@@ -1,0 +1,29 @@
+# Audiophile Player — Rust Production Workspace (Architectural Outline)
+#
+# Status: Structural skeleton only. Implementation begins after Phase 0 research
+# and Python/C++ POC validation. Third-party crate dependencies will be vetted
+# for open-source license compatibility in docs/research/08-architecture-and-verification.md.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/ap-core",
+    "crates/ap-source",
+    "crates/ap-dsp",
+    "crates/ap-output-win",
+    "crates/ap-control",
+    "crates/ap-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# License TBD (LGPL-compatible open-source license; finalized in INV-08).
+repository = "https://github.com/androxylo/audiophile_player"
+
+[workspace.dependencies]
+ap-core = { path = "crates/ap-core" }
+ap-source = { path = "crates/ap-source" }
+ap-dsp = { path = "crates/ap-dsp" }
+ap-output-win = { path = "crates/ap-output-win" }
+ap-control = { path = "crates/ap-control" }

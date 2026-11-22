@@ -1,0 +1,12 @@
+//! Milestone 2 placeholder: strictly Windows-mixer-free Tidal lossless stream source.
+//!
+//! Architecture finalized in `docs/research/07-tidal-and-companions.md` (INV-07).
+//! Standard mixer-involving virtual audio cables are strictly disqualified.
+
+/// Source kind distinguishing local FLAC files from live Tidal streams
+/// (used for on-the-fly DSP selection and `-3 dB` unknown-peak headroom).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceKind {
+    LocalFlac,
+    TidalStream,
+}

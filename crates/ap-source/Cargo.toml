@@ -1,0 +1,10 @@
+[package]
+name = "ap-source"
+description = "Audio sources ONLY: local FLAC library (recursive shuffle, RAM decode, ReplayGain tags) and Milestone 2 Tidal interface"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+ap-core.workspace = true
+# FLAC decoder crate (e.g. claxon / symphonia / libFLAC) finalized in INV-08.

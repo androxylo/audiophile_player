@@ -1,0 +1,10 @@
+[package]
+name = "ap-control"
+description = "Extremely rudimentary local HTTP control server (pick file/folder, Play/Stop, GitHub manual link)"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+ap-core.workspace = true
+# Minimal std::net or lightweight localhost HTTP server finalized in INV-08.

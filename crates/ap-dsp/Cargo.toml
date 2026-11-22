@@ -1,0 +1,10 @@
+[package]
+name = "ap-dsp"
+description = "Pure float64 DSP engine locked to 352.8/384 kHz: 4M-tap upsampling, core REW convolution, integer channel delay, and 8fS noise shaping"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+ap-core.workspace = true
+# LGPL-compatible 64-bit FFT crate (e.g. realfft / rustfft) finalized in INV-08 (no GPL-only FFTW3).
