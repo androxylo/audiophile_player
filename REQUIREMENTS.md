@@ -42,7 +42,8 @@ To keep the signal path pure and engineering focused entirely on sound quality:
 | **No volume control** | Avoid variable digital attenuation pipelines and user-facing gain stages (only fixed safety headroom is applied; see §5.2). |
 | **No general DSP suite** | No parametric EQ UI, tone controls, crossfeed, compression, or effects. Only REW stereo convolution and minimal channel delay alignment. |
 | **Windows-only** | No macOS or Linux portability overhead; optimize directly for Windows kernel-level audio transport. |
-| **Single reference DAC** | Optimize and validate strictly against the **Schiit Gungnir 2** DAC. |
+| **Single reference DAC** | Optimize and validate strictly against the **Schiit Gungnir 2** DAC (Unison 384, up to 32/384 kHz). |
+| **`352.8 / 384 kHz` native optimization only** | All DSP algorithms, noise shapers, and tests are explicitly optimized for **`352.8 kHz` and `384 kHz`** (`8fS`). We cannot optimize all sample rates equally well; DACs lacking `352.8/384 kHz` support are slightly penalized and gently recommended to upgrade (e.g., even the accessible Schiit Bifrost 3 with Unison 384 supports up to 32/384 kHz). |
 | **Only two audio sources** | Local FLAC files and Tidal only—nothing else (no Spotify, Qobuz, radio, podcasts, video, etc.). |
 
 ---
@@ -75,8 +76,9 @@ Every processing stage must prioritize mathematical purity:
 - **Curated Audiophile Filter Set:** We will **not** replicate HQPlayer's massive catalog of filters. Instead, we will implement a curated set covering **all filters consistently praised in audiophile reviews and message boards as pleasant and audiophile-class**.
 - **Dynamic On-the-Fly Algorithm Selection:** The engine will **switch upsampling and dithering/noise-shaping algorithms on the fly depending on the music source** (e.g., adapting automatically to input sample rate such as 1x `44.1/48 kHz` vs. Nx HiRes `88.2/96/192 kHz`, bit depth, local FLAC vs. Tidal stream, or other source/track attributes determined during research).
 
-### 5.1 High-Rate Floating-Point DSP Domain & HiRes Upsampling
-- **High-Rate DSP Domain (`≥ 352.8 / 384 kHz`, Floating-Point Only):** All core DSP processing (upsampling, REW stereo convolution, headroom scaling, channel delay) operates at **`352.8 / 384 kHz` or higher** in pure floating point. Downsampling is applied *only* at the end if required to match the target DAC's native rate *(note: Schiit Gungnir 2 Unison 384 natively accepts 352.8/384 kHz; whether processing above 352.8/384 kHz + downsampling provides any benefit is open for discussion in `INV-03`/`INV-05`)*.
+### 5.1 Locked `352.8 / 384 kHz` Floating-Point DSP Domain & HiRes Upsampling
+- **Explicit `352.8 / 384 kHz` (`8fS`) Optimization (Decided):** All DSP algorithms (upsampling filters, REW stereo convolution, channel delay, and noise shapers) and **all automated tests** are explicitly designed and optimized for **`352.8 kHz`** (`44.1 / 88.2 / 176.4 kHz` family via exact 8x / 4x / 2x integer ratios) and **`384 kHz`** (`48 / 96 / 192 kHz` family via exact 8x / 4x / 2x integer ratios) in pure floating point.
+- **No Compromise for Lower-Rate DACs:** Output runs natively at `352.8 / 384 kHz` with **zero downsampling** on Gungnir 2 (and other Unison 384 / 384 kHz-capable DACs such as Bifrost 3). Users with DACs that do not support `352.8 / 384 kHz` accept a slight penalty (e.g., end-stage downsampling if ever added) and are gently recommended to upgrade.
 - Because there is **no real-time constraint**, computationally intensive algorithms (up to the strict **4,000,000-tap cap**, offline/whole-track or large-block processing, pure high-precision floating-point arithmetic) are viable and encouraged wherever they improve fidelity.
 
 ### 5.2 Safety Headroom (`-3 dB` to `0 dB`, Never Boosting)

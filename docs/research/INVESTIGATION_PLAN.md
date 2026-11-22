@@ -21,6 +21,7 @@
    - After each investigation, update [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md) with resolved answers and any newly discovered questions.
 4. **Hard Design Constraints Governing All Investigations:**
    - **Strict 4,000,000-tap (4M) cap** (bounds mathematical complexity and memory buffers; not a quality compromise).
+   - **Locked `352.8 / 384 kHz` (`8fS`) DSP & test target:** All upsampling filters, REW convolution (first-class core feature), channel delay, noise shapers, and test suites are explicitly optimized for `352.8 kHz` (44.1x family) and `384 kHz` (48x family). Lower-rate DACs are not equally optimized.
    - **All internal calculations strictly in floating point**; integer conversion occurs **once** at final DAC output formatting.
    - **Curated filter set** covering all filters consistently praised in audiophile reviews and message boards as pleasant and audiophile-class (not HQPlayer's entire catalog), with **on-the-fly algorithm switching depending on the music source**.
    - **Safety headroom (`-3 dB` to `0 dB`, never boosting > 0 dB)** informed by FLAC ReplayGain & True Peak annotations (always `-3 dB` when max level is unknown), no user volume control, stereo REW convolution, optional single-channel delay only, no other DSP.
