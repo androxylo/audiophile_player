@@ -57,11 +57,14 @@ The player will handle **two and only two sources**, and work in tandem with exi
 
 ## 5. Audio Processing Pipeline (Strict DSP Specification)
 
-Every processing stage must prioritize mathematical purity (e.g., high-precision floating-point processing, optimal filtering, proper dithering/noise-shaping to DAC word length—exact algorithms to be finalized in research).
+Every processing stage must prioritize mathematical purity:
+- **Floating-Point-Only Processing:** **All internal calculations** across the entire DSP pipeline (decoding normalization, headroom scaling, upsampling, convolution, channel delay) must be executed strictly in **floating point only** (e.g., 64-bit IEEE 754 `float64` or higher as determined by research). **Only the final output** is converted/quantized into the DAC's native integer PCM format.
+- **Strict 4-Million-Tap Cap:** Filter length is strictly capped at **4,000,000 taps (4M)**. This bounds mathematical complexity and memory buffers and is **not** a sound-quality compromise—there is no credible evidence that exceeding 4M taps yields any audible benefit.
+- **Curated Audiophile Filter Set:** We will **not** replicate HQPlayer's massive catalog of filters. Instead, we will implement a curated set covering **all filters consistently praised in audiophile reviews and message boards as pleasant and audiophile-class**.
 
 ### 5.1 HiRes Upsampling
 - Upsample incoming PCM audio to optimal HiRes target sample rate(s) suited to the Gungnir 2 DAC.
-- Because there is **no real-time constraint**, arbitrarily expensive algorithms (very long FIR filters, offline/whole-track or large-block processing, high-precision arithmetic) are viable and encouraged if they improve fidelity.
+- Because there is **no real-time constraint**, computationally intensive algorithms (up to the strict **4,000,000-tap cap**, offline/whole-track or large-block processing, pure high-precision floating-point arithmetic) are viable and encouraged wherever they improve fidelity.
 
 ### 5.2 Fixed Safety Headroom (-3 dB)
 - **No user volume control.**
@@ -87,13 +90,9 @@ Every processing stage must prioritize mathematical purity (e.g., high-precision
 ## 7. Release Milestones
 
 ### Milestone 0 — Preparation & Research (Current Phase)
-Complete deep technical research before writing any production code. Planned small-step research topics (to be saved under `docs/research/`):
-1. **Gungnir 2 DAC Architecture & Optimal Input:** Supported PCM sample rates/bit depths, True Multibit / internal oversampling vs NOS behavior, Unison USB characteristics on Windows.
-2. **Upsampling Theory & Algorithms (HQPlayer+ Target):** Filter families (sinc, apodizing, polyphase, linear vs minimum phase), exploiting non-real-time latency (very long tap counts / whole-track processing), integer-multiple vs arbitrary ratios, internal precision (64-bit float+), dither & noise shaping, ISP headroom verification.
-3. **REW Stereo Convolution & Channel Delay:** Exact REW stereo IR format, convolution precision & architecture (non-real-time overlap-add / large FFT), order of operations (upsample vs convolve, IR resampling), fractional/sub-sample vs sample-level channel delay, gain normalization vs `-3 dB` headroom.
-4. **Windows Kernel-Level Output:** Kernel Streaming (KS) vs WASAPI Exclusive vs ASIO on Windows with Unison USB, bit-perfect verification, buffering, thread/process isolation, jitter & electrical noise considerations.
-5. **Companion / Tandem Integration:** Interfacing with vanilla Tidal desktop app and/or local frontend players (e.g., foobar2000) cleanly without Windows mixer contamination.
-6. **System Architecture & Tech Stack:** Programming language, headless CLI/daemon model, library vs custom DSP implementation, verification & measurement strategy.
+Complete deep technical research before writing any production code.
+- See [docs/research/INVESTIGATION_PLAN.md](docs/research/INVESTIGATION_PLAN.md) for the full ordered plan of investigations, resource-scanning scope (including audiophile message boards), and the browser-PDF handoff protocol for inaccessible resources.
+- See [docs/research/OPEN_QUESTIONS.md](docs/research/OPEN_QUESTIONS.md) for all tracked open technical and architectural questions.
 
 ### Milestone 1 — Initial Fully Featured Local Release (MVP)
 A headless player delivering the **complete uncompromising audio quality pipeline**:
