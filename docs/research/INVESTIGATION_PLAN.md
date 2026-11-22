@@ -25,6 +25,7 @@
    - **Curated filter set** covering all filters consistently praised in audiophile reviews and message boards as pleasant and audiophile-class (not HQPlayer's entire catalog).
    - **Fixed `-3 dB` safety attenuation**, no user volume control, stereo REW convolution, optional single-channel delay only, no other DSP.
    - **No real-time constraint**; **Windows-only**; **no GUI**; **Schiit Gungnir 2** reference DAC; **local FLAC + Tidal only**.
+   - **Zero Windows mixer anywhere in the pipeline** (input or output); **non-exclusive mode strictly forbidden in any form**; mixer-involving virtual audio cables are **non-compliant**; target **Audirvana-style Windows kernel-mode streaming**.
 
 ---
 
@@ -38,8 +39,8 @@
 | **INV-03** | Mathematical Filter Design, 4M-Tap Cap & Floating-Point Precision | `03-filter-math-and-precision.md` | Pending |
 | **INV-04** | Final DAC Quantization, Dither/Noise Shaping & `-3 dB` ISP Headroom | `04-quantization-dither-headroom.md` | Pending |
 | **INV-05** | REW Stereo Convolution, Processing Order & Channel Delay | `05-convolution-and-delay.md` | Pending |
-| **INV-06** | Windows Kernel Streaming (WDM-KS), Bit-Perfect Output & System Hygiene | `06-windows-kernel-streaming.md` | Pending |
-| **INV-07** | Tandem Architecture: Vanilla Tidal Lossless Capture & Local Companions | `07-tidal-and-companions.md` | Pending |
+| **INV-06** | Audirvana Kernel Mode, Windows Kernel Streaming (WDM-KS) & Bit-Perfect Output | `06-windows-kernel-streaming.md` | Pending |
+| **INV-07** | Tandem Architecture: Mixer-Free Tidal Capture & Local Companions | `07-tidal-and-companions.md` | Pending |
 | **INV-08** | Software Architecture, Tech Stack & Objective/Subjective Verification Plan | `08-architecture-and-verification.md` | Pending |
 
 ---
@@ -96,24 +97,27 @@
   - Measuring/handling REW IR gain so positive EQ boosts cannot exceed the `-3 dB` safety margin.
   - Single-channel delay implementation: Pure integer-sample delay at 352.8/384 kHz (~2.6 µs / ~0.9 mm resolution) vs fractional-sample allpass/sinc delay.
 
-### INV-06 — Windows Kernel Streaming (WDM-KS), Bit-Perfect Output & System Hygiene
-- **Objective:** Specify the exact Windows kernel-level output architecture to match/exceed Audirvana's Kernel Streaming with rock-solid stability on Gungnir 2.
+### INV-06 — Audirvana Kernel Mode, Windows Kernel Streaming (WDM-KS) & Bit-Perfect Output
+- **Objective:** Understand exactly **how the kernel mode used in Audirvana works** so we can replicate the same mechanism, guaranteeing zero Windows mixer involvement and rock-solid stability on Gungnir 2.
 - **What to investigate:**
-  - Low-level implementation mechanics of **WDM-KS (Kernel Streaming)** on Windows 10/11 (`KS` pins, `WaveRT`, PortAudio `paWDMKS`, Audirvana KS, foobar2000 `foo_out_ks`) vs **WASAPI Exclusive** (Event vs Push) and **ASIO**.
+  - **How Audirvana's Windows Kernel Streaming mode works in detail:** APIs/interfaces used (`ks.h`/`ksmedia.h`, WDM-KS pin creation, `WaveRT` vs standard KS IRP streaming, `SysAudio`/filter topology bypass), exclusive hardware acquisition, buffer management, memory/RAM pre-loading, sample-rate switching, and any published technical notes/posts from Damien Plisson / Audirvana forums / reverse-engineering analyses.
+  - Open-source WDM-KS reference implementations (`PortAudio` `paWDMKS`, `foobar2000` `foo_out_ks`, `Album Player` KS) to compare against Audirvana's behavior.
+  - Strict enforcement of **Exclusive-only / Zero Windows Mixer** policy (non-exclusive / Shared Mode explicitly unsupported in any form).
   - Known WDM-KS quirks with Microsoft's `usbaudio2.sys` and Schiit Unison 384 USB (device enumeration, exclusive pin locking, clean stream teardown/reopen when switching between `352.8 kHz` and `384 kHz`, avoiding clicks/pops/hangs).
-  - Full-memory (RAM) pre-buffering strategy (inspired by Album Player & Audirvana): pre-computing processed track buffers in RAM, locking pages (`VirtualLock`), pacing steady writes to the kernel audio buffer, MMCSS (`AvSetMmThreadCharacteristicsW` `"Pro Audio"`), thread affinity.
-  - Objective vs. subjective evidence on Windows playback hygiene (CPU wakeups, USB polling burstiness, power plans, DPC latency) and how to verify 100% bit-perfect transfer to the DAC.
+  - Full-memory (RAM) pre-buffering strategy (inspired by Audirvana & Album Player): pre-computing processed track buffers in RAM, locking pages (`VirtualLock`), pacing steady writes to the kernel audio buffer, MMCSS (`AvSetMmThreadCharacteristicsW` `"Pro Audio"`), thread affinity.
+  - Objective vs. subjective evidence on Windows playback hygiene (CPU wakeups, USB polling burstiness, power plans, DPC latency) and how to verify 100% bit-perfect transfer to the DAC (proving the Windows mixer is never touched).
 
-### INV-07 — Tandem Architecture: Vanilla Tidal Lossless Capture & Local Companions
-- **Objective:** Design a zero-degradation bridge for vanilla Tidal Desktop and evaluate companion GUI options for local playback so Milestone 1 and Milestone 2 share one clean core.
+### INV-07 — Tandem Architecture: Mixer-Free Tidal Capture & Local Companions
+- **Objective:** Design a strictly **Windows-mixer-free, exclusive-only** architecture for working with Tidal and local companions so Milestone 1 and Milestone 2 share one clean core.
+- **Hard Compliance Constraint:** Standard virtual audio cables are **non-compliant** because they involve the Windows audio mixer in one way or another. **Non-exclusive mode is strictly disallowed in any form.**
 - **What to investigate:**
-  - Current behavior of the official **vanilla Tidal Windows desktop app** (HiRes FLAC 24/44.1–24/192 support, Exclusive Mode vs Shared Mode output, sample-rate switching behavior, DRM/output restrictions).
-  - Bit-perfect capture methods on Windows without Windows mixer resampling:
-    - Virtual audio drivers (**VB-Audio Hi-Fi Cable**, **VB-Audio Matrix**, **Eugene Muzychenko VAC**, **Virtual Audio Driver / WDM-WaveRT sample driver** from Windows Driver Kit).
-    - Critical test question: Which virtual device preserves **dynamic sample-rate switching** from Tidal Exclusive Mode (44.1 → 96 → 192 kHz) bit-perfectly with zero Windows resampler involvement?
-    - Alternative check: Are there official/sanctioned lossless Tidal integration paths (or companion bridges like HQPlayer/foobar2000 setups) worth noting?
+  - Exact audio output behavior of the official **vanilla Tidal Windows desktop app** in **Exclusive Mode** (WASAPI Exclusive / direct endpoint interaction, HiRes FLAC 24/44.1–24/192 dynamic sample-rate switching, whether Tidal supports ASIO or KS output, DRM/output constraints).
+  - **Strictly mixer-free capture/integration paths** (verifying whether any mechanism genuinely keeps the Windows audio engine/mixer 100% out of the path):
+    - Can a custom **kernel-mode / WaveRT virtual audio endpoint** (accepting Tidal's *WASAPI Exclusive* output directly at the kernel miniport level, completely bypassing `audiodg.exe` / Windows mixer, with dynamic sample-rate switching) be built cleanly, and what are Windows 11 driver-signing implications?
+    - Can an **exclusive ASIO-only** or **direct kernel-pin** sink intercept Tidal without touching Windows Audio Engine? (Verify whether vanilla Tidal even supports ASIO.)
+    - If vanilla Tidal Desktop cannot be tapped without involving the Windows mixer at any layer, investigate compliant mixer-free alternatives (e.g., official/sanctioned Tidal API / UPnP / OpenHome / Tidal Connect / Audirvana-like direct Tidal stream ingestion, or companion bridges that stream raw FLAC without Windows audio routing).
   - Streaming-mode vs file-mode DSP architecture: How does a continuous live stream from Tidal (no known track end, live sample-rate changes) feed a high-latency 4M-tap overlap-add engine cleanly (accepting e.g. 5–15 s playback delay)?
-  - Local companion options beyond Milestone 1's folder-shuffle CLI: Can `foobar2000` (or another lightweight UI player) cleanly hand off file paths / playlists / streams to our headless engine?
+  - Local companion options beyond Milestone 1's folder-shuffle CLI: Can `foobar2000` (or another lightweight UI player) cleanly hand off file paths / playlists / lossless IPC streams to our headless engine without touching Windows audio routing at all?
 
 ### INV-08 — Software Architecture, Tech Stack & Verification Plan
 - **Objective:** Finalize language, dependencies, headless CLI/config specification, and rigorous verification/benchmarking suite before coding starts.

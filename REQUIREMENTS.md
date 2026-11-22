@@ -80,10 +80,12 @@ Every processing stage must prioritize mathematical purity:
 
 ---
 
-## 6. Audio Output & Transport (Windows)
+## 6. Audio Output, Transport & Zero-Mixer Rule (Windows)
 
-- **Kernel-Level Streaming:** Output directly via kernel-level streaming (as **Audirvana** does—e.g., Windows Kernel Streaming (KS), to be evaluated alongside WASAPI Exclusive and ASIO during research).
-- **Zero Windows Mixer Involvement:** Strictly bypass the Windows audio mixer, OS resampler, APOs, and system volume control.
+- **Audirvana-Style Kernel-Level Streaming:** Output directly via Windows Kernel Streaming (kernel mode as implemented in **Audirvana**—exact mechanism to be investigated and replicated).
+- **Zero Windows Mixer Anywhere in the Pipeline:** The Windows audio mixer must **never** be in the signal path at any stage (neither on input capture/routing nor on DAC output).
+- **Exclusive Mode Only:** Non-exclusive / Shared Mode will **not be supported at all, in any form**.
+- **Virtual Audio Cables Disqualified (If Mixer-Involved):** Standard virtual audio cables are **non-compliant** because they involve the Windows audio mixer in one way or another. Any Tidal or companion integration mechanism must strictly guarantee zero Windows mixer involvement.
 
 ---
 
