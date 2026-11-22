@@ -6,4 +6,4 @@ No copyrighted music or third-party recordings are ever committed to this reposi
 
 ## Included Fixtures
 
-- **`original_nocturne_24_96.flac`** — 12-second original algorithmic chamber nocturne (felt piano, bowed cello pedal, stereo chamber acoustics), synthesized in IEEE 754 `float64`, TPDF-dithered to **24-bit / 96 kHz** stereo lossless FLAC, normalized to **`-12 dBFS`** peak for amp-safe playback testing.
+- **`original_nocturne_24_96.flac`** — 14-second original physical-modeling acoustic duet (Karplus-Strong waveguide nylon-string guitar with cedar soundboard body resonances + plucked upright double bass + FFT-convolved stereo recital room), synthesized in IEEE 754 `float64`, TPDF-dithered to **24-bit / 96 kHz** stereo lossless FLAC, normalized to **`-12 dBFS`** peak for amp-safe playback testing.

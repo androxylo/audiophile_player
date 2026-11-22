@@ -20,7 +20,7 @@ def test_original_nocturne_fixture_exists_and_is_24bit_96khz_stereo_flac() -> No
     assert info.subtype == "PCM_24"
     assert info.samplerate == 96000
     assert info.channels == 2
-    assert 11.5 <= info.duration <= 12.5
+    assert 13.5 <= info.duration <= 14.5
 
 
 def test_original_nocturne_loads_cleanly_in_ram_with_true_stereo_and_safe_headroom() -> None:
