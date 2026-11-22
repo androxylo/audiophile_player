@@ -13,3 +13,4 @@ An extreme, headless, zero-compromise audiophile playback engine for Windows, ta
 - [docs/research/OPEN_QUESTIONS.md](docs/research/OPEN_QUESTIONS.md) — Tracked open technical, mathematical, hardware, and architectural questions.
 - [docs/research/00-landscape-and-sources.md](docs/research/00-landscape-and-sources.md) — Landscape survey of existing audiophile players, best practices, and curated reference sources.
 - [docs/research/02-audiophile-filter-survey.md](docs/research/02-audiophile-filter-survey.md) — Upsampling & noise-shaping algorithm sources, audiophile consensus, and list of inaccessible sources for user snippets.
+- [docs/research/06-windows-kernel-streaming.md](docs/research/06-windows-kernel-streaming.md) — WASAPI Exclusive vs. Audirvana-style WDM-KS (`usbaudio2.sys` / WaveRT), bit-perfect verification, and minimal-effort zero-mixer POC design.

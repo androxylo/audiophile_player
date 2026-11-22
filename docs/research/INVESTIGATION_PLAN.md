@@ -41,7 +41,7 @@
 | **INV-03** | Mathematical Filter Design, 4M-Tap Cap & Floating-Point Precision | `03-filter-math-and-precision.md` | Pending |
 | **INV-04** | Final DAC Quantization, Dither/Noise Shaping & `-3 dB` ISP Headroom | `04-quantization-dither-headroom.md` | Pending |
 | **INV-05** | REW Stereo Convolution, Processing Order & Channel Delay | `05-convolution-and-delay.md` | Pending |
-| **INV-06** | Audirvana Kernel Mode, Windows Kernel Streaming (WDM-KS) & Bit-Perfect Output | `06-windows-kernel-streaming.md` | Pending |
+| **INV-06** | Audirvana Kernel Mode, Windows Kernel Streaming (WDM-KS) & Bit-Perfect Output | [06-windows-kernel-streaming.md](06-windows-kernel-streaming.md) | Done |
 | **INV-07** | Tandem Architecture: Mixer-Free Tidal Capture & Local Companions | `07-tidal-and-companions.md` | Pending |
 | **INV-08** | Rust Production Architecture, Prototyping Stack, Licensing & TDD Verification Plan | `08-architecture-and-verification.md` | Pending |
 
