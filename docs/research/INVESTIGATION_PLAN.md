@@ -22,7 +22,7 @@
 4. **Hard Design Constraints Governing All Investigations:**
    - **Strict 4,000,000-tap (4M) cap** (bounds mathematical complexity and memory buffers; not a quality compromise).
    - **All internal calculations strictly in floating point**; integer conversion occurs **once** at final DAC output formatting.
-   - **Curated filter set** covering all filters consistently praised in audiophile reviews and message boards as pleasant and audiophile-class (not HQPlayer's entire catalog).
+   - **Curated filter set** covering all filters consistently praised in audiophile reviews and message boards as pleasant and audiophile-class (not HQPlayer's entire catalog), with **on-the-fly algorithm switching depending on the music source**.
    - **Fixed `-3 dB` safety attenuation**, no user volume control, stereo REW convolution, optional single-channel delay only, no other DSP.
    - **No real-time constraint**; **Windows-only**; **no GUI**; **Schiit Gungnir 2** reference DAC; **local FLAC + Tidal only**.
    - **Zero Windows mixer anywhere in the pipeline** (input or output); **non-exclusive mode strictly forbidden in any form**; mixer-involving virtual audio cables are **non-compliant**; target **Audirvana-style Windows kernel-mode streaming**.

@@ -73,6 +73,7 @@ Every processing stage must prioritize mathematical purity:
 - **Floating-Point-Only Processing:** **All internal calculations** across the entire DSP pipeline (decoding normalization, headroom scaling, upsampling, convolution, channel delay) must be executed strictly in **floating point only** (e.g., 64-bit IEEE 754 `float64` or higher as determined by research). **Only the final output** is converted/quantized into the DAC's native integer PCM format.
 - **Strict 4-Million-Tap Cap:** Filter length is strictly capped at **4,000,000 taps (4M)**. This bounds mathematical complexity and memory buffers and is **not** a sound-quality compromise—there is no credible evidence that exceeding 4M taps yields any audible benefit.
 - **Curated Audiophile Filter Set:** We will **not** replicate HQPlayer's massive catalog of filters. Instead, we will implement a curated set covering **all filters consistently praised in audiophile reviews and message boards as pleasant and audiophile-class**.
+- **Dynamic On-the-Fly Algorithm Selection:** The engine will **switch upsampling and dithering/noise-shaping algorithms on the fly depending on the music source** (e.g., adapting automatically to input sample rate such as 1x `44.1/48 kHz` vs. Nx HiRes `88.2/96/192 kHz`, bit depth, local FLAC vs. Tidal stream, or other source/track attributes determined during research).
 
 ### 5.1 HiRes Upsampling
 - Upsample incoming PCM audio to optimal HiRes target sample rate(s) suited to the Gungnir 2 DAC.
