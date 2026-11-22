@@ -1,0 +1,18 @@
+# Copyright protection: never commit third-party browser-captured PDFs or local test music
+docs/research/sources/*.pdf
+docs/research/sources/*.html
+docs/research/sources/*.mhtml
+
+# Rust / Cargo
+/target/
+
+# Python prototyping / tests
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# OS & editor junk
+.DS_Store
+Thumbs.db
+*.swp

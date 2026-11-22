@@ -14,7 +14,7 @@
    - **Audiophile reviews & message boards** (Audiophile Style / Computer Audiophile, Super Best Audio Friends, Head-Fi, Roon Community, Hydrogenaudio, AV NIRVANA, Audio Science Review forums, Reddit audiophile/DSP communities).
 2. **Browser PDF Handoff Protocol (Inaccessible Resources):**
    - **Whenever the agent cannot access a required resource**—due to paywalls, login walls, anti-bot/Cloudflare blocks, JavaScript-only forum pages, rate limits, or unindexed PDFs—the agent **must not guess or skip it**.
-   - Instead, the agent will list the exact URL, thread title, or document name and ask the user to **grab the PDF from their browser** and place it in `docs/research/sources/` (or share it directly in chat) so the agent can read and incorporate it directly.
+   - Instead, the agent will list the exact URL, thread title, or document name and ask the user to **grab the PDF from their browser** and place it locally in `docs/research/sources/` (gitignored so copyrighted PDFs are never committed to the public repo) or share it directly in chat so the agent can read and incorporate it.
 3. **Incremental Execution (Low-Token Cadence):**
    - Execute **one investigation (or half an investigation)** per session.
    - Save each completed investigation as `docs/research/0X-<topic>.md` with full source citations.
@@ -26,6 +26,7 @@
    - **Fixed `-3 dB` safety attenuation**, no user volume control, stereo REW convolution, optional single-channel delay only, no other DSP.
    - **No real-time constraint**; **Windows-only**; **no GUI**; **Schiit Gungnir 2** reference DAC; **local FLAC + Tidal only**.
    - **Zero Windows mixer anywhere in the pipeline** (input or output); **non-exclusive mode strictly forbidden in any form**; mixer-involving virtual audio cables are **non-compliant**; target **Audirvana-style Windows kernel-mode streaming**.
+   - **Public repo / copyright compliance:** No copyrighted music or any other restrictively copyrighted materials committed (papers, articles, proprietary blobs/SDKs/code); open-source license (LGPL-like, TBD); **TDD** in small steps; **Rust** as final production language, with any language allowed for prototyping/POC/tests (port to Rust only once working).
 
 ---
 
@@ -41,7 +42,7 @@
 | **INV-05** | REW Stereo Convolution, Processing Order & Channel Delay | `05-convolution-and-delay.md` | Pending |
 | **INV-06** | Audirvana Kernel Mode, Windows Kernel Streaming (WDM-KS) & Bit-Perfect Output | `06-windows-kernel-streaming.md` | Pending |
 | **INV-07** | Tandem Architecture: Mixer-Free Tidal Capture & Local Companions | `07-tidal-and-companions.md` | Pending |
-| **INV-08** | Software Architecture, Tech Stack & Objective/Subjective Verification Plan | `08-architecture-and-verification.md` | Pending |
+| **INV-08** | Rust Production Architecture, Prototyping Stack, Licensing & TDD Verification Plan | `08-architecture-and-verification.md` | Pending |
 
 ---
 
@@ -119,16 +120,18 @@
   - Streaming-mode vs file-mode DSP architecture: How does a continuous live stream from Tidal (no known track end, live sample-rate changes) feed a high-latency 4M-tap overlap-add engine cleanly (accepting e.g. 5–15 s playback delay)?
   - Local companion options beyond Milestone 1's folder-shuffle CLI: Can `foobar2000` (or another lightweight UI player) cleanly hand off file paths / playlists / lossless IPC streams to our headless engine without touching Windows audio routing at all?
 
-### INV-08 — Software Architecture, Tech Stack & Verification Plan
-- **Objective:** Finalize language, dependencies, headless CLI/config specification, and rigorous verification/benchmarking suite before coding starts.
+### INV-08 — Rust Production Architecture, Prototyping Stack, Licensing & TDD Verification Plan
+- **Objective:** Finalize the Rust production architecture, prototyping/POC toolchain, open-source license compatibility, and TDD verification/benchmarking suite before writing production code.
 - **What to investigate:**
-  - **Language & Ecosystem:** **Rust** vs **C++** (vs Rust core + small C/C++ Win32 KS shim):
-    - Win32 WDM-KS (`ks.h`, `ksmedia.h`, `setupapi`) and WASAPI Exclusive bindings.
-    - High-precision 64-bit FFT engines (`FFTW3`, `Intel IPP`, `PocketFFT`, `RustFFT`/`RealFFT`), SIMD (AVX2/AVX-512), and deterministic memory management.
-    - Lossless FLAC decoding (`libFLAC` vs pure Rust `claxon`/`symphonia` — bit-exactness verification).
+  - **Rust Production Crates & Bindings (with LGPL-compatible open-source licensing):**
+    - Win32 WDM-KS (`windows-rs` / direct Win32 `ks.h`/`ksmedia.h` FFI vs thin C/Rust interop module).
+    - High-precision 64-bit FFT engines (`RustFFT`/`RealFFT` MIT/Apache-2.0 vs `PocketFFT` BSD vs `FFTW3` GPL licensing caveat!), SIMD (AVX2/AVX-512), and deterministic memory management.
+    - Lossless FLAC decoding (pure Rust `claxon`/`symphonia` vs `libFLAC` BSD — bit-exactness verification).
+  - **Prototyping / POC & Test Toolchain:** Best rapid-prototyping stack (e.g., Python + NumPy/SciPy for DSP filter math & spectral verification, small C/C++ Win32 POCs for WDM-KS verification) before porting working designs to Rust.
   - **Headless Engine Architecture:** Process/thread topology, configuration format (TOML/YAML/JSON) for filter selection, REW stereo WAV path, optional channel delay, and DAC device selection; Milestone 1 recursive `~/Music` random playback CLI design.
-  - **Verification & Quality Assurance Plan:**
+  - **TDD & Quality Assurance Plan (Copyright-Free Test Assets):**
+    - Synthetic / AI-generated non-copyrighted test fixtures (chirps/sweeps, impulses, multi-tone signals, ISP stress files, synthetic musical clips) — zero copyrighted audio in repo.
     - Automated objective DSP verification (sweep/chirp aliasing plots akin to Infinite Wave, impulse/step/phase response plots, passband ripple, stopband attenuation, THD+N, ISO stress tests, peak-clipping assertions).
-    - Comparative null/delta testing (e.g., Paul Kane's **DeltaWave**) against HQPlayer / PGGB reference renders.
+    - Comparative null/delta testing (e.g., Paul Kane's **DeltaWave**) against HQPlayer / PGGB reference renders (using external `~/Music` or synthetic clips).
     - Bit-perfect Windows transport verification.
-    - Structured listening evaluation protocol on the Schiit Gungnir 2.
+    - Structured listening evaluation protocol on the Schiit Gungnir 2 using external `~/Music`.

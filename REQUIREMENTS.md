@@ -14,8 +14,20 @@ Build an extreme, best-in-class headless audiophile playback engine for Windows 
 - **Minimum Bar:** Clearly exceed **Audirvana** in sound quality.
 
 ### Development Approach
-- **Research-First:** Complete thorough technical preparation and architectural research before writing a single line of code.
+- **Research-First:** Complete thorough technical preparation and architectural research before writing a single line of production code.
 - **Incremental, Low-Token Cadence:** Progress in small, self-contained steps over several months. Every research decision and design tradeoff will be documented in the repo so work can resume cleanly across sessions.
+- **Test-Driven Development (TDD):** Development will be strictly test-driven, built in small steps with automated tests validating every mathematical, DSP, and transport requirement.
+- **Language Strategy:**
+  - **Final Production Language:** **Rust**.
+  - **Prototyping, POCs & Test Harnesses:** Any language (e.g., Python/SciPy for DSP math & measurement plots, C/C++ for Win32 kernel-streaming POCs) may be used freely during experimentation and testing.
+  - **Porting Rule:** Do **not** convert prototypes or POCs to Rust until they are proven and working.
+
+### Licensing & Copyright Compliance
+- **Public Open-Source Repository:** The repository is public and must strictly respect copyright laws.
+- **License:** Open-source license (such as **LGPL**; exact license to be finalized later). All third-party library choices must be vetted for open-source license compatibility.
+- **No Copyrighted or Restrictively Licensed Content in Repo:** The repository must **never** contain copyrighted music files **or any other restrictively copyrighted materials** (such as paywalled papers, copied articles, proprietary binaries/SDKs, proprietary filter coefficients, or restrictively licensed third-party code).
+  - Real-world music tests run strictly against an external local folder (e.g., `~/Music`).
+  - Automated tests in the repository may use programmatically generated test signals and/or AI-generated, non-copyrighted synthetic music samples.
 
 ---
 
