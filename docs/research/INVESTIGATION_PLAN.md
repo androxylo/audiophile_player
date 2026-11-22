@@ -25,7 +25,7 @@
    - **All internal calculations strictly in floating point**; integer conversion occurs **once** at final DAC output formatting.
    - **Curated filter set** covering all filters consistently praised in audiophile reviews and message boards as pleasant and audiophile-class (not HQPlayer's entire catalog), with **on-the-fly algorithm switching depending on the music source**.
    - **Safety headroom (`-3 dB` to `0 dB`, never boosting > 0 dB)** informed by FLAC ReplayGain & True Peak annotations (always `-3 dB` when max level is unknown), no user volume control, stereo REW convolution, optional single-channel delay only, no other DSP.
-   - **No real-time constraint**; **Windows-only**; **no GUI**; **Schiit Gungnir 2** reference DAC; **local FLAC + Tidal only**.
+   - **No real-time constraint**; **Windows-only**; **headless** (no desktop GUI — only an extremely rudimentary local HTTP page to pick a file/folder, Play/Stop, and link to the GitHub manual); **Schiit Gungnir 2** reference DAC; **local FLAC + Tidal only**.
    - **Zero Windows mixer anywhere in the pipeline** (input or output); **non-exclusive mode strictly forbidden in any form**; mixer-involving virtual audio cables are **non-compliant**; target **Audirvana-style Windows kernel-mode streaming**.
    - **Public repo / copyright compliance:** No copyrighted music or any other restrictively copyrighted materials committed (papers, articles, proprietary blobs/SDKs/code); open-source license (LGPL-like, TBD); **TDD** in small steps; **Rust** as final production language, with any language allowed for prototyping/POC/tests (port to Rust only once working).
 
@@ -131,7 +131,7 @@
     - High-precision 64-bit FFT engines (`RustFFT`/`RealFFT` MIT/Apache-2.0 vs `PocketFFT` BSD vs `FFTW3` GPL licensing caveat!), SIMD (AVX2/AVX-512), and deterministic memory management.
     - Lossless FLAC decoding (pure Rust `claxon`/`symphonia` vs `libFLAC` BSD — bit-exactness verification).
   - **Prototyping / POC & Test Toolchain:** Best rapid-prototyping stack (e.g., Python + NumPy/SciPy for DSP filter math & spectral verification, small C/C++ Win32 POCs for WDM-KS verification) before porting working designs to Rust.
-  - **Headless Engine Architecture:** Process/thread topology, configuration format (TOML/YAML/JSON) for filter selection, REW stereo WAV path, optional channel delay, and DAC device selection; Milestone 1 recursive `~/Music` random playback CLI design.
+  - **Headless Engine Architecture:** Process/thread topology, configuration format (TOML/YAML/JSON) for filter selection, REW stereo WAV path, optional channel delay, and DAC device selection; Milestone 1 recursive `~/Music` random playback CLI **and** an extremely rudimentary local HTTP server (literally pick file/folder, Play/Stop, and link to the GitHub manual at `https://github.com/androxylo/audiophile_player`, completely decoupled from audio-output threads so users can test out of the box without CLI expertise).
   - **TDD & Quality Assurance Plan (Copyright-Free Test Assets):**
     - Synthetic / AI-generated non-copyrighted test fixtures (chirps/sweeps, impulses, multi-tone signals, ISP stress files, synthetic musical clips) — zero copyrighted audio in repo.
     - Automated objective DSP verification (sweep/chirp aliasing plots akin to Infinite Wave, impulse/step/phase response plots, passband ripple, stopband attenuation, THD+N, ISO stress tests, peak-clipping assertions).

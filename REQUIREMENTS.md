@@ -37,7 +37,7 @@ To keep the signal path pure and engineering focused entirely on sound quality:
 
 | Sacrificed / Excluded | Rationale |
 | --- | --- |
-| **No GUI whatsoever** | Do not compete with existing players that already provide good user interfaces. Work headless and in tandem with companion software. |
+| **No desktop GUI / rich UI** | Do not compete with existing players that already provide full user interfaces. Run headless, with only an **extremely rudimentary local HTTP control page** (pick a file/folder, Play/Stop, and link to the GitHub manual) for out-of-the-box testing, plus optional tandem operation with companion software. |
 | **No real-time / low-latency requirement** | Playback latency (e.g., 10 seconds or whatever processing requires) is completely acceptable. Correct mathematical processing takes absolute priority over responsiveness. |
 | **No volume control** | Avoid variable digital attenuation pipelines and user-facing gain stages (only fixed safety headroom is applied; see §5.2). |
 | **No general DSP suite** | No parametric EQ UI, tone controls, crossfeed, compression, or effects. Only REW stereo convolution and minimal channel delay alignment. |
@@ -117,9 +117,12 @@ Complete deep technical research before writing any production code.
 - See [docs/research/OPEN_QUESTIONS.md](docs/research/OPEN_QUESTIONS.md) for all tracked open technical and architectural questions.
 
 ### Milestone 1 — Initial Fully Featured Local Release (MVP)
-A headless player delivering the **complete uncompromising audio quality pipeline**:
-- **Input:** Accepts a root folder path containing subfolders (e.g., `~/Music`).
-- **Playback Behavior:** Discovers supported audio files (FLAC) recursively and plays them **at random**.
+A headless player delivering the **complete uncompromising audio quality pipeline**, usable out of the box even before Tidal streaming is implemented:
+- **CLI Input:** Accepts a root folder path containing subfolders (e.g., `~/Music`) or individual FLAC files.
+- **Rudimentary Built-in HTTP Server:** Serves an ultra-minimal local web page so users can test and operate the player out of the box with little or no command-line knowledge:
+  - Literally **pick a file or folder**, **Play**, and **Stop** — nothing more (no volume slider, no DSP UI, no heavy frontend, strictly isolated from the real-time audio output thread).
+  - Includes a direct link to the project manual at the GitHub repository (`https://github.com/androxylo/audiophile_player`).
+- **Playback Behavior:** Plays a selected FLAC file, or discovers supported FLAC files recursively in a selected folder and plays them **at random**.
 - **Full Audio Pipeline:**
   - HiRes upsampling
   - Safety headroom (`-3 dB` to `0 dB` via FLAC ReplayGain / True Peak tags, never boosting `> 0 dB`, always `-3 dB` when max level is unknown; no user volume control)
