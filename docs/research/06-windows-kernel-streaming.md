@@ -129,7 +129,20 @@ Every prototype (starting with POC #1) must pass these four concrete checks:
 
 ---
 
-## 5. Primary References & Optional Inaccessible Sources
+## 5. Empirical Hardware Verification on Schiit Gungnir 2 (Unison 384)
+
+Tested live via [`poc/python/audiophile_poc`](../../poc/python/audiophile_poc/) against the real **Schiit Gungnir 2 (Unison 384 USB)** on Windows 11 (`usbaudio2.sys`):
+
+- **WDM-KS (`Windows WDM-KS` — `Speakers (Gungnir 2 Unison 384)`):**
+  - **16 / 16 live hardware stream opens succeeded**: `44.1, 48, 88.2, 96, 176.4, 192, 352.8, 384 kHz` in both `int32` and `int16`.
+  - Played a synthetic 1.5 s `-24 dBFS` 440 Hz sine wave at **`384,000 Hz / int32`** (`576,000` frames, `100.0 ms` buffer) via **Direct Kernel Streaming (`wdm-ks`)** with **`0` underflows**.
+- **WASAPI Exclusive (`Windows WASAPI` — `Speakers (3- Gungnir 2 Unison 384)`):**
+  - **16 / 16 live hardware stream opens succeeded**: `44.1, 48, 88.2, 96, 176.4, 192, 352.8, 384 kHz` in both `int32` and `int16`.
+- **Key takeaway:** Unlike earlier Schiit Bifrost 2 KS quirk reports on the Audirvana Forum, **Gungnir 2 Unison 384 natively handles full 32-bit / 352.8 & 384 kHz over both WDM-KS (Kernel Streaming) and WASAPI Exclusive cleanly on Windows 11.**
+
+---
+
+## 6. Primary References & Optional Inaccessible Sources
 
 ### Consulted Sources
 - Microsoft Learn — *Exclusive-Mode Streams (Core Audio / WASAPI)*: https://learn.microsoft.com/en-us/windows/win32/coreaudio/exclusive-mode-streams
