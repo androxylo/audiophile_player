@@ -23,8 +23,8 @@ Living list of unresolved technical, mathematical, hardware, and architectural q
 ## 3. Final Quantization, Dither & `-3 dB` Headroom (`INV-04`)
 
 - **OQ-11:** When quantizing our final `float64` stream to Gungnir 2's native integer PCM (24-bit or 32-bit), what is the optimal dithering/noise-shaping method (TPDF dither vs low-order shaped dither vs high-order noise shaping vs simple 24/32-bit TPDF), specifically given a NOS multibit DAC?
-- **OQ-12:** How do we guarantee zero digital clipping if a track contains rare inter-sample overs exceeding `+3 dB`, **or** if a user's REW convolution filter introduces positive boost peaks on top of `-3 dB` fixed headroom—while honoring the "no user volume control" and "always apply `-3 dB`" rules?
-- **OQ-13:** Should the fixed `-3 dB` attenuation be applied at the very beginning of the `float64` pipeline (before upsampling and convolution) or verified against peak output before final quantization? (In pure linear `float64` math, linear gain commutes—except for potential denormals or final quantization scaling; confirm mathematically.)
+- **OQ-12:** What exact decision rule should govern switching between **`-3 dB` and `0 dB`** gain using FLAC ReplayGain / True Peak tags (strictly `≤ 0 dB`, never boosting, always `-3 dB` when max level is unknown)—e.g., strict two-state (`-3 dB` vs `0 dB`) or continuous clamped attenuation in `[-3 dB, 0 dB]`, and should album vs. track ReplayGain tags be prioritized? Also, how do we guarantee zero clipping if rare ISPs or REW convolution boosts exceed `3 dB`?
+- **OQ-13:** Because local FLAC tracks have no real-time constraint, should we rely strictly on FLAC ReplayGain/True Peak metadata tags (falling back to `-3 dB` when untagged), or optionally compute exact post-upsample/post-convolution true peak in `float64` before final quantization? (Confirm also that linear gain in `float64` commutes across linear DSP stages.)
 
 ## 4. REW Stereo Convolution & Channel Delay (`INV-05`)
 

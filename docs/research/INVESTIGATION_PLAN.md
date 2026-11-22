@@ -23,7 +23,7 @@
    - **Strict 4,000,000-tap (4M) cap** (bounds mathematical complexity and memory buffers; not a quality compromise).
    - **All internal calculations strictly in floating point**; integer conversion occurs **once** at final DAC output formatting.
    - **Curated filter set** covering all filters consistently praised in audiophile reviews and message boards as pleasant and audiophile-class (not HQPlayer's entire catalog), with **on-the-fly algorithm switching depending on the music source**.
-   - **Fixed `-3 dB` safety attenuation**, no user volume control, stereo REW convolution, optional single-channel delay only, no other DSP.
+   - **Safety headroom (`-3 dB` to `0 dB`, never boosting > 0 dB)** informed by FLAC ReplayGain & True Peak annotations (always `-3 dB` when max level is unknown), no user volume control, stereo REW convolution, optional single-channel delay only, no other DSP.
    - **No real-time constraint**; **Windows-only**; **no GUI**; **Schiit Gungnir 2** reference DAC; **local FLAC + Tidal only**.
    - **Zero Windows mixer anywhere in the pipeline** (input or output); **non-exclusive mode strictly forbidden in any form**; mixer-involving virtual audio cables are **non-compliant**; target **Audirvana-style Windows kernel-mode streaming**.
    - **Public repo / copyright compliance:** No copyrighted music or any other restrictively copyrighted materials committed (papers, articles, proprietary blobs/SDKs/code); open-source license (LGPL-like, TBD); **TDD** in small steps; **Rust** as final production language, with any language allowed for prototyping/POC/tests (port to Rust only once working).
@@ -77,10 +77,12 @@
   - Computational and RAM budgeting: Direct polyphase FIR vs FFT overlap-add convolution for up to 4M taps; buffer sizes, startup latency (e.g., 5–15 seconds), and CPU/RAM footprint on Windows.
   - Pre-ringing, passband ripple, transition bandwidth, and stopband attenuation targets (benchmarked against Infinite Wave / HQPlayer / PGGB standards).
 
-### INV-04 — Final DAC Quantization, Dither/Noise Shaping & `-3 dB` ISP Headroom
-- **Objective:** Perfect the single point where our floating-point pipeline converts to DAC integer PCM, while guaranteeing zero clipping under all real-world material.
+### INV-04 — Final DAC Quantization, Dither/Noise Shaping & `-3 dB` / `0 dB` ISP Headroom
+- **Objective:** Perfect the single point where our floating-point pipeline converts to DAC integer PCM, while guaranteeing zero clipping under all real-world material and never boosting gain (`≤ 0 dB`).
 - **What to investigate:**
-  - Empirical and theoretical worst-case inter-sample over (ISP) peaks across mastered recordings + our chosen filters; confirm whether `-3 dB` fixed attenuation covers virtually all tracks and how to handle rare `> +3 dB` peaks or convolution boost peaks without adding user volume controls.
+  - Empirical and theoretical worst-case inter-sample over (ISP) peaks across mastered recordings + our chosen filters.
+  - **FLAC ReplayGain & True Peak Metadata Rules:** Exact Vorbis comment tags used by tools like foobar2000/loudgain/r128gain (`REPLAYGAIN_TRACK_PEAK`, `REPLAYGAIN_ALBUM_PEAK`, `REPLAYGAIN_TRACK_GAIN`, `REPLAYGAIN_ALBUM_GAIN`, `R128_TRACK_GAIN`, etc.); define the exact decision rule for switching cleanly between **`-3 dB` and `0 dB`** (never `> 0 dB` boost; always `-3 dB` when max level is unknown, e.g., untagged FLAC or Tidal stream).
+  - Interaction between the `-3 dB` / `0 dB` safety margin and REW convolution boost peaks (ensuring zero clipping without violating the no-boost / no-user-volume rules).
   - Conversion from `float64` to Gungnir 2's integer format (24-bit vs 32-bit PCM): scaling (`2^23` vs `2^23 - 1`, symmetric vs asymmetric), rounding modes.
   - Dither & noise shaping specifically for a **NOS multibit DAC (DAC8812CRUZ)** at **352.8/384 kHz**:
     - TPDF dither vs shaped dither (e.g., Lipshitz/Wannamaker, HQPlayer `NS1`/`NS4`/`NS5`/`NS9`/`LNS15`, PGGB adaptive noise shaping) vs straight 24-bit/32-bit rounding.
