@@ -1,7 +1,9 @@
-//! Headless playback coordinator wiring:
-//!   Source (`ap-source`) -> Tidy 5-Stage `f64` Pipeline (`ap-dsp::pipeline::AudioPipeline`)
-//!   -> Bounded Look-Ahead `TrackPrefetchQueue` (zero between-track hiccups)
-//!   -> Native Rust `WDM-KS` WaveRT Output (`ap-output-win`, `VirtualLock` + MMCSS + 100 ms ring)
+//! Headless playback coordinator wiring the bounded-memory streaming pipeline:
+//!   `FlacBlockReader` (`DEFAULT_SOURCE_BLOCK_FRAMES` chunks — never loads multi-GB files)
+//!   -> Tidy 5-Stage `f64` `StreamingPipelineSession` (Headroom -> Upsampler -> NullConvolver
+//!      -> NullDelay -> StreamingQuantizer)
+//!   -> `BoundedBlockStreamBuffer` (~12 s RAM cap, 2 s prebuffer watermark — zero hiccups)
+//!   -> Native Rust `WDM-KS` WaveRT `play_block_stream` (zero Windows mixer, Audirvana-friendly Pause)
 //!   -> Decoupled Localhost HTTP Control UI (`ap-control`, safe port 8085+).
 
 use std::io::{self, Write};
@@ -12,16 +14,19 @@ use std::time::Duration;
 
 use ap_control::server::ControlServer;
 use ap_control::state::{ControlCommand, PlayModeLabel, SharedControl};
+use ap_core::buffer::DEFAULT_SOURCE_BLOCK_FRAMES;
 use ap_core::format::DacWireFormat;
-use ap_dsp::pipeline::{AudioPipeline, ProcessedTrack};
+use ap_dsp::pipeline::AudioPipeline;
 use ap_dsp::selector::UpsamplerPolicy;
 use ap_output_win::hygiene::OptimizationLevel;
-use ap_output_win::sink::{OutputError, ZeroMixerAudioSink};
+use ap_output_win::sink::OutputError;
 use ap_output_win::wdm_ks::WdmKsSink;
-use ap_source::flac::decode_flac_full_memory;
+use ap_source::flac::{AudioBlockSource, FlacBlockReader};
 use ap_source::library::{SequentialFlacCursor, default_user_music_dir, pick_random_flac_walk};
 
-use crate::prefetch::{PrefetchEvent, TrackPrefetchQueue};
+use crate::prefetch::{
+    BoundedBlockStreamBuffer, DEFAULT_MAX_BUFFERED_FRAMES, PREBUFFER_SECONDS, StreamEvent,
+};
 use crate::signals::{ShutdownController, ShutdownSignal};
 
 /// Run idle mode (`--idle`): print start, park at 0% CPU until signal, print graceful stop.
@@ -82,14 +87,8 @@ impl ProducerControl {
     }
 }
 
-struct PreparedTrack {
-    path: PathBuf,
-    mode_label: PlayModeLabel,
-    processed: ProcessedTrack,
-}
-
-/// Run default zero-config random FLAC playback via native Windows Kernel Streaming (`WDM-KS`),
-/// tidy `AudioPipeline`, hiccup-free 1-track look-ahead prefetching, and localhost HTTP UI.
+/// Run default zero-config random FLAC playback via bounded-memory block streaming,
+/// tidy `AudioPipeline`, native Windows Kernel Streaming (`WDM-KS`), and localhost HTTP UI.
 pub fn run_random_music_player(
     music_dir_override: Option<PathBuf>,
     device_filter: Option<String>,
@@ -124,7 +123,7 @@ pub fn run_random_music_player(
     let mut http_server = ControlServer::start(shared.clone(), http_port)?;
 
     println!(
-        "audiophile-player v{} started (WDM-KS WaveRT, opt={optimization:?}, DAC='{dac_name}', music='{}').",
+        "audiophile-player v{} started (WDM-KS WaveRT, streaming blocks, opt={optimization:?}, DAC='{dac_name}', music='{}').",
         env!("CARGO_PKG_VERSION"),
         music_dir.display()
     );
@@ -132,8 +131,8 @@ pub fn run_random_music_player(
     println!("Press Ctrl+C or Ctrl+Break to stop gracefully.");
     let _ = io::stdout().flush();
 
-    let prefetch_queue: Arc<TrackPrefetchQueue<PreparedTrack>> = TrackPrefetchQueue::new();
-    let mut active_epoch = prefetch_queue.current_epoch();
+    let stream_buf = BoundedBlockStreamBuffer::new(DEFAULT_MAX_BUFFERED_FRAMES);
+    let mut active_epoch = stream_buf.current_epoch();
     let prod_ctrl = ProducerControl::new(
         active_epoch,
         ProducerDirective::Random {
@@ -141,23 +140,20 @@ pub fn run_random_music_player(
         },
     );
 
-    // Spawn dedicated background DSP Producer thread (pre-decodes & processes Track N+1 into RAM
-    // while Track N streams out via WDM-KS so there are zero hiccups between tracks).
-    let q_bg = Arc::clone(&prefetch_queue);
+    // Dedicated background streaming DSP Producer thread (bounded ~36 MB buffer cap).
+    let buf_bg = Arc::clone(&stream_buf);
     let ctrl_bg = Arc::clone(&prod_ctrl);
     let shared_bg = Arc::clone(&shared);
     let producer_thread = thread::Builder::new()
-        .name("ap-dsp-prefetch".to_string())
-        .spawn(move || producer_loop(pipeline, ctrl_bg, q_bg, shared_bg))
-        .map_err(|e| format!("failed spawning DSP prefetch thread: {e}"))?;
+        .name("ap-dsp-stream".to_string())
+        .spawn(move || producer_loop(pipeline, ctrl_bg, buf_bg, shared_bg))
+        .map_err(|e| format!("failed spawning DSP streaming thread: {e}"))?;
 
     let mut is_paused = false;
 
     while controller.current_signal().is_none() {
-        // Apply any pending command from the HTTP UI.
         if let Some(cmd) = shared.take_pending_command() {
-            let (paused, next_ep) =
-                dispatch_command(cmd, &prefetch_queue, &prod_ctrl, &shared);
+            let (paused, next_ep) = dispatch_command(cmd, &stream_buf, &prod_ctrl, &shared);
             is_paused = paused;
             active_epoch = next_ep;
         }
@@ -167,7 +163,7 @@ pub fn run_random_music_player(
             match shared.wait_for_command_or_shutdown() {
                 Some(cmd) => {
                     let (paused, next_ep) =
-                        dispatch_command(cmd, &prefetch_queue, &prod_ctrl, &shared);
+                        dispatch_command(cmd, &stream_buf, &prod_ctrl, &shared);
                     is_paused = paused;
                     active_epoch = next_ep;
                     continue;
@@ -176,10 +172,7 @@ pub fn run_random_music_player(
             }
         }
 
-        // Wait for the next pre-buffered track (instantaneous once Track N+1 is ready in RAM;
-        // 50 ms wake window keeps Pause / Ctrl+C responsive even while Track 1 is decoding).
-        let Some(event) =
-            prefetch_queue.pop_for_epoch_timeout(active_epoch, Duration::from_millis(50))
+        let Some(event) = stream_buf.pop_for_epoch_timeout(active_epoch, Duration::from_millis(50))
         else {
             continue;
         };
@@ -188,40 +181,79 @@ pub fn run_random_music_player(
             break;
         }
         if let Some(cmd) = shared.take_pending_command() {
-            let (paused, next_ep) =
-                dispatch_command(cmd, &prefetch_queue, &prod_ctrl, &shared);
+            let (paused, next_ep) = dispatch_command(cmd, &stream_buf, &prod_ctrl, &shared);
             is_paused = paused;
             active_epoch = next_ep;
             continue;
         }
 
         match event {
-            PrefetchEvent::EndOfQueue(msg) | PrefetchEvent::FatalError(msg) => {
+            StreamEvent::EndOfQueue(msg) | StreamEvent::FatalError(msg) => {
                 shared.set_paused(msg);
-                active_epoch = prefetch_queue.reset_and_flush();
+                active_epoch = stream_buf.reset_and_flush();
                 prod_ctrl.set(active_epoch, ProducerDirective::Paused);
                 is_paused = true;
             }
-            PrefetchEvent::Track(prepared) => {
-                let pcm = &prepared.processed.pcm;
-                let report = &prepared.processed.report;
-                let dur_s = pcm.frames.len() as f64 / pcm.sample_rate_hz as f64;
-                let fmt_str = report.format_summary(dur_s);
-                let track_str = prepared.path.display().to_string();
+            StreamEvent::PcmBlock(_) | StreamEvent::TrackEnd => {
+                // Orphaned block/marker from an interrupted track — ignore safely.
+                continue;
+            }
+            StreamEvent::TrackStart {
+                path,
+                mode_label,
+                report,
+                total_duration_s,
+            } => {
+                let out_rate = report.output_rate_hz;
+                let watermark_frames = (out_rate as usize) * (PREBUFFER_SECONDS as usize);
 
+                // Wait until ~2 seconds of PCM are pre-buffered in RAM (or TrackEnd for short clips)
+                // while remaining immediately responsive to Pause / Ctrl+C.
+                loop {
+                    if controller.current_signal().is_some() {
+                        break;
+                    }
+                    if let Some(cmd) = shared.take_pending_command() {
+                        let (paused, next_ep) =
+                            dispatch_command(cmd, &stream_buf, &prod_ctrl, &shared);
+                        is_paused = paused;
+                        active_epoch = next_ep;
+                        break;
+                    }
+                    match stream_buf.wait_prebuffer_watermark(
+                        active_epoch,
+                        watermark_frames,
+                        Duration::from_millis(50),
+                    ) {
+                        Some(true) => break,
+                        Some(false) => continue,
+                        None => break,
+                    }
+                }
+
+                if is_paused || controller.current_signal().is_some() {
+                    continue;
+                }
+
+                let fmt_str = report.format_summary(total_duration_s);
+                let track_str = path.display().to_string();
                 println!("  [playing]  {track_str} ({fmt_str})");
                 println!("  [pipeline] {}", report.log_line());
                 let _ = io::stdout().flush();
                 shared.record_action(report.log_line());
-                shared.set_playing(prepared.mode_label, track_str, fmt_str);
+                shared.set_playing(mode_label, track_str, fmt_str);
 
-                match sink.play_full_memory(pcm, DacWireFormat::Int32) {
+                let ep_for_stream = active_epoch;
+                let buf_for_stream = Arc::clone(&stream_buf);
+                match sink.play_block_stream(out_rate, DacWireFormat::Int32, move || {
+                    buf_for_stream.pop_track_pcm_block(ep_for_stream, Duration::from_secs(5))
+                }) {
                     Ok(_stats) => {}
                     Err(err @ OutputError::DeviceBusy { .. }) => {
                         let msg = format!("DAC busy ({err}) — staying paused");
                         eprintln!("  [busy] {msg}");
                         shared.set_paused(msg);
-                        active_epoch = prefetch_queue.reset_and_flush();
+                        active_epoch = stream_buf.reset_and_flush();
                         prod_ctrl.set(active_epoch, ProducerDirective::Paused);
                         is_paused = true;
                     }
@@ -229,7 +261,7 @@ pub fn run_random_music_player(
                         let msg = format!("Output error ({err}) — paused & DAC released");
                         eprintln!("  [error] {msg}");
                         shared.set_paused(msg);
-                        active_epoch = prefetch_queue.reset_and_flush();
+                        active_epoch = stream_buf.reset_and_flush();
                         prod_ctrl.set(active_epoch, ProducerDirective::Paused);
                         is_paused = true;
                     }
@@ -238,8 +270,7 @@ pub fn run_random_music_player(
         }
     }
 
-    // Graceful teardown: stop producer thread, flush RAM buffer, shut down HTTP server.
-    prefetch_queue.close();
+    stream_buf.close();
     prod_ctrl.set(active_epoch.wrapping_add(1), ProducerDirective::Shutdown);
     let _ = producer_thread.join();
     http_server.shutdown();
@@ -256,11 +287,11 @@ pub fn run_random_music_player(
 
 fn dispatch_command(
     cmd: ControlCommand,
-    queue: &TrackPrefetchQueue<PreparedTrack>,
+    buf: &BoundedBlockStreamBuffer,
     prod_ctrl: &ProducerControl,
     shared: &SharedControl,
 ) -> (bool, u64) {
-    let ep = queue.reset_and_flush();
+    let ep = buf.reset_and_flush();
     match cmd {
         ControlCommand::PlayRandom(root) => {
             prod_ctrl.set(ep, ProducerDirective::Random { root });
@@ -284,12 +315,13 @@ fn dispatch_command(
     }
 }
 
-/// Background DSP Producer thread: selects, decodes, runs the full `AudioPipeline`, and
-/// deposits one track ahead into `TrackPrefetchQueue` for hiccup-free transitions.
+/// Background streaming DSP Producer: reads bounded blocks from `FlacBlockReader`,
+/// processes them incrementally through `StreamingPipelineSession`, and feeds
+/// `BoundedBlockStreamBuffer` with automatic backpressure (strictly bounded RAM).
 fn producer_loop(
     pipeline: AudioPipeline,
     ctrl: Arc<ProducerControl>,
-    queue: Arc<TrackPrefetchQueue<PreparedTrack>>,
+    buf: Arc<BoundedBlockStreamBuffer>,
     shared: Arc<SharedControl>,
 ) {
     let mut seq_cursor: Option<(u64, SequentialFlacCursor)> = None;
@@ -307,7 +339,7 @@ fn producer_loop(
                 let mut picked = match pick_random_flac_walk(&root) {
                     Ok(p) => p,
                     Err(err) => {
-                        let _ = queue.push_for_epoch(epoch, PrefetchEvent::FatalError(err));
+                        let _ = buf.push_for_epoch(epoch, StreamEvent::FatalError(err));
                         ctrl.set(epoch, ProducerDirective::Paused);
                         continue;
                     }
@@ -331,7 +363,7 @@ fn producer_loop(
                     match SequentialFlacCursor::new(root.clone()) {
                         Ok(c) => seq_cursor = Some((epoch, c)),
                         Err(err) => {
-                            let _ = queue.push_for_epoch(epoch, PrefetchEvent::FatalError(err));
+                            let _ = buf.push_for_epoch(epoch, StreamEvent::FatalError(err));
                             ctrl.set(epoch, ProducerDirective::Paused);
                             continue;
                         }
@@ -341,9 +373,9 @@ fn producer_loop(
                 match next {
                     Some(p) => (p, PlayModeLabel::Sequential),
                     None => {
-                        let _ = queue.push_for_epoch(
+                        let _ = buf.push_for_epoch(
                             epoch,
-                            PrefetchEvent::EndOfQueue(format!(
+                            StreamEvent::EndOfQueue(format!(
                                 "Finished sequential playback of '{}' — DAC released",
                                 root.display()
                             )),
@@ -355,9 +387,9 @@ fn producer_loop(
             }
             ProducerDirective::SingleFile { file } => {
                 if single_consumed_epoch == Some(epoch) {
-                    let _ = queue.push_for_epoch(
+                    let _ = buf.push_for_epoch(
                         epoch,
-                        PrefetchEvent::EndOfQueue("Finished single track — DAC released".into()),
+                        StreamEvent::EndOfQueue("Finished single track — DAC released".into()),
                     );
                     ctrl.set(epoch, ProducerDirective::Paused);
                     continue;
@@ -372,17 +404,17 @@ fn producer_loop(
             continue;
         }
 
-        let decoded = match decode_flac_full_memory(&chosen) {
-            Ok(d) => d,
+        let mut source = match FlacBlockReader::open(&chosen) {
+            Ok(s) => s,
             Err(err) => {
                 let msg = format!("Skipped unreadable FLAC '{}': {err}", chosen.display());
                 eprintln!("  [skip] {msg}");
                 shared.record_action(msg);
                 consecutive_errors += 1;
                 if consecutive_errors >= 10 {
-                    let _ = queue.push_for_epoch(
+                    let _ = buf.push_for_epoch(
                         epoch,
-                        PrefetchEvent::FatalError(
+                        StreamEvent::FatalError(
                             "Paused after 10 consecutive unreadable FLACs — DAC released".into(),
                         ),
                     );
@@ -394,33 +426,81 @@ fn producer_loop(
         };
         consecutive_errors = 0;
 
-        if ctrl.epoch() != epoch {
-            continue;
-        }
+        let spec = source.spec();
+        let peak_meta = source.peak_meta();
+        let total_duration_s = source
+            .total_frames()
+            .map(|f| f as f64 / spec.sample_rate_hz as f64);
 
-        let processed = match pipeline.process(decoded.audio, decoded.spec, &decoded.peak_meta, false)
-        {
-            Ok(p) => p,
+        let mut session = match pipeline.start_track(spec, &peak_meta, source.is_streaming()) {
+            Ok(s) => s,
             Err(err) => {
                 let msg = format!("DSP pipeline error on '{}': {err}", chosen.display());
                 eprintln!("  [dsp] {msg}");
                 shared.record_action(msg.clone());
-                let _ = queue.push_for_epoch(epoch, PrefetchEvent::FatalError(msg));
+                let _ = buf.push_for_epoch(epoch, StreamEvent::FatalError(msg));
                 ctrl.set(epoch, ProducerDirective::Paused);
                 continue;
             }
         };
 
-        // Blocks cleanly if 1 next track is already buffered in RAM; discards immediately if
-        // the user clicked Pause / switched mode while this track was being prepared.
-        let _ = queue.push_for_epoch(
+        if !buf.push_for_epoch(
             epoch,
-            PrefetchEvent::Track(PreparedTrack {
-                path: chosen,
+            StreamEvent::TrackStart {
+                path: chosen.clone(),
                 mode_label,
-                processed,
-            }),
-        );
+                report: session.report().clone(),
+                total_duration_s,
+            },
+        ) {
+            continue;
+        }
+
+        // Stream bounded source blocks incrementally through the 5-stage f64 DSP session.
+        let mut aborted = false;
+        loop {
+            if ctrl.epoch() != epoch {
+                aborted = true;
+                break;
+            }
+            let next_src = match source.read_next_block(DEFAULT_SOURCE_BLOCK_FRAMES) {
+                Ok(Some(b)) => b,
+                Ok(None) => break, // clean EOF
+                Err(err) => {
+                    let msg = format!("FLAC stream error in '{}': {err}", chosen.display());
+                    eprintln!("  [stream err] {msg}");
+                    shared.record_action(msg);
+                    break;
+                }
+            };
+
+            let pcm_block = match session.process_block(next_src) {
+                Ok(b) => b,
+                Err(err) => {
+                    let msg = format!("DSP block error on '{}': {err}", chosen.display());
+                    eprintln!("  [dsp] {msg}");
+                    shared.record_action(msg);
+                    aborted = true;
+                    break;
+                }
+            };
+
+            if !pcm_block.is_empty()
+                && !buf.push_for_epoch(epoch, StreamEvent::PcmBlock(pcm_block))
+            {
+                aborted = true;
+                break;
+            }
+        }
+
+        if !aborted && ctrl.epoch() == epoch {
+            if let Ok(tail) = session.flush() {
+                if !tail.is_empty() {
+                    let _ = buf.push_for_epoch(epoch, StreamEvent::PcmBlock(tail));
+                }
+            }
+            let _ = buf.push_for_epoch(epoch, StreamEvent::TrackEnd);
+        }
     }
 }
 

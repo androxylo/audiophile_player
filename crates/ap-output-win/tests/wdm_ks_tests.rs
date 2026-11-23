@@ -19,8 +19,8 @@ use ap_core::format::DacWireFormat;
 use ap_output_win::hygiene::{MemoryLockGuard, MmcssGuard, OptimizationLevel};
 use ap_output_win::sink::ZeroMixerAudioSink;
 use ap_output_win::wdm_ks::{
-    KsPinConnectBlob, KsRenderDevice, WaveRtFramePump, WdmKsSink, classify_ks_pin_error,
-    enumerate_wdm_ks_render_devices, select_wdm_ks_device,
+    KsPinConnectBlob, KsRenderDevice, StreamingWaveRtPump, WaveRtFramePump, WaveRtPumpSource,
+    WdmKsSink, classify_ks_pin_error, enumerate_wdm_ks_render_devices, select_wdm_ks_device,
 };
 
 static HARDWARE_LOCK: Mutex<()> = Mutex::new(());
@@ -128,6 +128,40 @@ fn wavert_frame_pump_fade_out_ramps_smoothly_to_near_zero() {
     assert_eq!(first_l, 1_000_000_000);
     assert!((mid_l - 500_000_000).abs() <= 1);
     assert!(last_l.abs() <= 15_000_000);
+}
+
+#[test]
+fn streaming_wavert_pump_bridges_uneven_blocks_seamlessly_without_gaps() {
+    let blocks = vec![
+        InterleavedInt32Buffer {
+            sample_rate_hz: 384_000,
+            frames: vec![[1, -1], [2, -2]],
+        },
+        InterleavedInt32Buffer {
+            sample_rate_hz: 384_000,
+            frames: vec![[3, -3]],
+        },
+        InterleavedInt32Buffer {
+            sample_rate_hz: 384_000,
+            frames: vec![[4, -4], [5, -5]],
+        },
+    ];
+    let mut iter = blocks.into_iter();
+    let mut pump = StreamingWaveRtPump::new(DacWireFormat::Int32, move || iter.next());
+
+    // Pull 3 frames at a time across 2 + 1 + 2 uneven blocks -> must bridge seamlessly!
+    let mut half0 = vec![0xFF_u8; 3 * 8];
+    assert_eq!(pump.fill_slice(&mut half0), 3);
+    assert_eq!(&half0[0..4], &1_i32.to_le_bytes());
+    assert_eq!(&half0[8..12], &2_i32.to_le_bytes());
+    assert_eq!(&half0[16..20], &3_i32.to_le_bytes());
+
+    let mut half1 = vec![0xFF_u8; 3 * 8];
+    assert_eq!(pump.fill_slice(&mut half1), 2);
+    assert_eq!(&half1[0..4], &4_i32.to_le_bytes());
+    assert_eq!(&half1[8..12], &5_i32.to_le_bytes());
+    assert_eq!(&half1[16..24], &[0_u8; 8]); // clean zero-pad on EOF
+    assert_eq!(pump.frames_written(), 5);
 }
 
 #[test]

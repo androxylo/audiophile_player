@@ -324,6 +324,202 @@ impl<'a> WaveRtFramePump<'a> {
     }
 }
 
+/// Internal chunk source abstraction shared by `play_full_memory` and `play_block_stream`.
+pub trait WaveRtPumpSource {
+    fn bytes_per_frame(&self) -> usize;
+    fn frames_written(&self) -> usize;
+    fn fill_slice(&mut self, dst: &mut [u8]) -> usize;
+    fn fill_fade_out_slice(&mut self, dst: &mut [u8]) -> usize;
+}
+
+impl WaveRtPumpSource for WaveRtFramePump<'_> {
+    fn bytes_per_frame(&self) -> usize {
+        WaveRtFramePump::bytes_per_frame(self)
+    }
+
+    fn frames_written(&self) -> usize {
+        WaveRtFramePump::frames_written(self)
+    }
+
+    fn fill_slice(&mut self, dst: &mut [u8]) -> usize {
+        WaveRtFramePump::fill_slice(self, dst)
+    }
+
+    fn fill_fade_out_slice(&mut self, dst: &mut [u8]) -> usize {
+        WaveRtFramePump::fill_fade_out_slice(self, dst)
+    }
+}
+
+/// Streaming WaveRT ring-buffer pump that pulls bounded `InterleavedInt32Buffer` blocks
+/// lazily across block boundaries with zero gaps and click-free fade-out on stop.
+pub struct StreamingWaveRtPump<F>
+where
+    F: FnMut() -> Option<InterleavedInt32Buffer>,
+{
+    next_block: F,
+    current: Option<InterleavedInt32Buffer>,
+    cursor: usize,
+    wire_format: DacWireFormat,
+    total_frames_written: usize,
+    eof: bool,
+}
+
+impl<F> StreamingWaveRtPump<F>
+where
+    F: FnMut() -> Option<InterleavedInt32Buffer>,
+{
+    pub fn new(wire_format: DacWireFormat, next_block: F) -> Self {
+        Self {
+            next_block,
+            current: None,
+            cursor: 0,
+            wire_format,
+            total_frames_written: 0,
+            eof: false,
+        }
+    }
+
+    fn ensure_current(&mut self) -> bool {
+        while !self.eof {
+            if let Some(buf) = &self.current {
+                if self.cursor < buf.frames.len() {
+                    return true;
+                }
+            }
+            match (self.next_block)() {
+                Some(buf) if !buf.frames.is_empty() => {
+                    self.current = Some(buf);
+                    self.cursor = 0;
+                    return true;
+                }
+                Some(_) => continue, // skip empty block
+                None => {
+                    self.current = None;
+                    self.cursor = 0;
+                    self.eof = true;
+                    return false;
+                }
+            }
+        }
+        false
+    }
+}
+
+impl<F> WaveRtPumpSource for StreamingWaveRtPump<F>
+where
+    F: FnMut() -> Option<InterleavedInt32Buffer>,
+{
+    fn bytes_per_frame(&self) -> usize {
+        match self.wire_format {
+            DacWireFormat::Int32 | DacWireFormat::Int24In32 => 8,
+            DacWireFormat::Int24Packed => 6,
+            DacWireFormat::Int16 => 4,
+        }
+    }
+
+    fn frames_written(&self) -> usize {
+        self.total_frames_written
+    }
+
+    fn fill_slice(&mut self, dst: &mut [u8]) -> usize {
+        let bpf = self.bytes_per_frame();
+        let max_frames = dst.len() / bpf;
+        let mut written_total = 0;
+
+        while written_total < max_frames {
+            if !self.ensure_current() {
+                break;
+            }
+            let buf = self.current.as_ref().unwrap();
+            let remaining = buf.frames.len() - self.cursor;
+            let to_copy = (max_frames - written_total).min(remaining);
+
+            let mut offset = written_total * bpf;
+            for &[l, r] in &buf.frames[self.cursor..self.cursor + to_copy] {
+                encode_frame(&mut dst[offset..offset + bpf], l, r, self.wire_format);
+                offset += bpf;
+            }
+            self.cursor += to_copy;
+            written_total += to_copy;
+            self.total_frames_written += to_copy;
+        }
+
+        let used_bytes = written_total * bpf;
+        if used_bytes < dst.len() {
+            dst[used_bytes..].fill(0);
+        }
+        written_total
+    }
+
+    fn fill_fade_out_slice(&mut self, dst: &mut [u8]) -> usize {
+        let written = self.fill_slice(dst);
+        apply_linear_fade_out_bytes(dst, written, self.wire_format);
+        written
+    }
+}
+
+#[inline]
+fn encode_frame(dst: &mut [u8], l: i32, r: i32, wire_format: DacWireFormat) {
+    match wire_format {
+        DacWireFormat::Int32 | DacWireFormat::Int24In32 => {
+            dst[0..4].copy_from_slice(&l.to_le_bytes());
+            dst[4..8].copy_from_slice(&r.to_le_bytes());
+        }
+        DacWireFormat::Int24Packed => {
+            let lb = l.to_le_bytes();
+            let rb = r.to_le_bytes();
+            dst[0..3].copy_from_slice(&lb[1..4]);
+            dst[3..6].copy_from_slice(&rb[1..4]);
+        }
+        DacWireFormat::Int16 => {
+            let l16 = (l >> 16) as i16;
+            let r16 = (r >> 16) as i16;
+            dst[0..2].copy_from_slice(&l16.to_le_bytes());
+            dst[2..4].copy_from_slice(&r16.to_le_bytes());
+        }
+    }
+}
+
+fn apply_linear_fade_out_bytes(dst: &mut [u8], written: usize, wire_format: DacWireFormat) {
+    if written == 0 {
+        return;
+    }
+    let bpf = match wire_format {
+        DacWireFormat::Int32 | DacWireFormat::Int24In32 => 8,
+        DacWireFormat::Int24Packed => 6,
+        DacWireFormat::Int16 => 4,
+    };
+    for i in 0..written {
+        let gain = 1.0 - (i as f64) / (written as f64);
+        let off = i * bpf;
+        match wire_format {
+            DacWireFormat::Int32 | DacWireFormat::Int24In32 => {
+                let l = i32::from_le_bytes(dst[off..off + 4].try_into().unwrap());
+                let r = i32::from_le_bytes(dst[off + 4..off + 8].try_into().unwrap());
+                let lf = ((l as f64) * gain).round() as i32;
+                let rf = ((r as f64) * gain).round() as i32;
+                dst[off..off + 4].copy_from_slice(&lf.to_le_bytes());
+                dst[off + 4..off + 8].copy_from_slice(&rf.to_le_bytes());
+            }
+            DacWireFormat::Int24Packed => {
+                for ch_off in [off, off + 3] {
+                    let s =
+                        i32::from_le_bytes([0, dst[ch_off], dst[ch_off + 1], dst[ch_off + 2]]);
+                    let sf = (((s as f64) * gain).round() as i32).to_le_bytes();
+                    dst[ch_off..ch_off + 3].copy_from_slice(&sf[1..4]);
+                }
+            }
+            DacWireFormat::Int16 => {
+                for ch_off in [off, off + 2] {
+                    let s = i16::from_le_bytes(dst[ch_off..ch_off + 2].try_into().unwrap());
+                    let sf = ((s as f64) * gain).round() as i16;
+                    dst[ch_off..ch_off + 2].copy_from_slice(&sf.to_le_bytes());
+                }
+            }
+        }
+    }
+}
+
 /// Classify a Win32 `KsCreatePin` failure code, highlighting busy/locked DACs (e.g. Audirvana).
 pub fn classify_ks_pin_error(
     os_error: u32,
@@ -496,39 +692,48 @@ impl WdmKsSink {
         )?;
         Ok(())
     }
-}
-
-impl ZeroMixerAudioSink for WdmKsSink {
+    /// Stream bounded `InterleavedInt32Buffer` blocks from `next_block` directly to the DAC
+    /// via Windows Kernel Streaming (`WDM-KS` WaveRT) without ever requiring the entire track
+    /// to live in RAM at once. Closes/releases the kernel pin cleanly via RAII on return.
     #[cfg(windows)]
-    fn play_full_memory(
+    pub fn play_block_stream<F>(
         &mut self,
-        pcm: &InterleavedInt32Buffer,
+        sample_rate_hz: u32,
         wire_format: DacWireFormat,
+        next_block: F,
+    ) -> Result<PlaybackStats, OutputError>
+    where
+        F: FnMut() -> Option<InterleavedInt32Buffer>,
+    {
+        let mut pump = StreamingWaveRtPump::new(wire_format, next_block);
+        self.run_wavert_pump(sample_rate_hz, wire_format, &mut pump)
+    }
+
+    #[cfg(windows)]
+    fn run_wavert_pump(
+        &mut self,
+        sample_rate_hz: u32,
+        wire_format: DacWireFormat,
+        pump: &mut dyn WaveRtPumpSource,
     ) -> Result<PlaybackStats, OutputError> {
-        if pcm.frames.is_empty() {
-            return Err(OutputError::InvalidBuffer("PCM buffer is empty".to_string()));
-        }
         self.stop_flag.store(false, Ordering::SeqCst);
 
-        // 1. Elevate thread priority via MMCSS "Pro Audio" and pin active RAM PCM buffer
-        //    with VirtualLock (both reverted automatically via RAII on drop).
+        // 1. Elevate thread priority via MMCSS "Pro Audio" (reverted automatically via RAII).
         let mmcss = MmcssGuard::enter_pro_audio(self.optimization);
-        let _mem_lock = MemoryLockGuard::lock_slice(&pcm.frames);
 
         // 2. Open KS filter and create WaveRT looped render pin directly via ksuser.dll.
         let filter = open_ks_filter(&self.device.device_path)?;
         let pin = create_ks_render_pin(
             filter.raw(),
             &self.device,
-            pcm.sample_rate_hz,
+            sample_rate_hz,
             wire_format,
             true,
         )?;
 
         // 3. Allocate WaveRT cyclic buffer (~100 ms total = two ~50 ms notification halves).
-        let mut pump = WaveRtFramePump::new(&pcm.frames, wire_format);
         let bpf = pump.bytes_per_frame() as u32;
-        let requested_bytes = ((pcm.sample_rate_hz / 10).max(256)) * bpf;
+        let requested_bytes = ((sample_rate_hz / 10).max(256)) * bpf;
         let rt_buf = allocate_wavert_buffer_with_notification(pin.raw(), requested_bytes, 2)?;
         if rt_buf.BufferAddress.is_null() || rt_buf.ActualBufferSize < bpf * 2 {
             return Err(OutputError::Win32 {
@@ -567,9 +772,6 @@ impl ZeroMixerAudioSink for WdmKsSink {
         state_guard.set_state(KSSTATE_RUN)?;
 
         // 8. Event-driven WaveRT loop: each notification signals one completed half-buffer.
-        //    - Normal EOF: pump 2 silent halves so the DAC clocks out the final sample cleanly.
-        //    - Async stop_flag: fade one half linearly to silence + 1 silent half so mid-track
-        //      stops are completely pop/click-free on external audiophile amplifiers.
         let mut next_half: usize = 0;
         let mut trailing_silent_halves: usize = 0;
         let mut stopping_fade_done = false;
@@ -627,13 +829,29 @@ impl ZeroMixerAudioSink for WdmKsSink {
 
         Ok(PlaybackStats {
             device_name: self.device.friendly_name.clone(),
-            sample_rate_hz: pcm.sample_rate_hz,
+            sample_rate_hz,
             wire_format,
             frames_played: pump.frames_written(),
             wavert_buffer_bytes: rt_buf.ActualBufferSize,
             notifications,
             mmcss_pro_audio: mmcss.is_active(),
         })
+    }
+}
+
+impl ZeroMixerAudioSink for WdmKsSink {
+    #[cfg(windows)]
+    fn play_full_memory(
+        &mut self,
+        pcm: &InterleavedInt32Buffer,
+        wire_format: DacWireFormat,
+    ) -> Result<PlaybackStats, OutputError> {
+        if pcm.frames.is_empty() {
+            return Err(OutputError::InvalidBuffer("PCM buffer is empty".to_string()));
+        }
+        let _mem_lock = MemoryLockGuard::lock_slice(&pcm.frames);
+        let mut pump = WaveRtFramePump::new(&pcm.frames, wire_format);
+        self.run_wavert_pump(pcm.sample_rate_hz, wire_format, &mut pump)
     }
 
     #[cfg(not(windows))]

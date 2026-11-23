@@ -1,29 +1,29 @@
-//! Tidy, linear, end-to-end pure-`f64` audio processing pipeline.
+//! Tidy, linear, bounded-memory streaming pure-`f64` audio processing pipeline.
 //!
-//! Exact processing order for every track:
+//! Designed so multi-hour 32-bit/384 kHz FLACs and continuous live streams (Milestone 2
+//! Tidal) flow cleanly through bounded blocks with **zero unbounded RAM** and **bit-identical**
+//! output across arbitrary chunk sizes:
 //! 1. **Headroom Selection & Scaling (`-3 dB` or `0 dB`, hardcoded)** in `f64`.
 //! 2. **Dynamic Per-Track Upsampling** (`SimpleWindowedSincUpsampler` or zero-copy
 //!    `NullUpsampler` for native `352.8 / 384 kHz` tracks) -> always `StereoF64Buffer`.
 //! 3. **Core REW Stereo Convolution** (`StereoConvolver`; currently [`NullConvolver`]).
 //! 4. **Per-Channel Room Alignment Delay** (`ChannelDelayer`; currently [`NullChannelDelayer`]).
-//! 5. **Single Final `f64 -> i32` Quantization** (TPDF dither or `Bypass` for untouched 32-bit).
-
-use std::time::{Duration, Instant};
+//! 5. **Single Final `f64 -> i32` Quantization** ([`StreamingQuantizer`], stateful across blocks).
 
 use ap_core::buffer::{InterleavedInt32Buffer, StereoF64Buffer};
 use ap_core::format::StreamSpec;
 use ap_core::headroom::{HeadroomDecision, HeadroomMode, TrackPeakMetadata, select_headroom};
 
-use crate::convolution::{NullConvolver, StereoConvolver};
-use crate::delay::{ChannelDelayer, NullChannelDelayer};
-use crate::quantize::{apply_safe_gain_f64, quantize_to_int32};
+use crate::convolution::{NullConvolverFactory, StereoConvolver, StereoConvolverFactory};
+use crate::delay::{ChannelDelayer, ChannelDelayerFactory, NullChannelDelayerFactory};
+use crate::quantize::{StreamingQuantizer, apply_safe_gain_f64};
 use crate::selector::{
     FilterArchetype, NoiseShaperProfile, SelectedDspPlan, TrackSourceInfo, UpsamplerPicker,
     UpsamplerPolicy,
 };
-use crate::upsampler::build_upsampler;
+use crate::upsampler::{Upsampler, build_upsampler};
 
-/// Diagnostic summary of every stage executed for one track.
+/// Diagnostic summary of every pipeline stage chosen for a track/stream.
 #[derive(Debug, Clone)]
 pub struct PipelineReport {
     pub source_spec: StreamSpec,
@@ -34,13 +34,16 @@ pub struct PipelineReport {
     pub convolver_name: &'static str,
     pub delayer_name: &'static str,
     pub effective_shaper: NoiseShaperProfile,
-    pub elapsed: Duration,
 }
 
 impl PipelineReport {
-    pub fn format_summary(&self, duration_s: f64) -> String {
+    pub fn format_summary(&self, total_duration_s: Option<f64>) -> String {
+        let dur_part = match total_duration_s {
+            Some(s) => format!("{s:.1} s"),
+            None => "stream".to_string(),
+        };
         format!(
-            "{}/{} Hz -> {} Hz f64 ({}, {}, {}, {}, {:.1} s, DSP {:.0} ms) | WDM-KS Int32",
+            "{}/{} Hz -> {} Hz f64 ({}, {}, {}, {}, {}) | WDM-KS Int32",
             self.source_spec.bits_per_sample,
             self.source_spec.sample_rate_hz,
             self.output_rate_hz,
@@ -48,8 +51,7 @@ impl PipelineReport {
             self.headroom.mode,
             self.convolver_name,
             self.delayer_name,
-            duration_s,
-            self.elapsed.as_secs_f64() * 1000.0,
+            dur_part,
         )
     }
 
@@ -64,21 +66,105 @@ impl PipelineReport {
     }
 }
 
-/// Fully processed track sitting ready in RAM for hiccup-free WDM-KS output.
+/// Fully processed one-shot track result (convenience helper for tests).
 #[derive(Debug)]
 pub struct ProcessedTrack {
     pub pcm: InterleavedInt32Buffer,
     pub report: PipelineReport,
 }
 
-/// Composable, pure-`f64` audiophile DSP pipeline.
-///
-/// Missing future stages (REW stereo convolution, per-channel delay) default cleanly to
-/// zero-copy null implementations ([`NullConvolver`], [`NullChannelDelayer`]).
-pub struct AudioPipeline {
-    picker: UpsamplerPicker,
+/// Active per-track stateful streaming DSP session (`process_block` + `flush`).
+pub struct StreamingPipelineSession {
+    report: PipelineReport,
+    upsampler: Box<dyn Upsampler>,
     convolver: Box<dyn StereoConvolver>,
     delayer: Box<dyn ChannelDelayer>,
+    quantizer: StreamingQuantizer,
+}
+
+impl StreamingPipelineSession {
+    pub fn report(&self) -> &PipelineReport {
+        &self.report
+    }
+
+    /// Process one bounded source `f64` block through all 5 stages -> ready `i32` PCM block.
+    pub fn process_block(
+        &mut self,
+        mut block: StereoF64Buffer,
+    ) -> Result<InterleavedInt32Buffer, String> {
+        if block.is_empty() {
+            return Ok(InterleavedInt32Buffer::empty(self.report.output_rate_hz));
+        }
+
+        // Stage 1: Hardcoded -3 dB / 0 dB headroom in f64.
+        apply_safe_gain_f64(&mut block, self.report.headroom.mode.gain_db())?;
+
+        // Stage 2: Dynamic per-track stateful f64 upsampler (or zero-copy NullUpsampler).
+        let block = self.upsampler.process_block(block)?;
+        if block.is_empty() {
+            return Ok(InterleavedInt32Buffer::empty(self.report.output_rate_hz));
+        }
+
+        // Stage 3: Stateful REW stereo convolution in f64 (currently NullConvolver).
+        let block = self.convolver.process_block(block)?;
+        if block.is_empty() {
+            return Ok(InterleavedInt32Buffer::empty(self.report.output_rate_hz));
+        }
+
+        // Stage 4: Stateful per-channel room delay in f64 (currently NullChannelDelayer).
+        let block = self.delayer.process_block(block)?;
+        if block.is_empty() {
+            return Ok(InterleavedInt32Buffer::empty(self.report.output_rate_hz));
+        }
+
+        // Stage 5: Single final f64 -> i32 quantization.
+        Ok(self.quantizer.quantize_block(&block))
+    }
+
+    /// Flush all stateful FIR / convolution / delay tails cleanly at end-of-track.
+    pub fn flush(&mut self) -> Result<InterleavedInt32Buffer, String> {
+        let mut frames = Vec::new();
+        let rate = self.report.output_rate_hz;
+
+        // 1. Flush upsampler tail -> feed through convolver -> delayer -> quantizer.
+        let up_tail = self.upsampler.flush()?;
+        if !up_tail.is_empty() {
+            let c_out = self.convolver.process_block(up_tail)?;
+            if !c_out.is_empty() {
+                let d_out = self.delayer.process_block(c_out)?;
+                if !d_out.is_empty() {
+                    frames.extend(self.quantizer.quantize_block(&d_out).frames);
+                }
+            }
+        }
+
+        // 2. Flush convolver tail -> feed through delayer -> quantizer.
+        let conv_tail = self.convolver.flush()?;
+        if !conv_tail.is_empty() {
+            let d_out = self.delayer.process_block(conv_tail)?;
+            if !d_out.is_empty() {
+                frames.extend(self.quantizer.quantize_block(&d_out).frames);
+            }
+        }
+
+        // 3. Flush delayer tail -> quantizer.
+        let delay_tail = self.delayer.flush()?;
+        if !delay_tail.is_empty() {
+            frames.extend(self.quantizer.quantize_block(&delay_tail).frames);
+        }
+
+        Ok(InterleavedInt32Buffer {
+            sample_rate_hz: rate,
+            frames,
+        })
+    }
+}
+
+/// Composable, pure-`f64` audiophile DSP pipeline factory.
+pub struct AudioPipeline {
+    picker: UpsamplerPicker,
+    convolver_factory: Box<dyn StereoConvolverFactory>,
+    delayer_factory: Box<dyn ChannelDelayerFactory>,
 }
 
 impl AudioPipeline {
@@ -86,60 +172,49 @@ impl AudioPipeline {
     pub fn new(upsampler_policy: UpsamplerPolicy) -> Result<Self, String> {
         Ok(Self {
             picker: UpsamplerPicker::new(upsampler_policy)?,
-            convolver: Box::new(NullConvolver),
-            delayer: Box::new(NullChannelDelayer),
+            convolver_factory: Box::new(NullConvolverFactory),
+            delayer_factory: Box::new(NullChannelDelayerFactory),
         })
     }
 
-    /// Construct a pipeline with explicit convolver and channel delayer implementations.
-    pub fn with_stages(
+    /// Construct a pipeline with explicit convolver and channel delayer factories.
+    pub fn with_factories(
         upsampler_policy: UpsamplerPolicy,
-        convolver: Box<dyn StereoConvolver>,
-        delayer: Box<dyn ChannelDelayer>,
+        convolver_factory: Box<dyn StereoConvolverFactory>,
+        delayer_factory: Box<dyn ChannelDelayerFactory>,
     ) -> Result<Self, String> {
         Ok(Self {
             picker: UpsamplerPicker::new(upsampler_policy)?,
-            convolver,
-            delayer,
+            convolver_factory,
+            delayer_factory,
         })
     }
 
-    /// Execute the full 5-stage floating-point pipeline on a decoded track buffer.
-    pub fn process(
+    /// Open a fresh stateful [`StreamingPipelineSession`] for one track or continuous stream.
+    pub fn start_track(
         &self,
-        mut audio: StereoF64Buffer,
         spec: StreamSpec,
         peak_meta: &TrackPeakMetadata,
         is_streaming_source: bool,
-    ) -> Result<ProcessedTrack, String> {
-        let started = Instant::now();
-
-        // Stage 1: Hardcoded -3 dB / 0 dB headroom selection & pure f64 scaling.
-        let headroom = select_headroom(
-            peak_meta,
-            is_streaming_source,
-            self.convolver.max_boost_db(),
-        );
-        apply_safe_gain_f64(&mut audio, headroom.mode.gain_db())?;
-
-        // Stage 2: Dynamic per-track upsampler selection & f64 upsampling (or NullUpsampler).
+    ) -> Result<StreamingPipelineSession, String> {
         let mut source_info = TrackSourceInfo::from_stream_spec(spec);
         source_info.is_streaming_source = is_streaming_source;
+
         let dsp_plan = self.picker.select(&source_info);
         let upsampler = build_upsampler(&dsp_plan)?;
-        let audio = upsampler.upsample(audio, &dsp_plan)?;
+        let convolver = self
+            .convolver_factory
+            .create_for_rate(dsp_plan.target_rate_hz)?;
+        let delayer = self
+            .delayer_factory
+            .create_for_rate(dsp_plan.target_rate_hz)?;
 
-        // Stage 3: Core REW stereo convolution in f64 (currently NullConvolver).
-        let audio = self.convolver.convolve(audio)?;
+        let headroom = select_headroom(peak_meta, is_streaming_source, convolver.max_boost_db());
 
-        // Stage 4: Optional per-channel room alignment delay in f64 (currently NullChannelDelayer).
-        let audio = self.delayer.apply(audio)?;
-
-        // Stage 5: Single final f64 -> i32 quantization for the DAC.
         let untouched_native = dsp_plan.filter == FilterArchetype::Null
             && headroom.mode == HeadroomMode::ZeroDb
-            && self.convolver.name() == "null-convolver"
-            && self.delayer.name() == "null-delay";
+            && convolver.name() == "null-convolver"
+            && delayer.name() == "null-delay";
 
         let (effective_shaper, output_bits) = if untouched_native {
             (dsp_plan.shaper, (spec.bits_per_sample as u8).clamp(16, 32))
@@ -149,21 +224,41 @@ impl AudioPipeline {
             (dsp_plan.shaper, 24)
         };
 
-        let output_rate_hz = audio.sample_rate_hz;
-        let pcm = quantize_to_int32(&audio, effective_shaper, output_bits);
-
         let report = PipelineReport {
             source_spec: spec,
-            output_rate_hz,
+            output_rate_hz: dsp_plan.target_rate_hz,
             output_bits,
             headroom,
             dsp_plan,
-            convolver_name: self.convolver.name(),
-            delayer_name: self.delayer.name(),
+            convolver_name: convolver.name(),
+            delayer_name: delayer.name(),
             effective_shaper,
-            elapsed: started.elapsed(),
         };
 
+        let quantizer = StreamingQuantizer::new(effective_shaper, output_bits);
+
+        Ok(StreamingPipelineSession {
+            report,
+            upsampler,
+            convolver,
+            delayer,
+            quantizer,
+        })
+    }
+
+    /// Convenience one-shot helper for small test buffers (delegates directly to `start_track`).
+    pub fn process(
+        &self,
+        audio: StereoF64Buffer,
+        spec: StreamSpec,
+        peak_meta: &TrackPeakMetadata,
+        is_streaming_source: bool,
+    ) -> Result<ProcessedTrack, String> {
+        let mut session = self.start_track(spec, peak_meta, is_streaming_source)?;
+        let mut pcm = session.process_block(audio)?;
+        let tail = session.flush()?;
+        pcm.frames.extend(tail.frames);
+        let report = session.report().clone();
         Ok(ProcessedTrack { pcm, report })
     }
 }

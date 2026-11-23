@@ -65,3 +65,49 @@ fn pipeline_runs_native_384khz_quiet_track_through_null_stages_at_0_db() {
     assert_eq!(processed.report.effective_shaper, NoiseShaperProfile::Bypass);
     assert_eq!(processed.report.output_bits, 32);
 }
+
+#[test]
+fn streaming_pipeline_session_matches_oneshot_bit_for_bit_across_blocks() {
+    let pipeline = AudioPipeline::new(UpsamplerPolicy::default()).unwrap();
+    let spec = StreamSpec {
+        sample_rate_hz: 44_100,
+        bits_per_sample: 16,
+        channels: 2,
+    };
+    let n = 600;
+    let left: Vec<f64> = (0..n).map(|i| 0.4 * ((i as f64) * 0.11).sin()).collect();
+    let right: Vec<f64> = (0..n).map(|i| 0.3 * ((i as f64) * 0.17).cos()).collect();
+    let meta = TrackPeakMetadata::default();
+
+    let oneshot = pipeline
+        .process(
+            StereoF64Buffer {
+                sample_rate_hz: 44_100,
+                left: left.clone(),
+                right: right.clone(),
+            },
+            spec,
+            &meta,
+            false,
+        )
+        .unwrap();
+
+    let mut session = pipeline.start_track(spec, &meta, false).unwrap();
+    let mut streamed_frames = Vec::new();
+    let mut pos = 0;
+    while pos < n {
+        let end = (pos + 113).min(n);
+        let blk = session
+            .process_block(StereoF64Buffer {
+                sample_rate_hz: 44_100,
+                left: left[pos..end].to_vec(),
+                right: right[pos..end].to_vec(),
+            })
+            .unwrap();
+        streamed_frames.extend(blk.frames);
+        pos = end;
+    }
+    streamed_frames.extend(session.flush().unwrap().frames);
+
+    assert_eq!(streamed_frames, oneshot.pcm.frames);
+}

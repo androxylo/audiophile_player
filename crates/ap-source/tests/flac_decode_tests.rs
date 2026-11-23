@@ -3,7 +3,8 @@
 use std::path::PathBuf;
 
 use ap_source::flac::{
-    decode_flac_full_memory, decode_flac_full_memory_int32, parse_peak_metadata_fields,
+    AudioBlockSource, FlacBlockReader, decode_flac_full_memory, decode_flac_full_memory_int32,
+    parse_peak_metadata_fields,
 };
 
 fn nocturne_fixture_path() -> PathBuf {
@@ -57,6 +58,32 @@ fn decodes_original_nocturne_24_96_flac_bit_exact_to_int32_and_f64() {
         assert_eq!((f64_track.audio.left[i] * scale) as i32, raw.pcm.frames[i][0]);
         assert_eq!((f64_track.audio.right[i] * scale) as i32, raw.pcm.frames[i][1]);
     }
+}
+
+#[test]
+fn streaming_flac_block_reader_matches_full_decode_bit_for_bit() {
+    let path = nocturne_fixture_path();
+    let full = decode_flac_full_memory(&path).unwrap();
+
+    // Stream in small uneven 17,777-frame chunks and verify exact sample-for-sample equality.
+    let mut reader = FlacBlockReader::open(&path).unwrap();
+    assert_eq!(reader.spec(), full.spec);
+    assert!(!reader.is_streaming());
+    assert_eq!(reader.total_frames(), Some(96_000 * 14));
+
+    let mut streamed_l = Vec::new();
+    let mut streamed_r = Vec::new();
+    let mut blocks = 0usize;
+    while let Some(block) = reader.read_next_block(17_777).unwrap() {
+        assert!(block.len() <= 17_777);
+        assert_eq!(block.sample_rate_hz, 96_000);
+        streamed_l.extend_from_slice(&block.left);
+        streamed_r.extend_from_slice(&block.right);
+        blocks += 1;
+    }
+    assert!(blocks > 50, "expected many bounded chunks, got {blocks}");
+    assert_eq!(streamed_l, full.audio.left);
+    assert_eq!(streamed_r, full.audio.right);
 }
 
 #[test]
