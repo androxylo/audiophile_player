@@ -154,3 +154,41 @@ fn http_server_serves_scrollable_no_volume_ui_and_routes_play_pause_commands() {
     assert!(TcpListener::bind(server.addr()).is_ok());
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[cfg(windows)]
+#[test]
+fn folder_browser_lists_windows_ntfs_junction_mounted_directories() {
+    let root = make_temp_music_dir("junction_root");
+    let target = make_temp_music_dir("junction_target");
+    fs::write(target.join("mounted_track.flac"), b"").unwrap();
+
+    let junction_path = root.join("Favorite");
+    let status = std::process::Command::new("cmd")
+        .args([
+            "/C",
+            "mklink",
+            "/J",
+            &junction_path.to_string_lossy(),
+            &target.to_string_lossy(),
+        ])
+        .status()
+        .expect("mklink /J failed");
+    assert!(status.success(), "mklink /J exited with {status:?}");
+
+    let listing = ap_control::browser::list_folder_entries(&root);
+    assert!(
+        listing.subdirs.iter().any(|d| d.ends_with("Favorite")),
+        "mounted junction 'Favorite' was missing from subdirs: {:?}",
+        listing.subdirs
+    );
+
+    let sub_listing = ap_control::browser::list_folder_entries(&junction_path);
+    assert!(sub_listing
+        .flac_files
+        .iter()
+        .any(|f| f.ends_with("mounted_track.flac")));
+
+    let _ = fs::remove_dir(&junction_path);
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&target);
+}

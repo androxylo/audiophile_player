@@ -61,13 +61,14 @@ fn walk_pick_recursive(dir: &Path, rng: &mut SplitMix64, depth: usize) -> Option
     let mut flacs: Vec<PathBuf> = Vec::new();
 
     for entry in entries.flatten() {
-        let Ok(ft) = entry.file_type() else {
+        let path = entry.path();
+        // Follow Windows NTFS junctions / volume mount points / symlinks via fs::metadata.
+        let Ok(meta) = fs::metadata(&path) else {
             continue;
         };
-        let path = entry.path();
-        if ft.is_dir() {
+        if meta.is_dir() {
             subdirs.push(path);
-        } else if ft.is_file() && is_flac_path(&path) {
+        } else if meta.is_file() && is_flac_path(&path) {
             flacs.push(path);
         }
     }
@@ -130,23 +131,26 @@ pub fn discover_flac_files(root: &Path) -> Result<Vec<PathBuf>, String> {
     }
 
     let mut out = Vec::new();
-    collect_flacs_recursive(root, &mut out);
+    collect_flacs_recursive(root, &mut out, 0);
     out.sort();
     Ok(out)
 }
 
-fn collect_flacs_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
+fn collect_flacs_recursive(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
+    if depth > MAX_WALK_DEPTH {
+        return;
+    }
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        let Ok(ft) = entry.file_type() else {
+        let Ok(meta) = fs::metadata(&path) else {
             continue;
         };
-        if ft.is_dir() {
-            collect_flacs_recursive(&path, out);
-        } else if ft.is_file() && is_flac_path(&path) {
+        if meta.is_dir() {
+            collect_flacs_recursive(&path, out, depth + 1);
+        } else if meta.is_file() && is_flac_path(&path) {
             out.push(path);
         }
     }
@@ -281,13 +285,13 @@ fn read_dir_frame(dir: &Path) -> DirFrame {
     let mut subdirs = Vec::new();
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
-            let Ok(ft) = entry.file_type() else {
+            let path = entry.path();
+            let Ok(meta) = fs::metadata(&path) else {
                 continue;
             };
-            let path = entry.path();
-            if ft.is_dir() {
+            if meta.is_dir() {
                 subdirs.push(path);
-            } else if ft.is_file() && is_flac_path(&path) {
+            } else if meta.is_file() && is_flac_path(&path) {
                 flacs.push(path);
             }
         }

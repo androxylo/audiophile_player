@@ -22,13 +22,16 @@ pub fn list_folder_entries(dir: &Path) -> FolderListing {
     match fs::read_dir(dir) {
         Ok(entries) => {
             for entry in entries.flatten() {
-                let Ok(ft) = entry.file_type() else {
+                let p = entry.path();
+                // Use fs::metadata(&p) rather than entry.file_type() so Windows NTFS volume
+                // mount points, directory junctions, and symlinks (e.g. mounted music drives)
+                // are properly recognized as directories/files.
+                let Ok(meta) = fs::metadata(&p) else {
                     continue;
                 };
-                let p = entry.path();
-                if ft.is_dir() {
+                if meta.is_dir() {
                     subdirs.push(p);
-                } else if ft.is_file()
+                } else if meta.is_file()
                     && p.extension()
                         .and_then(|e| e.to_str())
                         .is_some_and(|ext| ext.eq_ignore_ascii_case("flac"))

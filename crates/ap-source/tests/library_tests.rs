@@ -181,3 +181,36 @@ fn default_user_music_dir_resolves_to_music_folder() {
     let dir = default_user_music_dir().expect("expected HOME/USERPROFILE to resolve");
     assert!(dir.ends_with("Music"));
 }
+
+#[cfg(windows)]
+#[test]
+fn walk_and_sequential_pickers_traverse_windows_ntfs_junctions() {
+    let root = make_temp_tree("junc_walk_root");
+    let target = make_temp_tree("junc_walk_target");
+    fs::write(target.join("favorite_song.flac"), b"").unwrap();
+
+    let junction = root.join("Favorite");
+    let status = std::process::Command::new("cmd")
+        .args([
+            "/C",
+            "mklink",
+            "/J",
+            &junction.to_string_lossy(),
+            &target.to_string_lossy(),
+        ])
+        .status()
+        .expect("mklink /J failed");
+    assert!(status.success());
+
+    let picked = pick_random_flac_walk_with_seed(&root, 42)
+        .expect("walk picker must traverse NTFS junction");
+    assert!(picked.ends_with("favorite_song.flac"));
+
+    let mut cur = SequentialFlacCursor::new(root.clone()).unwrap();
+    let seq = cur.next_track().expect("sequential cursor must traverse NTFS junction");
+    assert!(seq.ends_with("favorite_song.flac"));
+
+    let _ = fs::remove_dir(&junction);
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&target);
+}
