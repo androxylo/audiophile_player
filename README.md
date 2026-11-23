@@ -2,6 +2,22 @@
 
 An extreme, headless, zero-compromise audiophile playback engine for Windows, targeting sound quality at or above HQPlayer (without a desktop GUI) and exceeding Audirvana.
 
+## Quick Start (Windows)
+
+```powershell
+# 1. Build optimized release binary
+cargo build --release --bin audiophile-player
+
+# 2. (Optional) Configure REW stereo convolution
+#    Copy audiophile-player.example.toml -> %APPDATA%\audiophile-player\config.toml
+
+# 3. Install Desktop & Start Menu "Audiophile Player" icon (starts player + opens Web UI)
+powershell -ExecutionPolicy Bypass -File scripts\install-shortcuts.ps1
+
+# Or run directly from terminal (zero args = random FLACs from ~/Music via WDM-KS + Web UI at :8085)
+.\target\release\audiophile-player.exe
+```
+
 ## Project Structure
 
 ```text
