@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering, fence};
 use ap_core::buffer::InterleavedInt32Buffer;
 use ap_core::format::DacWireFormat;
 
-use crate::hygiene::{MmcssGuard, OptimizationLevel};
+use crate::hygiene::{MemoryLockGuard, MmcssGuard, OptimizationLevel};
 use crate::sink::{OutputError, PlaybackStats, ZeroMixerAudioSink};
 
 #[cfg(windows)]
@@ -510,8 +510,10 @@ impl ZeroMixerAudioSink for WdmKsSink {
         }
         self.stop_flag.store(false, Ordering::SeqCst);
 
-        // 1. Elevate thread priority via MMCSS "Pro Audio" (reverted automatically on drop).
+        // 1. Elevate thread priority via MMCSS "Pro Audio" and pin active RAM PCM buffer
+        //    with VirtualLock (both reverted automatically via RAII on drop).
         let mmcss = MmcssGuard::enter_pro_audio(self.optimization);
+        let _mem_lock = MemoryLockGuard::lock_slice(&pcm.frames);
 
         // 2. Open KS filter and create WaveRT looped render pin directly via ksuser.dll.
         let filter = open_ks_filter(&self.device.device_path)?;

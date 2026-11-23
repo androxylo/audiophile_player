@@ -1,27 +1,46 @@
-//! First-class core REW stereo convolution engine operating at `352.8 / 384 kHz` in `f64`.
-
-use std::path::Path;
+//! Core first-class REW stereo convolution stage (`352.8 / 384 kHz` pure `f64`).
+//!
+//! Currently provides the explicit zero-copy [`NullConvolver`] placeholder while keeping
+//! the exact [`StereoConvolver`] trait boundary ready for FFT overlap-add convolution in
+//! `INV-05`. Default REW filter location: `C:\Program Files\EqualizerAPO\config` (most
+//! recent rate-matched 2-channel WAV by change date).
 
 use ap_core::buffer::StereoF64Buffer;
 
-/// Loaded stereo Room EQ Wizard impulse response prepared for `352.8 / 384 kHz` `f64` convolution.
-#[derive(Debug)]
-pub struct RewStereoIr {
-    pub sample_rate_hz: u32,
-    pub left_ir: Vec<f64>,
-    pub right_ir: Vec<f64>,
-    pub max_passband_gain_db: f64,
+/// Default directory where the user's REW stereo WAV convolution filters live.
+pub const DEFAULT_REW_CONVOLUTION_DIR: &str = r"C:\Program Files\EqualizerAPO\config";
+
+/// Pluggable stereo convolution stage operating strictly in IEEE 754 `f64`.
+pub trait StereoConvolver: Send + Sync {
+    fn name(&self) -> &'static str;
+
+    /// Maximum positive frequency-domain gain boost (`>= 0.0 dB`) introduced by this filter,
+    /// fed into `ap_core::headroom::select_headroom` so clipping is mathematically impossible.
+    fn max_boost_db(&self) -> f64;
+
+    fn convolve(&self, input: StereoF64Buffer) -> Result<StereoF64Buffer, String>;
 }
 
-/// Load a stereo REW WAV impulse response (handling 352.8/384 kHz derivation per INV-05).
-pub fn load_rew_ir(_path: &Path, _target_rate_hz: u32) -> Result<RewStereoIr, String> {
-    todo!("Implement REW stereo WAV loader & gain inspection (INV-05)")
-}
+/// Explicit zero-copy null convolver (`StereoF64Buffer -> StereoF64Buffer`).
+///
+/// Keeps the full processing pipeline tidy and uniform until real FFT overlap-add REW
+/// stereo convolution is implemented.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NullConvolver;
 
-/// Apply stereo REW overlap-add convolution strictly in `f64`.
-pub fn convolve_stereo_f64(
-    _audio: &StereoF64Buffer,
-    _ir: &RewStereoIr,
-) -> Result<StereoF64Buffer, String> {
-    todo!("Implement f64 FFT overlap-add stereo convolution (INV-05)")
+impl StereoConvolver for NullConvolver {
+    fn name(&self) -> &'static str {
+        "null-convolver"
+    }
+
+    fn max_boost_db(&self) -> f64 {
+        0.0
+    }
+
+    fn convolve(&self, input: StereoF64Buffer) -> Result<StereoF64Buffer, String> {
+        if input.left.len() != input.right.len() {
+            return Err("stereo f64 buffer L/R length mismatch in convolver".to_string());
+        }
+        Ok(input)
+    }
 }

@@ -1,12 +1,31 @@
-//! Optional per-channel room alignment delay (only minor DSP exception permitted).
+//! Optional per-channel room alignment delay stage (`352.8 / 384 kHz` pure `f64`).
 //!
 //! At `352.8 / 384 kHz`, 1 sample is ~2.6 microseconds (~0.9 mm acoustic distance),
-//! enabling pure integer-sample delay with zero fractional-delay filter coloration.
+//! enabling pure integer-sample delay with zero fractional-delay coloration.
+//! Currently provides the explicit zero-copy [`NullChannelDelayer`] placeholder.
 
 use ap_core::buffer::StereoF64Buffer;
-use ap_core::config::ChannelDelayConfig;
 
-/// Apply exact integer-sample channel delay at `352.8 / 384 kHz`.
-pub fn apply_channel_delay(_audio: &mut StereoF64Buffer, _delay: ChannelDelayConfig) {
-    todo!("Implement integer-sample channel delay at 8fS (INV-05)")
+/// Pluggable per-channel room alignment delay stage operating strictly in IEEE 754 `f64`.
+pub trait ChannelDelayer: Send + Sync {
+    fn name(&self) -> &'static str;
+
+    fn apply(&self, input: StereoF64Buffer) -> Result<StereoF64Buffer, String>;
+}
+
+/// Explicit zero-copy null channel delayer (`StereoF64Buffer -> StereoF64Buffer`).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NullChannelDelayer;
+
+impl ChannelDelayer for NullChannelDelayer {
+    fn name(&self) -> &'static str {
+        "null-delay"
+    }
+
+    fn apply(&self, input: StereoF64Buffer) -> Result<StereoF64Buffer, String> {
+        if input.left.len() != input.right.len() {
+            return Err("stereo f64 buffer L/R length mismatch in channel delayer".to_string());
+        }
+        Ok(input)
+    }
 }

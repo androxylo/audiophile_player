@@ -104,3 +104,58 @@ impl Drop for MmcssGuard {
         }
     }
 }
+
+/// Best-effort RAII guard pinning an active RAM audio buffer with Win32 `VirtualLock`
+/// so Windows never pages out playing audio frames mid-track.
+pub struct MemoryLockGuard {
+    #[cfg(windows)]
+    ptr: *const core::ffi::c_void,
+    #[cfg(windows)]
+    len: usize,
+    locked: bool,
+}
+
+impl MemoryLockGuard {
+    /// Attempt to lock `[ptr, ptr + byte_len)` in physical RAM (best-effort; never fails playback).
+    #[cfg(windows)]
+    pub fn lock_slice<T>(slice: &[T]) -> Self {
+        use windows_sys::Win32::System::Memory::VirtualLock;
+        let byte_len = core::mem::size_of_val(slice);
+        if byte_len == 0 {
+            return Self {
+                ptr: core::ptr::null(),
+                len: 0,
+                locked: false,
+            };
+        }
+        let ptr = slice.as_ptr().cast::<core::ffi::c_void>();
+        let ok = unsafe { VirtualLock(ptr, byte_len) } != 0;
+        Self {
+            ptr,
+            len: byte_len,
+            locked: ok,
+        }
+    }
+
+    #[cfg(not(windows))]
+    pub fn lock_slice<T>(_slice: &[T]) -> Self {
+        Self { locked: false }
+    }
+
+    pub fn is_locked(&self) -> bool {
+        self.locked
+    }
+}
+
+impl Drop for MemoryLockGuard {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        if self.locked && !self.ptr.is_null() && self.len > 0 {
+            use windows_sys::Win32::System::Memory::VirtualUnlock;
+            unsafe {
+                let _ = VirtualUnlock(self.ptr, self.len);
+            }
+            self.locked = false;
+        }
+    }
+}

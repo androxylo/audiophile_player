@@ -6,6 +6,7 @@
 
 mod cli_args;
 mod engine;
+mod prefetch;
 mod signals;
 
 use std::process::ExitCode;

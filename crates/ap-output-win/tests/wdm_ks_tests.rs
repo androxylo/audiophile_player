@@ -16,7 +16,7 @@ use std::sync::Mutex;
 
 use ap_core::buffer::InterleavedInt32Buffer;
 use ap_core::format::DacWireFormat;
-use ap_output_win::hygiene::{MmcssGuard, OptimizationLevel};
+use ap_output_win::hygiene::{MemoryLockGuard, MmcssGuard, OptimizationLevel};
 use ap_output_win::sink::ZeroMixerAudioSink;
 use ap_output_win::wdm_ks::{
     KsPinConnectBlob, KsRenderDevice, WaveRtFramePump, WdmKsSink, classify_ks_pin_error,
@@ -177,6 +177,15 @@ fn mmcss_pro_audio_guard_enters_and_drops_cleanly() {
     // On Windows desktop sessions, MMCSS "Pro Audio" should activate cleanly.
     #[cfg(windows)]
     assert!(guard.is_active(), "expected MMCSS 'Pro Audio' to activate on Windows");
+    drop(guard);
+}
+
+#[test]
+fn memory_lock_guard_pins_and_releases_pcm_slice_cleanly() {
+    let buf = vec![[0_i32, 0_i32]; 4096];
+    let guard = MemoryLockGuard::lock_slice(&buf);
+    #[cfg(windows)]
+    assert!(guard.is_locked(), "expected VirtualLock to succeed for 32 KiB PCM slice");
     drop(guard);
 }
 

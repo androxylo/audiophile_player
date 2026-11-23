@@ -7,6 +7,7 @@
 
 pub mod convolution;
 pub mod delay;
+pub mod pipeline;
 pub mod quantize;
 pub mod selector;
 pub mod upsampler;
