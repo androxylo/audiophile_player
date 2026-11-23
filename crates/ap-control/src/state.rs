@@ -19,6 +19,8 @@ pub enum ControlCommand {
     PlaySequential(PathBuf),
     /// Play a specific selected FLAC file.
     PlayFile(PathBuf),
+    /// Skip immediately (with smooth fade-out) to the next track in the active playback mode.
+    Next,
     /// Unified Pause/Stop: fade out cleanly and release the WDM-KS DAC pin immediately.
     Pause,
 }
@@ -122,6 +124,9 @@ impl SharedControl {
                     st.active_folder = parent.to_path_buf();
                 }
                 st.log.push(format!("Command: Play File -> {}", file.display()));
+            }
+            ControlCommand::Next => {
+                st.log.push("Command: Next track");
             }
             ControlCommand::Pause => {
                 st.log

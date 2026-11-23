@@ -104,6 +104,8 @@ fn http_server_serves_scrollable_no_volume_ui_and_routes_play_pause_commands() {
     assert!(page.contains(GITHUB_MANUAL_URL));
     assert!(page.contains("Play Random"));
     assert!(page.contains("Play Sequential"));
+    assert!(page.contains("/action/next"));
+    assert!(page.contains(">Next<"));
     assert!(page.contains("Pause (Release DAC)"));
     assert!(page.contains("overflow-y:auto")); // scrollable folder & action log
     assert!(page.contains("AlbumOne"));
@@ -128,7 +130,19 @@ fn http_server_serves_scrollable_no_volume_ui_and_routes_play_pause_commands() {
     );
     assert!(stop_flag.load(Ordering::SeqCst));
 
-    // 3. POST /action/pause dispatches unified Pause (release DAC) and sets stop_flag
+    // 3. POST /action/next dispatches Next and sets stop_flag for smooth skip
+    stop_flag.store(false, Ordering::SeqCst);
+    let post_next = format!(
+        "POST /action/next HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let resp_next = http_request(server.addr(), &post_next);
+    assert!(resp_next.starts_with("HTTP/1.1 303 See Other"));
+    assert_eq!(shared.take_pending_command(), Some(ControlCommand::Next));
+    assert!(stop_flag.load(Ordering::SeqCst));
+
+    // 4. POST /action/pause dispatches unified Pause (release DAC) and sets stop_flag
     stop_flag.store(false, Ordering::SeqCst);
     let post_pause = format!(
         "POST /action/pause HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{}",

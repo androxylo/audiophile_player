@@ -135,6 +135,10 @@ pre#action-log{{margin:0;max-height:170px;overflow-y:auto;background:#0f1115;bor
       <input type=\"hidden\" name=\"dir\" value=\"{dir_html}\">\n\
       <button type=\"submit\" class=\"primary\">Play Sequential</button>\n\
     </form>\n\
+    <form method=\"POST\" action=\"/action/next\">\n\
+      <input type=\"hidden\" name=\"dir\" value=\"{dir_html}\">\n\
+      <button type=\"submit\" class=\"primary\">Next</button>\n\
+    </form>\n\
     <form method=\"POST\" action=\"/action/pause\">\n\
       <input type=\"hidden\" name=\"dir\" value=\"{dir_html}\">\n\
       <button type=\"submit\" class=\"pause\">Pause (Release DAC)</button>\n\

@@ -95,6 +95,40 @@ impl BoundedBlockStreamBuffer {
         ep
     }
 
+    /// Skip the currently playing track cleanly:
+    /// - If the buffer already holds the next track's `TrackStart` (or `EndOfQueue`) at
+    ///   `expected_epoch`, drops only the skipped track's remaining blocks and returns
+    ///   `(true, expected_epoch)` so the pre-buffered next track plays immediately with 0 ms wait.
+    /// - Otherwise flushes everything, increments epoch, and returns `(false, new_epoch)` so the
+    ///   producer aborts the remainder of the current track and starts the next track immediately.
+    pub fn skip_to_next_track_or_flush(&self, expected_epoch: u64) -> (bool, u64) {
+        let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if st.epoch == expected_epoch {
+            if let Some(next_idx) = st.events.iter().position(|ev| {
+                matches!(
+                    ev,
+                    StreamEvent::TrackStart { .. }
+                        | StreamEvent::EndOfQueue(_)
+                        | StreamEvent::FatalError(_)
+                )
+            }) {
+                for _ in 0..next_idx {
+                    if let Some(StreamEvent::PcmBlock(b)) = st.events.pop_front() {
+                        st.buffered_frames = st.buffered_frames.saturating_sub(b.frames.len());
+                    }
+                }
+                self.cv.notify_all();
+                return (true, st.epoch);
+            }
+        }
+        st.epoch = st.epoch.wrapping_add(1);
+        st.events.clear();
+        st.buffered_frames = 0;
+        let ep = st.epoch;
+        self.cv.notify_all();
+        (false, ep)
+    }
+
     /// Permanently close the buffer for graceful shutdown, waking all blocked threads.
     pub fn close(&self) {
         let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -292,5 +326,31 @@ mod tests {
         assert!(!buf.push_for_epoch(ep0, StreamEvent::PcmBlock(make_block(10_000))));
         assert!(buf.push_for_epoch(ep1, StreamEvent::PcmBlock(make_block(10_000))));
         assert_eq!(buf.buffered_frames(), 10_000);
+    }
+
+    #[test]
+    fn skip_to_next_track_reuses_prebuffered_next_track_or_flushes_mid_track() {
+        let buf = BoundedBlockStreamBuffer::new(300_000);
+        let ep0 = buf.current_epoch();
+
+        // Case 1: mid-track (no next TrackStart queued yet) -> flushes and advances epoch.
+        assert!(buf.push_for_epoch(ep0, StreamEvent::PcmBlock(make_block(40_000))));
+        let (reused, ep1) = buf.skip_to_next_track_or_flush(ep0);
+        assert!(!reused);
+        assert_ne!(ep1, ep0);
+        assert_eq!(buf.buffered_frames(), 0);
+
+        // Case 2: tail of track A + EndOfQueue/next marker already buffered -> skips track A blocks, keeps next!
+        assert!(buf.push_for_epoch(ep1, StreamEvent::PcmBlock(make_block(30_000))));
+        assert!(buf.push_for_epoch(ep1, StreamEvent::TrackEnd));
+        assert!(buf.push_for_epoch(ep1, StreamEvent::EndOfQueue("next-marker".into())));
+        let (reused2, ep2) = buf.skip_to_next_track_or_flush(ep1);
+        assert!(reused2);
+        assert_eq!(ep2, ep1);
+        assert_eq!(buf.buffered_frames(), 0);
+        assert!(matches!(
+            buf.pop_for_epoch_timeout(ep1, Duration::from_millis(50)),
+            Some(StreamEvent::EndOfQueue(_))
+        ));
     }
 }

@@ -190,6 +190,11 @@ fn handle_connection(stream: &mut TcpStream, shared: &SharedControl) {
             }
             redirect_to_dir(stream, &dir);
         }
+        ("POST", "/action/next") => {
+            let dir = extract_dir(&body, shared);
+            shared.submit_command(ControlCommand::Next);
+            redirect_to_dir(stream, &dir);
+        }
         ("POST", "/action/pause") => {
             let dir = extract_dir(&body, shared);
             shared.submit_command(ControlCommand::Pause);

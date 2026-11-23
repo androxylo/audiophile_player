@@ -45,9 +45,17 @@ pub fn run_idle(controller: &ShutdownController) {
 #[derive(Debug, Clone)]
 enum ProducerDirective {
     Paused,
-    Random { root: PathBuf },
-    Sequential { root: PathBuf },
-    SingleFile { file: PathBuf },
+    Random {
+        root: PathBuf,
+    },
+    Sequential {
+        root: PathBuf,
+        seq_gen: u64,
+        start_after: Option<PathBuf>,
+    },
+    SingleFile {
+        file: PathBuf,
+    },
     Shutdown,
 }
 
@@ -161,10 +169,23 @@ pub fn run_random_music_player(
         .map_err(|e| format!("failed spawning DSP streaming thread: {e}"))?;
 
     let mut is_paused = false;
+    let mut last_play_directive = ProducerDirective::Random {
+        root: music_dir.clone(),
+    };
+    let mut next_seq_gen: u64 = 1;
 
     while controller.current_signal().is_none() {
         if let Some(cmd) = shared.take_pending_command() {
-            let (paused, next_ep) = dispatch_command(cmd, &stream_buf, &prod_ctrl, &shared);
+            let (paused, next_ep) = dispatch_command(
+                cmd,
+                is_paused,
+                active_epoch,
+                &mut last_play_directive,
+                &mut next_seq_gen,
+                &stream_buf,
+                &prod_ctrl,
+                &shared,
+            );
             is_paused = paused;
             active_epoch = next_ep;
         }
@@ -173,8 +194,16 @@ pub fn run_random_music_player(
             // DAC WDM-KS pin is completely closed & released — Audirvana can play freely!
             match shared.wait_for_command_or_shutdown() {
                 Some(cmd) => {
-                    let (paused, next_ep) =
-                        dispatch_command(cmd, &stream_buf, &prod_ctrl, &shared);
+                    let (paused, next_ep) = dispatch_command(
+                        cmd,
+                        is_paused,
+                        active_epoch,
+                        &mut last_play_directive,
+                        &mut next_seq_gen,
+                        &stream_buf,
+                        &prod_ctrl,
+                        &shared,
+                    );
                     is_paused = paused;
                     active_epoch = next_ep;
                     continue;
@@ -192,7 +221,16 @@ pub fn run_random_music_player(
             break;
         }
         if let Some(cmd) = shared.take_pending_command() {
-            let (paused, next_ep) = dispatch_command(cmd, &stream_buf, &prod_ctrl, &shared);
+            let (paused, next_ep) = dispatch_command(
+                cmd,
+                is_paused,
+                active_epoch,
+                &mut last_play_directive,
+                &mut next_seq_gen,
+                &stream_buf,
+                &prod_ctrl,
+                &shared,
+            );
             is_paused = paused;
             active_epoch = next_ep;
             continue;
@@ -225,8 +263,16 @@ pub fn run_random_music_player(
                         break;
                     }
                     if let Some(cmd) = shared.take_pending_command() {
-                        let (paused, next_ep) =
-                            dispatch_command(cmd, &stream_buf, &prod_ctrl, &shared);
+                        let (paused, next_ep) = dispatch_command(
+                            cmd,
+                            is_paused,
+                            active_epoch,
+                            &mut last_play_directive,
+                            &mut next_seq_gen,
+                            &stream_buf,
+                            &prod_ctrl,
+                            &shared,
+                        );
                         is_paused = paused;
                         active_epoch = next_ep;
                         break;
@@ -296,27 +342,94 @@ pub fn run_random_music_player(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_command(
     cmd: ControlCommand,
+    currently_paused: bool,
+    active_epoch: u64,
+    last_play_directive: &mut ProducerDirective,
+    next_seq_gen: &mut u64,
     buf: &BoundedBlockStreamBuffer,
     prod_ctrl: &ProducerControl,
     shared: &SharedControl,
 ) -> (bool, u64) {
-    let ep = buf.reset_and_flush();
     match cmd {
         ControlCommand::PlayRandom(root) => {
-            prod_ctrl.set(ep, ProducerDirective::Random { root });
+            let ep = buf.reset_and_flush();
+            let dir = ProducerDirective::Random { root };
+            *last_play_directive = dir.clone();
+            prod_ctrl.set(ep, dir);
             (false, ep)
         }
         ControlCommand::PlaySequential(root) => {
-            prod_ctrl.set(ep, ProducerDirective::Sequential { root });
+            let ep = buf.reset_and_flush();
+            let seq_gen = *next_seq_gen;
+            *next_seq_gen = next_seq_gen.wrapping_add(1);
+            let dir = ProducerDirective::Sequential {
+                root,
+                seq_gen,
+                start_after: None,
+            };
+            *last_play_directive = dir.clone();
+            prod_ctrl.set(ep, dir);
             (false, ep)
         }
         ControlCommand::PlayFile(file) => {
-            prod_ctrl.set(ep, ProducerDirective::SingleFile { file });
+            let ep = buf.reset_and_flush();
+            let dir = ProducerDirective::SingleFile { file };
+            *last_play_directive = dir.clone();
+            prod_ctrl.set(ep, dir);
+            (false, ep)
+        }
+        ControlCommand::Next => {
+            println!("  [next] Skipping to next track...");
+            let _ = io::stdout().flush();
+
+            // If playing a single file, advance sequentially to the next file in its folder.
+            if let ProducerDirective::SingleFile { file } = last_play_directive.clone() {
+                let ep = buf.reset_and_flush();
+                let parent = file
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| shared.snapshot().active_folder);
+                let seq_gen = *next_seq_gen;
+                *next_seq_gen = next_seq_gen.wrapping_add(1);
+                let dir = ProducerDirective::Sequential {
+                    root: parent,
+                    seq_gen,
+                    start_after: Some(file),
+                };
+                *last_play_directive = dir.clone();
+                prod_ctrl.set(ep, dir);
+                return (false, ep);
+            }
+
+            if !currently_paused {
+                let (reused_prebuffered, ep) = buf.skip_to_next_track_or_flush(active_epoch);
+                if reused_prebuffered {
+                    return (false, ep);
+                }
+                prod_ctrl.set(ep, last_play_directive.clone());
+                return (false, ep);
+            }
+
+            // When paused, Next starts playback of the next track in the last active mode/folder.
+            let ep = buf.reset_and_flush();
+            let resume_dir = match last_play_directive {
+                ProducerDirective::Paused | ProducerDirective::Shutdown => {
+                    let dir = ProducerDirective::Random {
+                        root: shared.snapshot().active_folder,
+                    };
+                    *last_play_directive = dir.clone();
+                    dir
+                }
+                other => other.clone(),
+            };
+            prod_ctrl.set(ep, resume_dir);
             (false, ep)
         }
         ControlCommand::Pause => {
+            let ep = buf.reset_and_flush();
             prod_ctrl.set(ep, ProducerDirective::Paused);
             shared.set_paused("Paused — WDM-KS kernel pin closed (DAC available to Audirvana)");
             println!("  [paused] WDM-KS kernel pin closed (DAC released).");
@@ -368,11 +481,24 @@ fn producer_loop(
                 last_random = Some(picked.clone());
                 (picked, PlayModeLabel::Random)
             }
-            ProducerDirective::Sequential { root } => {
-                let needs_init = seq_cursor.as_ref().is_none_or(|(ep, _)| *ep != epoch);
+            ProducerDirective::Sequential {
+                root,
+                seq_gen,
+                start_after,
+            } => {
+                let needs_init = seq_cursor.as_ref().is_none_or(|(g, _)| *g != seq_gen);
                 if needs_init {
                     match SequentialFlacCursor::new(root.clone()) {
-                        Ok(c) => seq_cursor = Some((epoch, c)),
+                        Ok(mut c) => {
+                            if let Some(after) = start_after.as_ref() {
+                                while let Some(p) = c.next_track() {
+                                    if &p == after {
+                                        break;
+                                    }
+                                }
+                            }
+                            seq_cursor = Some((seq_gen, c));
+                        }
                         Err(err) => {
                             let _ = buf.push_for_epoch(epoch, StreamEvent::FatalError(err));
                             ctrl.set(epoch, ProducerDirective::Paused);
