@@ -91,8 +91,9 @@ Every processing stage must prioritize mathematical purity:
   - Exact switching threshold / curve between `-3 dB` and `0 dB` (and interaction with REW convolution peak gain) will be finalized in `INV-04`.
 
 ### 5.3 Stereo Convolution (REW) — Core First-Class Feature
-- **Main Feature (Not a Sidecar):** Applying **stereo convolution filters** produced by **REW (Room EQ Wizard)** is a primary, first-class feature of the engine, deeply integrated into the high-rate (`≥ 352.8 / 384 kHz`) floating-point DSP pipeline.
-- Exact IR sample-rate handling (e.g., REW 352.8/384 kHz extended-bandwidth IRs vs automatic high-precision resampling of lower-rate IRs) and whether upsampling + convolution run sequentially or as a combined mathematical stage will be finalized in `INV-05`.
+- **Main Feature (Not a Sidecar):** Applying **stereo convolution filters** produced by **REW (Room EQ Wizard)** is a primary, first-class feature of the engine, deeply integrated into the locked `352.8 / 384 kHz` floating-point DSP pipeline.
+- **Default Discovery Location & Selection Rule:** Convolution filters live in **`C:\Program Files\EqualizerAPO\config`** by default. The engine automatically picks the **most recent stereo (2-channel) `.wav` file by change/modification date** matching the active `8fS` target sample rate (`352,800 Hz` for the 44.1 kHz family; `384,000 Hz` for the 48 kHz family), ignoring mono L/R helper files.
+- **Format & Tap Length:** Supports REW's native 32-bit IEEE float (and 64-bit float / 24-bit PCM) stereo WAV exports up to REW's `4M` (`2^22 = 4,194,304`-tap) power-of-two IR length. Exact processing order (sequential vs composite FIR kernel) will be finalized in `INV-05`.
 
 ### 5.4 Allowed Minor DSP Exception
 - **No other DSP settings are permitted**, with one minor allowed exception:
