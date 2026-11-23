@@ -1,23 +1,25 @@
-//! Headless playback coordinator for the rudimentary native Rust WDM-KS player.
+//! Headless playback coordinator for the native Rust WDM-KS player + rudimentary HTTP UI.
 //!
 //! Default mode (zero CLI arguments):
 //! 1. Resolves `~/Music` (or `--music-dir`).
 //! 2. Auto-selects the best Windows WDM-KS WaveRT DAC (preferring USB UAC2 / Schiit Unison).
-//! 3. Loops indefinitely: picks a random FLAC in `O(depth)` time via subfolder walk,
-//!    decodes bit-exact into RAM (RFC 9639 16/24/32-bit FLAC), and streams directly
-//!    to the DAC via Windows Kernel Streaming (`WDM-KS` WaveRT — zero Windows mixer).
-//! 4. On any Windows interrupt signal (`Ctrl+C`, `Ctrl+Break`, `Close`, `Logoff`, `Shutdown`),
-//!    immediately triggers a smooth click-free fade-out stop and releases the DAC pin cleanly.
+//! 3. Starts the rudimentary local HTTP control server on the first free port in `17441..=17499`
+//!    (never port 80 or 8080).
+//! 4. Immediately starts playing random FLACs via `O(depth)` subfolder walk & WDM-KS WaveRT.
+//! 5. Supports `Play Random`, `Play Sequential`, `Play File`, and unified `Pause` (which fades
+//!    out smoothly and immediately closes/releases the WDM-KS DAC pin so Audirvana can play).
 
 use std::io::{self, Write};
 use std::path::PathBuf;
 
+use ap_control::server::ControlServer;
+use ap_control::state::{ControlCommand, PlayModeLabel, SharedControl};
 use ap_core::format::DacWireFormat;
 use ap_output_win::hygiene::OptimizationLevel;
 use ap_output_win::sink::{OutputError, ZeroMixerAudioSink};
 use ap_output_win::wdm_ks::WdmKsSink;
 use ap_source::flac::decode_flac_full_memory_int32;
-use ap_source::library::{default_user_music_dir, pick_random_flac_walk};
+use ap_source::library::{SequentialFlacCursor, default_user_music_dir, pick_random_flac_walk};
 
 use crate::signals::{ShutdownController, ShutdownSignal};
 
@@ -33,11 +35,25 @@ pub fn run_idle(controller: &ShutdownController) {
     print_shutdown_banner(sig);
 }
 
-/// Run default zero-config random FLAC playback via native Windows Kernel Streaming (`WDM-KS`).
+enum ActivePlayState {
+    Paused,
+    Random {
+        root: PathBuf,
+        last_track: Option<PathBuf>,
+    },
+    Sequential {
+        cursor: SequentialFlacCursor,
+    },
+    SingleFile(Option<PathBuf>),
+}
+
+/// Run default zero-config random FLAC playback via native Windows Kernel Streaming (`WDM-KS`)
+/// paired with the rudimentary local HTTP control interface.
 pub fn run_random_music_player(
     music_dir_override: Option<PathBuf>,
     device_filter: Option<String>,
     optimization: OptimizationLevel,
+    http_port: Option<u16>,
     controller: &ShutdownController,
 ) -> Result<(), String> {
     let music_dir = match music_dir_override {
@@ -54,51 +70,115 @@ pub fn run_random_music_player(
 
     let mut sink = WdmKsSink::open_best(device_filter.as_deref(), optimization)
         .map_err(|e| e.to_string())?;
-    controller.attach_stop_flag(sink.stop_handle());
+    let dac_name = sink.device().friendly_name.clone();
+    let stop_handle = sink.stop_handle();
+
+    let shared = SharedControl::new(music_dir.clone(), dac_name.clone());
+    shared.attach_sink_stop_flag(stop_handle.clone());
+    controller.attach_stop_flag(stop_handle);
+    controller.attach_shared_control(shared.clone());
+
+    let mut http_server = ControlServer::start(shared.clone(), http_port)?;
 
     println!(
-        "audiophile-player v{} started (WDM-KS WaveRT, opt={optimization:?}, DAC='{}', music='{}').",
+        "audiophile-player v{} started (WDM-KS WaveRT, opt={optimization:?}, DAC='{dac_name}', music='{}').",
         env!("CARGO_PKG_VERSION"),
-        sink.device().friendly_name,
         music_dir.display()
     );
+    println!("Web control: {}", http_server.url());
     println!("Press Ctrl+C or Ctrl+Break to stop gracefully.");
     let _ = io::stdout().flush();
 
-    let mut last_track: Option<PathBuf> = None;
+    // Start immediately in highest-quality Play Random mode from ~/Music (zero-config default).
+    let mut play_state = ActivePlayState::Random {
+        root: music_dir,
+        last_track: None,
+    };
     let mut consecutive_errors: u32 = 0;
 
     while controller.current_signal().is_none() {
-        // Pick a random FLAC in O(depth) time; retry up to 3 times to avoid immediate repeats.
-        let mut chosen = match pick_random_flac_walk(&music_dir) {
-            Ok(p) => p,
-            Err(err) => return Err(err),
-        };
-        if last_track.as_ref() == Some(&chosen) {
-            for _ in 0..3 {
-                if let Ok(alt) = pick_random_flac_walk(&music_dir) {
-                    if last_track.as_ref() != Some(&alt) {
-                        chosen = alt;
-                        break;
-                    }
+        // Apply any queued command from the HTTP control page before selecting the next track.
+        if let Some(cmd) = shared.take_pending_command() {
+            play_state = apply_command(cmd, &shared);
+            consecutive_errors = 0;
+        }
+
+        if matches!(play_state, ActivePlayState::Paused) {
+            // DAC pin is completely closed & released here — Audirvana can play freely!
+            match shared.wait_for_command_or_shutdown() {
+                Some(cmd) => {
+                    play_state = apply_command(cmd, &shared);
+                    consecutive_errors = 0;
+                    continue;
                 }
+                None => break, // process shutdown signaled
             }
         }
 
+        // Select the next track for the active mode.
+        let (chosen, mode_label) = match &mut play_state {
+            ActivePlayState::Random { root, last_track } => {
+                let mut picked = match pick_random_flac_walk(root) {
+                    Ok(p) => p,
+                    Err(err) => {
+                        shared.set_paused(format!("Paused: {err}"));
+                        play_state = ActivePlayState::Paused;
+                        continue;
+                    }
+                };
+                if last_track.as_ref() == Some(&picked) {
+                    for _ in 0..3 {
+                        if let Ok(alt) = pick_random_flac_walk(root) {
+                            if last_track.as_ref() != Some(&alt) {
+                                picked = alt;
+                                break;
+                            }
+                        }
+                    }
+                }
+                *last_track = Some(picked.clone());
+                (picked, PlayModeLabel::Random)
+            }
+            ActivePlayState::Sequential { cursor } => match cursor.next_track() {
+                Some(p) => (p, PlayModeLabel::Sequential),
+                None => {
+                    shared.set_paused(format!(
+                        "Finished sequential playback of '{}' — DAC released",
+                        cursor.root().display()
+                    ));
+                    play_state = ActivePlayState::Paused;
+                    continue;
+                }
+            },
+            ActivePlayState::SingleFile(slot) => match slot.take() {
+                Some(p) => (p, PlayModeLabel::SingleFile),
+                None => {
+                    shared.set_paused("Finished single track — DAC released");
+                    play_state = ActivePlayState::Paused;
+                    continue;
+                }
+            },
+            ActivePlayState::Paused => continue,
+        };
+
         if controller.current_signal().is_some() {
             break;
+        }
+        if let Some(cmd) = shared.take_pending_command() {
+            play_state = apply_command(cmd, &shared);
+            continue;
         }
 
         let decoded = match decode_flac_full_memory_int32(&chosen) {
             Ok(d) => d,
             Err(err) => {
-                eprintln!(
-                    "  [skip] could not decode '{}': {err}",
-                    chosen.display()
-                );
+                let msg = format!("Skipped unreadable FLAC '{}': {err}", chosen.display());
+                eprintln!("  [skip] {msg}");
+                shared.record_action(msg);
                 consecutive_errors += 1;
                 if consecutive_errors >= 10 {
-                    return Err("too many consecutive unreadable FLAC files".to_string());
+                    shared.set_paused("Paused after 10 consecutive unreadable FLACs — DAC released");
+                    play_state = ActivePlayState::Paused;
                 }
                 continue;
             }
@@ -108,30 +188,42 @@ pub fn run_random_music_player(
         if controller.current_signal().is_some() {
             break;
         }
+        if let Some(cmd) = shared.take_pending_command() {
+            play_state = apply_command(cmd, &shared);
+            continue;
+        }
 
         let dur_s = decoded.pcm.frames.len() as f64 / decoded.spec.sample_rate_hz as f64;
-        println!(
-            "  [playing] {} ({}-bit / {} Hz, {:.1} s, WDM-KS Int32)",
-            chosen.display(),
-            decoded.spec.bits_per_sample,
-            decoded.spec.sample_rate_hz,
-            dur_s
+        let fmt_str = format!(
+            "{}-bit / {} Hz, {:.1} s, WDM-KS Int32",
+            decoded.spec.bits_per_sample, decoded.spec.sample_rate_hz, dur_s
         );
-        let _ = io::stdout().flush();
+        let track_str = chosen.display().to_string();
 
+        println!("  [playing] {track_str} ({fmt_str})");
+        let _ = io::stdout().flush();
+        shared.set_playing(mode_label, track_str, fmt_str);
+
+        // WdmKsSink::play_full_memory opens the kernel pin strictly for the duration of this call
+        // and closes/releases it via RAII immediately on return (including on Pause!).
         match sink.play_full_memory(&decoded.pcm, DacWireFormat::Int32) {
-            Ok(_stats) => {
-                last_track = Some(chosen);
-            }
+            Ok(_stats) => {}
             Err(err @ OutputError::DeviceBusy { .. }) => {
-                return Err(err.to_string());
+                let msg = format!("DAC busy ({err}) — staying paused");
+                eprintln!("  [busy] {msg}");
+                shared.set_paused(msg);
+                play_state = ActivePlayState::Paused;
             }
             Err(err) => {
-                eprintln!("  [output error] {err}");
-                return Err(err.to_string());
+                let msg = format!("Output error ({err}) — paused & DAC released");
+                eprintln!("  [error] {msg}");
+                shared.set_paused(msg);
+                play_state = ActivePlayState::Paused;
             }
         }
     }
+
+    http_server.shutdown();
 
     if let Some(sig) = controller.current_signal() {
         print_shutdown_banner(sig);
@@ -141,6 +233,29 @@ pub fn run_random_music_player(
     }
 
     Ok(())
+}
+
+fn apply_command(cmd: ControlCommand, shared: &SharedControl) -> ActivePlayState {
+    match cmd {
+        ControlCommand::PlayRandom(root) => ActivePlayState::Random {
+            root,
+            last_track: None,
+        },
+        ControlCommand::PlaySequential(root) => match SequentialFlacCursor::new(root) {
+            Ok(cursor) => ActivePlayState::Sequential { cursor },
+            Err(err) => {
+                shared.set_paused(format!("Cannot play sequentially: {err}"));
+                ActivePlayState::Paused
+            }
+        },
+        ControlCommand::PlayFile(file) => ActivePlayState::SingleFile(Some(file)),
+        ControlCommand::Pause => {
+            shared.set_paused("Paused — WDM-KS kernel pin closed (DAC available to Audirvana)");
+            println!("  [paused] WDM-KS kernel pin closed (DAC released).");
+            let _ = io::stdout().flush();
+            ActivePlayState::Paused
+        }
+    }
 }
 
 fn print_shutdown_banner(sig: ShutdownSignal) {

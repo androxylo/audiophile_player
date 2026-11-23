@@ -13,6 +13,6 @@ path = "src/main.rs"
 ap-core.workspace = true
 ap-source.workspace = true
 ap-output-win.workspace = true
+ap-control.workspace = true
 # Wired incrementally in Milestone 1 as remaining subsystems are implemented:
 # ap-dsp.workspace = true
-# ap-control.workspace = true

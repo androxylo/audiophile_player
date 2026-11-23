@@ -63,15 +63,18 @@ impl fmt::Display for ShutdownSignal {
     }
 }
 
+use ap_control::state::SharedControl;
+
 /// Thread-safe shutdown coordinator that parks the main thread at 0% CPU until signaled,
-/// and optionally flips an attached audio-sink stop flag immediately upon interrupt.
-#[derive(Debug, Default)]
+/// and propagates interrupts immediately to the shared control hub & active audio sink.
+#[derive(Default)]
 pub struct ShutdownController {
     signal: Mutex<Option<ShutdownSignal>>,
     signal_cv: Condvar,
     cleanup_done: Mutex<bool>,
     cleanup_cv: Condvar,
     active_stop_flag: Mutex<Option<Arc<AtomicBool>>>,
+    shared_control: Mutex<Option<Arc<SharedControl>>>,
 }
 
 impl ShutdownController {
@@ -96,6 +99,22 @@ impl ShutdownController {
             .unwrap_or_else(|e| e.into_inner()) = Some(flag);
     }
 
+    /// Attach the shared HTTP control hub so interrupts also wake a paused engine immediately.
+    pub fn attach_shared_control(&self, shared: Arc<SharedControl>) {
+        let already_signaled = self
+            .signal
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some();
+        if already_signaled {
+            shared.request_shutdown();
+        }
+        *self
+            .shared_control
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(shared);
+    }
+
     /// Check non-blockingly whether a shutdown signal has already been received.
     pub fn current_signal(&self) -> Option<ShutdownSignal> {
         *self.signal.lock().unwrap_or_else(|e| e.into_inner())
@@ -115,6 +134,14 @@ impl ShutdownController {
             .as_ref()
         {
             flag.store(true, Ordering::SeqCst);
+        }
+        if let Some(shared) = self
+            .shared_control
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            shared.request_shutdown();
         }
     }
 

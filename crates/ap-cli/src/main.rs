@@ -43,7 +43,14 @@ fn main() -> ExitCode {
             music_dir,
             device_filter,
             optimization,
-        } => engine::run_random_music_player(music_dir, device_filter, optimization, controller),
+            http_port,
+        } => engine::run_random_music_player(
+            music_dir,
+            device_filter,
+            optimization,
+            http_port,
+            controller,
+        ),
         RunMode::Help => unreachable!(),
     };
 

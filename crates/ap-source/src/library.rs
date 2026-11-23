@@ -215,3 +215,89 @@ pub fn pick_random_flac<'a>(files: &'a [PathBuf]) -> Option<&'a PathBuf> {
     let seed = next_entropy_seed(files.as_ptr() as usize as u64);
     pick_random_flac_with_seed(files, seed)
 }
+
+/// Lazy, bounded-memory sequential `.flac` cursor resilient to 20,000+ track libraries.
+///
+/// Walks directories in deterministic sorted order keeping only the active ancestor stack
+/// in memory (never scanning the entire tree upfront). Yields `.flac` files in the current
+/// directory first, then descends into immediate subdirectories in alphabetical order.
+#[derive(Debug)]
+pub struct SequentialFlacCursor {
+    root: PathBuf,
+    stack: Vec<DirFrame>,
+}
+
+#[derive(Debug)]
+struct DirFrame {
+    flacs: Vec<PathBuf>,
+    flac_idx: usize,
+    subdirs: Vec<PathBuf>,
+    subdir_idx: usize,
+}
+
+impl SequentialFlacCursor {
+    pub fn new(root: PathBuf) -> Result<Self, String> {
+        if !root.exists() {
+            return Err(format!("music directory does not exist: '{}'", root.display()));
+        }
+        if !root.is_dir() {
+            return Err(format!("music path is not a directory: '{}'", root.display()));
+        }
+        let first = read_dir_frame(&root);
+        Ok(Self {
+            root,
+            stack: vec![first],
+        })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Return the next `.flac` file in sorted sequential order, or `None` when the folder tree
+    /// has been completely played through.
+    pub fn next_track(&mut self) -> Option<PathBuf> {
+        loop {
+            let depth = self.stack.len();
+            let top = self.stack.last_mut()?;
+            if top.flac_idx < top.flacs.len() {
+                let path = top.flacs[top.flac_idx].clone();
+                top.flac_idx += 1;
+                return Some(path);
+            }
+            if top.subdir_idx < top.subdirs.len() && depth <= MAX_WALK_DEPTH {
+                let next_dir = top.subdirs[top.subdir_idx].clone();
+                top.subdir_idx += 1;
+                self.stack.push(read_dir_frame(&next_dir));
+                continue;
+            }
+            self.stack.pop();
+        }
+    }
+}
+
+fn read_dir_frame(dir: &Path) -> DirFrame {
+    let mut flacs = Vec::new();
+    let mut subdirs = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if ft.is_dir() {
+                subdirs.push(path);
+            } else if ft.is_file() && is_flac_path(&path) {
+                flacs.push(path);
+            }
+        }
+    }
+    flacs.sort();
+    subdirs.sort();
+    DirFrame {
+        flacs,
+        flac_idx: 0,
+        subdirs,
+        subdir_idx: 0,
+    }
+}

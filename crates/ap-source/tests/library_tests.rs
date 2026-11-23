@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ap_source::library::{
-    default_user_music_dir, discover_flac_files, pick_random_flac, pick_random_flac_walk,
-    pick_random_flac_walk_with_seed, pick_random_flac_with_seed,
+    SequentialFlacCursor, default_user_music_dir, discover_flac_files, pick_random_flac,
+    pick_random_flac_walk, pick_random_flac_walk_with_seed, pick_random_flac_with_seed,
 };
 
 fn make_temp_tree(tag: &str) -> PathBuf {
@@ -151,6 +151,29 @@ fn random_picker_handles_empty_and_selects_valid_entries() {
 
     let c = pick_random_flac(&files).unwrap();
     assert!(files.contains(c));
+}
+
+#[test]
+fn sequential_cursor_yields_flacs_in_sorted_order_lazily_skipping_empty_dirs() {
+    let root = make_temp_tree("seq_cursor");
+    fs::create_dir_all(root.join("00_Empty")).unwrap();
+    fs::create_dir_all(root.join("01_AlbumA")).unwrap();
+    fs::create_dir_all(root.join("02_AlbumB")).unwrap();
+
+    fs::write(root.join("00_root.flac"), b"").unwrap();
+    fs::write(root.join("01_AlbumA").join("02.flac"), b"").unwrap();
+    fs::write(root.join("01_AlbumA").join("01.flac"), b"").unwrap();
+    fs::write(root.join("02_AlbumB").join("01.FLAC"), b"").unwrap();
+    fs::write(root.join("02_AlbumB").join("cover.jpg"), b"").unwrap();
+
+    let mut cur = SequentialFlacCursor::new(root.clone()).unwrap();
+    let mut yielded = Vec::new();
+    while let Some(p) = cur.next_track() {
+        yielded.push(p.file_name().unwrap().to_string_lossy().to_string());
+    }
+    assert_eq!(yielded, vec!["00_root.flac", "01.flac", "02.flac", "01.FLAC"]);
+
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
