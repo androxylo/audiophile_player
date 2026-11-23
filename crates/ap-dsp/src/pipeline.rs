@@ -11,12 +11,12 @@
 //! 5. **Single Final `f64 -> i32` Quantization** ([`StreamingQuantizer`], stateful across blocks).
 
 use ap_core::buffer::{InterleavedInt32Buffer, StereoF64Buffer};
+use ap_core::config::ConvolutionConfig;
 use ap_core::format::StreamSpec;
 use ap_core::headroom::{HeadroomDecision, HeadroomMode, TrackPeakMetadata, select_headroom};
 
 use crate::convolution::{
-    NullConvolverFactory, RewConvolutionConfig, RewConvolverFactory, StereoConvolver,
-    StereoConvolverFactory,
+    NullConvolverFactory, RewConvolverFactory, StereoConvolver, StereoConvolverFactory,
 };
 use crate::delay::{ChannelDelayer, ChannelDelayerFactory, NullChannelDelayerFactory};
 use crate::quantize::{StreamingQuantizer, apply_safe_gain_f64};
@@ -181,10 +181,10 @@ impl AudioPipeline {
         })
     }
 
-    /// Construct a pipeline with automatic/explicit REW stereo convolution + null delay.
+    /// Construct a pipeline with configured REW stereo convolution (`ConvolutionConfig`) + null delay.
     pub fn with_rew_config(
         upsampler_policy: UpsamplerPolicy,
-        rew_config: RewConvolutionConfig,
+        rew_config: ConvolutionConfig,
     ) -> Result<Self, String> {
         Self::with_factories(
             upsampler_policy,

@@ -6,12 +6,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ap_core::buffer::StereoF64Buffer;
+use ap_core::config::ConvolutionConfig;
 use ap_core::format::StreamSpec;
 use ap_core::headroom::{HeadroomMode, TrackPeakMetadata};
 use ap_dsp::convolution::{
-    DEFAULT_REW_CONVOLUTION_DIR, PartitionedStereoConvolver, PreparedStereoIr,
-    RewConvolutionConfig, RewConvolverFactory, StereoConvolver, StereoConvolverFactory,
-    WavSampleEncoding, discover_latest_rew_wav, load_stereo_wav, probe_wav_header,
+    PartitionedStereoConvolver, PreparedStereoIr, RewConvolverFactory, StereoConvolver,
+    StereoConvolverFactory, WavSampleEncoding, discover_latest_rew_wav, load_stereo_wav,
+    probe_wav_header,
 };
 use ap_dsp::pipeline::AudioPipeline;
 use ap_dsp::selector::{FilterArchetype, NoiseShaperProfile, UpsamplerPolicy};
@@ -349,13 +350,32 @@ fn auto_discovery_picks_newest_rate_matched_stereo_wav_and_ignores_mono_helpers(
     // Non-existent rate returns None -> factory falls back cleanly to NullConvolver.
     assert!(discover_latest_rew_wav(&tmp, 192_000).unwrap().is_none());
 
-    let factory = RewConvolverFactory::new(RewConvolutionConfig::AutoDir(tmp.clone()));
+    let factory = RewConvolverFactory::new(ConvolutionConfig::auto_dir(tmp.clone()));
     let c384 = factory.create_for_rate(384_000).unwrap();
     assert_eq!(c384.name(), "rew-fft-f64");
     assert!(c384.description().contains("new_384.wav"));
 
     let c192 = factory.create_for_rate(192_000).unwrap();
     assert_eq!(c192.name(), "null-convolver");
+
+    // Per-rate explicit file overrides `dir` for that specific rate while `dir` handles the other.
+    let mut per_rate_cfg = ConvolutionConfig::auto_dir(tmp.clone());
+    per_rate_cfg.file_384000 = Some(old_384.clone());
+    let per_rate_factory = RewConvolverFactory::new(per_rate_cfg);
+    assert!(
+        per_rate_factory
+            .create_for_rate(384_000)
+            .unwrap()
+            .description()
+            .contains("old_384.wav")
+    );
+    assert!(
+        per_rate_factory
+            .create_for_rate(352_800)
+            .unwrap()
+            .description()
+            .contains("filter_352.wav")
+    );
 
     let _ = fs::remove_dir_all(&tmp);
 }
@@ -380,7 +400,7 @@ fn rew_boost_triggers_minus_3db_headroom_and_convolution_runs_before_noise_shape
             shaper_override: Some(NoiseShaperProfile::Bypass),
             ..UpsamplerPolicy::default()
         },
-        RewConvolutionConfig::ExplicitFile(wav_path),
+        ConvolutionConfig::explicit_file(wav_path),
     )
     .unwrap();
 
@@ -416,7 +436,7 @@ fn rew_boost_triggers_minus_3db_headroom_and_convolution_runs_before_noise_shape
 
 #[test]
 fn real_equalizer_apo_rew_filters_load_and_stream_4m_taps_if_present() {
-    let dir = Path::new(DEFAULT_REW_CONVOLUTION_DIR);
+    let dir = Path::new(r"C:\Program Files\EqualizerAPO\config");
     if !dir.is_dir() {
         return;
     }

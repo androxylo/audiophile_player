@@ -26,11 +26,9 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use ap_core::buffer::StereoF64Buffer;
+use ap_core::config::ConvolutionConfig;
 use realfft::num_complex::Complex;
 use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
-
-/// Default directory where the user's REW stereo WAV convolution filters live.
-pub const DEFAULT_REW_CONVOLUTION_DIR: &str = r"C:\Program Files\EqualizerAPO\config";
 
 /// Minimum and maximum UPOLS partition block sizes (`B`, FFT size `N = 2 * B`).
 const MIN_PARTITION_BLOCK: usize = 1_024;
@@ -943,24 +941,6 @@ impl StereoConvolver for PartitionedStereoConvolver {
     }
 }
 
-/// Configuration for REW stereo convolution discovery/loading.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RewConvolutionConfig {
-    /// Scan a folder (default `C:\Program Files\EqualizerAPO\config`) and pick the newest
-    /// 2-channel WAV matching the active `8fS` rate; falls back to `NullConvolver` if absent.
-    AutoDir(PathBuf),
-    /// Strictly load one explicit stereo WAV file (must match the active sample rate).
-    ExplicitFile(PathBuf),
-    /// Explicitly disable REW convolution (`NullConvolver`).
-    Disabled,
-}
-
-impl Default for RewConvolutionConfig {
-    fn default() -> Self {
-        Self::AutoDir(PathBuf::from(DEFAULT_REW_CONVOLUTION_DIR))
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CachedIrKey {
     path: PathBuf,
@@ -974,26 +954,37 @@ struct CachedIrEntry {
 }
 
 /// Caching, hot-reloading REW stereo convolver factory keyed by active sample rate.
+///
+/// Configured via [`ConvolutionConfig`] (loaded from `config.toml` or CLI flags).
+/// By default (`ConvolutionConfig::disabled()`), convolution is disabled (`NullConvolver`)
+/// because room-correction filters are user-specific and cannot have a universal default.
 pub struct RewConvolverFactory {
-    config: RewConvolutionConfig,
+    config: ConvolutionConfig,
     cache: Mutex<HashMap<u32, CachedIrEntry>>,
 }
 
 impl RewConvolverFactory {
-    pub fn new(config: RewConvolutionConfig) -> Self {
+    pub fn new(config: ConvolutionConfig) -> Self {
         Self {
             config,
             cache: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Default factory scanning `C:\Program Files\EqualizerAPO\config` automatically.
-    pub fn auto_default() -> Self {
-        Self::new(RewConvolutionConfig::default())
+    pub fn config(&self) -> &ConvolutionConfig {
+        &self.config
     }
 
-    pub fn config(&self) -> &RewConvolutionConfig {
-        &self.config
+    fn load_explicit_file(
+        &self,
+        rate_hz: u32,
+        path: &Path,
+    ) -> Result<Box<dyn StereoConvolver>, String> {
+        let meta = fs::metadata(path).map_err(|e| {
+            format!("configured REW WAV '{}' not accessible: {e}", path.display())
+        })?;
+        let ir = self.load_or_get_cached(rate_hz, path, meta.modified().ok(), meta.len())?;
+        Ok(Box::new(PartitionedStereoConvolver::new(ir)))
     }
 
     fn load_or_get_cached(
@@ -1043,38 +1034,47 @@ impl RewConvolverFactory {
 
 impl StereoConvolverFactory for RewConvolverFactory {
     fn create_for_rate(&self, target_rate_hz: u32) -> Result<Box<dyn StereoConvolver>, String> {
-        match &self.config {
-            RewConvolutionConfig::Disabled => Ok(Box::new(NullConvolver {
+        if !self.config.enabled {
+            return Ok(Box::new(NullConvolver {
                 sample_rate_hz: target_rate_hz,
-            })),
-            RewConvolutionConfig::ExplicitFile(path) => {
-                let meta = fs::metadata(path).map_err(|e| {
-                    format!("explicit REW WAV '{}' not accessible: {e}", path.display())
-                })?;
-                let ir = self.load_or_get_cached(
-                    target_rate_hz,
-                    path,
-                    meta.modified().ok(),
-                    meta.len(),
-                )?;
-                Ok(Box::new(PartitionedStereoConvolver::new(ir)))
-            }
-            RewConvolutionConfig::AutoDir(dir) => {
-                match discover_latest_rew_wav(dir, target_rate_hz)? {
-                    Some(found) => {
-                        let ir = self.load_or_get_cached(
-                            target_rate_hz,
-                            &found.path,
-                            found.modified,
-                            found.file_len,
-                        )?;
-                        Ok(Box::new(PartitionedStereoConvolver::new(ir)))
-                    }
-                    None => Ok(Box::new(NullConvolver {
-                        sample_rate_hz: target_rate_hz,
-                    })),
-                }
-            }
+            }));
         }
+
+        // 1. Per-rate explicit file override (`file_352800` / `file_384000`).
+        let rate_file = match target_rate_hz {
+            352_800 => self.config.file_352800.as_deref(),
+            384_000 => self.config.file_384000.as_deref(),
+            _ => None,
+        };
+        if let Some(path) = rate_file {
+            return self.load_explicit_file(target_rate_hz, path);
+        }
+
+        // 2. Single explicit WAV file (`file`).
+        if let Some(path) = self.config.file.as_deref() {
+            return self.load_explicit_file(target_rate_hz, path);
+        }
+
+        // 3. Auto-discovery directory (`dir`: newest 2-ch WAV matching target_rate_hz).
+        if let Some(dir) = self.config.dir.as_deref() {
+            return match discover_latest_rew_wav(dir, target_rate_hz)? {
+                Some(found) => {
+                    let ir = self.load_or_get_cached(
+                        target_rate_hz,
+                        &found.path,
+                        found.modified,
+                        found.file_len,
+                    )?;
+                    Ok(Box::new(PartitionedStereoConvolver::new(ir)))
+                }
+                None => Ok(Box::new(NullConvolver {
+                    sample_rate_hz: target_rate_hz,
+                })),
+            };
+        }
+
+        Ok(Box::new(NullConvolver {
+            sample_rate_hz: target_rate_hz,
+        }))
     }
 }

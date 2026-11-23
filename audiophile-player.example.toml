@@ -1,0 +1,26 @@
+# Audiophile Player configuration file (example template)
+#
+# Copy this file to ONE of the following locations:
+#   1. %APPDATA%\audiophile-player\config.toml   (recommended per-user Windows location)
+#   2. .\audiophile-player.toml                  (portable, next to working directory)
+#   3. Any path passed via: audiophile-player --config <PATH>
+#
+# Upsampling and noise shaping have strong automatic defaults; only room-specific
+# REW stereo convolution needs to be configured here.
+
+[convolution]
+# Master switch. Set to false to temporarily bypass convolution without deleting paths.
+enabled = false
+
+# Option A: Folder containing rate-matched 2-channel REW WAV filters.
+# Auto-picks the most recent 2-channel .wav by modification date matching the active
+# 8fS rate (352800 Hz or 384000 Hz) and ignores mono .L / .R helper files.
+# Tip: Use single quotes ('...') on Windows so backslashes do not need escaping.
+# dir = 'C:\Program Files\EqualizerAPO\config'
+
+# Option B: Explicit per-rate 2-channel WAV files (override `dir` for that rate).
+# file_352800 = 'C:\path\to\room-352800.wav'
+# file_384000 = 'C:\path\to\room-384000.wav'
+
+# Option C: Single explicit 2-channel WAV file (used when its sample rate matches).
+# file = 'C:\path\to\room-384000.wav'

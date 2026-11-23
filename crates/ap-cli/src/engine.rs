@@ -15,8 +15,8 @@ use std::time::Duration;
 use ap_control::server::ControlServer;
 use ap_control::state::{ControlCommand, PlayModeLabel, SharedControl};
 use ap_core::buffer::DEFAULT_SOURCE_BLOCK_FRAMES;
+use ap_core::config::{ConvolutionConfig, PlayerConfig};
 use ap_core::format::DacWireFormat;
-use ap_dsp::convolution::RewConvolutionConfig;
 use ap_dsp::pipeline::AudioPipeline;
 use ap_dsp::selector::UpsamplerPolicy;
 use ap_output_win::hygiene::OptimizationLevel;
@@ -91,15 +91,20 @@ impl ProducerControl {
 /// Run default zero-config random FLAC playback via bounded-memory block streaming,
 /// tidy `AudioPipeline`, native Windows Kernel Streaming (`WDM-KS`), and localhost HTTP UI.
 pub fn run_random_music_player(
+    config_path: Option<PathBuf>,
     music_dir_override: Option<PathBuf>,
     device_filter: Option<String>,
     optimization: OptimizationLevel,
     http_port: Option<u16>,
     upsampler_policy: UpsamplerPolicy,
-    rew_convolution: RewConvolutionConfig,
+    rew_override: Option<ConvolutionConfig>,
     controller: &ShutdownController,
 ) -> Result<(), String> {
-    let pipeline = AudioPipeline::with_rew_config(upsampler_policy, rew_convolution)?;
+    let loaded_cfg = PlayerConfig::discover_and_load(config_path.as_deref())?;
+    let effective_conv = rew_override.unwrap_or(loaded_cfg.config.convolution);
+    effective_conv.validate()?;
+
+    let pipeline = AudioPipeline::with_rew_config(upsampler_policy, effective_conv)?;
     let music_dir = match music_dir_override {
         Some(dir) => dir,
         None => default_user_music_dir()
@@ -129,6 +134,10 @@ pub fn run_random_music_player(
         env!("CARGO_PKG_VERSION"),
         music_dir.display()
     );
+    match &loaded_cfg.source_path {
+        Some(path) => println!("Config file: {}", path.display()),
+        None => println!("Config file: none (using built-in defaults; convolution disabled)"),
+    }
     println!("Web control: {}", http_server.url());
     println!("Press Ctrl+C or Ctrl+Break to stop gracefully.");
     let _ = io::stdout().flush();

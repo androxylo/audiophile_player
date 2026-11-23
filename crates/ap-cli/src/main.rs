@@ -41,19 +41,21 @@ fn main() -> ExitCode {
             Ok(())
         }
         RunMode::PlayRandom {
+            config_path,
             music_dir,
             device_filter,
             optimization,
             http_port,
             upsampler_policy,
-            rew_convolution,
+            rew_override,
         } => engine::run_random_music_player(
+            config_path,
             music_dir,
             device_filter,
             optimization,
             http_port,
             upsampler_policy,
-            rew_convolution,
+            rew_override,
             controller,
         ),
         RunMode::Help => unreachable!(),
