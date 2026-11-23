@@ -64,11 +64,13 @@ impl fmt::Display for UpsampleRatio {
     }
 }
 
-/// Curated audiophile PCM filter archetypes (plus initial `SimpleTest` bootstrap kernel).
+/// Curated audiophile PCM filter archetypes (plus `Null` 1:1 `f64` pass-through and initial `SimpleTest`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterArchetype {
-    /// No upsampling filter applied (1:1 floating-point pass-through).
-    Bypass,
+    /// Null 1:1 floating-point upsampler (`StereoF64Buffer -> StereoF64Buffer`, zero copy).
+    /// Used for native `352.8 / 384 kHz` sources so they still enter the `f64` DSP domain
+    /// (REW convolution, headroom, channel delay) without resampling.
+    Null,
     /// Initial simple windowed-sinc `f64` polyphase upsampler (temporary sole implemented
     /// upsampler until deep `INV-03` algorithms land; will NOT remain default once curated
     /// filters are implemented).
@@ -90,7 +92,7 @@ pub enum FilterArchetype {
 impl FilterArchetype {
     pub fn cli_name(self) -> &'static str {
         match self {
-            Self::Bypass => "bypass",
+            Self::Null => "null",
             Self::SimpleTest => "simple-test",
             Self::GaussApod4M => "gauss-apod-4m",
             Self::SincSteep4M => "sinc-steep-4m",
@@ -103,7 +105,7 @@ impl FilterArchetype {
 
     /// True if this filter kernel is currently implemented and runnable in `ap-dsp`.
     pub fn is_implemented(self) -> bool {
-        matches!(self, Self::Bypass | Self::SimpleTest)
+        matches!(self, Self::Null | Self::SimpleTest)
     }
 
     /// Recommended tap budget per archetype (strictly bounded by `max_taps <= 4,000,000`).
@@ -115,7 +117,7 @@ impl FilterArchetype {
             UpsampleRatio::Arbitrary => 8,
         };
         let desired = match self {
-            Self::Bypass => 0,
+            Self::Null => 0,
             Self::SimpleTest => 64 * mult,       // 512 @ 8x, 256 @ 4x, 128 @ 2x (fast initial kernel)
             Self::GaussApod4M => 262_144 * mult, // 2.1M @ 8x, 1.05M @ 4x, 524k @ 2x
             Self::SincSteep4M => 500_000 * mult, // 4.0M @ 8x, 2.0M @ 4x, 1.0M @ 2x
@@ -138,7 +140,7 @@ impl FromStr for FilterArchetype {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "bypass" => Ok(Self::Bypass),
+            "null" | "bypass" => Ok(Self::Null),
             "simple-test" => Ok(Self::SimpleTest),
             "gauss-apod-4m" => Ok(Self::GaussApod4M),
             "sinc-steep-4m" => Ok(Self::SincSteep4M),
@@ -147,7 +149,7 @@ impl FromStr for FilterArchetype {
             "gauss-hires-mp" => Ok(Self::GaussHiresMp),
             "ext-sharp-lp" => Ok(Self::ExtSharpLp),
             other => Err(format!(
-                "unknown filter '{other}'; expected auto, bypass, simple-test, gauss-apod-4m, \
+                "unknown filter '{other}'; expected auto, null, simple-test, gauss-apod-4m, \
                  sinc-steep-4m, gauss-long-lp, gauss-hires-ip, gauss-hires-mp, or ext-sharp-lp"
             )),
         }
@@ -316,20 +318,20 @@ impl UpsamplerPicker {
         let target_audiophile = planned_audiophile_filter(source, raw_ratio);
 
         let (filter, ratio, filter_overridden, filter_reason) = match self.policy.filter_override {
-            Some(FilterArchetype::Bypass) => (
-                FilterArchetype::Bypass,
+            Some(FilterArchetype::Null) => (
+                FilterArchetype::Null,
                 UpsampleRatio::Bypass1x,
                 true,
-                "cli --filter bypass".to_string(),
+                "cli --filter null (1:1 f64 pass-through)".to_string(),
             ),
             Some(forced) => {
                 if raw_ratio == UpsampleRatio::Bypass1x {
                     (
-                        FilterArchetype::Bypass,
+                        FilterArchetype::Null,
                         UpsampleRatio::Bypass1x,
                         true,
                         format!(
-                            "already at {} Hz (1x bypass; cli --filter {} not needed)",
+                            "already at {} Hz (null 1:1 f64 upsampler; cli --filter {} not needed)",
                             source.sample_rate_hz, forced
                         ),
                     )
@@ -355,7 +357,7 @@ impl UpsamplerPicker {
         SelectedDspPlan {
             source_rate_hz: source.sample_rate_hz,
             target_rate,
-            target_rate_hz: if filter == FilterArchetype::Bypass {
+            target_rate_hz: if filter == FilterArchetype::Null {
                 source.sample_rate_hz
             } else {
                 t_hz
@@ -375,7 +377,7 @@ impl UpsamplerPicker {
 /// Curated long-term audiophile filter mapping (active once `INV-03` filters are implemented).
 fn planned_audiophile_filter(source: &TrackSourceInfo, ratio: UpsampleRatio) -> FilterArchetype {
     if ratio == UpsampleRatio::Bypass1x {
-        return FilterArchetype::Bypass;
+        return FilterArchetype::Null;
     }
     if source.apodizing_needed {
         return FilterArchetype::GaussApod4M;
@@ -397,10 +399,13 @@ fn auto_select_active_filter(
 ) -> (FilterArchetype, UpsampleRatio, bool, String) {
     if ratio == UpsampleRatio::Bypass1x {
         return (
-            FilterArchetype::Bypass,
+            FilterArchetype::Null,
             UpsampleRatio::Bypass1x,
             false,
-            format!("auto: native 8fS ({} Hz) pass-through", source.sample_rate_hz),
+            format!(
+                "auto: native 8fS ({} Hz) -> null upsampler (f64 domain)",
+                source.sample_rate_hz
+            ),
         );
     }
 
@@ -430,7 +435,7 @@ fn auto_select_shaper(
     filter: FilterArchetype,
     ratio: UpsampleRatio,
 ) -> NoiseShaperProfile {
-    if filter == FilterArchetype::Bypass
+    if filter == FilterArchetype::Null
         && ratio == UpsampleRatio::Bypass1x
         && source.bits_per_sample >= 32
     {

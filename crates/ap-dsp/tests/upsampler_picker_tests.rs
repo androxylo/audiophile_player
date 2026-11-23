@@ -49,19 +49,19 @@ fn auto_picker_uses_initial_simple_test_upsampler_and_tracks_future_curated_defa
     assert_eq!(p_192.filter, FilterArchetype::SimpleTest);
     assert_eq!(p_192.target_audiophile_filter, FilterArchetype::GaussHiresIp);
 
-    // 4. 32/384 pre-upsampled PGGB FLAC -> 1x Bypass + Bypass shaper (never double-upsample!)
+    // 4. 32/384 pre-upsampled PGGB FLAC -> Null 1:1 f64 upsampler (still in f64 domain!)
     let p_384 = picker.select(&track(384_000, 32));
     assert_eq!(p_384.target_rate, TargetDspRate::Hz384000);
     assert_eq!(p_384.ratio, UpsampleRatio::Bypass1x);
-    assert_eq!(p_384.filter, FilterArchetype::Bypass);
+    assert_eq!(p_384.filter, FilterArchetype::Null);
     assert_eq!(p_384.shaper, NoiseShaperProfile::Bypass);
     assert_eq!(p_384.tap_budget, 0);
 
-    // 5. 32/352.8 pre-upsampled PGGB FLAC -> 1x Bypass
+    // 5. 32/352.8 pre-upsampled PGGB FLAC -> Null 1:1 f64 upsampler
     let p_352 = picker.select(&track(352_800, 32));
     assert_eq!(p_352.target_rate, TargetDspRate::Hz352800);
     assert_eq!(p_352.ratio, UpsampleRatio::Bypass1x);
-    assert_eq!(p_352.filter, FilterArchetype::Bypass);
+    assert_eq!(p_352.filter, FilterArchetype::Null);
 
     // Distinct target rates & future curated filters across the playlist sequence
     assert_ne!(p_cd.target_rate, p_96.target_rate);
@@ -104,24 +104,24 @@ fn cli_filter_and_shaper_overrides_are_enforced_across_tracks() {
         assert!(plan.tap_budget <= MAX_FILTER_TAPS);
     }
 
-    // Already 384 kHz must still stay 1x bypass (cannot upsample 1:1), while shaper override applies.
+    // Already 384 kHz must still select Null 1:1 f64 upsampler, while shaper override applies.
     let plan_384 = picker.select(&track(384_000, 32));
-    assert_eq!(plan_384.filter, FilterArchetype::Bypass);
+    assert_eq!(plan_384.filter, FilterArchetype::Null);
     assert_eq!(plan_384.ratio, UpsampleRatio::Bypass1x);
     assert_eq!(plan_384.shaper, NoiseShaperProfile::Lns15Smooth);
 }
 
 #[test]
-fn cli_bypass_override_disables_upsampling_on_all_rates() {
+fn cli_null_override_disables_resampling_while_staying_in_f64_domain() {
     let policy = UpsamplerPolicy {
-        filter_override: Some(FilterArchetype::Bypass),
+        filter_override: Some(FilterArchetype::Null),
         shaper_override: Some(NoiseShaperProfile::Bypass),
         max_taps: MAX_FILTER_TAPS,
     };
     let picker = UpsamplerPicker::new(policy).unwrap();
 
     let p = picker.select(&track(44_100, 16));
-    assert_eq!(p.filter, FilterArchetype::Bypass);
+    assert_eq!(p.filter, FilterArchetype::Null);
     assert_eq!(p.ratio, UpsampleRatio::Bypass1x);
     assert_eq!(p.target_rate_hz, 44_100);
     assert_eq!(p.tap_budget, 0);
@@ -148,7 +148,7 @@ fn policy_enforces_strict_4_million_tap_ceiling() {
 #[test]
 fn cli_names_parse_roundtrip_for_all_filters_and_shapers() {
     for f in [
-        FilterArchetype::Bypass,
+        FilterArchetype::Null,
         FilterArchetype::SimpleTest,
         FilterArchetype::GaussApod4M,
         FilterArchetype::SincSteep4M,
@@ -159,6 +159,7 @@ fn cli_names_parse_roundtrip_for_all_filters_and_shapers() {
     ] {
         assert_eq!(FilterArchetype::from_str(f.cli_name()).unwrap(), f);
     }
+    assert_eq!(FilterArchetype::from_str("bypass").unwrap(), FilterArchetype::Null);
     assert!(FilterArchetype::from_str("nonexistent").is_err());
 
     for s in [

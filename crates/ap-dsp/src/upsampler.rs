@@ -12,12 +12,15 @@ use ap_core::buffer::StereoF64Buffer;
 use crate::selector::{FilterArchetype, SelectedDspPlan, UpsampleRatio};
 
 /// Pluggable floating-point upsampler interface (always `StereoF64Buffer` -> `StereoF64Buffer`).
+///
+/// Takes ownership of `input` so [`NullUpsampler`] moves native `352.8 / 384 kHz` floating-point
+/// buffers in `O(1)` time with zero copy, while resampling filters free source memory immediately.
 pub trait Upsampler: Send + Sync {
     fn name(&self) -> &'static str;
 
     fn upsample(
         &self,
-        input: &StereoF64Buffer,
+        input: StereoF64Buffer,
         plan: &SelectedDspPlan,
     ) -> Result<StereoF64Buffer, String>;
 }
@@ -25,30 +28,37 @@ pub trait Upsampler: Send + Sync {
 /// Build the concrete floating-point [`Upsampler`] implementation for a [`SelectedDspPlan`].
 pub fn build_upsampler(plan: &SelectedDspPlan) -> Result<Box<dyn Upsampler>, String> {
     match plan.filter {
-        FilterArchetype::Bypass => Ok(Box::new(BypassUpsampler)),
+        FilterArchetype::Null => Ok(Box::new(NullUpsampler)),
         FilterArchetype::SimpleTest => Ok(Box::new(SimpleWindowedSincUpsampler::default())),
         other => Err(format!(
             "upsampler filter '{other}' is not implemented yet (pending INV-03 algorithm research); \
-             use 'auto', 'simple-test', or 'bypass' for now"
+             use 'auto', 'simple-test', or 'null' for now"
         )),
     }
 }
 
-/// Exact 1:1 floating-point pass-through (used for native 352.8/384 kHz tracks or `--filter bypass`).
+/// Null 1:1 floating-point upsampler (`StereoF64Buffer -> StereoF64Buffer`, zero copy).
+///
+/// Native `352.8 / 384 kHz` FLAC tracks are decoded into IEEE 754 `f64` and routed through
+/// `NullUpsampler` so downstream `f64` stages (REW stereo convolution, channel delay, headroom,
+/// final quantization) always receive a uniform floating-point `8fS` buffer without resampling.
 #[derive(Debug, Default)]
-pub struct BypassUpsampler;
+pub struct NullUpsampler;
 
-impl Upsampler for BypassUpsampler {
+impl Upsampler for NullUpsampler {
     fn name(&self) -> &'static str {
-        "bypass"
+        "null"
     }
 
     fn upsample(
         &self,
-        input: &StereoF64Buffer,
+        input: StereoF64Buffer,
         _plan: &SelectedDspPlan,
     ) -> Result<StereoF64Buffer, String> {
-        Ok(input.clone())
+        if input.left.len() != input.right.len() {
+            return Err("stereo f64 buffer L/R length mismatch".to_string());
+        }
+        Ok(input)
     }
 }
 
@@ -160,16 +170,16 @@ impl Upsampler for SimpleWindowedSincUpsampler {
 
     fn upsample(
         &self,
-        input: &StereoF64Buffer,
+        input: StereoF64Buffer,
         plan: &SelectedDspPlan,
     ) -> Result<StereoF64Buffer, String> {
         if input.left.len() != input.right.len() {
             return Err("stereo f64 buffer L/R length mismatch".to_string());
         }
         let ratio = match plan.ratio {
-            UpsampleRatio::Bypass1x => return Ok(input.clone()),
+            UpsampleRatio::Bypass1x => return Ok(input),
             UpsampleRatio::Integer(r) if r >= 2 => r as usize,
-            UpsampleRatio::Integer(_) => return Ok(input.clone()),
+            UpsampleRatio::Integer(_) => return Ok(input),
             UpsampleRatio::Arbitrary => {
                 return Err(format!(
                     "simple-test upsampler requires an exact integer ratio to 352.8/384 kHz \

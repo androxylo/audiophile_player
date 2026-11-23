@@ -213,17 +213,18 @@ pub fn run_random_music_player(
             }
         };
 
-        // Pure IEEE 754 f64 pipeline: optional -3 dB safety headroom -> f64 upsampling ->
-        // single final f64 -> i32 quantization for the DAC.
+        // Pure IEEE 754 f64 pipeline: optional -3 dB safety headroom -> f64 upsampling (or
+        // zero-copy NullUpsampler for native 352.8/384 kHz files) -> single final f64 -> i32
+        // quantization for the DAC.
         let dsp_start = std::time::Instant::now();
-        if dsp_plan.filter != FilterArchetype::Bypass {
+        if dsp_plan.filter != FilterArchetype::Null {
             if let Err(err) = apply_safe_gain_f64(&mut decoded.audio, UNKNOWN_PEAK_HEADROOM_DB) {
                 shared.set_paused(format!("Headroom error: {err}"));
                 play_state = ActivePlayState::Paused;
                 continue;
             }
         }
-        let upsampled_f64 = match upsampler.upsample(&decoded.audio, &dsp_plan) {
+        let upsampled_f64 = match upsampler.upsample(decoded.audio, &dsp_plan) {
             Ok(buf) => buf,
             Err(err) => {
                 let msg = format!("Upsampling failed for '{}': {err}", chosen.display());
@@ -232,7 +233,7 @@ pub fn run_random_music_player(
                 continue;
             }
         };
-        let dac_bits = if dsp_plan.filter == FilterArchetype::Bypass {
+        let dac_bits = if dsp_plan.filter == FilterArchetype::Null {
             (decoded.spec.bits_per_sample as u8).clamp(16, 32)
         } else {
             24

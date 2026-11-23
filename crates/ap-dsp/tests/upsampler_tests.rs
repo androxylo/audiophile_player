@@ -37,7 +37,7 @@ fn simple_upsampler_outputs_float64_at_352800_and_384000_preserving_dc_exactly()
             right: vec![-0.25_f64; n_in],
         };
 
-        let out = upsampler.upsample(&input, &plan).expect("upsample failed");
+        let out = upsampler.upsample(input, &plan).expect("upsample failed");
         assert_eq!(out.sample_rate_hz, expected_out_rate);
         let ratio = (expected_out_rate / src_rate) as usize;
         assert_eq!(out.left.len(), n_in * ratio);
@@ -86,7 +86,7 @@ fn simple_upsampler_reconstructs_1khz_sine_at_8x_352800_with_high_accuracy() {
     };
 
     let upsampler = build_upsampler(&plan).unwrap();
-    let out = upsampler.upsample(&input, &plan).unwrap();
+    let out = upsampler.upsample(input, &plan).unwrap();
     assert_eq!(out.sample_rate_hz, 352_800);
 
     // Compare interior upsampled sine against analytical 1 kHz sine at 352,800 Hz.
@@ -131,7 +131,7 @@ fn simple_upsampler_suppresses_ultrasonic_images_at_8x() {
     };
 
     let upsampler = build_upsampler(&plan).unwrap();
-    let out = upsampler.upsample(&input, &plan).unwrap();
+    let out = upsampler.upsample(input, &plan).unwrap();
 
     // Windowed Goertzel / DFT energy check on interior segment
     let seg = &out.left[(48 * 8)..(out.left.len() - 48 * 8)];
@@ -177,6 +177,36 @@ fn safe_gain_and_tpdf_quantizer_never_boost_and_clamp_cleanly() {
     // Clamped cleanly inside i32 bounds with zero wraparound
     assert!(pcm.frames[2][1] > 0);
     assert!(pcm.frames[3][1] < 0);
+}
+
+#[test]
+fn null_upsampler_moves_native_384khz_f64_buffer_zero_copy_and_bit_exact() {
+    let picker = UpsamplerPicker::new(UpsamplerPolicy::default()).unwrap();
+    let plan = picker.select(&TrackSourceInfo::from_stream_spec(StreamSpec {
+        sample_rate_hz: 384_000,
+        bits_per_sample: 32,
+        channels: 2,
+    }));
+    assert_eq!(plan.filter, FilterArchetype::Null);
+
+    let input = StereoF64Buffer {
+        sample_rate_hz: 384_000,
+        left: vec![0.123456789_f64, -0.987654321, 0.0, 0.5],
+        right: vec![-0.111111111_f64, 0.222222222, -0.5, 0.0],
+    };
+    let orig_ptr_l = input.left.as_ptr();
+    let orig_ptr_r = input.right.as_ptr();
+
+    let upsampler = build_upsampler(&plan).unwrap();
+    assert_eq!(upsampler.name(), "null");
+    let out = upsampler.upsample(input, &plan).unwrap();
+
+    // Zero-copy pointer identity proves zero reallocation and exact f64 preservation
+    assert_eq!(out.left.as_ptr(), orig_ptr_l);
+    assert_eq!(out.right.as_ptr(), orig_ptr_r);
+    assert_eq!(out.sample_rate_hz, 384_000);
+    assert_eq!(out.left[0], 0.123456789_f64);
+    assert_eq!(out.right[1], 0.222222222_f64);
 }
 
 #[test]
