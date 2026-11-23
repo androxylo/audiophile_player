@@ -3,6 +3,7 @@ name = "ap-core"
 description = "Core audio domain types, pure float64 buffers, 352.8/384 kHz targets, headroom policy, and config"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 repository.workspace = true
 
 [dependencies]

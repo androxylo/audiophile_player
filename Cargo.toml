@@ -18,7 +18,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-# License TBD (LGPL-compatible open-source license; finalized in INV-08).
+license = "LGPL-3.0-or-later"
 repository = "https://github.com/androxylo/audiophile_player"
 
 [workspace.dependencies]

@@ -3,6 +3,7 @@ name = "ap-output-win"
 description = "Windows-only strictly zero-mixer audio output: direct WDM-KS (Audirvana kernel mode) and event-driven WASAPI Exclusive"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 repository.workspace = true
 
 [dependencies]

@@ -34,3 +34,9 @@ audiophile_player/
 - [docs/research/02-audiophile-filter-survey.md](docs/research/02-audiophile-filter-survey.md) — Upsampling & noise-shaping algorithm sources, audiophile consensus, and list of inaccessible sources for user snippets.
 - [docs/research/06-windows-kernel-streaming.md](docs/research/06-windows-kernel-streaming.md) — WASAPI Exclusive vs. Audirvana-style WDM-KS (`usbaudio2.sys` / WaveRT), bit-perfect verification, and minimal-effort zero-mixer POC design.
 - [poc/README.md](poc/README.md) — Prototype setup, hardware probe, and test-tone/FLAC verification commands.
+
+## License
+
+This project is licensed under the **GNU Lesser General Public License v3.0 or later (`LGPL-3.0-or-later`)**.
+
+See [LICENSE](LICENSE) (GNU LGPL v3.0) and [COPYING](COPYING) (GNU GPL v3.0, incorporated by reference) for full terms.

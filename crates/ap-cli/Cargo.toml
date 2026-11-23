@@ -3,6 +3,7 @@ name = "ap-cli"
 description = "Headless CLI binary wiring ap-source -> ap-dsp -> ap-output-win + rudimentary ap-control server"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 repository.workspace = true
 
 [[bin]]

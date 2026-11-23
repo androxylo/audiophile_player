@@ -3,6 +3,7 @@ name = "ap-control"
 description = "Extremely rudimentary local HTTP control server (pick file/folder, Play/Stop, GitHub manual link)"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 repository.workspace = true
 
 [dependencies]
