@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use ap_dsp::MAX_FILTER_TAPS;
+use ap_dsp::convolution::{DEFAULT_REW_CONVOLUTION_DIR, RewConvolutionConfig};
 use ap_dsp::selector::{FilterArchetype, NoiseShaperProfile, UpsamplerPolicy};
 use ap_output_win::hygiene::OptimizationLevel;
 
@@ -23,6 +24,7 @@ pub enum RunMode {
         optimization: OptimizationLevel,
         http_port: Option<u16>,
         upsampler_policy: UpsamplerPolicy,
+        rew_convolution: RewConvolutionConfig,
     },
     /// Explicit `--idle` mode: keep running without touching audio hardware (for signal tests).
     Idle,
@@ -43,6 +45,7 @@ where
     let mut optimization = OptimizationLevel::High;
     let mut http_port: Option<u16> = None;
     let mut upsampler_policy = UpsamplerPolicy::default();
+    let mut rew_convolution = RewConvolutionConfig::default();
     let mut idle = false;
 
     while let Some(arg_raw) = iter.next() {
@@ -111,6 +114,21 @@ where
                 }
                 upsampler_policy.max_taps = taps;
             }
+            "--conv-dir" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| "--conv-dir requires a REW WAV directory path".to_string())?;
+                rew_convolution = RewConvolutionConfig::AutoDir(PathBuf::from(val.as_ref()));
+            }
+            "--conv-file" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| "--conv-file requires a stereo REW WAV file path".to_string())?;
+                rew_convolution = RewConvolutionConfig::ExplicitFile(PathBuf::from(val.as_ref()));
+            }
+            "--no-conv" => {
+                rew_convolution = RewConvolutionConfig::Disabled;
+            }
             "--opt" => {
                 let val = iter
                     .next()
@@ -146,6 +164,7 @@ where
         optimization,
         http_port,
         upsampler_policy,
+        rew_convolution,
     })
 }
 
@@ -168,6 +187,10 @@ pub fn help_text() -> String {
            --shaper <NAME>      Enforce 8fS shaper: auto | bypass | ns5 | lns15 |\n\
                                 pggb-optimal | tpdf (default: auto per track)\n\
            --max-taps <N>       Tap ceiling <= 4000000 (default: 4000000)\n\
+           --conv-dir <PATH>    REW stereo WAV folder (default: {DEFAULT_REW_CONVOLUTION_DIR};\n\
+                                auto-picks newest 2-ch WAV matching 352.8 / 384 kHz)\n\
+           --conv-file <PATH>   Explicit 2-ch REW WAV file (overrides --conv-dir)\n\
+           --no-conv            Disable REW stereo convolution (null pass-through)\n\
            --opt <LEVEL>        KS priority tier: normal | high | extreme (default: high)\n\
            --idle               Start idle without opening audio hardware (signal test mode)\n\
            -h, --help           Show this help message\n",
@@ -190,6 +213,9 @@ mod tests {
                 optimization: OptimizationLevel::High,
                 http_port: None,
                 upsampler_policy: UpsamplerPolicy::default(),
+                rew_convolution: RewConvolutionConfig::AutoDir(PathBuf::from(
+                    DEFAULT_REW_CONVOLUTION_DIR
+                )),
             }
         );
     }
@@ -210,6 +236,8 @@ mod tests {
             "lns15",
             "--max-taps",
             "2000000",
+            "--conv-file",
+            r"C:\Filters\room-384k.wav",
             "--opt",
             "extreme",
         ])
@@ -226,8 +254,20 @@ mod tests {
                     shaper_override: Some(NoiseShaperProfile::Lns15Smooth),
                     max_taps: 2_000_000,
                 },
+                rew_convolution: RewConvolutionConfig::ExplicitFile(PathBuf::from(
+                    r"C:\Filters\room-384k.wav"
+                )),
             }
         );
+
+        let no_conv = parse_args(["audiophile-player", "--no-conv"]).unwrap();
+        assert!(matches!(
+            no_conv,
+            RunMode::PlayRandom {
+                rew_convolution: RewConvolutionConfig::Disabled,
+                ..
+            }
+        ));
 
         assert_eq!(
             parse_args(["audiophile-player", "--idle"]).unwrap(),

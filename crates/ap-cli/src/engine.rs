@@ -16,6 +16,7 @@ use ap_control::server::ControlServer;
 use ap_control::state::{ControlCommand, PlayModeLabel, SharedControl};
 use ap_core::buffer::DEFAULT_SOURCE_BLOCK_FRAMES;
 use ap_core::format::DacWireFormat;
+use ap_dsp::convolution::RewConvolutionConfig;
 use ap_dsp::pipeline::AudioPipeline;
 use ap_dsp::selector::UpsamplerPolicy;
 use ap_output_win::hygiene::OptimizationLevel;
@@ -95,9 +96,10 @@ pub fn run_random_music_player(
     optimization: OptimizationLevel,
     http_port: Option<u16>,
     upsampler_policy: UpsamplerPolicy,
+    rew_convolution: RewConvolutionConfig,
     controller: &ShutdownController,
 ) -> Result<(), String> {
-    let pipeline = AudioPipeline::new(upsampler_policy)?;
+    let pipeline = AudioPipeline::with_rew_config(upsampler_policy, rew_convolution)?;
     let music_dir = match music_dir_override {
         Some(dir) => dir,
         None => default_user_music_dir()

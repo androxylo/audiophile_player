@@ -14,7 +14,10 @@ use ap_core::buffer::{InterleavedInt32Buffer, StereoF64Buffer};
 use ap_core::format::StreamSpec;
 use ap_core::headroom::{HeadroomDecision, HeadroomMode, TrackPeakMetadata, select_headroom};
 
-use crate::convolution::{NullConvolverFactory, StereoConvolver, StereoConvolverFactory};
+use crate::convolution::{
+    NullConvolverFactory, RewConvolutionConfig, RewConvolverFactory, StereoConvolver,
+    StereoConvolverFactory,
+};
 use crate::delay::{ChannelDelayer, ChannelDelayerFactory, NullChannelDelayerFactory};
 use crate::quantize::{StreamingQuantizer, apply_safe_gain_f64};
 use crate::selector::{
@@ -32,6 +35,7 @@ pub struct PipelineReport {
     pub headroom: HeadroomDecision,
     pub dsp_plan: SelectedDspPlan,
     pub convolver_name: &'static str,
+    pub convolver_description: String,
     pub delayer_name: &'static str,
     pub effective_shaper: NoiseShaperProfile,
 }
@@ -49,7 +53,7 @@ impl PipelineReport {
             self.output_rate_hz,
             self.dsp_plan.filter,
             self.headroom.mode,
-            self.convolver_name,
+            self.convolver_description,
             self.delayer_name,
             dur_part,
         )
@@ -60,7 +64,7 @@ impl PipelineReport {
             "{} | {} | conv={} | delay={}",
             self.dsp_plan.summary(),
             self.headroom.summary(),
-            self.convolver_name,
+            self.convolver_description,
             self.delayer_name,
         )
     }
@@ -177,6 +181,18 @@ impl AudioPipeline {
         })
     }
 
+    /// Construct a pipeline with automatic/explicit REW stereo convolution + null delay.
+    pub fn with_rew_config(
+        upsampler_policy: UpsamplerPolicy,
+        rew_config: RewConvolutionConfig,
+    ) -> Result<Self, String> {
+        Self::with_factories(
+            upsampler_policy,
+            Box::new(RewConvolverFactory::new(rew_config)),
+            Box::new(NullChannelDelayerFactory),
+        )
+    }
+
     /// Construct a pipeline with explicit convolver and channel delayer factories.
     pub fn with_factories(
         upsampler_policy: UpsamplerPolicy,
@@ -231,6 +247,7 @@ impl AudioPipeline {
             headroom,
             dsp_plan,
             convolver_name: convolver.name(),
+            convolver_description: convolver.description(),
             delayer_name: delayer.name(),
             effective_shaper,
         };

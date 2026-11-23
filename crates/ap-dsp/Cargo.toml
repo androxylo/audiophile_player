@@ -8,4 +8,4 @@ repository.workspace = true
 
 [dependencies]
 ap-core.workspace = true
-# LGPL-compatible 64-bit FFT crate (e.g. realfft / rustfft) finalized in INV-08 (no GPL-only FFTW3).
+realfft = "3.4"
