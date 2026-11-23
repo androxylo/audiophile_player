@@ -15,11 +15,14 @@ use std::path::PathBuf;
 use ap_control::server::ControlServer;
 use ap_control::state::{ControlCommand, PlayModeLabel, SharedControl};
 use ap_core::format::DacWireFormat;
-use ap_dsp::selector::{TrackSourceInfo, UpsamplerPicker, UpsamplerPolicy};
+use ap_core::headroom::UNKNOWN_PEAK_HEADROOM_DB;
+use ap_dsp::quantize::{apply_safe_gain_f64, quantize_to_int32};
+use ap_dsp::selector::{FilterArchetype, TrackSourceInfo, UpsamplerPicker, UpsamplerPolicy};
+use ap_dsp::upsampler::build_upsampler;
 use ap_output_win::hygiene::OptimizationLevel;
 use ap_output_win::sink::{OutputError, ZeroMixerAudioSink};
 use ap_output_win::wdm_ks::WdmKsSink;
-use ap_source::flac::decode_flac_full_memory_int32;
+use ap_source::flac::decode_flac_full_memory;
 use ap_source::library::{SequentialFlacCursor, default_user_music_dir, pick_random_flac_walk};
 
 use crate::signals::{ShutdownController, ShutdownSignal};
@@ -172,7 +175,7 @@ pub fn run_random_music_player(
             continue;
         }
 
-        let decoded = match decode_flac_full_memory_int32(&chosen) {
+        let mut decoded = match decode_flac_full_memory(&chosen) {
             Ok(d) => d,
             Err(err) => {
                 let msg = format!("Skipped unreadable FLAC '{}': {err}", chosen.display());
@@ -200,17 +203,60 @@ pub fn run_random_music_player(
         // different source rates/bit-depths/filters from track to track, honoring CLI overrides).
         let source_info = TrackSourceInfo::from_stream_spec(decoded.spec);
         let dsp_plan = upsampler_picker.select(&source_info);
+        let upsampler = match build_upsampler(&dsp_plan) {
+            Ok(u) => u,
+            Err(err) => {
+                eprintln!("  [dsp error] {err}");
+                shared.set_paused(format!("DSP configuration error: {err}"));
+                play_state = ActivePlayState::Paused;
+                continue;
+            }
+        };
 
-        let dur_s = decoded.pcm.frames.len() as f64 / decoded.spec.sample_rate_hz as f64;
+        // Pure IEEE 754 f64 pipeline: optional -3 dB safety headroom -> f64 upsampling ->
+        // single final f64 -> i32 quantization for the DAC.
+        let dsp_start = std::time::Instant::now();
+        if dsp_plan.filter != FilterArchetype::Bypass {
+            if let Err(err) = apply_safe_gain_f64(&mut decoded.audio, UNKNOWN_PEAK_HEADROOM_DB) {
+                shared.set_paused(format!("Headroom error: {err}"));
+                play_state = ActivePlayState::Paused;
+                continue;
+            }
+        }
+        let upsampled_f64 = match upsampler.upsample(&decoded.audio, &dsp_plan) {
+            Ok(buf) => buf,
+            Err(err) => {
+                let msg = format!("Upsampling failed for '{}': {err}", chosen.display());
+                eprintln!("  [dsp skip] {msg}");
+                shared.record_action(msg);
+                continue;
+            }
+        };
+        let dac_bits = if dsp_plan.filter == FilterArchetype::Bypass {
+            (decoded.spec.bits_per_sample as u8).clamp(16, 32)
+        } else {
+            24
+        };
+        let final_pcm = quantize_to_int32(&upsampled_f64, dsp_plan.shaper, dac_bits);
+        let dsp_ms = dsp_start.elapsed().as_secs_f64() * 1000.0;
+
+        if controller.current_signal().is_some() {
+            break;
+        }
+        if let Some(cmd) = shared.take_pending_command() {
+            play_state = apply_command(cmd, &shared);
+            continue;
+        }
+
+        let dur_s = final_pcm.frames.len() as f64 / final_pcm.sample_rate_hz as f64;
         let fmt_str = format!(
-            "{}-bit / {} Hz, {:.1} s | WDM-KS Int32 | plan: {} ({} -> {} Hz) + {}",
+            "{}/{} Hz -> {} Hz f64 ({}, {:.1} s, DSP {:.0} ms) | WDM-KS Int32",
             decoded.spec.bits_per_sample,
             decoded.spec.sample_rate_hz,
-            dur_s,
+            final_pcm.sample_rate_hz,
             dsp_plan.filter,
-            dsp_plan.ratio,
-            dsp_plan.target_rate_hz,
-            dsp_plan.shaper,
+            dur_s,
+            dsp_ms,
         );
         let track_str = chosen.display().to_string();
 
@@ -222,7 +268,7 @@ pub fn run_random_music_player(
 
         // WdmKsSink::play_full_memory opens the kernel pin strictly for the duration of this call
         // and closes/releases it via RAII immediately on return (including on Pause!).
-        match sink.play_full_memory(&decoded.pcm, DacWireFormat::Int32) {
+        match sink.play_full_memory(&final_pcm, DacWireFormat::Int32) {
             Ok(_stats) => {}
             Err(err @ OutputError::DeviceBusy { .. }) => {
                 let msg = format!("DAC busy ({err}) — staying paused");

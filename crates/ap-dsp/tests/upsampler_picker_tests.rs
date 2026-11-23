@@ -20,33 +20,34 @@ fn track(rate: u32, bits: u16) -> TrackSourceInfo {
 }
 
 #[test]
-fn auto_picker_switches_upsampler_dynamically_across_different_track_rates() {
+fn auto_picker_uses_initial_simple_test_upsampler_and_tracks_future_curated_defaults() {
     let picker = UpsamplerPicker::new(UpsamplerPolicy::default()).unwrap();
 
-    // 1. 16/44.1 Redbook -> 8x 352.8 kHz, GaussApod4M + NS5
+    // 1. 16/44.1 Redbook -> 8x 352.8 kHz f64 (active: SimpleTest; future default: GaussApod4M)
     let p_cd = picker.select(&track(44_100, 16));
     assert_eq!(p_cd.target_rate, TargetDspRate::Hz352800);
     assert_eq!(p_cd.target_rate_hz, 352_800);
     assert_eq!(p_cd.ratio, UpsampleRatio::Integer(8));
-    assert_eq!(p_cd.filter, FilterArchetype::GaussApod4M);
-    assert_eq!(p_cd.shaper, NoiseShaperProfile::Ns5Multibit);
+    assert_eq!(p_cd.filter, FilterArchetype::SimpleTest);
+    assert_eq!(p_cd.target_audiophile_filter, FilterArchetype::GaussApod4M);
+    assert_eq!(p_cd.shaper, NoiseShaperProfile::TpdfDither);
     assert!(p_cd.tap_budget > 0 && p_cd.tap_budget <= MAX_FILTER_TAPS);
     assert!(!p_cd.filter_overridden);
 
-    // 2. 24/96 HiRes -> 4x 384 kHz, GaussLongLp + NS5
+    // 2. 24/96 HiRes -> 4x 384 kHz f64 (active: SimpleTest; future default: GaussLongLp)
     let p_96 = picker.select(&track(96_000, 24));
     assert_eq!(p_96.target_rate, TargetDspRate::Hz384000);
     assert_eq!(p_96.target_rate_hz, 384_000);
     assert_eq!(p_96.ratio, UpsampleRatio::Integer(4));
-    assert_eq!(p_96.filter, FilterArchetype::GaussLongLp);
-    assert_eq!(p_96.shaper, NoiseShaperProfile::Ns5Multibit);
-    assert!(p_96.tap_budget <= MAX_FILTER_TAPS);
+    assert_eq!(p_96.filter, FilterArchetype::SimpleTest);
+    assert_eq!(p_96.target_audiophile_filter, FilterArchetype::GaussLongLp);
 
-    // 3. 24/192 HiRes -> 2x 384 kHz, GaussHiresIp + NS5
+    // 3. 24/192 HiRes -> 2x 384 kHz f64 (active: SimpleTest; future default: GaussHiresIp)
     let p_192 = picker.select(&track(192_000, 24));
     assert_eq!(p_192.target_rate, TargetDspRate::Hz384000);
     assert_eq!(p_192.ratio, UpsampleRatio::Integer(2));
-    assert_eq!(p_192.filter, FilterArchetype::GaussHiresIp);
+    assert_eq!(p_192.filter, FilterArchetype::SimpleTest);
+    assert_eq!(p_192.target_audiophile_filter, FilterArchetype::GaussHiresIp);
 
     // 4. 32/384 pre-upsampled PGGB FLAC -> 1x Bypass + Bypass shaper (never double-upsample!)
     let p_384 = picker.select(&track(384_000, 32));
@@ -62,21 +63,22 @@ fn auto_picker_switches_upsampler_dynamically_across_different_track_rates() {
     assert_eq!(p_352.ratio, UpsampleRatio::Bypass1x);
     assert_eq!(p_352.filter, FilterArchetype::Bypass);
 
-    // Confirm distinct filters were selected across the playlist sequence
-    assert_ne!(p_cd.filter, p_96.filter);
-    assert_ne!(p_96.filter, p_192.filter);
+    // Distinct target rates & future curated filters across the playlist sequence
+    assert_ne!(p_cd.target_rate, p_96.target_rate);
+    assert_ne!(p_cd.target_audiophile_filter, p_96.target_audiophile_filter);
+    assert_ne!(p_96.target_audiophile_filter, p_192.target_audiophile_filter);
     assert_ne!(p_192.filter, p_384.filter);
 }
 
 #[test]
-fn apodizing_flag_overrides_hires_auto_filter_to_gauss_apod() {
+fn apodizing_flag_targets_gauss_apod_for_hires_sources() {
     let picker = UpsamplerPicker::new(UpsamplerPolicy::default()).unwrap();
     let mut bad_master = track(96_000, 24);
     bad_master.apodizing_needed = true;
 
     let plan = picker.select(&bad_master);
-    assert_eq!(plan.filter, FilterArchetype::GaussApod4M);
-    assert!(plan.reason.contains("apodizing"));
+    assert_eq!(plan.target_audiophile_filter, FilterArchetype::GaussApod4M);
+    assert_eq!(plan.filter, FilterArchetype::SimpleTest); // sole implemented non-bypass filter for now
 }
 
 #[test]
@@ -147,6 +149,7 @@ fn policy_enforces_strict_4_million_tap_ceiling() {
 fn cli_names_parse_roundtrip_for_all_filters_and_shapers() {
     for f in [
         FilterArchetype::Bypass,
+        FilterArchetype::SimpleTest,
         FilterArchetype::GaussApod4M,
         FilterArchetype::SincSteep4M,
         FilterArchetype::GaussLongLp,
@@ -160,10 +163,10 @@ fn cli_names_parse_roundtrip_for_all_filters_and_shapers() {
 
     for s in [
         NoiseShaperProfile::Bypass,
+        NoiseShaperProfile::TpdfDither,
         NoiseShaperProfile::Ns5Multibit,
         NoiseShaperProfile::Lns15Smooth,
         NoiseShaperProfile::PggbOptimal,
-        NoiseShaperProfile::TpdfDither,
     ] {
         assert_eq!(NoiseShaperProfile::from_str(s.cli_name()).unwrap(), s);
     }
