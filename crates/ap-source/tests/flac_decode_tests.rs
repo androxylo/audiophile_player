@@ -2,7 +2,9 @@
 
 use std::path::PathBuf;
 
-use ap_source::flac::{decode_flac_full_memory, decode_flac_full_memory_int32};
+use ap_source::flac::{
+    decode_flac_full_memory, decode_flac_full_memory_int32, parse_peak_metadata_fields,
+};
 
 fn nocturne_fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -55,4 +57,20 @@ fn decodes_original_nocturne_24_96_flac_bit_exact_to_int32_and_f64() {
         assert_eq!((f64_track.audio.left[i] * scale) as i32, raw.pcm.frames[i][0]);
         assert_eq!((f64_track.audio.right[i] * scale) as i32, raw.pcm.frames[i][1]);
     }
+}
+
+#[test]
+fn parses_replaygain_and_true_peak_vorbis_comment_fields() {
+    let fields = vec![
+        "ARTIST=Test".to_string(),
+        "REPLAYGAIN_TRACK_GAIN=-4.25 dB".to_string(),
+        "REPLAYGAIN_TRACK_PEAK=0.612345".to_string(),
+        "REPLAYGAIN_ALBUM_GAIN=-3.10 dB".to_string(),
+        "REPLAYGAIN_ALBUM_PEAK=0.890000".to_string(),
+    ];
+    let meta = parse_peak_metadata_fields(&fields);
+    assert_eq!(meta.replaygain_track_gain_db, Some(-4.25));
+    assert_eq!(meta.replaygain_track_peak, Some(0.612345));
+    assert_eq!(meta.replaygain_album_gain_db, Some(-3.10));
+    assert_eq!(meta.replaygain_album_peak, Some(0.89));
 }

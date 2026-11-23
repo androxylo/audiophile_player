@@ -28,12 +28,9 @@ pub struct DecodedFlacInt32 {
 }
 
 /// Parse ReplayGain / peak Vorbis comment tags from a `VorbisComment` metadata block.
-fn parse_peak_metadata(vc: Option<&VorbisComment>) -> TrackPeakMetadata {
+pub fn parse_peak_metadata_fields(fields: &[String]) -> TrackPeakMetadata {
     let mut meta = TrackPeakMetadata::default();
-    let Some(vc) = vc else {
-        return meta;
-    };
-    for field in &vc.fields {
+    for field in fields {
         let Some((k, v)) = field.split_once('=') else {
             continue;
         };
@@ -44,13 +41,31 @@ fn parse_peak_metadata(vc: Option<&VorbisComment>) -> TrackPeakMetadata {
             .and_then(|s| s.parse::<f64>().ok());
         match key.as_str() {
             "REPLAYGAIN_TRACK_GAIN" => meta.replaygain_track_gain_db = val_num,
-            "REPLAYGAIN_TRACK_PEAK" => meta.replaygain_track_peak = val_num,
+            "REPLAYGAIN_TRACK_PEAK" | "TRUE_PEAK" | "REPLAYGAIN_TRACK_TRUE_PEAK" => {
+                meta.replaygain_track_peak = val_num;
+            }
             "REPLAYGAIN_ALBUM_GAIN" => meta.replaygain_album_gain_db = val_num,
-            "REPLAYGAIN_ALBUM_PEAK" => meta.replaygain_album_peak = val_num,
+            "REPLAYGAIN_ALBUM_PEAK" | "REPLAYGAIN_ALBUM_TRUE_PEAK" => {
+                meta.replaygain_album_peak = val_num;
+            }
+            "R128_TRACK_GAIN" => {
+                // RFC 7845 Q7.8 fixed-point dB
+                meta.replaygain_track_gain_db = val_num.map(|q| q / 256.0);
+            }
+            "R128_ALBUM_GAIN" => {
+                meta.replaygain_album_gain_db = val_num.map(|q| q / 256.0);
+            }
             _ => {}
         }
     }
     meta
+}
+
+fn parse_peak_metadata(vc: Option<&VorbisComment>) -> TrackPeakMetadata {
+    match vc {
+        Some(v) => parse_peak_metadata_fields(&v.fields),
+        None => TrackPeakMetadata::default(),
+    }
 }
 
 /// Decode a local stereo FLAC file completely into RAM as bit-exact MSB-aligned `i32` frames.

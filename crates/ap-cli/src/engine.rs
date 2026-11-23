@@ -15,9 +15,11 @@ use std::path::PathBuf;
 use ap_control::server::ControlServer;
 use ap_control::state::{ControlCommand, PlayModeLabel, SharedControl};
 use ap_core::format::DacWireFormat;
-use ap_core::headroom::UNKNOWN_PEAK_HEADROOM_DB;
+use ap_core::headroom::{HeadroomMode, select_headroom};
 use ap_dsp::quantize::{apply_safe_gain_f64, quantize_to_int32};
-use ap_dsp::selector::{FilterArchetype, TrackSourceInfo, UpsamplerPicker, UpsamplerPolicy};
+use ap_dsp::selector::{
+    FilterArchetype, NoiseShaperProfile, TrackSourceInfo, UpsamplerPicker, UpsamplerPolicy,
+};
 use ap_dsp::upsampler::build_upsampler;
 use ap_output_win::hygiene::OptimizationLevel;
 use ap_output_win::sink::{OutputError, ZeroMixerAudioSink};
@@ -213,16 +215,18 @@ pub fn run_random_music_player(
             }
         };
 
-        // Pure IEEE 754 f64 pipeline: optional -3 dB safety headroom -> f64 upsampling (or
+        // Hardcoded -3 dB / 0 dB headroom selection from FLAC ReplayGain & True Peak annotations
+        // (always -3 dB when max level is unknown; never boosts > 0 dB).
+        let headroom = select_headroom(&decoded.peak_meta, source_info.is_streaming_source, 0.0);
+
+        // Pure IEEE 754 f64 pipeline: hardcoded -3 dB / 0 dB headroom -> f64 upsampling (or
         // zero-copy NullUpsampler for native 352.8/384 kHz files) -> single final f64 -> i32
         // quantization for the DAC.
         let dsp_start = std::time::Instant::now();
-        if dsp_plan.filter != FilterArchetype::Null {
-            if let Err(err) = apply_safe_gain_f64(&mut decoded.audio, UNKNOWN_PEAK_HEADROOM_DB) {
-                shared.set_paused(format!("Headroom error: {err}"));
-                play_state = ActivePlayState::Paused;
-                continue;
-            }
+        if let Err(err) = apply_safe_gain_f64(&mut decoded.audio, headroom.mode.gain_db()) {
+            shared.set_paused(format!("Headroom error: {err}"));
+            play_state = ActivePlayState::Paused;
+            continue;
         }
         let upsampled_f64 = match upsampler.upsample(decoded.audio, &dsp_plan) {
             Ok(buf) => buf,
@@ -233,12 +237,16 @@ pub fn run_random_music_player(
                 continue;
             }
         };
-        let dac_bits = if dsp_plan.filter == FilterArchetype::Null {
-            (decoded.spec.bits_per_sample as u8).clamp(16, 32)
-        } else {
-            24
-        };
-        let final_pcm = quantize_to_int32(&upsampled_f64, dsp_plan.shaper, dac_bits);
+        let (effective_shaper, dac_bits) =
+            if dsp_plan.filter == FilterArchetype::Null && headroom.mode == HeadroomMode::ZeroDb {
+                (dsp_plan.shaper, (decoded.spec.bits_per_sample as u8).clamp(16, 32))
+            } else if dsp_plan.shaper == NoiseShaperProfile::Bypass {
+                // Signal was scaled by -3 dB in f64; dither cleanly instead of truncating.
+                (NoiseShaperProfile::TpdfDither, 24)
+            } else {
+                (dsp_plan.shaper, 24)
+            };
+        let final_pcm = quantize_to_int32(&upsampled_f64, effective_shaper, dac_bits);
         let dsp_ms = dsp_start.elapsed().as_secs_f64() * 1000.0;
 
         if controller.current_signal().is_some() {
@@ -251,20 +259,22 @@ pub fn run_random_music_player(
 
         let dur_s = final_pcm.frames.len() as f64 / final_pcm.sample_rate_hz as f64;
         let fmt_str = format!(
-            "{}/{} Hz -> {} Hz f64 ({}, {:.1} s, DSP {:.0} ms) | WDM-KS Int32",
+            "{}/{} Hz -> {} Hz f64 ({}, {}, {:.1} s, DSP {:.0} ms) | WDM-KS Int32",
             decoded.spec.bits_per_sample,
             decoded.spec.sample_rate_hz,
             final_pcm.sample_rate_hz,
             dsp_plan.filter,
+            headroom.mode,
             dur_s,
             dsp_ms,
         );
         let track_str = chosen.display().to_string();
 
-        println!("  [playing] {track_str} ({fmt_str})");
-        println!("  [picker]  {}", dsp_plan.summary());
+        println!("  [playing]  {track_str} ({fmt_str})");
+        println!("  [picker]   {}", dsp_plan.summary());
+        println!("  [headroom] {}", headroom.summary());
         let _ = io::stdout().flush();
-        shared.record_action(dsp_plan.summary());
+        shared.record_action(format!("{} | {}", dsp_plan.summary(), headroom.summary()));
         shared.set_playing(mode_label, track_str, fmt_str);
 
         // WdmKsSink::play_full_memory opens the kernel pin strictly for the duration of this call
