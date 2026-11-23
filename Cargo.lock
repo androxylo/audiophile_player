@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "ap-control",
  "ap-core",
+ "ap-dsp",
  "ap-output-win",
  "ap-source",
 ]

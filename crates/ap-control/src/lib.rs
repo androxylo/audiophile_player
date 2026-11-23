@@ -6,7 +6,7 @@
 //!   immediately so Audirvana or another player can use the DAC while paused).
 //! - Bounded bottom action log (discards history beyond latest 50 entries).
 //! - Direct link to the GitHub manual (`https://github.com/androxylo/audiophile_player`).
-//! - Safe conventional localhost port picker (`17441..=17499` — never 80 or 8080).
+//! - Safe conventional localhost port picker (`8085..=8199` — never 80 or 8080, never hijacks).
 //! - **Strictly NO volume control.**
 
 pub mod browser;

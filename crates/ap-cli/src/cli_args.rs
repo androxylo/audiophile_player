@@ -2,10 +2,14 @@
 //!
 //! Default behavior with **zero arguments**: immediately plays random FLAC files from
 //! `~/Music` in highest-quality Windows Kernel Streaming (`WDM-KS` WaveRT) mode on the
-//! auto-selected best DAC. Any non-default mode requires explicit command-line options.
+//! auto-selected best DAC, with automatic per-track upsampler selection (`UpsamplerPicker`)
+//! and the local HTTP UI starting at port `8085`. Any non-default mode requires explicit flags.
 
 use std::path::PathBuf;
+use std::str::FromStr;
 
+use ap_dsp::MAX_FILTER_TAPS;
+use ap_dsp::selector::{FilterArchetype, NoiseShaperProfile, UpsamplerPolicy};
 use ap_output_win::hygiene::OptimizationLevel;
 
 pub const MANUAL_URL: &str = "https://github.com/androxylo/audiophile_player";
@@ -18,6 +22,7 @@ pub enum RunMode {
         device_filter: Option<String>,
         optimization: OptimizationLevel,
         http_port: Option<u16>,
+        upsampler_policy: UpsamplerPolicy,
     },
     /// Explicit `--idle` mode: keep running without touching audio hardware (for signal tests).
     Idle,
@@ -37,6 +42,7 @@ where
     let mut device_filter: Option<String> = None;
     let mut optimization = OptimizationLevel::High;
     let mut http_port: Option<u16> = None;
+    let mut upsampler_policy = UpsamplerPolicy::default();
     let mut idle = false;
 
     while let Some(arg_raw) = iter.next() {
@@ -69,6 +75,42 @@ where
                 }
                 http_port = Some(port);
             }
+            "--filter" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| "--filter requires a filter name or 'auto'".to_string())?;
+                if val.as_ref().eq_ignore_ascii_case("auto") {
+                    upsampler_policy.filter_override = None;
+                } else {
+                    upsampler_policy.filter_override = Some(FilterArchetype::from_str(val.as_ref())?);
+                }
+            }
+            "--shaper" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| "--shaper requires a shaper name or 'auto'".to_string())?;
+                if val.as_ref().eq_ignore_ascii_case("auto") {
+                    upsampler_policy.shaper_override = None;
+                } else {
+                    upsampler_policy.shaper_override =
+                        Some(NoiseShaperProfile::from_str(val.as_ref())?);
+                }
+            }
+            "--max-taps" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| "--max-taps requires a positive integer <= 4000000".to_string())?;
+                let taps = val
+                    .as_ref()
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid --max-taps '{}'", val.as_ref()))?;
+                if taps == 0 || taps > MAX_FILTER_TAPS {
+                    return Err(format!(
+                        "--max-taps must be in 1..={MAX_FILTER_TAPS}, got {taps}"
+                    ));
+                }
+                upsampler_policy.max_taps = taps;
+            }
             "--opt" => {
                 let val = iter
                     .next()
@@ -96,11 +138,14 @@ where
         return Ok(RunMode::Idle);
     }
 
+    upsampler_policy.validate()?;
+
     Ok(RunMode::PlayRandom {
         music_dir,
         device_filter,
         optimization,
         http_port,
+        upsampler_policy,
     })
 }
 
@@ -115,7 +160,13 @@ pub fn help_text() -> String {
          OPTIONS:\n\
            --music-dir <PATH>   Root folder containing FLAC subfolders (default: ~/Music)\n\
            --device <NAME>      WDM-KS DAC name filter (default: auto-select best USB DAC)\n\
-           --port <PORT>        Local HTTP UI port (default: auto-pick free port in 17441..17499)\n\
+           --port <PORT>        Local HTTP UI port (default: auto-pick free port in 8085..8199)\n\
+           --filter <NAME>      Enforce upsampling filter: auto | bypass | gauss-apod-4m |\n\
+                                sinc-steep-4m | gauss-long-lp | gauss-hires-ip |\n\
+                                gauss-hires-mp | ext-sharp-lp (default: auto per track)\n\
+           --shaper <NAME>      Enforce 8fS shaper: auto | bypass | ns5 | lns15 |\n\
+                                pggb-optimal | tpdf (default: auto per track)\n\
+           --max-taps <N>       Tap ceiling <= 4000000 (default: 4000000)\n\
            --opt <LEVEL>        KS priority tier: normal | high | extreme (default: high)\n\
            --idle               Start idle without opening audio hardware (signal test mode)\n\
            -h, --help           Show this help message\n",
@@ -137,12 +188,13 @@ mod tests {
                 device_filter: None,
                 optimization: OptimizationLevel::High,
                 http_port: None,
+                upsampler_policy: UpsamplerPolicy::default(),
             }
         );
     }
 
     #[test]
-    fn explicit_flags_parse_cleanly() {
+    fn explicit_flags_including_upsampler_overrides_parse_cleanly() {
         let mode = parse_args([
             "audiophile-player",
             "--music-dir",
@@ -150,7 +202,13 @@ mod tests {
             "--device",
             "Gungnir 2",
             "--port",
-            "17450",
+            "8090",
+            "--filter",
+            "sinc-steep-4m",
+            "--shaper",
+            "lns15",
+            "--max-taps",
+            "2000000",
             "--opt",
             "extreme",
         ])
@@ -161,7 +219,12 @@ mod tests {
                 music_dir: Some(PathBuf::from(r"D:\Audio")),
                 device_filter: Some("Gungnir 2".to_string()),
                 optimization: OptimizationLevel::Extreme,
-                http_port: Some(17450),
+                http_port: Some(8090),
+                upsampler_policy: UpsamplerPolicy {
+                    filter_override: Some(FilterArchetype::SincSteep4M),
+                    shaper_override: Some(NoiseShaperProfile::Lns15Smooth),
+                    max_taps: 2_000_000,
+                },
             }
         );
 
@@ -176,7 +239,9 @@ mod tests {
     }
 
     #[test]
-    fn unknown_flag_returns_error() {
+    fn rejects_invalid_filter_and_over_4m_taps() {
+        assert!(parse_args(["audiophile-player", "--filter", "bogus"]).is_err());
+        assert!(parse_args(["audiophile-player", "--max-taps", "4000001"]).is_err());
         assert!(parse_args(["audiophile-player", "--bad-flag"]).is_err());
     }
 }

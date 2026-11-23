@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use ap_control::server::ControlServer;
 use ap_control::state::{ControlCommand, PlayModeLabel, SharedControl};
 use ap_core::format::DacWireFormat;
+use ap_dsp::selector::{TrackSourceInfo, UpsamplerPicker, UpsamplerPolicy};
 use ap_output_win::hygiene::OptimizationLevel;
 use ap_output_win::sink::{OutputError, ZeroMixerAudioSink};
 use ap_output_win::wdm_ks::WdmKsSink;
@@ -48,14 +49,16 @@ enum ActivePlayState {
 }
 
 /// Run default zero-config random FLAC playback via native Windows Kernel Streaming (`WDM-KS`)
-/// paired with the rudimentary local HTTP control interface.
+/// paired with the rudimentary local HTTP control interface and dynamic per-track upsampler picker.
 pub fn run_random_music_player(
     music_dir_override: Option<PathBuf>,
     device_filter: Option<String>,
     optimization: OptimizationLevel,
     http_port: Option<u16>,
+    upsampler_policy: UpsamplerPolicy,
     controller: &ShutdownController,
 ) -> Result<(), String> {
+    let upsampler_picker = UpsamplerPicker::new(upsampler_policy)?;
     let music_dir = match music_dir_override {
         Some(dir) => dir,
         None => default_user_music_dir()
@@ -193,15 +196,28 @@ pub fn run_random_music_player(
             continue;
         }
 
+        // Re-select the upsampler & 8fS noise shaper freshly for EVERY track (expects
+        // different source rates/bit-depths/filters from track to track, honoring CLI overrides).
+        let source_info = TrackSourceInfo::from_stream_spec(decoded.spec);
+        let dsp_plan = upsampler_picker.select(&source_info);
+
         let dur_s = decoded.pcm.frames.len() as f64 / decoded.spec.sample_rate_hz as f64;
         let fmt_str = format!(
-            "{}-bit / {} Hz, {:.1} s, WDM-KS Int32",
-            decoded.spec.bits_per_sample, decoded.spec.sample_rate_hz, dur_s
+            "{}-bit / {} Hz, {:.1} s | WDM-KS Int32 | plan: {} ({} -> {} Hz) + {}",
+            decoded.spec.bits_per_sample,
+            decoded.spec.sample_rate_hz,
+            dur_s,
+            dsp_plan.filter,
+            dsp_plan.ratio,
+            dsp_plan.target_rate_hz,
+            dsp_plan.shaper,
         );
         let track_str = chosen.display().to_string();
 
         println!("  [playing] {track_str} ({fmt_str})");
+        println!("  [picker]  {}", dsp_plan.summary());
         let _ = io::stdout().flush();
+        shared.record_action(dsp_plan.summary());
         shared.set_playing(mode_label, track_str, fmt_str);
 
         // WdmKsSink::play_full_memory opens the kernel pin strictly for the duration of this call

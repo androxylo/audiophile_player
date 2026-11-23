@@ -1,9 +1,12 @@
 //! Localhost-only HTTP/1.1 control server strictly decoupled from the audio output thread.
 //!
 //! Port selection policy:
-//! - Starts at a clean non-conflicting localhost range (`17441..=17499` — nod to 44.1 kHz).
-//! - **Never** binds or touches conventional service ports like `80` or `8080`.
-//! - Automatically advances to the next free port in range if the first port is occupied.
+//! - Starts at a reasonable conventional localhost range (`8085..=8199`).
+//! - **Never** binds or touches port `80` or `8080`, and **never** kills or hijacks any
+//!   other process listening on a candidate port.
+//! - Accurately probes each candidate port (detecting both `127.0.0.1:port` and wildcard
+//!   `0.0.0.0:port` / `[::]:port` listeners before binding) and automatically advances to
+//!   the next free port when busy.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -17,25 +20,47 @@ use crate::browser::{list_folder_entries, parse_form_param, url_encode};
 use crate::html::{render_control_page, render_status_json};
 use crate::state::{ControlCommand, SharedControl};
 
-/// Conventional non-conflicting localhost port range (far away from 80, 443, 3000, 8000, 8080).
-pub const DEFAULT_PORT_START: u16 = 17_441;
-pub const DEFAULT_PORT_END: u16 = 17_499;
+/// Reasonable default localhost port range (avoids 80, 443, 8080; auto-skips busy ports).
+pub const DEFAULT_PORT_START: u16 = 8085;
+pub const DEFAULT_PORT_END: u16 = 8199;
 
-/// Bind a localhost `TcpListener` starting at `start_port` up to `end_port`.
-pub fn bind_first_available_port(start_port: u16, end_port: u16) -> Result<(TcpListener, u16), String> {
-    if start_port > end_port {
+/// Non-destructively check whether another service is already accepting TCP connections
+/// on localhost at `port` (catches services bound to `0.0.0.0:port`, `[::]:port`, or
+/// `127.0.0.1:port` so Windows' dual-bind quirk cannot hijack another process's traffic).
+fn is_localhost_port_accepting(port: u16) -> bool {
+    let v4 = SocketAddr::from(([127, 0, 0, 1], port));
+    if TcpStream::connect_timeout(&v4, Duration::from_millis(20)).is_ok() {
+        return true;
+    }
+    let v6 = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], port));
+    TcpStream::connect_timeout(&v6, Duration::from_millis(20)).is_ok()
+}
+
+/// Bind a localhost `TcpListener` on the first genuinely unused port in `start_port..=end_port`.
+///
+/// Guarantees:
+/// - Never terminates or interferes with existing services.
+/// - Detects listeners bound to `0.0.0.0:port`, `[::]:port`, or `127.0.0.1:port` and skips them.
+pub fn bind_first_available_port(
+    start_port: u16,
+    end_port: u16,
+) -> Result<(TcpListener, u16), String> {
+    if start_port == 0 || start_port > end_port {
         return Err(format!("invalid port range {start_port}..={end_port}"));
     }
-    let mut last_err = None;
+    let mut last_err = String::new();
     for port in start_port..=end_port {
+        if is_localhost_port_accepting(port) {
+            last_err = format!("port {port} is already accepting connections");
+            continue;
+        }
         match TcpListener::bind(("127.0.0.1", port)) {
             Ok(listener) => return Ok((listener, port)),
-            Err(e) => last_err = Some(e),
+            Err(e) => last_err = e.to_string(),
         }
     }
     Err(format!(
-        "could not bind any localhost HTTP port in {start_port}..={end_port}: {}",
-        last_err.map(|e| e.to_string()).unwrap_or_default()
+        "could not bind any free localhost HTTP port in {start_port}..={end_port}: {last_err}"
     ))
 }
 

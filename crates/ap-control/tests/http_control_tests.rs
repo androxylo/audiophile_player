@@ -51,17 +51,32 @@ fn action_log_is_strictly_bounded_and_discards_oldest_entries() {
 }
 
 #[test]
-fn default_port_range_avoids_80_and_8080_and_skips_occupied_ports() {
-    assert!(DEFAULT_PORT_START > 1024);
-    assert!(DEFAULT_PORT_START != 80 && DEFAULT_PORT_START != 8080);
+fn default_port_range_starts_at_8085_avoids_80_and_8080_and_skips_loopback_and_wildcard_listeners() {
+    assert_eq!(DEFAULT_PORT_START, 8085);
     assert!(!(DEFAULT_PORT_START..=DEFAULT_PORT_END).contains(&80));
     assert!(!(DEFAULT_PORT_START..=DEFAULT_PORT_END).contains(&8080));
 
-    // Occupy a test port and verify bind_first_available_port advances to the next port cleanly.
-    let (occupied, first_port) = bind_first_available_port(17_480, 17_495).unwrap();
-    let (_second, second_port) = bind_first_available_port(first_port, 17_495).unwrap();
-    assert_eq!(second_port, first_port + 1);
-    drop(occupied);
+    // Occupy port A on 127.0.0.1 and port B on wildcard 0.0.0.0 (which Windows otherwise
+    // lets 127.0.0.1 shadow if not probed!) — picker must safely skip BOTH without disturbing them.
+    let (occ_v4_loopback, port_a) = bind_first_available_port(8140, 8180).unwrap();
+    let port_b = port_a + 1;
+    let occ_wildcard = TcpListener::bind(("0.0.0.0", port_b));
+
+    let (_picked, picked_port) = bind_first_available_port(port_a, 8190).unwrap();
+    if occ_wildcard.is_ok() {
+        assert_eq!(
+            picked_port,
+            port_b + 1,
+            "must skip both 127.0.0.1:{port_a} AND wildcard 0.0.0.0:{port_b}"
+        );
+    } else {
+        assert!(picked_port > port_a);
+    }
+
+    // Confirm original occupied listeners are still completely alive & untouched.
+    assert_eq!(occ_v4_loopback.local_addr().unwrap().port(), port_a);
+    drop(occ_wildcard);
+    drop(occ_v4_loopback);
 }
 
 #[test]
