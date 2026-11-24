@@ -33,8 +33,8 @@ use crate::browser::{
 };
 use crate::html::{render_control_page, render_status_json};
 use crate::security::{
-    is_allowed_fetch_site, is_valid_localhost_host, is_valid_localhost_origin,
-    validate_path_within_root, validate_playable_flac_path,
+    is_allowed_fetch_dest, is_allowed_fetch_site, is_valid_localhost_host,
+    is_valid_localhost_origin, validate_path_within_root, validate_playable_flac_path,
 };
 use crate::state::{ControlCommand, SharedControl};
 
@@ -48,8 +48,51 @@ pub const MAX_HEADER_BYTES: usize = 8 * 1024;
 pub const MAX_BODY_BYTES: usize = 24 * 1024;
 /// Overall wall-clock deadline for reading a single HTTP request (prevents trickle slowloris).
 pub const REQUEST_READ_DEADLINE: Duration = Duration::from_secs(5);
+/// Overall wall-clock deadline for an entire HTTP connection (read + browse + chunked write)
+/// so slow-reading clients cannot pin worker slots indefinitely.
+pub const CONNECTION_TOTAL_DEADLINE: Duration = Duration::from_secs(10);
+/// Chunk size used when writing HTTP response bodies under the overall connection deadline.
+const RESPONSE_WRITE_CHUNK_BYTES: usize = 16 * 1024;
 /// Maximum concurrent connection worker threads.
 pub const MAX_CONCURRENT_WORKERS: usize = 16;
+
+/// Path to the runtime URL discovery file (`%LOCALAPPDATA%\audiophile-player\server.url` on
+/// Windows) read by launcher scripts so they find the active port even beyond 8105 without
+/// launching a duplicate instance.
+pub fn runtime_url_file_path() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("LOCALAPPDATA")
+            .map(|dir| PathBuf::from(dir).join("audiophile-player").join("server.url"))
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(|dir| PathBuf::from(dir).join("audiophile-player").join("server.url"))
+    }
+}
+
+/// Best-effort write of the active localhost control UI URL for launcher discovery.
+pub fn write_runtime_url_file(url: &str) {
+    if let Some(path) = runtime_url_file_path() {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&path, format!("{url}\n"));
+    }
+}
+
+/// Best-effort cleanup of the runtime URL file if it still points to `url`.
+pub fn clear_runtime_url_file(url: &str) {
+    if let Some(path) = runtime_url_file_path() {
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            if contents.trim() == url.trim() {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+}
 
 /// Non-destructively check whether another service is already accepting TCP connections
 /// on localhost at `port` (catches services bound to `0.0.0.0:port`, `[::]:port`, or
@@ -208,12 +251,15 @@ fn serve_loop(
                 let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
 
                 let Some(slot_guard) = try_acquire_worker_slot(&active_workers) else {
+                    let deadline = Instant::now() + Duration::from_secs(1);
                     write_response(
                         &mut stream,
                         "503 Service Unavailable",
                         "text/plain; charset=utf-8",
                         b"Too many concurrent HTTP requests",
                         None,
+                        deadline,
+                        &stop,
                     );
                     continue;
                 };
@@ -248,6 +294,7 @@ struct HttpRequest {
     duplicate_host: bool,
     origin: Option<String>,
     sec_fetch_site: Option<String>,
+    sec_fetch_dest: Option<String>,
     body: String,
 }
 
@@ -265,6 +312,7 @@ fn handle_connection(
     shared: &SharedControl,
     stop: &AtomicBool,
 ) {
+    let conn_deadline = Instant::now() + CONNECTION_TOTAL_DEADLINE;
     let req = match read_http_request(stream, stop) {
         Ok(r) => r,
         Err(ReadRequestError::ClosedOrMalformed) => return,
@@ -275,6 +323,8 @@ fn handle_connection(
                 "text/plain; charset=utf-8",
                 b"Request Timeout",
                 None,
+                conn_deadline,
+                stop,
             );
             return;
         }
@@ -285,6 +335,8 @@ fn handle_connection(
                 "text/plain; charset=utf-8",
                 b"Request Header Fields Too Large",
                 None,
+                conn_deadline,
+                stop,
             );
             return;
         }
@@ -295,6 +347,8 @@ fn handle_connection(
                 "text/plain; charset=utf-8",
                 b"Payload Too Large",
                 None,
+                conn_deadline,
+                stop,
             );
             return;
         }
@@ -305,6 +359,8 @@ fn handle_connection(
                 "text/plain; charset=utf-8",
                 b"Invalid Content-Length",
                 None,
+                conn_deadline,
+                stop,
             );
             return;
         }
@@ -323,8 +379,26 @@ fn handle_connection(
             "text/plain; charset=utf-8",
             b"Forbidden: invalid Host header",
             None,
+            conn_deadline,
+            stop,
         );
         return;
+    }
+
+    // Block framing / clickjacking attempts (iframe, frame, object, embed) on EVERY route.
+    if let Some(dest) = req.sec_fetch_dest.as_deref() {
+        if !is_allowed_fetch_dest(dest) {
+            write_response(
+                stream,
+                "403 Forbidden",
+                "text/plain; charset=utf-8",
+                b"Forbidden: embedded framing rejected",
+                None,
+                conn_deadline,
+                stop,
+            );
+            return;
+        }
     }
 
     let (path, query) = req
@@ -342,6 +416,8 @@ fn handle_connection(
                     "text/plain; charset=utf-8",
                     b"Forbidden: cross-origin POST rejected",
                     None,
+                    conn_deadline,
+                    stop,
                 );
                 return;
             }
@@ -354,6 +430,8 @@ fn handle_connection(
                     "text/plain; charset=utf-8",
                     b"Forbidden: cross-site POST rejected",
                     None,
+                    conn_deadline,
+                    stop,
                 );
                 return;
             }
@@ -374,6 +452,8 @@ fn handle_connection(
                             "text/plain; charset=utf-8",
                             b"Forbidden: cross-site directory probe rejected",
                             None,
+                            conn_deadline,
+                            stop,
                         );
                         return;
                     }
@@ -391,6 +471,8 @@ fn handle_connection(
                             "text/plain; charset=utf-8",
                             format!("Forbidden path: {reason}").as_bytes(),
                             None,
+                            conn_deadline,
+                            stop,
                         );
                         return;
                     }
@@ -406,6 +488,8 @@ fn handle_connection(
                 "text/html; charset=utf-8",
                 html.as_bytes(),
                 None,
+                conn_deadline,
+                stop,
             );
         }
         ("GET", "/api/status") => {
@@ -417,6 +501,8 @@ fn handle_connection(
                         "text/plain; charset=utf-8",
                         b"Forbidden: cross-site status fetch rejected",
                         None,
+                        conn_deadline,
+                        stop,
                     );
                     return;
                 }
@@ -429,6 +515,8 @@ fn handle_connection(
                 "application/json; charset=utf-8",
                 json.as_bytes(),
                 None,
+                conn_deadline,
+                stop,
             );
         }
         ("POST", "/action/play-random") => {
@@ -441,12 +529,14 @@ fn handle_connection(
                         "text/plain; charset=utf-8",
                         format!("Forbidden folder: {reason}").as_bytes(),
                         None,
+                        conn_deadline,
+                        stop,
                     );
                     return;
                 }
             };
             shared.submit_command(ControlCommand::PlayRandom(dir.clone()));
-            redirect_to_dir(stream, &dir);
+            redirect_to_dir(stream, &dir, conn_deadline, stop);
         }
         ("POST", "/action/play-sequential") => {
             let dir = match extract_validated_dir(&req.body, shared, &allowed_root) {
@@ -458,12 +548,14 @@ fn handle_connection(
                         "text/plain; charset=utf-8",
                         format!("Forbidden folder: {reason}").as_bytes(),
                         None,
+                        conn_deadline,
+                        stop,
                     );
                     return;
                 }
             };
             shared.submit_command(ControlCommand::PlaySequential(dir.clone()));
-            redirect_to_dir(stream, &dir);
+            redirect_to_dir(stream, &dir, conn_deadline, stop);
         }
         ("POST", "/action/play-file") => {
             let dir = match extract_validated_dir(&req.body, shared, &allowed_root) {
@@ -475,6 +567,8 @@ fn handle_connection(
                         "text/plain; charset=utf-8",
                         format!("Forbidden folder: {reason}").as_bytes(),
                         None,
+                        conn_deadline,
+                        stop,
                     );
                     return;
                 }
@@ -488,6 +582,8 @@ fn handle_connection(
                     "text/plain; charset=utf-8",
                     b"Missing file path",
                     None,
+                    conn_deadline,
+                    stop,
                 );
                 return;
             };
@@ -500,6 +596,8 @@ fn handle_connection(
                         "text/plain; charset=utf-8",
                         format!("Invalid path token: {reason}").as_bytes(),
                         None,
+                        conn_deadline,
+                        stop,
                     );
                     return;
                 }
@@ -513,46 +611,30 @@ fn handle_connection(
                         "text/plain; charset=utf-8",
                         format!("Rejected file path: {reason}").as_bytes(),
                         None,
+                        conn_deadline,
+                        stop,
                     );
                     return;
                 }
             };
             shared.submit_command(ControlCommand::PlayFile(valid_file));
-            redirect_to_dir(stream, &dir);
+            redirect_to_dir(stream, &dir, conn_deadline, stop);
         }
         ("POST", "/action/next") => {
-            let dir = match extract_validated_dir(&req.body, shared, &allowed_root) {
-                Ok(d) => d,
-                Err(reason) => {
-                    write_response(
-                        stream,
-                        "403 Forbidden",
-                        "text/plain; charset=utf-8",
-                        format!("Forbidden folder: {reason}").as_bytes(),
-                        None,
-                    );
-                    return;
-                }
-            };
+            // Next does not act on a user-supplied filesystem path; fall back cleanly to
+            // active_folder if the hidden redirect `dir` token is missing or stale.
+            let dir = extract_validated_dir(&req.body, shared, &allowed_root)
+                .unwrap_or_else(|_| shared.snapshot().active_folder);
             shared.submit_command(ControlCommand::Next);
-            redirect_to_dir(stream, &dir);
+            redirect_to_dir(stream, &dir, conn_deadline, stop);
         }
         ("POST", "/action/pause") => {
-            let dir = match extract_validated_dir(&req.body, shared, &allowed_root) {
-                Ok(d) => d,
-                Err(reason) => {
-                    write_response(
-                        stream,
-                        "403 Forbidden",
-                        "text/plain; charset=utf-8",
-                        format!("Forbidden folder: {reason}").as_bytes(),
-                        None,
-                    );
-                    return;
-                }
-            };
+            // Pause MUST always succeed to release the exclusive DAC pin, even if the hidden
+            // redirect `dir` token is missing or stale.
+            let dir = extract_validated_dir(&req.body, shared, &allowed_root)
+                .unwrap_or_else(|_| shared.snapshot().active_folder);
             shared.submit_command(ControlCommand::Pause);
-            redirect_to_dir(stream, &dir);
+            redirect_to_dir(stream, &dir, conn_deadline, stop);
         }
         _ => {
             write_response(
@@ -561,6 +643,8 @@ fn handle_connection(
                 "text/plain; charset=utf-8",
                 b"Not Found",
                 None,
+                conn_deadline,
+                stop,
             );
         }
     }
@@ -582,7 +666,7 @@ fn extract_validated_dir(
     }
 }
 
-fn redirect_to_dir(stream: &mut TcpStream, dir: &Path) {
+fn redirect_to_dir(stream: &mut TcpStream, dir: &Path, deadline: Instant, stop: &AtomicBool) {
     let loc = format!("/?dir={}", url_encode(&encode_path_token(dir)));
     write_response(
         stream,
@@ -590,6 +674,8 @@ fn redirect_to_dir(stream: &mut TcpStream, dir: &Path) {
         "text/plain; charset=utf-8",
         b"OK",
         Some(&loc),
+        deadline,
+        stop,
     );
 }
 
@@ -666,6 +752,7 @@ fn read_http_request(
     let mut duplicate_host = false;
     let mut origin: Option<String> = None;
     let mut sec_fetch_site: Option<String> = None;
+    let mut sec_fetch_dest: Option<String> = None;
 
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
@@ -689,6 +776,8 @@ fn read_http_request(
                 origin = Some(val.to_string());
             } else if name.eq_ignore_ascii_case("sec-fetch-site") {
                 sec_fetch_site = Some(val.to_string());
+            } else if name.eq_ignore_ascii_case("sec-fetch-dest") {
+                sec_fetch_dest = Some(val.to_string());
             }
         }
     }
@@ -714,6 +803,7 @@ fn read_http_request(
         duplicate_host,
         origin,
         sec_fetch_site,
+        sec_fetch_dest,
         body,
     })
 }
@@ -722,18 +812,55 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+fn write_all_with_deadline(
+    stream: &mut TcpStream,
+    mut data: &[u8],
+    deadline: Instant,
+    stop: &AtomicBool,
+) -> bool {
+    while !data.is_empty() {
+        if stop.load(Ordering::Relaxed) {
+            return false;
+        }
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return false;
+        };
+        let slice_timeout = remaining.min(Duration::from_millis(500));
+        let _ = stream.set_write_timeout(Some(slice_timeout));
+        let chunk_len = data.len().min(RESPONSE_WRITE_CHUNK_BYTES);
+        match stream.write(&data[..chunk_len]) {
+            Ok(0) => return false,
+            Ok(n) => data = &data[n..],
+            Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(ref e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                continue;
+            }
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
 fn write_response(
     stream: &mut TcpStream,
     status: &str,
     content_type: &str,
     body: &[u8],
     location: Option<&str>,
+    deadline: Instant,
+    stop: &AtomicBool,
 ) {
     let mut head = format!(
         "HTTP/1.1 {status}\r\n\
          Content-Type: {content_type}\r\n\
          Content-Length: {}\r\n\
          Cache-Control: no-store\r\n\
+         X-Frame-Options: DENY\r\n\
+         Content-Security-Policy: frame-ancestors 'none'\r\n\
+         X-Content-Type-Options: nosniff\r\n\
          Connection: close\r\n",
         body.len()
     );
@@ -741,7 +868,8 @@ fn write_response(
         head.push_str(&format!("Location: {loc}\r\n"));
     }
     head.push_str("\r\n");
-    let _ = stream.write_all(head.as_bytes());
-    let _ = stream.write_all(body);
-    let _ = stream.flush();
+    if write_all_with_deadline(stream, head.as_bytes(), deadline, stop) {
+        let _ = write_all_with_deadline(stream, body, deadline, stop);
+        let _ = stream.flush();
+    }
 }

@@ -35,6 +35,10 @@ pub fn list_folder_entries_in_root(dir: &Path, allowed_root: &Path) -> FolderLis
     list_folder_entries_inner(dir, Some(allowed_root))
 }
 
+/// Maximum folder entries rendered in one HTML browser page so huge flat directories cannot
+/// create multi-MB responses that stall HTTP workers.
+pub const MAX_BROWSER_ENTRIES: usize = 5_000;
+
 fn list_folder_entries_inner(dir: &Path, allowed_root: Option<&Path>) -> FolderListing {
     let at_root = allowed_root.is_some_and(|root| {
         let norm_root = normalize_allowed_root(root);
@@ -47,13 +51,27 @@ fn list_folder_entries_inner(dir: &Path, allowed_root: Option<&Path>) -> FolderL
         dir.parent().map(Path::to_path_buf)
     };
     match read_dir_frame(dir) {
-        Ok(frame) => FolderListing {
-            current_dir: dir.to_path_buf(),
-            parent_dir,
-            subdirs: frame.subdirs,
-            flac_files: frame.flacs,
-            error: None,
-        },
+        Ok(mut frame) => {
+            let total = frame.subdirs.len() + frame.flacs.len();
+            let mut note = None;
+            if total > MAX_BROWSER_ENTRIES {
+                let keep_dirs = frame.subdirs.len().min(MAX_BROWSER_ENTRIES);
+                frame.subdirs.truncate(keep_dirs);
+                let keep_flacs = MAX_BROWSER_ENTRIES.saturating_sub(keep_dirs);
+                frame.flacs.truncate(keep_flacs);
+                note = Some(format!(
+                    "Showing first {MAX_BROWSER_ENTRIES} of {total} entries in '{}'",
+                    dir.display()
+                ));
+            }
+            FolderListing {
+                current_dir: dir.to_path_buf(),
+                parent_dir,
+                subdirs: frame.subdirs,
+                flac_files: frame.flacs,
+                error: note,
+            }
+        }
         Err(err) => FolderListing {
             current_dir: dir.to_path_buf(),
             parent_dir,

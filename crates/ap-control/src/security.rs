@@ -23,8 +23,9 @@ use std::os::windows::fs::MetadataExt;
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
 #[cfg(windows)]
 const FILE_ATTRIBUTE_DEVICE: u32 = 0x0000_0040;
-#[cfg(windows)]
-const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+/// Maximum symlink/junction chain hops resolved when validating reparse targets.
+const MAX_REPARSE_CHAIN_HOPS: usize = 8;
 
 /// Windows reserved DOS device base names (case-insensitive, matched before the first `.` after
 /// trimming trailing spaces/dots).
@@ -34,44 +35,90 @@ const RESERVED_DOS_DEVICES: &[&str] = &[
     "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 ];
 
-/// Normalize a trusted configured music root into an absolute, lexically clean local path.
+/// Extract `(server, share)` (lowercased) if `path` is a standard or verbatim UNC path
+/// (`\\server\share...` or `\\?\UNC\server\share...`), or `None` for local paths.
+pub fn extract_unc_share(path: &Path) -> Option<(String, String)> {
+    let raw = path.to_string_lossy();
+    let rest = if let Some(r) = raw
+        .strip_prefix(r"\\?\UNC\")
+        .or_else(|| raw.strip_prefix(r"\\?\unc\"))
+    {
+        r
+    } else if raw.starts_with(r"\\") && !raw.starts_with(r"\\?\") && !raw.starts_with(r"\\.\") {
+        &raw[2..]
+    } else {
+        return None;
+    };
+    let mut parts = rest.split(['\\', '/']).filter(|s| !s.is_empty());
+    let server = parts.next()?;
+    let share = parts.next()?;
+    if server.contains(':') || share.contains(':') {
+        return None;
+    }
+    Some((server.to_ascii_lowercase(), share.to_ascii_lowercase()))
+}
+
+/// Normalize a trusted configured music root into an absolute, lexically clean path.
 ///
-/// If `root` is relative, it is resolved against `std::env::current_dir()`. On Windows, a
-/// `\\?\C:\...` verbatim disk prefix (e.g. from `fs::canonicalize`) is unwrapped to `C:\...`
-/// so lexical prefix matching against normal user paths is consistent.
+/// Supports both local disk roots (e.g. `C:\Users\name\Music`) and trusted UNC NAS roots
+/// explicitly configured at startup (e.g. `\\NAS\Music`). Unwraps Windows verbatim prefixes
+/// (`\\?\C:\...` -> `C:\...`, `\\?\UNC\server\share\...` -> `\\server\share\...`) so lexical
+/// prefix matching against normal paths is consistent.
 pub fn normalize_allowed_root(root: &Path) -> PathBuf {
-    let candidate = unwrap_verbatim_disk(root);
-    let abs = if candidate.is_absolute() {
+    let candidate = unwrap_verbatim_prefix(root);
+    let unc_share = extract_unc_share(&candidate);
+    let abs = if unc_share.is_some() || candidate.is_absolute() {
         candidate
     } else if let Ok(cwd) = std::env::current_dir() {
         cwd.join(candidate)
     } else {
         candidate
     };
-    validate_local_path_syntax(&abs).unwrap_or(abs)
+    let share_ref = unc_share
+        .as_ref()
+        .map(|(s, sh)| (s.as_str(), sh.as_str()));
+    validate_path_syntax_for_root(&abs, share_ref).unwrap_or(abs)
 }
 
-fn unwrap_verbatim_disk(path: &Path) -> PathBuf {
+fn unwrap_verbatim_prefix(path: &Path) -> PathBuf {
     #[cfg(windows)]
     {
         let mut comps = path.components();
         if let Some(Component::Prefix(p)) = comps.next() {
-            if let Prefix::VerbatimDisk(drive) = p.kind() {
-                let mut out = PathBuf::from(format!("{}:\\", (drive as char).to_ascii_uppercase()));
-                for c in comps {
-                    match c {
-                        Component::RootDir => {}
-                        other => out.push(other.as_os_str()),
+            match p.kind() {
+                Prefix::VerbatimDisk(drive) => {
+                    let mut out =
+                        PathBuf::from(format!("{}:\\", (drive as char).to_ascii_uppercase()));
+                    for c in comps {
+                        match c {
+                            Component::RootDir => {}
+                            other => out.push(other.as_os_str()),
+                        }
                     }
+                    return out;
                 }
-                return out;
+                Prefix::VerbatimUNC(server, share) => {
+                    let mut out = PathBuf::from(format!(
+                        "\\\\{}\\{}\\",
+                        server.to_string_lossy(),
+                        share.to_string_lossy()
+                    ));
+                    for c in comps {
+                        match c {
+                            Component::RootDir => {}
+                            other => out.push(other.as_os_str()),
+                        }
+                    }
+                    return out;
+                }
+                _ => {}
             }
         }
     }
     path.to_path_buf()
 }
 
-/// Validate raw syntax of an untrusted path and return its lexically normalized local form.
+/// Validate raw syntax of an untrusted local path and return its lexically normalized local form.
 ///
 /// Performs **zero** filesystem I/O. Rejects:
 /// - Empty paths or embedded NUL bytes.
@@ -82,6 +129,20 @@ fn unwrap_verbatim_disk(path: &Path) -> PathBuf {
 /// - Any segment containing `:` (blocks NTFS Alternate Data Streams / misplaced drive specs).
 /// - Any segment matching a Windows reserved DOS device name (`CON`, `CONIN$`, `NUL`, `COM1`, ...).
 pub fn validate_local_path_syntax(path: &Path) -> Result<PathBuf, String> {
+    validate_path_syntax_for_root(path, None)
+}
+
+/// Validate raw syntax of an untrusted path against an optional trusted UNC `(server, share)`
+/// configured as `--music-dir`.
+///
+/// When `allowed_unc_share` is `None` (normal local disk root), ALL UNC paths are rejected before
+/// any filesystem syscall. When `allowed_unc_share` is `Some((srv, shr))`, ONLY paths whose
+/// `\\server\share` prefix matches that exact trusted share are accepted; all other UNC shares,
+/// Win32 device paths (`\\.\`, `\\?\`), `..` escapes, `:`, and reserved DOS names remain blocked.
+pub fn validate_path_syntax_for_root(
+    path: &Path,
+    allowed_unc_share: Option<(&str, &str)>,
+) -> Result<PathBuf, String> {
     let raw = path.as_os_str().as_encoded_bytes();
     if raw.is_empty() {
         return Err("path must not be empty".to_string());
@@ -89,11 +150,25 @@ pub fn validate_local_path_syntax(path: &Path) -> Result<PathBuf, String> {
     if raw.contains(&0) {
         return Err("path must not contain NUL bytes".to_string());
     }
-    if raw.len() >= 2
+
+    let leading_double_sep = raw.len() >= 2
         && matches!(raw[0], b'\\' | b'/')
-        && matches!(raw[1], b'\\' | b'/')
-    {
-        return Err("UNC and Windows device paths are forbidden".to_string());
+        && matches!(raw[1], b'\\' | b'/');
+    if leading_double_sep {
+        // Always reject device-namespace / verbatim prefixes (`\\.\`, `\\?\`, `//./`, `//?/`).
+        if raw.len() >= 4
+            && matches!(raw[2], b'.' | b'?')
+            && matches!(raw[3], b'\\' | b'/')
+        {
+            return Err("UNC and Windows device paths are forbidden".to_string());
+        }
+        let matches_trusted_unc = allowed_unc_share.is_some_and(|(srv, shr)| {
+            extract_unc_share(path)
+                .is_some_and(|(ps, psh)| ps == srv && psh == shr)
+        });
+        if !matches_trusted_unc {
+            return Err("UNC and Windows device paths are forbidden".to_string());
+        }
     }
 
     let mut out = PathBuf::new();
@@ -101,7 +176,7 @@ pub fn validate_local_path_syntax(path: &Path) -> Result<PathBuf, String> {
     let mut depth: usize = 0;
 
     #[cfg(windows)]
-    let mut saw_disk_prefix = false;
+    let mut saw_allowed_prefix = false;
 
     for comp in path.components() {
         match comp {
@@ -109,12 +184,25 @@ pub fn validate_local_path_syntax(path: &Path) -> Result<PathBuf, String> {
                 Prefix::Disk(drive) => {
                     #[cfg(windows)]
                     {
-                        saw_disk_prefix = true;
+                        saw_allowed_prefix = true;
                     }
                     let d = (drive as char).to_ascii_uppercase();
                     out.push(format!("{d}:"));
                 }
-                Prefix::UNC(_, _) | Prefix::VerbatimUNC(_, _) => {
+                Prefix::UNC(server, share) => {
+                    let s = server.to_string_lossy().to_ascii_lowercase();
+                    let sh = share.to_string_lossy().to_ascii_lowercase();
+                    if allowed_unc_share == Some((s.as_str(), sh.as_str())) {
+                        #[cfg(windows)]
+                        {
+                            saw_allowed_prefix = true;
+                        }
+                        out.push(format!("\\\\{}\\{}", server.to_string_lossy(), share.to_string_lossy()));
+                    } else {
+                        return Err("UNC network paths are forbidden".to_string());
+                    }
+                }
+                Prefix::VerbatimUNC(_, _) => {
                     return Err("UNC network paths are forbidden".to_string());
                 }
                 Prefix::DeviceNS(_) | Prefix::Verbatim(_) | Prefix::VerbatimDisk(_) => {
@@ -150,7 +238,7 @@ pub fn validate_local_path_syntax(path: &Path) -> Result<PathBuf, String> {
     }
 
     #[cfg(windows)]
-    if !saw_disk_prefix || !saw_root {
+    if !saw_allowed_prefix || !saw_root {
         return Err("path must be an absolute local drive path (e.g. C:\\...)".to_string());
     }
 
@@ -232,14 +320,23 @@ pub fn normalized_paths_equal(a: &Path, b: &Path) -> bool {
         .all(|(ca, cb)| path_component_eq(ca.as_os_str(), cb.as_os_str()))
 }
 
-/// Validate that `path` is a safe local path lexically confined under `allowed_root`, and verify
-/// that no symlink or Windows reparse point along the path redirects to a UNC share or device.
+/// Validate that `path` is a safe path lexically confined under `allowed_root`, and verify
+/// that no symlink or Windows mount point along the path (or chained link target) redirects to
+/// an untrusted UNC share or Win32 device namespace.
 ///
-/// Local NTFS directory junctions and volume mount points inside `allowed_root` (e.g.
-/// `C:\Users\name\Music\Favorite -> D:\Music`) are explicitly supported.
+/// - Local NTFS directory junctions and volume mount points inside `allowed_root` (e.g.
+///   `C:\Users\name\Music\Favorite -> D:\Music`) are explicitly supported.
+/// - Non-link Windows reparse points (such as OneDrive Files On-Demand placeholders, WCI, and
+///   Data Deduplication) are treated as ordinary files/directories rather than rejected.
+/// - When `allowed_root` itself is a trusted UNC NAS path (`\\NAS\Music`), paths confined under
+///   that exact `\\server\share` root are allowed while all other UNC shares remain blocked.
 pub fn validate_path_within_root(path: &Path, allowed_root: &Path) -> Result<PathBuf, String> {
     let norm_root = normalize_allowed_root(allowed_root);
-    let norm_path = validate_local_path_syntax(path)?;
+    let allowed_unc = extract_unc_share(&norm_root);
+    let share_ref = allowed_unc
+        .as_ref()
+        .map(|(s, sh)| (s.as_str(), sh.as_str()));
+    let norm_path = validate_path_syntax_for_root(path, share_ref)?;
 
     if !lexically_within_root(&norm_path, &norm_root) {
         return Err(format!(
@@ -249,14 +346,20 @@ pub fn validate_path_within_root(path: &Path, allowed_root: &Path) -> Result<Pat
         ));
     }
 
-    verify_no_unc_reparse_points(&norm_root, &norm_path)?;
+    verify_no_unc_reparse_points(&norm_root, &norm_path, share_ref)?;
     Ok(norm_path)
 }
 
 /// Inspect each existing component from `norm_root` down to `norm_path` using `symlink_metadata`
-/// (which never follows links or initiates SMB) and reject any reparse point whose target is a
-/// UNC/network share or device namespace.
-fn verify_no_unc_reparse_points(norm_root: &Path, norm_path: &Path) -> Result<(), String> {
+/// (which never follows links or initiates SMB). Only actual symlinks and NTFS mount points
+/// (`meta.file_type().is_symlink()`, which checks `IO_REPARSE_TAG_SYMLINK` and
+/// `IO_REPARSE_TAG_MOUNT_POINT` on Windows) are inspected via `read_link`, resolving chained
+/// links up to [`MAX_REPARSE_CHAIN_HOPS`] hops and rejecting any untrusted UNC or device target.
+fn verify_no_unc_reparse_points(
+    norm_root: &Path,
+    norm_path: &Path,
+    allowed_unc_share: Option<(&str, &str)>,
+) -> Result<(), String> {
     let root_count = norm_root.components().count();
     let mut cur = PathBuf::new();
 
@@ -269,38 +372,61 @@ fn verify_no_unc_reparse_points(norm_root: &Path, norm_path: &Path) -> Result<()
             // Non-existent suffix is safe here; downstream read_dir/metadata will report NotFound.
             break;
         };
-        let is_link = is_symlink_or_reparse(&meta);
-        if is_link {
-            let target = fs::read_link(&cur).map_err(|e| {
-                format!(
-                    "cannot inspect symlink/junction target for '{}': {e}",
-                    cur.display()
-                )
-            })?;
-            check_reparse_target_is_local(&target)?;
+        if meta.file_type().is_symlink() {
+            verify_symlink_chain_is_allowed(&cur, allowed_unc_share)?;
         }
     }
     Ok(())
 }
 
-fn is_symlink_or_reparse(meta: &fs::Metadata) -> bool {
-    if meta.file_type().is_symlink() {
-        return true;
+fn verify_symlink_chain_is_allowed(
+    start_link: &Path,
+    allowed_unc_share: Option<(&str, &str)>,
+) -> Result<(), String> {
+    let mut cur = start_link.to_path_buf();
+    for _ in 0..MAX_REPARSE_CHAIN_HOPS {
+        let target = fs::read_link(&cur).map_err(|e| {
+            format!(
+                "cannot inspect symlink/junction target for '{}': {e}",
+                cur.display()
+            )
+        })?;
+        check_reparse_target_is_allowed(&target, allowed_unc_share)?;
+        let next = if target.is_absolute() {
+            target
+        } else {
+            cur.parent()
+                .map(|p| p.join(&target))
+                .unwrap_or(target)
+        };
+        let Ok(meta) = fs::symlink_metadata(&next) else {
+            // Target doesn't exist yet; syntax already passed safe-target validation.
+            return Ok(());
+        };
+        if !meta.file_type().is_symlink() {
+            return Ok(());
+        }
+        cur = next;
     }
-    #[cfg(windows)]
-    {
-        (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
+    Err(format!(
+        "symlink/junction chain exceeded {MAX_REPARSE_CHAIN_HOPS} hops at '{}'",
+        start_link.display()
+    ))
 }
 
-fn check_reparse_target_is_local(target: &Path) -> Result<(), String> {
+fn check_reparse_target_is_allowed(
+    target: &Path,
+    allowed_unc_share: Option<(&str, &str)>,
+) -> Result<(), String> {
     let raw = target.as_os_str().as_encoded_bytes();
     if raw.contains(&0) {
         return Err("reparse target contains NUL byte".to_string());
+    }
+    if let Some((ts, tsh)) = extract_unc_share(target) {
+        if allowed_unc_share != Some((ts.as_str(), tsh.as_str())) {
+            return Err("symlink/junction targeting a UNC network share is forbidden".into());
+        }
+        return Ok(());
     }
     if let Some(Component::Prefix(p)) = target.components().next() {
         match p.kind() {
@@ -313,10 +439,12 @@ fn check_reparse_target_is_local(target: &Path) -> Result<(), String> {
             Prefix::Verbatim(v) => {
                 // Allow NTFS volume mount points (`\\?\Volume{...}\`), reject anything else.
                 let v_bytes = v.as_encoded_bytes();
-                let is_volume = v_bytes.len() >= 7
-                    && v_bytes[..7].eq_ignore_ascii_case(b"Volume{");
+                let is_volume =
+                    v_bytes.len() >= 7 && v_bytes[..7].eq_ignore_ascii_case(b"Volume{");
                 if !is_volume {
-                    return Err("symlink/junction targeting a non-local verbatim path is forbidden".into());
+                    return Err(
+                        "symlink/junction targeting a non-local verbatim path is forbidden".into(),
+                    );
                 }
             }
             Prefix::Disk(_) | Prefix::VerbatimDisk(_) => {}
@@ -342,7 +470,7 @@ pub fn validate_playable_flac_path(
         Some(root) => validate_path_within_root(path, root)?,
         None => {
             let n = validate_local_path_syntax(path)?;
-            verify_no_unc_reparse_points(&n, &n)?;
+            verify_no_unc_reparse_points(&n, &n, None)?;
             n
         }
     };
@@ -399,4 +527,15 @@ pub fn is_valid_localhost_origin(origin: &str, bound_port: u16) -> bool {
 pub fn is_allowed_fetch_site(sec_fetch_site: &str) -> bool {
     let trimmed = sec_fetch_site.trim();
     trimmed.eq_ignore_ascii_case("same-origin") || trimmed.eq_ignore_ascii_case("none")
+}
+
+/// Validate `Sec-Fetch-Dest` (when present): reject embedded framing contexts (`iframe`, `frame`,
+/// `object`, `embed`, `fencedframe`) to block clickjacking even in browsers that omit Origin.
+pub fn is_allowed_fetch_dest(sec_fetch_dest: &str) -> bool {
+    let trimmed = sec_fetch_dest.trim();
+    !trimmed.eq_ignore_ascii_case("iframe")
+        && !trimmed.eq_ignore_ascii_case("frame")
+        && !trimmed.eq_ignore_ascii_case("object")
+        && !trimmed.eq_ignore_ascii_case("embed")
+        && !trimmed.eq_ignore_ascii_case("fencedframe")
 }

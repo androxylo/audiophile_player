@@ -342,7 +342,11 @@ fn rejects_unc_device_reserved_and_out_of_root_paths_on_get_and_post() {
     let mut server = ControlServer::start(Arc::clone(&shared), None).unwrap();
     let port = server.addr().port();
 
-    let parent_escape = format!("{}\\..\\outside", dir.display());
+    let parent_escape = dir
+        .join("..")
+        .join("outside")
+        .to_string_lossy()
+        .into_owned();
     let bad_dirs = [
         r"\\attacker.example\share",
         r"//attacker.example/share",
@@ -383,7 +387,7 @@ fn rejects_unc_device_reserved_and_out_of_root_paths_on_get_and_post() {
     // PlayFile must reject devices, UNC, directories, non-.flac files, and out-of-root paths.
     let bad_files = [
         "CONIN$".to_string(),
-        format!("{}\\CON.flac", dir.display()),
+        dir.join("CON.flac").to_string_lossy().into_owned(),
         r"\\.\pipe\ap_fake_pipe".to_string(),
         r"\\attacker.example\share\evil.flac".to_string(),
         dir.join("notes.txt").to_string_lossy().into_owned(),
@@ -623,4 +627,141 @@ fn browser_listing_uses_natural_order_and_skips_hidden_and_appledouble_entries()
     assert_eq!(flac_names, vec!["1.flac", "2.flac", "10.flac"]);
 
     let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn trusted_unc_music_root_allows_own_share_and_blocks_foreign_unc_and_pause_always_works() {
+    use std::path::Path;
+    use ap_control::security::{
+        validate_local_path_syntax, validate_path_syntax_for_root, validate_path_within_root,
+    };
+
+    // Direct syntax checks asserting specific rejection reasons across platforms (#25).
+    let err_dos = validate_local_path_syntax(&PathBuf::from("C:\\Music").join("CON.flac"))
+        .expect_err("CON.flac must be rejected as reserved DOS name");
+    assert!(
+        err_dos.contains("reserved Windows device name"),
+        "unexpected err: {err_dos}"
+    );
+    let err_unc = validate_local_path_syntax(Path::new(r"\\attacker\share\a.flac"))
+        .expect_err("UNC must be rejected for local root");
+    assert!(
+        err_unc.contains("UNC"),
+        "unexpected err: {err_unc}"
+    );
+    let err_escape = validate_local_path_syntax(&PathBuf::from("C:\\").join("..").join("outside"))
+        .expect_err("escaping above root must be rejected");
+    assert!(
+        err_escape.contains("escapes filesystem root"),
+        "unexpected err: {err_escape}"
+    );
+
+    // Trusted UNC root `\\NAS\Music`: allows paths under `\\NAS\Music`, blocks foreign shares
+    // and device paths (#2).
+    let unc_root = Path::new(r"\\NAS\Music");
+    let sub_ok = validate_path_within_root(Path::new(r"\\nas\music\Artist\Album"), unc_root)
+        .expect("subfolder under configured UNC root must be allowed");
+    assert!(
+        sub_ok.to_string_lossy().to_ascii_lowercase().contains("artist"),
+        "unexpected normalized UNC path: {}",
+        sub_ok.display()
+    );
+
+    let err_foreign = validate_path_within_root(Path::new(r"\\Evil\Share\Album"), unc_root)
+        .expect_err("foreign UNC share must remain blocked even with UNC music root");
+    assert!(err_foreign.contains("UNC"), "unexpected err: {err_foreign}");
+
+    let err_same_srv_other_share =
+        validate_path_within_root(Path::new(r"\\NAS\Private\Secrets"), unc_root)
+            .expect_err("different share on same NAS must remain blocked");
+    assert!(
+        err_same_srv_other_share.contains("UNC")
+            || err_same_srv_other_share.contains("outside"),
+        "unexpected err: {err_same_srv_other_share}"
+    );
+
+    let err_dev = validate_path_syntax_for_root(Path::new(r"\\.\pipe\foo"), Some(("nas", "music")))
+        .expect_err("Win32 device namespace must stay blocked even with UNC root");
+    assert!(err_dev.contains("UNC") || err_dev.contains("device"));
+
+    let err_dos_unc =
+        validate_path_within_root(Path::new(r"\\NAS\Music\CON.flac"), unc_root)
+            .expect_err("reserved DOS name inside UNC root must still be blocked");
+    assert!(err_dos_unc.contains("reserved Windows device name"));
+
+    // HTTP Pause and Next must ALWAYS succeed even if the hidden `dir` field is stale/invalid!
+    let dir = make_temp_music_dir("pause_always_works");
+    let shared = SharedControl::new(dir.clone(), "Test DAC");
+    let mut server = ControlServer::start(Arc::clone(&shared), None).unwrap();
+    let port = server.addr().port();
+
+    for (endpoint, expected_cmd) in [
+        ("/action/pause", ControlCommand::Pause),
+        ("/action/next", ControlCommand::Next),
+    ] {
+        let body = format!(
+            "dir={}",
+            ap_control::browser::url_encode(r"\\stale-server\other\folder")
+        );
+        let resp = http_request(
+            server.addr(),
+            &format!(
+                "POST {endpoint} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://127.0.0.1:{port}\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            ),
+        );
+        assert!(
+            resp.starts_with("HTTP/1.1 303 See Other"),
+            "expected {endpoint} to succeed even with invalid hidden dir, got {resp:?}"
+        );
+        assert_eq!(shared.take_pending_command(), Some(expected_cmd));
+    }
+
+    server.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn anti_clickjacking_headers_and_sec_fetch_dest_block_framing() {
+    let dir = make_temp_music_dir("clickjacking_sec");
+    let shared = SharedControl::new(dir.clone(), "Test DAC");
+    let mut server = ControlServer::start(Arc::clone(&shared), None).unwrap();
+    let port = server.addr().port();
+
+    // Normal GET / must carry X-Frame-Options, CSP frame-ancestors 'none', and nosniff.
+    let resp = http_request(
+        server.addr(),
+        &format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
+    );
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "unexpected resp: {resp}");
+    assert!(
+        resp.contains("X-Frame-Options: DENY\r\n"),
+        "missing X-Frame-Options header"
+    );
+    assert!(
+        resp.contains("Content-Security-Policy: frame-ancestors 'none'\r\n"),
+        "missing CSP frame-ancestors header"
+    );
+    assert!(
+        resp.contains("X-Content-Type-Options: nosniff\r\n"),
+        "missing X-Content-Type-Options header"
+    );
+
+    // Framed GET / with Sec-Fetch-Dest: iframe/frame/object/embed must be rejected with 403!
+    for dest in ["iframe", "frame", "object", "embed"] {
+        let framed = http_request(
+            server.addr(),
+            &format!(
+                "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nSec-Fetch-Dest: {dest}\r\n\r\n"
+            ),
+        );
+        assert!(
+            framed.starts_with("HTTP/1.1 403 Forbidden"),
+            "expected 403 for Sec-Fetch-Dest: {dest}, got {framed:?}"
+        );
+    }
+
+    server.shutdown();
+    let _ = fs::remove_dir_all(&dir);
 }

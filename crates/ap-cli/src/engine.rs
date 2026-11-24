@@ -15,7 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ap_control::security::validate_playable_flac_path;
-use ap_control::server::ControlServer;
+use ap_control::server::{ControlServer, clear_runtime_url_file, write_runtime_url_file};
 use ap_control::state::{ControlCommand, PlayModeLabel, SharedControl};
 use ap_core::buffer::DEFAULT_SOURCE_BLOCK_FRAMES;
 use ap_core::config::{ConvolutionConfig, PlayerConfig};
@@ -428,6 +428,8 @@ pub fn run_random_music_player(
     controller.attach_shared_control(shared.clone());
 
     let mut http_server = ControlServer::start(shared.clone(), http_port)?;
+    let http_url = http_server.url();
+    write_runtime_url_file(&http_url);
 
     println!(
         "audiophile-player v{} started (WDM-KS WaveRT, streaming blocks, opt={optimization:?}, DAC='{dac_name}', music='{}').",
@@ -639,6 +641,7 @@ pub fn run_random_music_player(
         ProducerDirective::Shutdown,
     );
     http_server.shutdown();
+    clear_runtime_url_file(&http_url);
     drop(sink);
 
     let _ = join_producer_bounded(
