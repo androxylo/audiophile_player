@@ -11,6 +11,7 @@ dependencies = [
  "ap-dsp",
  "ap-output-win",
  "ap-source",
+ "flac-codec",
 ]
 
 [[package]]
