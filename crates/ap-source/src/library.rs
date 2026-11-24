@@ -252,6 +252,70 @@ fn is_unsafe_link_target(target: &Path, allowed_unc_share: Option<&str>) -> bool
     false
 }
 
+#[cfg(windows)]
+fn is_link_reparse_tag(path: &Path, attrs: u32) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+    const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+    if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) == 0 {
+        return false;
+    }
+
+    #[repr(C)]
+    struct Win32FindDataW {
+        file_attributes: u32,
+        creation_time: [u32; 2],
+        last_access_time: [u32; 2],
+        last_write_time: [u32; 2],
+        file_size_high: u32,
+        file_size_low: u32,
+        reserved0: u32,
+        reserved1: u32,
+        file_name: [u16; 260],
+        alternate_file_name: [u16; 14],
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn FindFirstFileW(lp_file_name: *const u16, lp_find_file_data: *mut Win32FindDataW) -> isize;
+        fn FindClose(h_find_file: isize) -> i32;
+    }
+
+    let mut units: Vec<u16> = path.as_os_str().encode_wide().collect();
+    while units.len() > 3 && matches!(units.last(), Some(&0x5C | &0x2F)) {
+        units.pop();
+    }
+    units.push(0);
+
+    let mut data: Win32FindDataW = unsafe { core::mem::zeroed() };
+    let handle = unsafe { FindFirstFileW(units.as_ptr(), &mut data) };
+    if handle == -1 {
+        return false;
+    }
+    unsafe {
+        let _ = FindClose(handle);
+    }
+    matches!(data.reserved0, IO_REPARSE_TAG_SYMLINK | IO_REPARSE_TAG_MOUNT_POINT)
+}
+
+fn is_symlink_or_junction(path: &Path, meta: &fs::Metadata) -> bool {
+    if meta.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        is_link_reparse_tag(path, meta.file_attributes())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 /// Walk a symlink/junction chain starting at `link_path` up to [`MAX_SYMLINK_HOPS`] hops
 /// WITHOUT calling `fs::metadata` on unsafe hops. Returns `true` only if every hop target is
 /// safe (local or within `allowed_unc_share`) and the chain terminates without exceeding hops.
@@ -276,7 +340,7 @@ fn symlink_chain_is_safe(link_path: &Path, allowed_unc_share: Option<&str>) -> b
         let Ok(meta) = fs::symlink_metadata(&next) else {
             return false;
         };
-        if !meta.file_type().is_symlink() {
+        if !is_symlink_or_junction(&next, &meta) {
             return true;
         }
         current = next;
@@ -310,8 +374,24 @@ pub fn read_dir_frame(dir: &Path) -> io::Result<DirEntries> {
             continue;
         };
         let path = entry.path();
-        if ft.is_symlink() {
-            // Inspect link chain BEFORE calling fs::metadata so a malicious symlink to
+        let entry_is_link = if ft.is_symlink() {
+            true
+        } else {
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                entry
+                    .metadata()
+                    .ok()
+                    .is_some_and(|m| is_link_reparse_tag(&path, m.file_attributes()))
+            }
+            #[cfg(not(windows))]
+            {
+                false
+            }
+        };
+        if entry_is_link {
+            // Inspect link chain BEFORE calling fs::metadata so a malicious symlink/junction to
             // `\\attacker\share` (direct or chained) never triggers outbound SMB auth.
             if !symlink_chain_is_safe(&path, allowed_unc_share.as_deref()) {
                 continue;

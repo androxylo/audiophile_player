@@ -23,6 +23,81 @@ use std::os::windows::fs::MetadataExt;
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
 #[cfg(windows)]
 const FILE_ATTRIBUTE_DEVICE: u32 = 0x0000_0040;
+#[cfg(windows)]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+#[cfg(windows)]
+const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+#[cfg(windows)]
+const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+
+#[cfg(windows)]
+fn query_windows_reparse_tag(path: &Path) -> Option<u32> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[repr(C)]
+    struct Win32FindDataW {
+        file_attributes: u32,
+        creation_time: [u32; 2],
+        last_access_time: [u32; 2],
+        last_write_time: [u32; 2],
+        file_size_high: u32,
+        file_size_low: u32,
+        reserved0: u32,
+        reserved1: u32,
+        file_name: [u16; 260],
+        alternate_file_name: [u16; 14],
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn FindFirstFileW(lp_file_name: *const u16, lp_find_file_data: *mut Win32FindDataW) -> isize;
+        fn FindClose(h_find_file: isize) -> i32;
+    }
+
+    const INVALID_HANDLE_VALUE: isize = -1;
+
+    // FindFirstFileW fails on a trailing backslash (except drive root), so strip trailing separators.
+    let mut units: Vec<u16> = path.as_os_str().encode_wide().collect();
+    while units.len() > 3 && matches!(units.last(), Some(&0x5C | &0x2F)) {
+        units.pop();
+    }
+    units.push(0);
+
+    let mut data: Win32FindDataW = unsafe { core::mem::zeroed() };
+    let handle = unsafe { FindFirstFileW(units.as_ptr(), &mut data) };
+    if handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    unsafe {
+        let _ = FindClose(handle);
+    }
+    if (data.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+        Some(data.reserved0)
+    } else {
+        None
+    }
+}
+
+/// Returns `true` only when `path` is an actual symlink or Windows NTFS mount point/junction
+/// (`IO_REPARSE_TAG_SYMLINK` or `IO_REPARSE_TAG_MOUNT_POINT`). Non-link Windows reparse points
+/// (OneDrive Files On-Demand cloud placeholders, Data Deduplication, WCI) return `false`.
+pub fn is_symlink_or_mount_point(path: &Path, meta: &fs::Metadata) -> bool {
+    if meta.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            return matches!(
+                query_windows_reparse_tag(path),
+                Some(IO_REPARSE_TAG_SYMLINK | IO_REPARSE_TAG_MOUNT_POINT)
+            );
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = path;
+    false
+}
 
 /// Maximum symlink/junction chain hops resolved when validating reparse targets.
 const MAX_REPARSE_CHAIN_HOPS: usize = 8;
@@ -372,7 +447,7 @@ fn verify_no_unc_reparse_points(
             // Non-existent suffix is safe here; downstream read_dir/metadata will report NotFound.
             break;
         };
-        if meta.file_type().is_symlink() {
+        if is_symlink_or_mount_point(&cur, &meta) {
             verify_symlink_chain_is_allowed(&cur, allowed_unc_share)?;
         }
     }
@@ -403,7 +478,7 @@ fn verify_symlink_chain_is_allowed(
             // Target doesn't exist yet; syntax already passed safe-target validation.
             return Ok(());
         };
-        if !meta.file_type().is_symlink() {
+        if !is_symlink_or_mount_point(&next, &meta) {
             return Ok(());
         }
         cur = next;

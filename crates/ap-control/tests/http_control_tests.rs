@@ -765,3 +765,57 @@ fn anti_clickjacking_headers_and_sec_fetch_dest_block_framing() {
     server.shutdown();
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[cfg(windows)]
+#[test]
+fn reparse_tag_detector_identifies_ntfs_junctions_and_rejects_cyclic_link_chains() {
+    use ap_control::security::{is_symlink_or_mount_point, validate_path_within_root};
+
+    let root = make_temp_music_dir("reparse_tag_check");
+    let target = make_temp_music_dir("reparse_tag_target");
+    let junction = root.join("MountPoint");
+    let st = std::process::Command::new("cmd")
+        .args([
+            "/C",
+            "mklink",
+            "/J",
+            &junction.to_string_lossy(),
+            &target.to_string_lossy(),
+        ])
+        .status()
+        .expect("mklink /J failed");
+    assert!(st.success());
+
+    let root_meta = fs::symlink_metadata(&root).unwrap();
+    let junc_meta = fs::symlink_metadata(&junction).unwrap();
+    assert!(!is_symlink_or_mount_point(&root, &root_meta));
+    assert!(
+        is_symlink_or_mount_point(&junction, &junc_meta),
+        "NTFS junction (IO_REPARSE_TAG_MOUNT_POINT) must be detected via dwReserved0"
+    );
+    assert!(validate_path_within_root(&junction, &root).is_ok());
+
+    // Cyclic junction chain (J1 -> J2 -> J1) must be rejected cleanly by MAX_REPARSE_CHAIN_HOPS.
+    let cyc_dir = make_temp_music_dir("reparse_cycle_check");
+    let j1 = cyc_dir.join("J1");
+    let j2 = cyc_dir.join("J2");
+    let s1 = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J", &j1.to_string_lossy(), &j2.to_string_lossy()])
+        .status()
+        .unwrap();
+    let s2 = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J", &j2.to_string_lossy(), &j1.to_string_lossy()])
+        .status()
+        .unwrap();
+    assert!(s1.success() && s2.success());
+    let err = validate_path_within_root(&j1, &cyc_dir)
+        .expect_err("cyclic junction chain must exceed hop limit and be rejected");
+    assert!(err.contains("exceeded"), "unexpected err: {err}");
+
+    let _ = fs::remove_dir(&junction);
+    let _ = fs::remove_dir(&j1);
+    let _ = fs::remove_dir(&j2);
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&target);
+    let _ = fs::remove_dir_all(&cyc_dir);
+}
