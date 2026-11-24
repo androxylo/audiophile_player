@@ -631,63 +631,65 @@ fn browser_listing_uses_natural_order_and_skips_hidden_and_appledouble_entries()
 
 #[test]
 fn trusted_unc_music_root_allows_own_share_and_blocks_foreign_unc_and_pause_always_works() {
-    use std::path::Path;
-    use ap_control::security::{
-        validate_local_path_syntax, validate_path_syntax_for_root, validate_path_within_root,
-    };
+    #[cfg(windows)]
+    {
+        use std::path::Path;
+        use ap_control::security::{
+            validate_local_path_syntax, validate_path_syntax_for_root, validate_path_within_root,
+        };
 
-    // Direct syntax checks asserting specific rejection reasons across platforms (#25).
-    let err_dos = validate_local_path_syntax(&PathBuf::from("C:\\Music").join("CON.flac"))
-        .expect_err("CON.flac must be rejected as reserved DOS name");
-    assert!(
-        err_dos.contains("reserved Windows device name"),
-        "unexpected err: {err_dos}"
-    );
-    let err_unc = validate_local_path_syntax(Path::new(r"\\attacker\share\a.flac"))
-        .expect_err("UNC must be rejected for local root");
-    assert!(
-        err_unc.contains("UNC"),
-        "unexpected err: {err_unc}"
-    );
-    let err_escape = validate_local_path_syntax(&PathBuf::from("C:\\").join("..").join("outside"))
-        .expect_err("escaping above root must be rejected");
-    assert!(
-        err_escape.contains("escapes filesystem root"),
-        "unexpected err: {err_escape}"
-    );
+        // Direct syntax checks asserting specific rejection reasons on Windows (Review #3 #23).
+        let err_dos = validate_local_path_syntax(&PathBuf::from("C:\\Music").join("CON.flac"))
+            .expect_err("CON.flac must be rejected as reserved DOS name");
+        assert!(
+            err_dos.contains("reserved Windows device name"),
+            "unexpected err: {err_dos}"
+        );
+        let err_unc = validate_local_path_syntax(Path::new(r"\\attacker\share\a.flac"))
+            .expect_err("UNC must be rejected for local root");
+        assert!(err_unc.contains("UNC"), "unexpected err: {err_unc}");
+        let err_escape =
+            validate_local_path_syntax(&PathBuf::from("C:\\").join("..").join("outside"))
+                .expect_err("escaping above root must be rejected");
+        assert!(
+            err_escape.contains("escapes filesystem root"),
+            "unexpected err: {err_escape}"
+        );
 
-    // Trusted UNC root `\\NAS\Music`: allows paths under `\\NAS\Music`, blocks foreign shares
-    // and device paths (#2).
-    let unc_root = Path::new(r"\\NAS\Music");
-    let sub_ok = validate_path_within_root(Path::new(r"\\nas\music\Artist\Album"), unc_root)
-        .expect("subfolder under configured UNC root must be allowed");
-    assert!(
-        sub_ok.to_string_lossy().to_ascii_lowercase().contains("artist"),
-        "unexpected normalized UNC path: {}",
-        sub_ok.display()
-    );
+        // Trusted UNC root `\\NAS\Music`: allows paths under `\\NAS\Music`, blocks foreign shares
+        // and device paths.
+        let unc_root = Path::new(r"\\NAS\Music");
+        let sub_ok = validate_path_within_root(Path::new(r"\\nas\music\Artist\Album"), unc_root)
+            .expect("subfolder under configured UNC root must be allowed");
+        assert!(
+            sub_ok.to_string_lossy().to_ascii_lowercase().contains("artist"),
+            "unexpected normalized UNC path: {}",
+            sub_ok.display()
+        );
 
-    let err_foreign = validate_path_within_root(Path::new(r"\\Evil\Share\Album"), unc_root)
-        .expect_err("foreign UNC share must remain blocked even with UNC music root");
-    assert!(err_foreign.contains("UNC"), "unexpected err: {err_foreign}");
+        let err_foreign = validate_path_within_root(Path::new(r"\\Evil\Share\Album"), unc_root)
+            .expect_err("foreign UNC share must remain blocked even with UNC music root");
+        assert!(err_foreign.contains("UNC"), "unexpected err: {err_foreign}");
 
-    let err_same_srv_other_share =
-        validate_path_within_root(Path::new(r"\\NAS\Private\Secrets"), unc_root)
-            .expect_err("different share on same NAS must remain blocked");
-    assert!(
-        err_same_srv_other_share.contains("UNC")
-            || err_same_srv_other_share.contains("outside"),
-        "unexpected err: {err_same_srv_other_share}"
-    );
+        let err_same_srv_other_share =
+            validate_path_within_root(Path::new(r"\\NAS\Private\Secrets"), unc_root)
+                .expect_err("different share on same NAS must remain blocked");
+        assert!(
+            err_same_srv_other_share.contains("UNC")
+                || err_same_srv_other_share.contains("outside"),
+            "unexpected err: {err_same_srv_other_share}"
+        );
 
-    let err_dev = validate_path_syntax_for_root(Path::new(r"\\.\pipe\foo"), Some(("nas", "music")))
-        .expect_err("Win32 device namespace must stay blocked even with UNC root");
-    assert!(err_dev.contains("UNC") || err_dev.contains("device"));
+        let err_dev =
+            validate_path_syntax_for_root(Path::new(r"\\.\pipe\foo"), Some(("nas", "music")))
+                .expect_err("Win32 device namespace must stay blocked even with UNC root");
+        assert!(err_dev.contains("UNC") || err_dev.contains("device"));
 
-    let err_dos_unc =
-        validate_path_within_root(Path::new(r"\\NAS\Music\CON.flac"), unc_root)
-            .expect_err("reserved DOS name inside UNC root must still be blocked");
-    assert!(err_dos_unc.contains("reserved Windows device name"));
+        let err_dos_unc =
+            validate_path_within_root(Path::new(r"\\NAS\Music\CON.flac"), unc_root)
+                .expect_err("reserved DOS name inside UNC root must still be blocked");
+        assert!(err_dos_unc.contains("reserved Windows device name"));
+    }
 
     // HTTP Pause and Next must ALWAYS succeed even if the hidden `dir` field is stale/invalid!
     let dir = make_temp_music_dir("pause_always_works");
@@ -791,7 +793,7 @@ fn reparse_tag_detector_identifies_ntfs_junctions_and_rejects_cyclic_link_chains
     assert!(!is_symlink_or_mount_point(&root, &root_meta));
     assert!(
         is_symlink_or_mount_point(&junction, &junc_meta),
-        "NTFS junction (IO_REPARSE_TAG_MOUNT_POINT) must be detected via dwReserved0"
+        "NTFS junction (IO_REPARSE_TAG_MOUNT_POINT) must be detected by FileType::is_symlink()"
     );
     assert!(validate_path_within_root(&junction, &root).is_ok());
 

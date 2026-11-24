@@ -16,6 +16,8 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Component, Path, PathBuf, Prefix};
 
+pub use ap_source::library::{check_reparse_target_is_allowed, extract_unc_share};
+
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
 
@@ -23,84 +25,14 @@ use std::os::windows::fs::MetadataExt;
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
 #[cfg(windows)]
 const FILE_ATTRIBUTE_DEVICE: u32 = 0x0000_0040;
-#[cfg(windows)]
-const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-#[cfg(windows)]
-const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
-#[cfg(windows)]
-const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
 
-#[cfg(windows)]
-fn query_windows_reparse_tag(path: &Path) -> Option<u32> {
-    use std::os::windows::ffi::OsStrExt;
-
-    #[repr(C)]
-    struct Win32FindDataW {
-        file_attributes: u32,
-        creation_time: [u32; 2],
-        last_access_time: [u32; 2],
-        last_write_time: [u32; 2],
-        file_size_high: u32,
-        file_size_low: u32,
-        reserved0: u32,
-        reserved1: u32,
-        file_name: [u16; 260],
-        alternate_file_name: [u16; 14],
-    }
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn FindFirstFileW(lp_file_name: *const u16, lp_find_file_data: *mut Win32FindDataW) -> isize;
-        fn FindClose(h_find_file: isize) -> i32;
-    }
-
-    const INVALID_HANDLE_VALUE: isize = -1;
-
-    // FindFirstFileW fails on a trailing backslash (except drive root), so strip trailing separators.
-    let mut units: Vec<u16> = path.as_os_str().encode_wide().collect();
-    while units.len() > 3 && matches!(units.last(), Some(&0x5C | &0x2F)) {
-        units.pop();
-    }
-    units.push(0);
-
-    let mut data: Win32FindDataW = unsafe { core::mem::zeroed() };
-    let handle = unsafe { FindFirstFileW(units.as_ptr(), &mut data) };
-    if handle == INVALID_HANDLE_VALUE {
-        return None;
-    }
-    unsafe {
-        let _ = FindClose(handle);
-    }
-    if (data.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
-        Some(data.reserved0)
-    } else {
-        None
-    }
+/// Returns `true` only when `meta` represents an actual symlink or Windows NTFS mount
+/// point/junction (`meta.file_type().is_symlink()`, which checks `IsReparseTagNameSurrogate` on
+/// Windows — true for `IO_REPARSE_TAG_SYMLINK` and `IO_REPARSE_TAG_MOUNT_POINT`, false for
+/// non-link reparse points such as OneDrive cloud placeholders, WCI, and Data Deduplication).
+pub fn is_symlink_or_mount_point(_path: &Path, meta: &fs::Metadata) -> bool {
+    ap_source::library::is_symlink_or_mount_point(meta)
 }
-
-/// Returns `true` only when `path` is an actual symlink or Windows NTFS mount point/junction
-/// (`IO_REPARSE_TAG_SYMLINK` or `IO_REPARSE_TAG_MOUNT_POINT`). Non-link Windows reparse points
-/// (OneDrive Files On-Demand cloud placeholders, Data Deduplication, WCI) return `false`.
-pub fn is_symlink_or_mount_point(path: &Path, meta: &fs::Metadata) -> bool {
-    if meta.file_type().is_symlink() {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
-            return matches!(
-                query_windows_reparse_tag(path),
-                Some(IO_REPARSE_TAG_SYMLINK | IO_REPARSE_TAG_MOUNT_POINT)
-            );
-        }
-    }
-    #[cfg(not(windows))]
-    let _ = path;
-    false
-}
-
-/// Maximum symlink/junction chain hops resolved when validating reparse targets.
-const MAX_REPARSE_CHAIN_HOPS: usize = 8;
 
 /// Windows reserved DOS device base names (case-insensitive, matched before the first `.` after
 /// trimming trailing spaces/dots).
@@ -109,29 +41,6 @@ const RESERVED_DOS_DEVICES: &[&str] = &[
     "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT0", "LPT1", "LPT2", "LPT3", "LPT4",
     "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 ];
-
-/// Extract `(server, share)` (lowercased) if `path` is a standard or verbatim UNC path
-/// (`\\server\share...` or `\\?\UNC\server\share...`), or `None` for local paths.
-pub fn extract_unc_share(path: &Path) -> Option<(String, String)> {
-    let raw = path.to_string_lossy();
-    let rest = if let Some(r) = raw
-        .strip_prefix(r"\\?\UNC\")
-        .or_else(|| raw.strip_prefix(r"\\?\unc\"))
-    {
-        r
-    } else if raw.starts_with(r"\\") && !raw.starts_with(r"\\?\") && !raw.starts_with(r"\\.\") {
-        &raw[2..]
-    } else {
-        return None;
-    };
-    let mut parts = rest.split(['\\', '/']).filter(|s| !s.is_empty());
-    let server = parts.next()?;
-    let share = parts.next()?;
-    if server.contains(':') || share.contains(':') {
-        return None;
-    }
-    Some((server.to_ascii_lowercase(), share.to_ascii_lowercase()))
-}
 
 /// Normalize a trusted configured music root into an absolute, lexically clean path.
 ///
@@ -429,7 +338,7 @@ pub fn validate_path_within_root(path: &Path, allowed_root: &Path) -> Result<Pat
 /// (which never follows links or initiates SMB). Only actual symlinks and NTFS mount points
 /// (`meta.file_type().is_symlink()`, which checks `IO_REPARSE_TAG_SYMLINK` and
 /// `IO_REPARSE_TAG_MOUNT_POINT` on Windows) are inspected via `read_link`, resolving chained
-/// links up to [`MAX_REPARSE_CHAIN_HOPS`] hops and rejecting any untrusted UNC or device target.
+/// links up to `MAX_SYMLINK_HOPS` hops and rejecting any untrusted UNC or device target.
 fn verify_no_unc_reparse_points(
     norm_root: &Path,
     norm_path: &Path,
@@ -448,81 +357,7 @@ fn verify_no_unc_reparse_points(
             break;
         };
         if is_symlink_or_mount_point(&cur, &meta) {
-            verify_symlink_chain_is_allowed(&cur, allowed_unc_share)?;
-        }
-    }
-    Ok(())
-}
-
-fn verify_symlink_chain_is_allowed(
-    start_link: &Path,
-    allowed_unc_share: Option<(&str, &str)>,
-) -> Result<(), String> {
-    let mut cur = start_link.to_path_buf();
-    for _ in 0..MAX_REPARSE_CHAIN_HOPS {
-        let target = fs::read_link(&cur).map_err(|e| {
-            format!(
-                "cannot inspect symlink/junction target for '{}': {e}",
-                cur.display()
-            )
-        })?;
-        check_reparse_target_is_allowed(&target, allowed_unc_share)?;
-        let next = if target.is_absolute() {
-            target
-        } else {
-            cur.parent()
-                .map(|p| p.join(&target))
-                .unwrap_or(target)
-        };
-        let Ok(meta) = fs::symlink_metadata(&next) else {
-            // Target doesn't exist yet; syntax already passed safe-target validation.
-            return Ok(());
-        };
-        if !is_symlink_or_mount_point(&next, &meta) {
-            return Ok(());
-        }
-        cur = next;
-    }
-    Err(format!(
-        "symlink/junction chain exceeded {MAX_REPARSE_CHAIN_HOPS} hops at '{}'",
-        start_link.display()
-    ))
-}
-
-fn check_reparse_target_is_allowed(
-    target: &Path,
-    allowed_unc_share: Option<(&str, &str)>,
-) -> Result<(), String> {
-    let raw = target.as_os_str().as_encoded_bytes();
-    if raw.contains(&0) {
-        return Err("reparse target contains NUL byte".to_string());
-    }
-    if let Some((ts, tsh)) = extract_unc_share(target) {
-        if allowed_unc_share != Some((ts.as_str(), tsh.as_str())) {
-            return Err("symlink/junction targeting a UNC network share is forbidden".into());
-        }
-        return Ok(());
-    }
-    if let Some(Component::Prefix(p)) = target.components().next() {
-        match p.kind() {
-            Prefix::UNC(_, _) | Prefix::VerbatimUNC(_, _) => {
-                return Err("symlink/junction targeting a UNC network share is forbidden".into());
-            }
-            Prefix::DeviceNS(_) => {
-                return Err("symlink/junction targeting a device namespace is forbidden".into());
-            }
-            Prefix::Verbatim(v) => {
-                // Allow NTFS volume mount points (`\\?\Volume{...}\`), reject anything else.
-                let v_bytes = v.as_encoded_bytes();
-                let is_volume =
-                    v_bytes.len() >= 7 && v_bytes[..7].eq_ignore_ascii_case(b"Volume{");
-                if !is_volume {
-                    return Err(
-                        "symlink/junction targeting a non-local verbatim path is forbidden".into(),
-                    );
-                }
-            }
-            Prefix::Disk(_) | Prefix::VerbatimDisk(_) => {}
+            ap_source::library::verify_symlink_chain_is_allowed(&cur, allowed_unc_share)?;
         }
     }
     Ok(())

@@ -18,10 +18,10 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static SEED_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -93,7 +93,13 @@ fn is_excluded_entry_name(name: &str) -> bool {
 /// Returns `true` if a `DirEntry` should be skipped due to name or Windows `HIDDEN`/`SYSTEM`
 /// file attributes on the entry itself (using `entry.metadata()` which does NOT traverse
 /// junctions/volume mount points, so a normal junction pointing to a drive root like `D:\` is
-/// preserved while hidden/system files and folders are excluded).
+/// preserved).
+///
+/// Review #3 Finding #8: Samba NAS shares (Synology/QNAP/TrueNAS) default to
+/// `hide dot files = yes`, automatically setting `FILE_ATTRIBUTE_HIDDEN` on real dot-prefixed
+/// albums/tracks such as `...And Justice for All`. Since [`is_excluded_entry_name`] already
+/// filters dot-metadata (`._*`, `.DS_Store`, `.git`, `.Trash`, `.Spotlight-V100`, etc.), we apply
+/// `FILE_ATTRIBUTE_SYSTEM` to all entries and `FILE_ATTRIBUTE_HIDDEN` only to non-dot names.
 fn should_skip_dir_entry(entry: &fs::DirEntry) -> bool {
     let file_name = entry.file_name();
     let name = file_name.to_string_lossy();
@@ -107,8 +113,11 @@ fn should_skip_dir_entry(entry: &fs::DirEntry) -> bool {
         const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
         const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
         if let Ok(entry_meta) = entry.metadata() {
-            if (entry_meta.file_attributes() & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) != 0
-            {
+            let attrs = entry_meta.file_attributes();
+            if (attrs & FILE_ATTRIBUTE_SYSTEM) != 0 {
+                return true;
+            }
+            if !name.starts_with('.') && (attrs & FILE_ATTRIBUTE_HIDDEN) != 0 {
                 return true;
             }
         }
@@ -208,13 +217,22 @@ fn natural_full_path_cmp(a: &Path, b: &Path) -> CmpOrdering {
     }
 }
 
-/// Extract the normalized `\\server\share` (lowercased) prefix if `path` is a UNC path
-/// (either `\\server\share...` or `\\?\UNC\server\share...`), or `None` for local paths.
-fn unc_share_prefix(path: &Path) -> Option<String> {
+/// Extract `(server, share)` (lowercased) if `path` is a standard or verbatim UNC path
+/// (`\\server\share...` or `\\?\UNC\server\share...`, case-insensitive on `UNC`), or `None`
+/// for local paths.
+pub fn extract_unc_share(path: &Path) -> Option<(String, String)> {
     let raw = path.to_string_lossy();
-    let rest = if let Some(r) = raw.strip_prefix(r"\\?\UNC\").or_else(|| raw.strip_prefix(r"\\?\unc\")) {
-        r
-    } else if raw.starts_with(r"\\") && !raw.starts_with(r"\\?\") && !raw.starts_with(r"\\.\") {
+    let rest = if raw.len() >= 8
+        && (raw.starts_with(r"\\?\") || raw.starts_with("//?/"))
+        && raw[4..8].eq_ignore_ascii_case(r"unc\")
+        || (raw.len() >= 8
+            && (raw.starts_with(r"\\?\") || raw.starts_with("//?/"))
+            && raw[4..8].eq_ignore_ascii_case("unc/"))
+    {
+        &raw[8..]
+    } else if (raw.starts_with(r"\\") || raw.starts_with("//"))
+        && !(raw.len() >= 4 && matches!(raw.as_bytes()[2], b'.' | b'?') && matches!(raw.as_bytes()[3], b'\\' | b'/'))
+    {
         &raw[2..]
     } else {
         return None;
@@ -222,112 +240,135 @@ fn unc_share_prefix(path: &Path) -> Option<String> {
     let mut parts = rest.split(['\\', '/']).filter(|s| !s.is_empty());
     let server = parts.next()?;
     let share = parts.next()?;
-    Some(format!(
-        "\\\\{}\\{}",
-        server.to_ascii_lowercase(),
-        share.to_ascii_lowercase()
-    ))
+    if server.contains(':') || share.contains(':') {
+        return None;
+    }
+    Some((server.to_ascii_lowercase(), share.to_ascii_lowercase()))
 }
 
-/// Returns `true` if `target` points to a Win32 device namespace (`\\.\`, `\??\`, `\\?\Pipe\`)
-/// or a UNC share that does not match `allowed_unc_share` (preventing NetNTLM SMB leaks when
-/// reading directory entries containing malicious symlinks or chained links).
-fn is_unsafe_link_target(target: &Path, allowed_unc_share: Option<&str>) -> bool {
+/// Strict allow-list check for a symlink or Windows NTFS junction target (shared by `ap-source`
+/// and `ap-control`).
+///
+/// Allows ONLY:
+/// - Relative targets (no Windows prefix, no leading `\\` / `//` / `\??\`),
+/// - Local disk paths (`C:\...`, `\\?\C:\...`),
+/// - Local NTFS volume mount points (`\\?\Volume{...}\`),
+/// - UNC targets matching `allowed_unc_share` (when a trusted UNC `--music-dir` is configured).
+///
+/// Rejects ALL untrusted UNC shares (including mixed-case `\\?\Unc\...` and
+/// `\\?\Global\UNC\...`), NT object manager paths (`\??\...`), and Win32 device namespaces
+/// (`\\.\...`, `\\?\Pipe\...`, `\\?\GLOBALROOT\...`) BEFORE any `fs::metadata` call.
+pub fn check_reparse_target_is_allowed(
+    target: &Path,
+    allowed_unc_share: Option<(&str, &str)>,
+) -> Result<(), String> {
+    let raw_bytes = target.as_os_str().as_encoded_bytes();
+    if raw_bytes.contains(&0) {
+        return Err("reparse target contains NUL byte".to_string());
+    }
+
     let raw = target.to_string_lossy();
     let lower = raw.to_ascii_lowercase();
-    if lower.starts_with(r"\\.\")
-        || lower.starts_with(r"\??\")
-        || lower.starts_with(r"\\?\pipe\")
-        || lower.starts_with(r"\\?\globalroot\")
-    {
-        return true;
+    if lower.starts_with(r"\??\") || lower.starts_with("/??/") {
+        return Err("symlink/junction targeting NT object namespace is forbidden".into());
     }
-    if let Some(target_share) = unc_share_prefix(target) {
-        return allowed_unc_share != Some(target_share.as_str());
-    }
-    // Unparseable bare `\\...` or `//...` UNC-like prefix without a valid share is always unsafe.
-    if (raw.starts_with(r"\\") || raw.starts_with("//")) && !raw.starts_with(r"\\?\") {
-        return true;
-    }
-    false
-}
-
-#[cfg(windows)]
-fn is_link_reparse_tag(path: &Path, attrs: u32) -> bool {
-    use std::os::windows::ffi::OsStrExt;
-
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-    const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
-    const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
-    if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) == 0 {
-        return false;
+    if lower.starts_with(r"\\.\") || lower.starts_with("//./") {
+        return Err("symlink/junction targeting a device namespace is forbidden".into());
     }
 
-    #[repr(C)]
-    struct Win32FindDataW {
-        file_attributes: u32,
-        creation_time: [u32; 2],
-        last_access_time: [u32; 2],
-        last_write_time: [u32; 2],
-        file_size_high: u32,
-        file_size_low: u32,
-        reserved0: u32,
-        reserved1: u32,
-        file_name: [u16; 260],
-        alternate_file_name: [u16; 14],
-    }
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn FindFirstFileW(lp_file_name: *const u16, lp_find_file_data: *mut Win32FindDataW) -> isize;
-        fn FindClose(h_find_file: isize) -> i32;
-    }
-
-    let mut units: Vec<u16> = path.as_os_str().encode_wide().collect();
-    while units.len() > 3 && matches!(units.last(), Some(&0x5C | &0x2F)) {
-        units.pop();
-    }
-    units.push(0);
-
-    let mut data: Win32FindDataW = unsafe { core::mem::zeroed() };
-    let handle = unsafe { FindFirstFileW(units.as_ptr(), &mut data) };
-    if handle == -1 {
-        return false;
-    }
-    unsafe {
-        let _ = FindClose(handle);
-    }
-    matches!(data.reserved0, IO_REPARSE_TAG_SYMLINK | IO_REPARSE_TAG_MOUNT_POINT)
-}
-
-fn is_symlink_or_junction(path: &Path, meta: &fs::Metadata) -> bool {
-    if meta.file_type().is_symlink() {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        is_link_reparse_tag(path, meta.file_attributes())
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = path;
-        false
-    }
-}
-
-/// Walk a symlink/junction chain starting at `link_path` up to [`MAX_SYMLINK_HOPS`] hops
-/// WITHOUT calling `fs::metadata` on unsafe hops. Returns `true` only if every hop target is
-/// safe (local or within `allowed_unc_share`) and the chain terminates without exceeding hops.
-fn symlink_chain_is_safe(link_path: &Path, allowed_unc_share: Option<&str>) -> bool {
-    let mut current = link_path.to_path_buf();
-    for _ in 0..MAX_SYMLINK_HOPS {
-        let Ok(target) = fs::read_link(&current) else {
-            return false;
-        };
-        if is_unsafe_link_target(&target, allowed_unc_share) {
-            return false;
+    // Strict allow-list for Windows verbatim `\\?\...` targets (blocks `\\?\Global\UNC\...`,
+    // `\\?\GLOBALROOT\...`, `\\?\Pipe\...`, and untrusted `\\?\Unc\...` case-insensitively).
+    if lower.starts_with(r"\\?\") || lower.starts_with("//?/") {
+        let after = &raw[4..];
+        let after_lower = &lower[4..];
+        if after_lower.starts_with(r"unc\") || after_lower.starts_with("unc/") {
+            let Some((ts, tsh)) = extract_unc_share(target) else {
+                return Err("symlink/junction targeting an invalid UNC path is forbidden".into());
+            };
+            if allowed_unc_share != Some((ts.as_str(), tsh.as_str())) {
+                return Err("symlink/junction targeting a UNC network share is forbidden".into());
+            }
+            return Ok(());
         }
+        let is_verbatim_disk = after.len() >= 2
+            && after.as_bytes()[0].is_ascii_alphabetic()
+            && after.as_bytes()[1] == b':'
+            && (after.len() == 2 || matches!(after.as_bytes()[2], b'\\' | b'/'));
+        let is_volume_guid = after_lower.starts_with("volume{");
+        if !is_verbatim_disk && !is_volume_guid {
+            return Err(
+                "symlink/junction targeting a non-local verbatim path is forbidden".into(),
+            );
+        }
+        return Ok(());
+    }
+
+    // Standard UNC (`\\server\share` or `//server/share`): allow ONLY the trusted root share.
+    if raw.starts_with(r"\\") || raw.starts_with("//") {
+        let Some((ts, tsh)) = extract_unc_share(target) else {
+            return Err("symlink/junction targeting a UNC network share is forbidden".into());
+        };
+        if allowed_unc_share != Some((ts.as_str(), tsh.as_str())) {
+            return Err("symlink/junction targeting a UNC network share is forbidden".into());
+        }
+        return Ok(());
+    }
+
+    // Defense-in-depth component Prefix allow-list.
+    if let Some(Component::Prefix(p)) = target.components().next() {
+        match p.kind() {
+            Prefix::Disk(_) | Prefix::VerbatimDisk(_) => {}
+            Prefix::Verbatim(v) => {
+                let vb = v.as_encoded_bytes();
+                if !(vb.len() >= 7 && vb[..7].eq_ignore_ascii_case(b"Volume{")) {
+                    return Err(
+                        "symlink/junction targeting a non-local verbatim path is forbidden".into(),
+                    );
+                }
+            }
+            Prefix::UNC(s, sh) | Prefix::VerbatimUNC(s, sh) => {
+                let ts = s.to_string_lossy().to_ascii_lowercase();
+                let tsh = sh.to_string_lossy().to_ascii_lowercase();
+                if allowed_unc_share != Some((ts.as_str(), tsh.as_str())) {
+                    return Err(
+                        "symlink/junction targeting a UNC network share is forbidden".into(),
+                    );
+                }
+            }
+            Prefix::DeviceNS(_) => {
+                return Err("symlink/junction targeting a device namespace is forbidden".into());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Returns `true` when `meta` represents a symlink or Windows NTFS junction/mount point.
+///
+/// On Windows, Rust's `FileType::is_symlink()` checks `IsReparseTagNameSurrogate`, which is
+/// already `true` for both `IO_REPARSE_TAG_SYMLINK` and `IO_REPARSE_TAG_MOUNT_POINT` (NTFS
+/// junctions) and `false` for non-link reparse points such as OneDrive cloud placeholders.
+pub fn is_symlink_or_mount_point(meta: &fs::Metadata) -> bool {
+    meta.file_type().is_symlink()
+}
+
+/// Walk a symlink/junction chain starting at `start_link` up to [`MAX_SYMLINK_HOPS`] hops
+/// WITHOUT calling `fs::metadata` on unsafe hops. Returns `Ok(())` only if every hop target
+/// satisfies [`check_reparse_target_is_allowed`] and the chain terminates within the hop cap.
+pub fn verify_symlink_chain_is_allowed(
+    start_link: &Path,
+    allowed_unc_share: Option<(&str, &str)>,
+) -> Result<(), String> {
+    let mut current = start_link.to_path_buf();
+    for _ in 0..MAX_SYMLINK_HOPS {
+        let target = fs::read_link(&current).map_err(|e| {
+            format!(
+                "cannot inspect symlink/junction target for '{}': {e}",
+                current.display()
+            )
+        })?;
+        check_reparse_target_is_allowed(&target, allowed_unc_share)?;
         let next = if target.is_absolute() {
             target
         } else {
@@ -338,14 +379,18 @@ fn symlink_chain_is_safe(link_path: &Path, allowed_unc_share: Option<&str>) -> b
         };
         // Check if `next` itself is another symlink/junction (without following it!).
         let Ok(meta) = fs::symlink_metadata(&next) else {
-            return false;
+            // Non-existent target is syntactically safe; downstream open will fail cleanly.
+            return Ok(());
         };
-        if !is_symlink_or_junction(&next, &meta) {
-            return true;
+        if !is_symlink_or_mount_point(&meta) {
+            return Ok(());
         }
         current = next;
     }
-    false
+    Err(format!(
+        "symlink/junction chain exceeded {MAX_SYMLINK_HOPS} hops at '{}'",
+        start_link.display()
+    ))
 }
 
 /// Read ONLY the immediate subdirectories and `.flac` files of `dir`.
@@ -354,15 +399,18 @@ fn symlink_chain_is_safe(link_path: &Path, allowed_unc_share: Option<&str>) -> b
 ///   syscalls on Windows/SMB) and only resolves `fs::metadata` on actual symlinks / NTFS junctions
 ///   AFTER verifying the entire link chain does not target untrusted UNC or Win32 device paths.
 /// - Skips excluded metadata entries (`._*`, `.DS_Store`, `.Trash`, `$RECYCLE.BIN`,
-///   `System Volume Information`, Windows `HIDDEN`/`SYSTEM`) while preserving real dot-prefixed
-///   albums and tracks (e.g. `...And Justice for All`).
+///   `System Volume Information`, Windows `SYSTEM` and non-dot `HIDDEN`) while preserving real
+///   dot-prefixed albums and tracks (e.g. `...And Justice for All`), even on Samba NAS shares.
 /// - Sorts both `subdirs` and `flacs` in deterministic case-insensitive natural order.
 ///
 /// Shared by [`pick_random_flac_walk`], [`discover_flac_files`], [`SequentialFlacCursor`], and
 /// `ap-control`'s HTTP folder browser so filtering and ordering never drift.
 pub fn read_dir_frame(dir: &Path) -> io::Result<DirEntries> {
     let entries = fs::read_dir(dir)?;
-    let allowed_unc_share = unc_share_prefix(dir);
+    let allowed_unc = extract_unc_share(dir);
+    let share_ref = allowed_unc
+        .as_ref()
+        .map(|(s, sh)| (s.as_str(), sh.as_str()));
     let mut subdirs = Vec::new();
     let mut flacs = Vec::new();
 
@@ -374,26 +422,10 @@ pub fn read_dir_frame(dir: &Path) -> io::Result<DirEntries> {
             continue;
         };
         let path = entry.path();
-        let entry_is_link = if ft.is_symlink() {
-            true
-        } else {
-            #[cfg(windows)]
-            {
-                use std::os::windows::fs::MetadataExt;
-                entry
-                    .metadata()
-                    .ok()
-                    .is_some_and(|m| is_link_reparse_tag(&path, m.file_attributes()))
-            }
-            #[cfg(not(windows))]
-            {
-                false
-            }
-        };
-        if entry_is_link {
+        if ft.is_symlink() {
             // Inspect link chain BEFORE calling fs::metadata so a malicious symlink/junction to
             // `\\attacker\share` (direct or chained) never triggers outbound SMB auth.
-            if !symlink_chain_is_safe(&path, allowed_unc_share.as_deref()) {
+            if verify_symlink_chain_is_allowed(&path, share_ref).is_err() {
                 continue;
             }
             let Ok(meta) = fs::metadata(&path) else {
@@ -421,9 +453,13 @@ fn canonical_dir_id(dir: &Path) -> PathBuf {
     fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
 }
 
+/// Wall-clock TTL for cached directory weights (prevents stale grandchild aggregates and
+/// eliminates per-subdir `fs::metadata` / SMB `CreateFile` calls in the `> 32`-subdir branch).
+const WEIGHT_CACHE_TTL: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Clone, Copy)]
 struct CachedDirWeight {
-    modified: Option<SystemTime>,
+    stored_at: Instant,
     weight: u64,
 }
 
@@ -432,14 +468,10 @@ fn dir_weight_cache() -> &'static Mutex<HashMap<PathBuf, CachedDirWeight>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn dir_mtime(dir: &Path) -> Option<SystemTime> {
-    fs::metadata(dir).ok().and_then(|m| m.modified().ok())
-}
-
-fn lookup_cached_weight(dir: &Path, mtime: Option<SystemTime>) -> Option<u64> {
+fn lookup_cached_weight(dir: &Path) -> Option<u64> {
     let cache = dir_weight_cache().lock().unwrap_or_else(|e| e.into_inner());
     cache.get(dir).and_then(|entry| {
-        if entry.modified == mtime {
+        if entry.weight > 0 && entry.stored_at.elapsed() < WEIGHT_CACHE_TTL {
             Some(entry.weight)
         } else {
             None
@@ -447,29 +479,42 @@ fn lookup_cached_weight(dir: &Path, mtime: Option<SystemTime>) -> Option<u64> {
     })
 }
 
-fn store_cached_weight(dir: PathBuf, modified: Option<SystemTime>, weight: u64) {
+fn store_cached_weight(dir: PathBuf, weight: u64) {
     let mut cache = dir_weight_cache().lock().unwrap_or_else(|e| e.into_inner());
+    // Review #3 Finding #5: NEVER cache a 0 aggregate weight (e.g. a newly created empty rip
+    // directory or transient NAS error); removing the entry ensures future picks revisit it once
+    // tracks arrive instead of making the subtree permanently unreachable.
+    if weight == 0 {
+        cache.remove(&dir);
+        return;
+    }
     if cache.len() >= MAX_WEIGHT_CACHE_ENTRIES {
         cache.clear();
     }
-    cache.insert(dir, CachedDirWeight { modified, weight });
+    cache.insert(
+        dir,
+        CachedDirWeight {
+            stored_at: Instant::now(),
+            weight,
+        },
+    );
 }
 
 /// Compute or fetch the cached FLAC-aware weight for `dir` (counting only `.flac` files and
 /// non-excluded subdirectories, never `cover.jpg`/`.cue`/`.log`), avoiding repeated directory
 /// scans across consecutive random picks on NAS/SMB libraries.
 fn cached_shallow_flac_weight(dir: &Path) -> u64 {
-    let mtime = dir_mtime(dir);
-    if let Some(w) = lookup_cached_weight(dir, mtime) {
+    if let Some(w) = lookup_cached_weight(dir) {
         return w;
     }
     let Ok(frame) = read_dir_frame(dir) else {
+        // Transient read failure: skip on this pick without caching 0.
         return 0;
     };
     let flac_w = frame.flacs.len() as u64;
     let sub_w = (frame.subdirs.len() as u64).saturating_mul(DEFAULT_SUBDIR_WEIGHT);
     let weight = flac_w.saturating_add(sub_w);
-    store_cached_weight(dir.to_path_buf(), mtime, weight);
+    store_cached_weight(dir.to_path_buf(), weight);
     weight
 }
 
@@ -516,10 +561,9 @@ fn walk_pick_recursive(
     // Build weighted candidate choices:
     // - `Here` (direct `.flac` files in this folder) is weighted by `flacs.len()`.
     // - Each immediate subdirectory is weighted by a cheap 1-level shallow entry-count peek when
-    //   `subdirs.len() <= MAX_SHALLOW_PEEK_SUBDIRS` (skipping completely empty folders immediately),
-    //   or `DEFAULT_SUBDIR_WEIGHT` when there are many immediate subfolders.
-    // This preserves O(depth) latency on 20,000+ track libraries while strongly reducing
-    // over-sampling of single-track folders or loose files next to large collections.
+    //   `subdirs.len() <= MAX_SHALLOW_PEEK_SUBDIRS` (skipping completely empty folders on this pick
+    //   without caching 0), or an in-memory TTL-cached weight / `DEFAULT_SUBDIR_WEIGHT` with ZERO
+    //   per-subdir metadata syscalls when there are >32 immediate subfolders (Review #3 #22).
     enum Choice {
         Here,
         Subdir(PathBuf),
@@ -536,19 +580,18 @@ fn walk_pick_recursive(
         let weight = if peek_subdirs {
             cached_shallow_flac_weight(&sub)
         } else {
-            // For directories with >32 subfolders, reuse any previously learned cached weight
-            // without triggering an upfront scan of all subfolders.
-            let mtime = dir_mtime(&sub);
-            lookup_cached_weight(&sub, mtime).unwrap_or(DEFAULT_SUBDIR_WEIGHT)
+            // Review #3 Finding #22: purely in-memory TTL lookup (zero fs::metadata/CreateFile
+            // calls per subdir), preserving O(depth) latency on 2,000+ folder NAS roots.
+            lookup_cached_weight(&sub).unwrap_or(DEFAULT_SUBDIR_WEIGHT)
         };
         learned_total = learned_total.saturating_add(weight);
         if weight > 0 {
             candidates.push((Choice::Subdir(sub), weight));
         }
     }
-    // Refine this directory's cached weight from its actual FLACs + child weights so future
-    // picks at parent levels converge toward true subtree sizes in O(depth) time.
-    store_cached_weight(dir.to_path_buf(), dir_mtime(dir), learned_total);
+    // Refine this directory's cached weight from its actual FLACs + child weights (only when > 0,
+    // never caching 0 so newly populated grandchildren remain immediately reachable).
+    store_cached_weight(dir.to_path_buf(), learned_total);
 
     // Weighted random selection without replacement so we descend into ONE weighted-random
     // branch on the happy path and backtrack cleanly only if a chosen branch has no `.flac` files.

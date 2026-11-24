@@ -570,3 +570,141 @@ fn walk_picker_weights_large_folders_and_here_slot_fairly() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn newly_populated_grandchild_folder_is_not_permanently_hidden_by_cached_zero() {
+    // Review #3 Finding #5: an empty Artist\Album visited during ripping must NEVER cache 0
+    // under Artist's mtime and make the subtree permanently unreachable once tracks land in Album.
+    let root = make_temp_tree("no_cached_zero_poison");
+    let artist = root.join("Artist");
+    let album = artist.join("Album");
+    let other = root.join("Other");
+    fs::create_dir_all(&album).unwrap();
+    fs::create_dir_all(&other).unwrap();
+    fs::write(other.join("01.flac"), b"").unwrap();
+
+    // Visit while Artist\Album is completely empty (would previously cache Artist=0 under Artist's mtime!).
+    for seed in 0..20_u64 {
+        let p = pick_random_flac_walk_with_seed(&root, seed).unwrap();
+        assert_eq!(p, other.join("01.flac"));
+    }
+
+    // Now write a FLAC inside grandchild Album (Artist's own mtime does NOT change!).
+    let new_track = album.join("02.flac");
+    fs::write(&new_track, b"").unwrap();
+
+    let mut reached_new = false;
+    for seed in 0..100_u64 {
+        if pick_random_flac_walk_with_seed(&root, seed).unwrap() == new_track {
+            reached_new = true;
+            break;
+        }
+    }
+    assert!(
+        reached_new,
+        "newly populated grandchild track must be reachable (never poisoned by cached 0)"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn reparse_target_allow_list_blocks_mixed_case_unc_and_global_verbatim_targets() {
+    use ap_source::library::check_reparse_target_is_allowed;
+    use std::path::Path;
+
+    // Review #3 Finding #28: component + raw-prefix allow-list must reject mixed-case \\?\Unc\,
+    // \\?\Global\UNC\, \??\UNC\, \\.\pipe\, and foreign UNC shares before any metadata syscall.
+    for evil in [
+        r"\\?\Unc\evil\share\a.flac",
+        r"\\?\UNC\evil\share\a.flac",
+        r"\\?\Global\UNC\evil\share\a.flac",
+        r"\\?\GLOBALROOT\Device\LanmanRedirector\evil\share",
+        r"\??\UNC\evil\share",
+        r"\\.\pipe\ntlm_trap",
+        r"\\evil\share\track.flac",
+        r"//evil/share/track.flac",
+    ] {
+        assert!(
+            check_reparse_target_is_allowed(Path::new(evil), None).is_err(),
+            "unsafe link target MUST be rejected for local root: {evil}"
+        );
+        assert!(
+            check_reparse_target_is_allowed(Path::new(evil), Some(("nas", "music"))).is_err(),
+            "foreign/device link target MUST be rejected even with trusted NAS root: {evil}"
+        );
+    }
+
+    // Allowed local and trusted-share targets.
+    for safe_local in [
+        r"C:\Music\Album",
+        r"\\?\D:\Music\Album",
+        r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\Music",
+        "relative/subdir",
+    ] {
+        assert!(
+            check_reparse_target_is_allowed(Path::new(safe_local), None).is_ok(),
+            "safe local link target should be allowed: {safe_local}"
+        );
+    }
+    assert!(
+        check_reparse_target_is_allowed(
+            Path::new(r"\\?\Unc\NAS\Music\Album"),
+            Some(("nas", "music"))
+        )
+        .is_ok(),
+        "trusted UNC share in mixed-case verbatim form should be allowed for its own root"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn samba_hidden_dot_prefixed_album_remains_visible_while_non_dot_hidden_is_skipped() {
+    // Review #3 Finding #8: Samba sets FILE_ATTRIBUTE_HIDDEN on dot-prefixed entries by default
+    // (`hide dot files = yes`). Real dot-prefixed albums (`...And Justice for All`) must remain
+    // visible even with FILE_ATTRIBUTE_HIDDEN set, while non-dot hidden folders and excluded
+    // dot-metadata (`.git`, `._track.flac`) are still skipped.
+    let root = make_temp_tree("samba_hidden_dots");
+    let ellipsis_album = root.join("...And Justice for All");
+    let hidden_nondot = root.join("HiddenNonDot");
+    let dot_git = root.join(".git");
+    fs::create_dir_all(&ellipsis_album).unwrap();
+    fs::create_dir_all(&hidden_nondot).unwrap();
+    fs::create_dir_all(&dot_git).unwrap();
+    let ellipsis_track = ellipsis_album.join("...One.flac");
+    fs::write(&ellipsis_track, b"").unwrap();
+    fs::write(hidden_nondot.join("secret.flac"), b"").unwrap();
+    fs::write(dot_git.join("ignored.flac"), b"").unwrap();
+    let apple_double = root.join("._01.flac");
+    fs::write(&apple_double, b"").unwrap();
+
+    for p in [&ellipsis_album, &ellipsis_track, &hidden_nondot, &dot_git, &apple_double] {
+        let st = std::process::Command::new("attrib")
+            .args(["+H", &p.to_string_lossy()])
+            .status()
+            .expect("attrib +H failed");
+        assert!(st.success(), "attrib +H failed for {}", p.display());
+    }
+
+    let frame = read_dir_frame(&root).unwrap();
+    let dir_names: Vec<String> = frame
+        .subdirs
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(
+        dir_names,
+        vec!["...And Justice for All"],
+        "hidden ellipsis album must stay visible while HiddenNonDot and .git are skipped"
+    );
+    assert!(frame.flacs.is_empty(), "._01.flac must stay excluded");
+
+    let album_frame = read_dir_frame(&ellipsis_album).unwrap();
+    assert_eq!(
+        album_frame.flacs,
+        vec![ellipsis_track],
+        "hidden dot-prefixed track inside ellipsis album must stay visible"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
