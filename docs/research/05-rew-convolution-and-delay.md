@@ -11,9 +11,10 @@ Across reference audiophile DSP engines (**HQPlayer**, **PGGB**, **Roon DSP**, *
 2. **Convolution warps the Noise Transfer Function (NTF):**
    - An `8fS` noise shaper carefully pushes quantization noise out of the audible band (`0–20 kHz`) into ultrasonic frequencies (`50–192 kHz`).
    - Any FIR room filter applied *after* noise shaping multiplies that shaped ultrasonic noise spectrum by $|H_{\text{REW}}(e^{j\omega})|$, altering the NTF, increasing out-of-band energy where the filter boosts, and potentially causing numerical overload on the ultrasonic noise floor.
-3. **Zero internal truncation in `f64` + exact headroom safety:**
+3. **Zero internal truncation in `f64` + auto-normalized headroom safety:**
    - Executing all linear time-invariant (LTI) stages in IEEE 754 `f64` before the single final quantizer keeps internal rounding noise at `~-319 dB`—orders of magnitude below both 24-bit PCM (`-144 dB`) and any physical DAC.
-   - Because `select_headroom(..., rew_max_boost_db)` accounts for the exact FFT peak magnitude of the loaded REW IR (`max_boost_db`), linear headroom scaling (`-3 dB` or `0 dB`), upsampling, convolution, and channel delay all remain mathematically clip-free prior to the single final quantizer.
+   - At IR load time, `PreparedStereoIr` measures `max |H(f)|` across both channels with a `>= 2x` zero-padded real FFT. Any IR whose peak frequency gain exceeds `0 dB` is **auto-normalized down to `0 dB`** (scaling left and right equally to preserve L/R balance) and logged once on first load, so the hardcoded `-3 dB` fail-safe always retains a full `3 dB` steady-state margin.
+   - Because an all-pass or excess-phase FIR can still increase instantaneous crest factor on phase-aligned transients (worst-case bounded by its L1 norm $\sum |h[n]|$), `PreparedStereoIr` also computes `l1_norm_db` and feeds `peak_gain_bound_db()` into `select_headroom` so `0 dB` mode is only granted when a track's verified native headroom also covers the conservative L1 bound.
 
 ### Locked Pipeline Order (`ap-dsp`)
 ```text
@@ -27,13 +28,14 @@ Source f64 blocks (<= 65,536 frames)
 
 ---
 
-## 2. Empirical Findings on User's REW Filters (`C:\Program Files\EqualizerAPO\config`)
+## 2. Configuration & Discovery Rules (`ConvolutionConfig`)
 
-- **Auto-Discovery Rule:** Scan `C:\Program Files\EqualizerAPO\config` (header-only fast probe, `< 1 ms`), filter strictly to **2-channel (`channels == 2`) `.wav`** files whose sample rate matches the active `8fS` domain (`352,800 Hz` or `384,000 Hz`), and select the **most recent by modification date** (ignoring mono `.L`/`.R` helper WAVs).
-- **Verified Filter Formats:**
+- **Disabled by Default:** Convolution defaults to `ConvolutionConfig::disabled()` (`NullConvolver`) because room-correction filters are strictly user- and room-specific. Users opt in via `config.toml` (`[convolution]`) or `--conv-dir` / `--conv-file`.
+- **Folder Auto-Discovery Rule (when `dir` is configured):** Scan `dir` (header-only fast probe, `< 1 ms`), filter strictly to complete **2-channel (`channels == 2`) `.wav`** files whose sample rate matches the active `8fS` domain (`352,800 Hz` or `384,000 Hz`), and select the **most recent by filesystem modification time (`mtime`)** (ignoring mono `.L`/`.R` helper WAVs and truncated/in-progress writes). EqualizerAPO's `config.txt` (`Include:` / `Preamp:` / `Delay:` / `Convolution:`) is **not** parsed; pin explicit filters via `file_352800` / `file_384000` (or `file`) when multiple rate-matched WAVs coexist in one folder.
+- **Verified Reference Filter Formats (`C:\Program Files\EqualizerAPO\config`):**
   - `Oct26rs225-384k.wav`: `WAVE_FORMAT_IEEE_FLOAT` (`32`-bit float), `2 ch`, `384,000 Hz`, `4,194,304` taps (`2^22`), `max_boost_db = 0.000 dB`, energy `> -200 dB` ends at `433,771` samples (`1.13 s`).
   - `Oct26rs225-384k-352k.wav`: `WAVE_FORMAT_IEEE_FLOAT` (`32`-bit float), `2 ch`, `352,800 Hz`, `4,194,304` taps (`2^22`), `max_boost_db = 0.000 dB`, energy `> -200 dB` ends at `398,833` samples (`1.13 s`).
-  - WAV loader also supports `64`-bit IEEE float, `16/24/32`-bit PCM, and `WAVE_FORMAT_EXTENSIBLE` (`0xFFFE`).
+  - WAV loader also supports `64`-bit IEEE float, `16/24/32`-bit PCM, and `WAVE_FORMAT_EXTENSIBLE` (`0xFFFE`), while rejecting truncated `data` chunks and all-zero silent IRs.
 
 ---
 
@@ -41,8 +43,9 @@ Source f64 blocks (<= 65,536 frames)
 
 - **FFT Engine:** `realfft` + `rustfft` (`MIT OR Apache-2.0`, LGPL-3.0 compatible, runtime x86_64 AVX2/FMA SIMD).
 - **Partitioning:** Dynamic block size `B = active_taps.next_power_of_two().clamp(1024, 65_536)` with real FFT size `N = 2 * B` (`131,072` for 4M-tap IRs → `64` partitions max, `170.7 ms` block quantum at `384 kHz`, ~5% of one CPU core at 384 kHz stereo!).
-- **Exactness:**
+- **Exactness & Gapless Continuity:**
   - Every non-zero partition up to the last non-zero tap is convolved verbatim in `f64` (zero audible or ultrasonic truncation during playback); exact-zero partitions are skipped without changing a single bit.
-  - Arbitrary streaming chunk sizes match one-shot linear convolution bit-for-bit (`< 1e-13` vs. naive $O(L \cdot M)$ time-domain convolution).
-  - End-of-track `flush()` flushes the full impulse tail down to `-200 dB` (`1e-10`, `~1.13 s` on `Oct26rs225-384k.wav`, avoiding `8+ s` of sub-`-250 dB` denormal silence between songs while preserving exact mathematical `active_taps - 1` tail for all short/unit-test IRs).
+  - Arbitrary streaming chunk sizes match one-shot linear convolution bit-for-bit (`< 1e-12` vs. naive $O(L \cdot M)$ / reference FFT convolution).
+  - For single-file playback, `flush()` emits the impulse tail down to `-200 dB` (`1e-10`, `~1.13 s` on `Oct26rs225-384k.wav`, preserving exact `active_taps - 1` tail for all short/unit-test IRs).
+  - For consecutive equal-rate tracks (gapless albums), `flush_for_gapless()` completes the exact track length and splits off the decaying room tail (`ConvolutionTail`), overlap-adding it in `f64` onto the next track's opening samples so there is no `~1.13 s` silence gap between tracks (and resetting cleanly on skip, pause, or sample-rate change).
 - **Caching & Hot Reload:** `RewConvolverFactory` caches `Arc<PreparedStereoIr>` per sample rate (`352,800` / `384,000 Hz`) keyed by `(path, modified_time, file_len)` so switching tracks reuses pre-transformed spectra in microseconds and automatically picks up newly saved REW filters on the next track.

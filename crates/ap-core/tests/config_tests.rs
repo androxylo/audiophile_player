@@ -127,3 +127,65 @@ fn shipped_example_toml_template_parses_cleanly() {
     let cfg = PlayerConfig::load_from_file(&example_path).unwrap();
     assert!(!cfg.convolution.enabled);
 }
+
+#[test]
+fn rejects_duplicate_keys_and_duplicate_convolution_section() {
+    let dup_enabled = "[convolution]\nenabled = true\ndir = 'C:\\REW'\nenabled = false\n";
+    let err = PlayerConfig::from_toml_str(dup_enabled).unwrap_err();
+    assert!(
+        err.contains("duplicate key 'enabled'"),
+        "expected duplicate key error, got: {err}"
+    );
+
+    let dup_dir = "[convolution]\ndir = 'C:\\REW\\A'\ndir = 'C:\\REW\\B'\n";
+    let err = PlayerConfig::from_toml_str(dup_dir).unwrap_err();
+    assert!(
+        err.contains("duplicate key 'dir'"),
+        "expected duplicate key error, got: {err}"
+    );
+
+    let dup_section = "[convolution]\ndir = 'C:\\REW\\A'\n[convolution]\n";
+    let err = PlayerConfig::from_toml_str(dup_section).unwrap_err();
+    assert!(
+        err.contains("duplicate section"),
+        "expected duplicate section error, got: {err}"
+    );
+}
+
+#[test]
+fn validate_paths_rejects_missing_dir_or_file_when_enabled_and_allows_when_disabled() {
+    let tmp = std::env::temp_dir().join(format!(
+        "ap_core_cfg_paths_test_{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(&tmp).unwrap();
+    let missing_dir = tmp.join("does_not_exist");
+    let existing_file = tmp.join("ir.wav");
+    fs::write(&existing_file, b"RIFF").unwrap();
+    let missing_file = tmp.join("missing.wav");
+
+    // Disabled config skips disk existence checks.
+    let disabled_missing = ConvolutionConfig {
+        enabled: false,
+        dir: Some(missing_dir.clone()),
+        ..ConvolutionConfig::default()
+    };
+    disabled_missing.validate_paths().unwrap();
+
+    // Enabled config with missing dir must error.
+    let err = ConvolutionConfig::auto_dir(missing_dir).validate_paths().unwrap_err();
+    assert!(err.contains("does not exist"), "unexpected err: {err}");
+
+    // Enabled config with existing dir succeeds.
+    ConvolutionConfig::auto_dir(tmp.clone()).validate_paths().unwrap();
+
+    // Enabled config with missing file must error.
+    let err = ConvolutionConfig::explicit_file(missing_file).validate_paths().unwrap_err();
+    assert!(err.contains("does not exist"), "unexpected err: {err}");
+
+    // Enabled config with existing file succeeds.
+    ConvolutionConfig::explicit_file(existing_file).validate_paths().unwrap();
+
+    let _ = fs::remove_dir_all(&tmp);
+}

@@ -3,11 +3,16 @@
 //! Strict audiophile rules (from `REQUIREMENTS.md` §5.2):
 //! - **Only two hardcoded modes exist:** `-3 dB` ([`HeadroomMode::Minus3Db`]) or `0 dB`
 //!   ([`HeadroomMode::ZeroDb`]). Intermediate attenuation or `> 0 dB` boosting is impossible.
-//! - **Quiet tracks with verified native headroom** (`peak <= -3.0 dBFS`, adjusted for any REW
-//!   convolution boost) run at **`0 dB`**, giving dynamic/low-volume recordings a natural
-//!   leveling advantage without ever boosting a single sample.
+//! - **Quiet tracks with verified native headroom** (`peak <= -3.0 dBFS`, reduced further by any
+//!   conservative REW filter peak margin) run at **`0 dB`**, giving dynamic/low-volume recordings
+//!   a natural leveling advantage without ever boosting a single sample.
 //! - **Unknown max peak fail-safe:** Untagged FLACs, malformed peak tags, or live streaming
 //!   sources (Tidal) **always** receive **`-3 dB`**.
+//! - **REW filter auto-normalization (`ap-dsp`):** Any loaded REW convolution IR whose peak
+//!   frequency gain exceeds `0 dB` is auto-normalized down to `0 dB` at load time (preserving L/R
+//!   balance), so `-3 dB` always retains a full 3 dB margin against steady-state tones. Note that
+//!   an arbitrary all-pass/excess-phase FIR can still increase instantaneous crest factor on
+//!   pathological full-scale square-wave transients (bounded by its L1 norm `sum |h[n]|`).
 
 use std::fmt;
 
@@ -98,12 +103,16 @@ impl HeadroomDecision {
 /// Choose strictly between hardcoded **`0 dB`** and **`-3 dB`** safety headroom for a track.
 ///
 /// - `is_streaming_source`: when `true` (e.g. live Tidal stream), peak is unknown -> always `-3 dB`.
-/// - `rew_max_boost_db`: positive peak boost (`>= 0.0`) introduced by any active REW convolution
-///   filter (`0.0` when no REW boost is present).
+/// - `rew_peak_margin_db`: conservative peak gain margin (`>= 0.0 dB`, e.g. derived from the
+///   normalized REW IR's L1 norm `sum |h[n]|` and/or frequency peak) required in addition to the
+///   `3.0 dB` ISP margin before a track may run at `0 dB`.
+///
+/// Note: REW IRs with peak frequency gain `> 0 dB` are auto-normalized down to `0 dB` when loaded
+/// in `ap-dsp`, so the `-3 dB` mode never needs variable attenuation beyond `-3 dB`.
 pub fn select_headroom(
     meta: &TrackPeakMetadata,
     is_streaming_source: bool,
-    rew_max_boost_db: f64,
+    rew_peak_margin_db: f64,
 ) -> HeadroomDecision {
     if is_streaming_source {
         return HeadroomDecision {
@@ -122,8 +131,8 @@ pub fn select_headroom(
     };
 
     let peak_dbfs = 20.0 * peak_lin.log10();
-    let extra_rew_db = if rew_max_boost_db.is_finite() && rew_max_boost_db > 0.0 {
-        rew_max_boost_db
+    let extra_rew_db = if rew_peak_margin_db.is_finite() && rew_peak_margin_db > 0.0 {
+        rew_peak_margin_db
     } else {
         0.0
     };

@@ -10,6 +10,7 @@
 //! 3. `%APPDATA%\audiophile-player\config.toml` on Windows (or `$HOME/.config/audiophile-player/config.toml`).
 //! 4. If no config file is found: safe default with convolution **disabled** (null pass-through).
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -30,22 +31,13 @@ pub enum OutputTransport {
     WasapiExclusive,
 }
 
-/// Optional per-channel time alignment delay for non-symmetric listening rooms.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct ChannelDelayConfig {
-    /// Delay applied to left channel in microseconds (quantized to integer 8fS samples ~2.6 us).
-    pub left_us: f64,
-    /// Delay applied to right channel in microseconds.
-    pub right_us: f64,
-}
-
 /// REW stereo convolution configuration loaded from `[convolution]` in `config.toml`
 /// or overridden via CLI flags.
 ///
 /// Resolution order for an active `8fS` sample rate (`352_800` or `384_000 Hz`):
 /// 1. If `!enabled` -> disabled (`NullConvolver`).
 /// 2. Explicit per-rate WAV (`file_352800` for `352_800 Hz`, `file_384000` for `384_000 Hz`).
-/// 3. Explicit single WAV (`file`, must match active rate).
+/// 3. Explicit single WAV (`file`, used when its sample rate matches; otherwise falls through).
 /// 4. Auto-discovery directory (`dir`: newest 2-channel `.wav` by modification date matching rate).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ConvolutionConfig {
@@ -102,6 +94,40 @@ impl ConvolutionConfig {
         }
         Ok(())
     }
+
+    /// Validate that configured paths exist on disk when `enabled = true`.
+    ///
+    /// Called at runtime startup so mistyped `dir` or `file` paths fail loudly instead of
+    /// silently falling back to `NullConvolver`.
+    pub fn validate_paths(&self) -> Result<(), String> {
+        self.validate()?;
+        if !self.enabled {
+            return Ok(());
+        }
+        if let Some(ref dir) = self.dir {
+            if !dir.is_dir() {
+                return Err(format!(
+                    "[convolution] configured 'dir' does not exist or is not a directory: '{}'",
+                    dir.display()
+                ));
+            }
+        }
+        for (label, opt) in [
+            ("file", &self.file),
+            ("file_352800", &self.file_352800),
+            ("file_384000", &self.file_384000),
+        ] {
+            if let Some(path) = opt {
+                if !path.is_file() {
+                    return Err(format!(
+                        "[convolution] configured '{label}' does not exist or is not a file: '{}'",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Top-level user configuration file (`config.toml` / `audiophile-player.toml`).
@@ -151,6 +177,8 @@ impl PlayerConfig {
         let text = input.strip_prefix('\u{feff}').unwrap_or(input);
 
         let mut in_convolution = false;
+        let mut seen_convolution_section = false;
+        let mut seen_keys: HashSet<&str> = HashSet::new();
         let mut explicit_enabled: Option<bool> = None;
         let mut conv = ConvolutionConfig::default();
 
@@ -169,7 +197,15 @@ impl PlayerConfig {
                 }
                 let section = stripped[1..stripped.len() - 1].trim();
                 match section {
-                    "convolution" => in_convolution = true,
+                    "convolution" => {
+                        if seen_convolution_section {
+                            return Err(format!(
+                                "config line {line_no}: duplicate section '[convolution]'"
+                            ));
+                        }
+                        seen_convolution_section = true;
+                        in_convolution = true;
+                    }
                     other => {
                         return Err(format!(
                             "config line {line_no}: unknown section '[{other}]' (currently only [convolution] is supported)"
@@ -192,6 +228,12 @@ impl PlayerConfig {
             };
             let key = raw_key.trim();
             let val = raw_val.trim();
+
+            if !seen_keys.insert(key) {
+                return Err(format!(
+                    "config line {line_no}: duplicate key '{key}' in [convolution]"
+                ));
+            }
 
             match key {
                 "enabled" => {

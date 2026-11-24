@@ -20,6 +20,7 @@ use ap_control::state::{ControlCommand, PlayModeLabel, SharedControl};
 use ap_core::buffer::DEFAULT_SOURCE_BLOCK_FRAMES;
 use ap_core::config::{ConvolutionConfig, PlayerConfig};
 use ap_core::format::DacWireFormat;
+use ap_dsp::convolution::ConvolutionTail;
 use ap_dsp::pipeline::AudioPipeline;
 use ap_dsp::selector::UpsamplerPolicy;
 use ap_output_win::hygiene::OptimizationLevel;
@@ -328,7 +329,7 @@ pub fn run_random_music_player(
 ) -> Result<(), String> {
     let loaded_cfg = PlayerConfig::discover_and_load(config_path.as_deref())?;
     let effective_conv = rew_override.unwrap_or(loaded_cfg.config.convolution);
-    effective_conv.validate()?;
+    effective_conv.validate_paths()?;
 
     let pipeline = AudioPipeline::with_rew_config(upsampler_policy, effective_conv)?;
     let music_dir = match music_dir_override {
@@ -606,6 +607,7 @@ fn producer_loop(
     let mut last_seen_epoch: Option<u64> = None;
     let mut consecutive_errors: u32 = 0;
     let mut consecutive_unsupported: u32 = 0;
+    let mut carried_tail: Option<ConvolutionTail> = None;
 
     while let Some((epoch, directive)) = ctrl.wait_active() {
         // Guard against the brief window where `buf.reset_and_flush()` bumped the buffer epoch
@@ -620,6 +622,7 @@ fn producer_loop(
         if last_seen_epoch != Some(epoch) {
             consecutive_errors = 0;
             consecutive_unsupported = 0;
+            carried_tail = None;
             last_seen_epoch = Some(epoch);
         }
 
@@ -711,23 +714,46 @@ fn producer_loop(
 
         // Isolate per-track decode & DSP in `catch_unwind` so a malformed FLAC panic never kills
         // the producer thread or wedges the UI.
-        let outcome = match catch_unwind(AssertUnwindSafe(|| {
-            stream_single_track(&pipeline, &ctrl, &buf, &shared, epoch, &chosen, mode_label)
+        let incoming_tail = if is_single_file {
+            drop(carried_tail.take());
+            None
+        } else {
+            carried_tail.take()
+        };
+        let (outcome, next_tail) = match catch_unwind(AssertUnwindSafe(|| {
+            stream_single_track(
+                &pipeline,
+                &ctrl,
+                &buf,
+                &shared,
+                epoch,
+                &chosen,
+                mode_label,
+                incoming_tail,
+                !is_single_file,
+            )
         })) {
-            Ok(out) => out,
-            Err(_) => TrackStreamOutcome::Failed(format!(
-                "Internal panic while decoding/processing '{}'",
-                chosen.display()
-            )),
+            Ok(res) => res,
+            Err(_) => (
+                TrackStreamOutcome::Failed(format!(
+                    "Internal panic while decoding/processing '{}'",
+                    chosen.display()
+                )),
+                None,
+            ),
         };
 
         match outcome {
             TrackStreamOutcome::Played => {
                 consecutive_errors = 0;
                 consecutive_unsupported = 0;
+                carried_tail = next_tail;
             }
-            TrackStreamOutcome::Aborted => {}
+            TrackStreamOutcome::Aborted => {
+                carried_tail = None;
+            }
             TrackStreamOutcome::Unsupported(msg) => {
+                carried_tail = None;
                 eprintln!("  [skip] {msg}");
                 shared.record_action(msg.clone());
                 if is_single_file {
@@ -748,6 +774,7 @@ fn producer_loop(
                 }
             }
             TrackStreamOutcome::Failed(msg) => {
+                carried_tail = None;
                 eprintln!("  [skip] {msg}");
                 shared.record_action(msg.clone());
                 if is_single_file {
@@ -776,6 +803,7 @@ fn producer_loop(
 ///
 /// Defers emitting `TrackStart` until the first non-empty `PcmBlock` is produced so 0-frame or
 /// immediately-corrupt tracks never open/close the DAC pin and always count toward error limits.
+#[allow(clippy::too_many_arguments)]
 fn stream_single_track(
     pipeline: &AudioPipeline,
     ctrl: &ProducerControl,
@@ -784,28 +812,39 @@ fn stream_single_track(
     epoch: u64,
     chosen: &Path,
     mode_label: PlayModeLabel,
-) -> TrackStreamOutcome {
+    incoming_tail: Option<ConvolutionTail>,
+    gapless_carryover: bool,
+) -> (TrackStreamOutcome, Option<ConvolutionTail>) {
     let allowed_root = shared.allowed_root();
     if let Err(reason) = validate_playable_flac_path(chosen, Some(&allowed_root)) {
-        return TrackStreamOutcome::Failed(format!(
-            "Rejected non-playable path '{}': {reason}",
-            chosen.display()
-        ));
+        return (
+            TrackStreamOutcome::Failed(format!(
+                "Rejected non-playable path '{}': {reason}",
+                chosen.display()
+            )),
+            None,
+        );
     }
 
     let mut source = match FlacBlockReader::open(chosen) {
         Ok(s) => s,
         Err(err) => {
             if err.starts_with(UNSUPPORTED_CHANNEL_LAYOUT_PREFIX) {
-                return TrackStreamOutcome::Unsupported(format!(
-                    "Skipped unsupported FLAC '{}': {err}",
-                    chosen.display()
-                ));
+                return (
+                    TrackStreamOutcome::Unsupported(format!(
+                        "Skipped unsupported FLAC '{}': {err}",
+                        chosen.display()
+                    )),
+                    None,
+                );
             }
-            return TrackStreamOutcome::Failed(format!(
-                "Skipped unreadable FLAC '{}': {err}",
-                chosen.display()
-            ));
+            return (
+                TrackStreamOutcome::Failed(format!(
+                    "Skipped unreadable FLAC '{}': {err}",
+                    chosen.display()
+                )),
+                None,
+            );
         }
     };
 
@@ -818,12 +857,18 @@ fn stream_single_track(
     let mut session = match pipeline.start_track(spec, &peak_meta, source.is_streaming()) {
         Ok(s) => s,
         Err(err) => {
-            return TrackStreamOutcome::Failed(format!(
-                "DSP pipeline error on '{}': {err}",
-                chosen.display()
-            ));
+            return (
+                TrackStreamOutcome::Failed(format!(
+                    "DSP pipeline error on '{}': {err}",
+                    chosen.display()
+                )),
+                None,
+            );
         }
     };
+    if let Some(tail) = incoming_tail {
+        session.set_incoming_convolver_tail(tail);
+    }
 
     let mut pending_start = Some(StreamEvent::TrackStart {
         path: chosen.to_path_buf(),
@@ -836,7 +881,7 @@ fn stream_single_track(
 
     loop {
         if ctrl.epoch() != epoch {
-            return TrackStreamOutcome::Aborted;
+            return (TrackStreamOutcome::Aborted, None);
         }
         let next_src = match source.read_next_block(DEFAULT_SOURCE_BLOCK_FRAMES) {
             Ok(Some(b)) => b,
@@ -858,43 +903,50 @@ fn stream_single_track(
             Err(err) => {
                 let msg = format!("DSP block error on '{}': {err}", chosen.display());
                 if !pushed_any_pcm {
-                    return TrackStreamOutcome::Failed(msg);
+                    return (TrackStreamOutcome::Failed(msg), None);
                 }
                 eprintln!("  [dsp] {msg}");
                 shared.record_action(msg);
                 let _ = buf.push_for_epoch(epoch, StreamEvent::TrackEnd);
-                return TrackStreamOutcome::Played;
+                return (TrackStreamOutcome::Played, None);
             }
         };
 
         if !pcm_block.is_empty() {
             if let Some(start_ev) = pending_start.take() {
                 if !buf.push_for_epoch(epoch, start_ev) {
-                    return TrackStreamOutcome::Aborted;
+                    return (TrackStreamOutcome::Aborted, None);
                 }
             }
             if !buf.push_for_epoch(epoch, StreamEvent::PcmBlock(pcm_block)) {
-                return TrackStreamOutcome::Aborted;
+                return (TrackStreamOutcome::Aborted, None);
             }
             pushed_any_pcm = true;
         }
     }
 
     if ctrl.epoch() != epoch {
-        return TrackStreamOutcome::Aborted;
+        return (TrackStreamOutcome::Aborted, None);
     }
 
     // Flush DSP tail (only if there wasn't a pre-first-block stream error).
+    let mut next_tail: Option<ConvolutionTail> = None;
     if first_block_error.is_none() {
-        if let Ok(tail) = session.flush() {
-            if !tail.is_empty() {
+        let flushed = if gapless_carryover {
+            session.flush_for_gapless()
+        } else {
+            session.flush().map(|pcm| (pcm, None))
+        };
+        if let Ok((tail_pcm, conv_tail)) = flushed {
+            next_tail = conv_tail;
+            if !tail_pcm.is_empty() {
                 if let Some(start_ev) = pending_start.take() {
                     if !buf.push_for_epoch(epoch, start_ev) {
-                        return TrackStreamOutcome::Aborted;
+                        return (TrackStreamOutcome::Aborted, None);
                     }
                 }
-                if !buf.push_for_epoch(epoch, StreamEvent::PcmBlock(tail)) {
-                    return TrackStreamOutcome::Aborted;
+                if !buf.push_for_epoch(epoch, StreamEvent::PcmBlock(tail_pcm)) {
+                    return (TrackStreamOutcome::Aborted, None);
                 }
                 pushed_any_pcm = true;
             }
@@ -902,15 +954,18 @@ fn stream_single_track(
     }
 
     if !pushed_any_pcm {
-        return TrackStreamOutcome::Failed(first_block_error.unwrap_or_else(|| {
-            format!("Skipped empty (0-frame) FLAC '{}'", chosen.display())
-        }));
+        return (
+            TrackStreamOutcome::Failed(first_block_error.unwrap_or_else(|| {
+                format!("Skipped empty (0-frame) FLAC '{}'", chosen.display())
+            })),
+            None,
+        );
     }
 
     if !buf.push_for_epoch(epoch, StreamEvent::TrackEnd) {
-        return TrackStreamOutcome::Aborted;
+        return (TrackStreamOutcome::Aborted, None);
     }
-    TrackStreamOutcome::Played
+    (TrackStreamOutcome::Played, next_tail)
 }
 
 fn print_shutdown_banner(sig: ShutdownSignal) {
@@ -1099,7 +1154,7 @@ mod tests {
             assert_eq!(state.active_epoch, ep0);
 
             // Direct producer-side guard must also reject without blocking on open().
-            let outcome = stream_single_track(
+            let (outcome, next_tail) = stream_single_track(
                 &pipeline,
                 &ctrl,
                 &buf,
@@ -1107,7 +1162,10 @@ mod tests {
                 ep0,
                 &bad,
                 PlayModeLabel::SingleFile,
+                None,
+                false,
             );
+            assert!(next_tail.is_none());
             assert!(
                 matches!(outcome, TrackStreamOutcome::Failed(ref m) if m.contains("Rejected")),
                 "expected rejection for {}, got {outcome:?}",

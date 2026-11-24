@@ -146,4 +146,16 @@ fn rew_convolution_boost_raises_required_native_headroom_margin() {
         select_headroom(&very_quiet, false, 2.0).mode,
         HeadroomMode::ZeroDb
     );
+
+    // Phase-dispersive IR with L1 bound = 1.5 (+3.52 dB) on a -4.58 dBFS (0.59) track ->
+    // requires <= -6.52 dBFS for 0 dB, so must drop back to hardcoded -3 dB.
+    let l1_margin_db = 20.0 * 1.5_f64.log10();
+    let track_059 = TrackPeakMetadata {
+        replaygain_track_peak: Some(0.59),
+        ..TrackPeakMetadata::default()
+    };
+    assert_eq!(
+        select_headroom(&track_059, false, l1_margin_db).mode,
+        HeadroomMode::Minus3Db
+    );
 }

@@ -6,7 +6,8 @@
 //! 1. **Headroom Selection & Scaling (`-3 dB` or `0 dB`, hardcoded)** in `f64`.
 //! 2. **Dynamic Per-Track Upsampling** (`SimpleWindowedSincUpsampler` or zero-copy
 //!    `NullUpsampler` for native `352.8 / 384 kHz` tracks) -> always `StereoF64Buffer`.
-//! 3. **Core REW Stereo Convolution** (`StereoConvolver`; currently [`NullConvolver`]).
+//! 3. **Core REW Stereo Convolution** (`StereoConvolver`; UPOLS pure-`f64` FFT when configured,
+//!    or [`NullConvolver`] by default).
 //! 4. **Per-Channel Room Alignment Delay** (`ChannelDelayer`; currently [`NullChannelDelayer`]).
 //! 5. **Single Final `f64 -> i32` Quantization** ([`StreamingQuantizer`], stateful across blocks).
 
@@ -16,7 +17,8 @@ use ap_core::format::StreamSpec;
 use ap_core::headroom::{HeadroomDecision, HeadroomMode, TrackPeakMetadata, select_headroom};
 
 use crate::convolution::{
-    NullConvolverFactory, RewConvolverFactory, StereoConvolver, StereoConvolverFactory,
+    ConvolutionTail, NullConvolverFactory, RewConvolverFactory, StereoConvolver,
+    StereoConvolverFactory,
 };
 use crate::delay::{ChannelDelayer, ChannelDelayerFactory, NullChannelDelayerFactory};
 use crate::quantize::{StreamingQuantizer, apply_safe_gain_f64};
@@ -125,7 +127,14 @@ impl StreamingPipelineSession {
         Ok(self.quantizer.quantize_block(&block))
     }
 
-    /// Flush all stateful FIR / convolution / delay tails cleanly at end-of-track.
+    /// Attach a residual convolution tail carried over from the preceding equal-rate track so it
+    /// overlap-adds smoothly onto this track's opening samples in `f64` (before delay & quantizer).
+    pub fn set_incoming_convolver_tail(&mut self, tail: ConvolutionTail) {
+        self.convolver.set_incoming_tail(tail);
+    }
+
+    /// Flush all stateful FIR / convolution / delay tails cleanly at end-of-track (emits the full
+    /// decaying convolution tail — ideal for single-file playback and end-of-queue).
     pub fn flush(&mut self) -> Result<InterleavedInt32Buffer, String> {
         let mut frames = Vec::new();
         let rate = self.report.output_rate_hz;
@@ -161,6 +170,51 @@ impl StreamingPipelineSession {
             sample_rate_hz: rate,
             frames,
         })
+    }
+
+    /// Flush end-of-track audio for gapless album continuity: emits the exact remaining samples
+    /// of the current track and returns the decaying REW convolution tail separately so the next
+    /// equal-rate track can overlap-add it without inserting a multi-second silence gap.
+    pub fn flush_for_gapless(
+        &mut self,
+    ) -> Result<(InterleavedInt32Buffer, Option<ConvolutionTail>), String> {
+        let mut frames = Vec::new();
+        let rate = self.report.output_rate_hz;
+
+        // 1. Flush upsampler tail -> feed through convolver -> delayer -> quantizer.
+        let up_tail = self.upsampler.flush()?;
+        if !up_tail.is_empty() {
+            let c_out = self.convolver.process_block(up_tail)?;
+            if !c_out.is_empty() {
+                let d_out = self.delayer.process_block(c_out)?;
+                if !d_out.is_empty() {
+                    frames.extend(self.quantizer.quantize_block(&d_out).frames);
+                }
+            }
+        }
+
+        // 2. Complete the current track's exact sample count and split off the decaying room tail.
+        let (track_end, carried_tail) = self.convolver.flush_split_tail()?;
+        if !track_end.is_empty() {
+            let d_out = self.delayer.process_block(track_end)?;
+            if !d_out.is_empty() {
+                frames.extend(self.quantizer.quantize_block(&d_out).frames);
+            }
+        }
+
+        // 3. Flush delayer tail -> quantizer.
+        let delay_tail = self.delayer.flush()?;
+        if !delay_tail.is_empty() {
+            frames.extend(self.quantizer.quantize_block(&delay_tail).frames);
+        }
+
+        Ok((
+            InterleavedInt32Buffer {
+                sample_rate_hz: rate,
+                frames,
+            },
+            carried_tail,
+        ))
     }
 }
 
@@ -225,7 +279,11 @@ impl AudioPipeline {
             .delayer_factory
             .create_for_rate(dsp_plan.target_rate_hz)?;
 
-        let headroom = select_headroom(peak_meta, is_streaming_source, convolver.max_boost_db());
+        let headroom = select_headroom(
+            peak_meta,
+            is_streaming_source,
+            convolver.peak_gain_bound_db(),
+        );
 
         let untouched_native = dsp_plan.filter == FilterArchetype::Null
             && headroom.mode == HeadroomMode::ZeroDb
