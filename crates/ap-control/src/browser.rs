@@ -1,7 +1,17 @@
-//! Single-folder directory listing (never recursive) and URL/HTML/JSON encoding helpers.
+//! Single-folder directory listing (never recursive), lossless OS path tokens, and URL/HTML/JSON
+//! encoding helpers.
 
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use crate::security::{is_flac_extension, normalize_allowed_root, normalized_paths_equal};
+
+/// Prefix for lossless UTF-16 code-unit hex encoding of Windows paths containing unpaired
+/// surrogates (or paths colliding with this prefix).
+pub const RAW_OS_PATH_PREFIX_UTF16: &str = "ap-os-u16:";
+/// Prefix for lossless raw-byte hex encoding of non-UTF-8 Unix paths.
+pub const RAW_OS_PATH_PREFIX_BYTES: &str = "ap-os-hex:";
 
 /// Immediate contents of one browsed folder (sorted folders first, then `.flac` files).
 #[derive(Debug, Clone)]
@@ -15,7 +25,26 @@ pub struct FolderListing {
 
 /// Read ONLY the immediate children of `dir` so browsing stays instant even in huge libraries.
 pub fn list_folder_entries(dir: &Path) -> FolderListing {
-    let parent_dir = dir.parent().map(Path::to_path_buf);
+    list_folder_entries_inner(dir, None)
+}
+
+/// Read ONLY the immediate children of `dir`, omitting `parent_dir` when `dir` is at `allowed_root`
+/// so the browser UI stays confined to the configured music root.
+pub fn list_folder_entries_in_root(dir: &Path, allowed_root: &Path) -> FolderListing {
+    list_folder_entries_inner(dir, Some(allowed_root))
+}
+
+fn list_folder_entries_inner(dir: &Path, allowed_root: Option<&Path>) -> FolderListing {
+    let at_root = allowed_root.is_some_and(|root| {
+        let norm_root = normalize_allowed_root(root);
+        let norm_dir = normalize_allowed_root(dir);
+        normalized_paths_equal(&norm_dir, &norm_root)
+    });
+    let parent_dir = if at_root {
+        None
+    } else {
+        dir.parent().map(Path::to_path_buf)
+    };
     let mut subdirs = Vec::new();
     let mut flac_files = Vec::new();
 
@@ -31,11 +60,7 @@ pub fn list_folder_entries(dir: &Path) -> FolderListing {
                 };
                 if meta.is_dir() {
                     subdirs.push(p);
-                } else if meta.is_file()
-                    && p.extension()
-                        .and_then(|e| e.to_str())
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("flac"))
-                {
+                } else if meta.is_file() && is_flac_extension(&p) {
                     flac_files.push(p);
                 }
             }
@@ -57,6 +82,98 @@ pub fn list_folder_entries(dir: &Path) -> FolderListing {
             error: Some(format!("Cannot read folder '{}': {err}", dir.display())),
         },
     }
+}
+
+/// Encode a `Path` for lossless round-tripping through HTML hidden inputs, links, and redirects.
+///
+/// Valid UTF-8 paths (not starting with an internal escape prefix) are returned as-is for
+/// readability. Paths containing invalid UTF-8 (Unix) or unpaired UTF-16 surrogates (Windows NTFS)
+/// are encoded with an unambiguous hex prefix so no OS path characters are ever lost to U+FFFD.
+pub fn encode_path_token(path: &Path) -> String {
+    if let Some(s) = path.to_str() {
+        if !s.starts_with(RAW_OS_PATH_PREFIX_UTF16) && !s.starts_with(RAW_OS_PATH_PREFIX_BYTES) {
+            return s.to_owned();
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let units: Vec<u16> = path.as_os_str().encode_wide().collect();
+        let mut out = String::with_capacity(RAW_OS_PATH_PREFIX_UTF16.len() + units.len() * 4);
+        out.push_str(RAW_OS_PATH_PREFIX_UTF16);
+        for u in units {
+            out.push_str(&format!("{u:04x}"));
+        }
+        out
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = path.as_os_str().as_bytes();
+        let mut out = String::with_capacity(RAW_OS_PATH_PREFIX_BYTES.len() + bytes.len() * 2);
+        out.push_str(RAW_OS_PATH_PREFIX_BYTES);
+        for &b in bytes {
+            out.push_str(&format!("{b:02x}"));
+        }
+        out
+    }
+}
+
+/// Decode a path token produced by [`encode_path_token`] (or plain UTF-8 text typed by the user).
+pub fn decode_path_token(raw: &str) -> Result<PathBuf, String> {
+    const MAX_HEX_LEN: usize = 65_536;
+
+    if let Some(hex) = raw.strip_prefix(RAW_OS_PATH_PREFIX_UTF16) {
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+            if hex.is_empty() || hex.len() > MAX_HEX_LEN || hex.len() % 4 != 0 {
+                return Err("malformed UTF-16 path token".to_string());
+            }
+            let bytes = hex.as_bytes();
+            let mut units = Vec::with_capacity(bytes.len() / 4);
+            for chunk in bytes.chunks_exact(4) {
+                let d0 = hex_val(chunk[0]).ok_or_else(|| "invalid hex in path token".to_string())?;
+                let d1 = hex_val(chunk[1]).ok_or_else(|| "invalid hex in path token".to_string())?;
+                let d2 = hex_val(chunk[2]).ok_or_else(|| "invalid hex in path token".to_string())?;
+                let d3 = hex_val(chunk[3]).ok_or_else(|| "invalid hex in path token".to_string())?;
+                units.push(((d0 as u16) << 12) | ((d1 as u16) << 8) | ((d2 as u16) << 4) | (d3 as u16));
+            }
+            return Ok(PathBuf::from(OsString::from_wide(&units)));
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (hex, MAX_HEX_LEN);
+            return Err("UTF-16 path tokens are only supported on Windows".to_string());
+        }
+    }
+
+    if let Some(hex) = raw.strip_prefix(RAW_OS_PATH_PREFIX_BYTES) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            if hex.is_empty() || hex.len() > MAX_HEX_LEN || hex.len() % 2 != 0 {
+                return Err("malformed raw-byte path token".to_string());
+            }
+            let bytes = hex.as_bytes();
+            let mut out = Vec::with_capacity(bytes.len() / 2);
+            for chunk in bytes.chunks_exact(2) {
+                let hi = hex_val(chunk[0]).ok_or_else(|| "invalid hex in path token".to_string())?;
+                let lo = hex_val(chunk[1]).ok_or_else(|| "invalid hex in path token".to_string())?;
+                out.push((hi << 4) | lo);
+            }
+            return Ok(PathBuf::from(OsString::from_vec(out)));
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (hex, MAX_HEX_LEN);
+            return Err("raw-byte path tokens are only supported on Unix".to_string());
+        }
+    }
+
+    Ok(PathBuf::from(raw))
 }
 
 pub fn html_escape(input: &str) -> String {

@@ -14,6 +14,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use ap_control::security::validate_playable_flac_path;
 use ap_control::server::ControlServer;
 use ap_control::state::{ControlCommand, PlayModeLabel, SharedControl};
 use ap_core::buffer::DEFAULT_SOURCE_BLOCK_FRAMES;
@@ -227,7 +228,20 @@ impl<'a> EngineState<'a> {
                 );
             }
             ControlCommand::PlayFile(file) => {
-                self.start_directive(PlayDirective::SingleFile { file }, true);
+                let root = self.shared.allowed_root();
+                match validate_playable_flac_path(&file, Some(&root)) {
+                    Ok(valid) => {
+                        self.start_directive(PlayDirective::SingleFile { file: valid }, true);
+                    }
+                    Err(reason) => {
+                        let msg = format!(
+                            "Rejected invalid PlayFile path '{}': {reason}",
+                            file.display()
+                        );
+                        eprintln!("  [reject] {msg}");
+                        self.shared.record_action(msg);
+                    }
+                }
             }
             ControlCommand::Next => {
                 println!("  [next] Skipping to next track...");
@@ -561,6 +575,7 @@ pub fn run_random_music_player(
 }
 
 /// Outcome of decoding and streaming one chosen FLAC track inside `producer_loop`.
+#[derive(Debug)]
 enum TrackStreamOutcome {
     /// At least one non-empty PCM block was pushed and the track completed cleanly (or reached EOF).
     Played,
@@ -741,6 +756,14 @@ fn stream_single_track(
     chosen: &Path,
     mode_label: PlayModeLabel,
 ) -> TrackStreamOutcome {
+    let allowed_root = shared.allowed_root();
+    if let Err(reason) = validate_playable_flac_path(chosen, Some(&allowed_root)) {
+        return TrackStreamOutcome::Failed(format!(
+            "Rejected non-playable path '{}': {reason}",
+            chosen.display()
+        ));
+    }
+
     let mut source = match FlacBlockReader::open(chosen) {
         Ok(s) => s,
         Err(err) => {
@@ -1013,6 +1036,48 @@ mod tests {
                 assert!(!*folder_only);
             }
             other => panic!("expected Sequential resume, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn engine_rejects_device_unc_and_outside_root_play_file_before_opening() {
+        let buf = BoundedBlockStreamBuffer::new(DEFAULT_MAX_BUFFERED_FRAMES);
+        let ep0 = buf.current_epoch();
+        let root = PathBuf::from(r"C:\Music");
+        let init = PlayDirective::Random { root: root.clone() };
+        let ctrl = ProducerControl::new(ep0, ProducerDirective::Active(init.clone()));
+        let shared = SharedControl::new(root.clone(), "Test DAC");
+        let pipeline = AudioPipeline::new(UpsamplerPolicy::default()).unwrap();
+
+        let mut state = EngineState::new(ep0, init, &buf, &ctrl, &shared);
+
+        for bad in [
+            PathBuf::from("CONIN$"),
+            PathBuf::from(r"\\.\pipe\ap_nonexistent_pipe"),
+            PathBuf::from(r"\\attacker.example\share\track.flac"),
+            PathBuf::from(r"C:\Music\CON.flac"),
+            PathBuf::from(r"C:\Windows\System32\drivers\etc\hosts"),
+        ] {
+            state.dispatch(ControlCommand::PlayFile(bad.clone()));
+            // Must NOT switch last_play to SingleFile or bump epoch.
+            assert!(matches!(state.last_play, PlayDirective::Random { .. }));
+            assert_eq!(state.active_epoch, ep0);
+
+            // Direct producer-side guard must also reject without blocking on open().
+            let outcome = stream_single_track(
+                &pipeline,
+                &ctrl,
+                &buf,
+                &shared,
+                ep0,
+                &bad,
+                PlayModeLabel::SingleFile,
+            );
+            assert!(
+                matches!(outcome, TrackStreamOutcome::Failed(ref m) if m.contains("Rejected")),
+                "expected rejection for {}, got {outcome:?}",
+                bad.display()
+            );
         }
     }
 }

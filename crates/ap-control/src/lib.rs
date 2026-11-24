@@ -12,6 +12,7 @@
 pub mod browser;
 pub mod html;
 pub mod log;
+pub mod security;
 pub mod server;
 pub mod state;
 

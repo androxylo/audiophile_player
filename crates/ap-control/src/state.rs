@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::log::ActionLog;
+use crate::security::normalize_allowed_root;
 
 /// Maximum number of queued relative commands (`Next`) before additional clicks are dropped.
 const MAX_QUEUED_COMMANDS: usize = 16;
@@ -64,6 +65,7 @@ struct InnerState {
     is_playing: bool,
     mode: PlayModeLabel,
     dac_name: String,
+    allowed_root: PathBuf,
     active_folder: PathBuf,
     current_track: Option<String>,
     current_format: Option<String>,
@@ -81,17 +83,19 @@ pub struct SharedControl {
 
 impl SharedControl {
     pub fn new(initial_folder: PathBuf, dac_name: impl Into<String>) -> Arc<Self> {
+        let allowed_root = normalize_allowed_root(&initial_folder);
         let mut log = ActionLog::default();
         log.push(format!(
             "Initialized control interface (folder: {})",
-            initial_folder.display()
+            allowed_root.display()
         ));
         Arc::new(Self {
             inner: Mutex::new(InnerState {
                 is_playing: false,
                 mode: PlayModeLabel::Paused,
                 dac_name: dac_name.into(),
-                active_folder: initial_folder,
+                allowed_root: allowed_root.clone(),
+                active_folder: allowed_root,
                 current_track: None,
                 current_format: None,
                 pending_commands: VecDeque::new(),
@@ -101,6 +105,12 @@ impl SharedControl {
             }),
             cv: Condvar::new(),
         })
+    }
+
+    /// Configured root folder that HTTP browsing and `/action/play-*` paths are confined to.
+    pub fn allowed_root(&self) -> PathBuf {
+        let st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        st.allowed_root.clone()
     }
 
     /// Attach the active audio sink's `stop_handle()` so Pause / mode switch interrupts immediately.

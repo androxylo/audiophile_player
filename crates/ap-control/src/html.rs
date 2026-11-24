@@ -8,13 +8,14 @@
 //! - Bounded bottom action log (auto-discards old history, live-updated via `/api/status`).
 
 use crate::GITHUB_MANUAL_URL;
-use crate::browser::{FolderListing, html_escape, json_escape, url_encode};
+use crate::browser::{FolderListing, encode_path_token, html_escape, json_escape, url_encode};
 use crate::state::ControlSnapshot;
 
 /// Render the minimal control page for the currently browsed folder and player state.
 pub fn render_control_page(snapshot: &ControlSnapshot, listing: &FolderListing) -> String {
-    let dir_str = listing.current_dir.to_string_lossy();
-    let dir_html = html_escape(&dir_str);
+    let dir_token = encode_path_token(&listing.current_dir);
+    let dir_token_html = html_escape(&dir_token);
+    let dir_display_html = html_escape(&listing.current_dir.to_string_lossy());
     let dac_html = html_escape(&snapshot.dac_name);
     let status_badge = if snapshot.is_playing {
         format!(
@@ -39,7 +40,7 @@ pub fn render_control_page(snapshot: &ControlSnapshot, listing: &FolderListing) 
         ));
     }
     if let Some(parent) = &listing.parent_dir {
-        let p_enc = url_encode(&parent.to_string_lossy());
+        let p_enc = url_encode(&encode_path_token(parent));
         items_html.push_str(&format!(
             "<div class=\"row dir\"><a href=\"/?dir={p_enc}\">.. (Parent Folder)</a></div>"
         ));
@@ -49,7 +50,7 @@ pub fn render_control_page(snapshot: &ControlSnapshot, listing: &FolderListing) 
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| sub.to_string_lossy().into_owned());
-        let p_enc = url_encode(&sub.to_string_lossy());
+        let p_enc = url_encode(&encode_path_token(sub));
         items_html.push_str(&format!(
             "<div class=\"row dir\"><a href=\"/?dir={p_enc}\">[DIR] {}</a></div>",
             html_escape(&name)
@@ -60,12 +61,12 @@ pub fn render_control_page(snapshot: &ControlSnapshot, listing: &FolderListing) 
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| file.to_string_lossy().into_owned());
-        let f_html = html_escape(&file.to_string_lossy());
+        let f_html = html_escape(&encode_path_token(file));
         items_html.push_str(&format!(
             "<div class=\"row file\">\
              <form method=\"POST\" action=\"/action/play-file\">\
              <input type=\"hidden\" name=\"path\" value=\"{f_html}\">\
-             <input type=\"hidden\" name=\"dir\" value=\"{dir_html}\">\
+             <input type=\"hidden\" name=\"dir\" value=\"{dir_token_html}\">\
              <button type=\"submit\" class=\"link-btn\">&#9835; {}</button>\
              </form></div>",
             html_escape(&name)
@@ -128,24 +129,24 @@ pre#action-log{{margin:0;max-height:170px;overflow-y:auto;background:#0f1115;bor
 <section class=\"card\">\n\
   <div class=\"controls\">\n\
     <form method=\"POST\" action=\"/action/play-random\">\n\
-      <input type=\"hidden\" name=\"dir\" value=\"{dir_html}\">\n\
+      <input type=\"hidden\" name=\"dir\" value=\"{dir_token_html}\">\n\
       <button type=\"submit\" class=\"primary\">Play Random</button>\n\
     </form>\n\
     <form method=\"POST\" action=\"/action/play-sequential\">\n\
-      <input type=\"hidden\" name=\"dir\" value=\"{dir_html}\">\n\
+      <input type=\"hidden\" name=\"dir\" value=\"{dir_token_html}\">\n\
       <button type=\"submit\" class=\"primary\">Play Sequential</button>\n\
     </form>\n\
     <form method=\"POST\" action=\"/action/next\">\n\
-      <input type=\"hidden\" name=\"dir\" value=\"{dir_html}\">\n\
+      <input type=\"hidden\" name=\"dir\" value=\"{dir_token_html}\">\n\
       <button type=\"submit\" class=\"primary\">Next</button>\n\
     </form>\n\
     <form method=\"POST\" action=\"/action/pause\">\n\
-      <input type=\"hidden\" name=\"dir\" value=\"{dir_html}\">\n\
+      <input type=\"hidden\" name=\"dir\" value=\"{dir_token_html}\">\n\
       <button type=\"submit\" class=\"pause\">Pause (Release DAC)</button>\n\
     </form>\n\
   </div>\n\
   <form class=\"path-bar\" method=\"GET\" action=\"/\">\n\
-    <input type=\"text\" name=\"dir\" value=\"{dir_html}\" aria-label=\"Folder path\">\n\
+    <input type=\"text\" name=\"dir\" value=\"{dir_display_html}\" aria-label=\"Folder path\">\n\
     <button type=\"submit\">Open Folder</button>\n\
   </form>\n\
   <div class=\"browser\" aria-label=\"Scrollable folder contents\">\n\
