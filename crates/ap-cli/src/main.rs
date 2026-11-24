@@ -14,7 +14,7 @@ use std::process::ExitCode;
 use cli_args::{RunMode, help_text, parse_args};
 
 fn main() -> ExitCode {
-    let mode = match parse_args(std::env::args()) {
+    let mode = match parse_args(std::env::args_os()) {
         Ok(m) => m,
         Err(err) => {
             eprintln!("audiophile-player argument error: {err}");

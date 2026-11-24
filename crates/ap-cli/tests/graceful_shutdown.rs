@@ -24,7 +24,7 @@ mod windows_signal_test {
             .arg("--idle")
             .creation_flags(CREATE_NEW_PROCESS_GROUP)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::null())
             .spawn()
             .expect("failed to spawn audiophile-player.exe");
 

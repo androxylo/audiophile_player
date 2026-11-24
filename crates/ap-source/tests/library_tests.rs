@@ -214,3 +214,58 @@ fn walk_and_sequential_pickers_traverse_windows_ntfs_junctions() {
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&target);
 }
+
+#[test]
+fn sequential_cursor_folder_only_does_not_descend_and_handles_missing_start_after() {
+    let root = make_temp_tree("seq_folder_only");
+    let sub = root.join("SubAlbum");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(root.join("01.flac"), b"").unwrap();
+    fs::write(root.join("02.flac"), b"").unwrap();
+    fs::write(root.join("04.flac"), b"").unwrap();
+    fs::write(sub.join("99_sub.flac"), b"").unwrap();
+
+    // Exact match: yields only remaining direct files, never descends into SubAlbum.
+    let mut cur =
+        SequentialFlacCursor::new_folder_only(root.clone(), Some(&root.join("01.flac"))).unwrap();
+    let mut yielded = Vec::new();
+    while let Some(p) = cur.next_track() {
+        yielded.push(p.file_name().unwrap().to_string_lossy().to_string());
+    }
+    assert_eq!(yielded, vec!["02.flac", "04.flac"]);
+
+    // Missing/deleted start_after ("03.flac"): resumes at first entry sorting after it ("04.flac").
+    let mut cur2 =
+        SequentialFlacCursor::new_folder_only(root.clone(), Some(&root.join("03.flac"))).unwrap();
+    let mut yielded2 = Vec::new();
+    while let Some(p) = cur2.next_track() {
+        yielded2.push(p.file_name().unwrap().to_string_lossy().to_string());
+    }
+    assert_eq!(yielded2, vec!["04.flac"]);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn sequential_cursor_starting_after_resumes_deep_in_tree_in_o_depth() {
+    let root = make_temp_tree("seq_start_after");
+    let album_a = root.join("AlbumA");
+    let album_b = root.join("AlbumB");
+    fs::create_dir_all(&album_a).unwrap();
+    fs::create_dir_all(&album_b).unwrap();
+    fs::write(root.join("00_root.flac"), b"").unwrap();
+    fs::write(album_a.join("01.flac"), b"").unwrap();
+    fs::write(album_a.join("02.flac"), b"").unwrap();
+    fs::write(album_b.join("01.flac"), b"").unwrap();
+
+    let mut cur =
+        SequentialFlacCursor::new_starting_after(root.clone(), &album_a.join("01.flac")).unwrap();
+    let mut yielded = Vec::new();
+    while let Some(p) = cur.next_track() {
+        let rel = p.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/");
+        yielded.push(rel);
+    }
+    assert_eq!(yielded, vec!["AlbumA/02.flac", "AlbumB/01.flac"]);
+
+    let _ = fs::remove_dir_all(&root);
+}

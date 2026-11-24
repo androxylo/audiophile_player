@@ -5,6 +5,7 @@
 //! auto-selected best DAC, with automatic per-track upsampler selection (`UpsamplerPicker`)
 //! and the local HTTP UI starting at port `8085`. Any non-default mode requires explicit flags.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -34,12 +35,17 @@ pub enum RunMode {
     Help,
 }
 
+fn require_utf8_arg(flag: &str, raw: OsString) -> Result<String, String> {
+    raw.into_string()
+        .map_err(|bad| format!("{flag} requires valid UTF-8, got '{}'", bad.to_string_lossy()))
+}
+
 pub fn parse_args<I, S>(args: I) -> Result<RunMode, String>
 where
     I: IntoIterator<Item = S>,
-    S: AsRef<str>,
+    S: Into<OsString>,
 {
-    let mut iter = args.into_iter();
+    let mut iter = args.into_iter().map(Into::into);
     let _program = iter.next(); // skip argv[0]
 
     let mut config_path: Option<PathBuf> = None;
@@ -52,7 +58,12 @@ where
     let mut idle = false;
 
     while let Some(arg_raw) = iter.next() {
-        let arg = arg_raw.as_ref();
+        let arg = arg_raw.to_str().ok_or_else(|| {
+            format!(
+                "unknown non-UTF-8 option '{}' (run with --help for usage)",
+                arg_raw.to_string_lossy()
+            )
+        })?;
         match arg {
             "-h" | "--help" => return Ok(RunMode::Help),
             "--idle" => idle = true,
@@ -60,28 +71,28 @@ where
                 let val = iter
                     .next()
                     .ok_or_else(|| "--config requires a TOML config file path".to_string())?;
-                config_path = Some(PathBuf::from(val.as_ref()));
+                config_path = Some(PathBuf::from(val));
             }
             "--music-dir" => {
                 let val = iter
                     .next()
                     .ok_or_else(|| "--music-dir requires a folder path".to_string())?;
-                music_dir = Some(PathBuf::from(val.as_ref()));
+                music_dir = Some(PathBuf::from(val));
             }
             "--device" => {
                 let val = iter
                     .next()
                     .ok_or_else(|| "--device requires a DAC name substring".to_string())?;
-                device_filter = Some(val.as_ref().to_string());
+                device_filter = Some(require_utf8_arg("--device", val)?);
             }
             "--port" => {
                 let val = iter
                     .next()
                     .ok_or_else(|| "--port requires a numeric TCP port".to_string())?;
-                let port = val
-                    .as_ref()
+                let val_str = require_utf8_arg("--port", val)?;
+                let port = val_str
                     .parse::<u16>()
-                    .map_err(|_| format!("invalid --port '{}'; expected 1..=65535", val.as_ref()))?;
+                    .map_err(|_| format!("invalid --port '{val_str}'; expected 1..=65535"))?;
                 if port == 0 {
                     return Err("--port must be in 1..=65535".to_string());
                 }
@@ -91,31 +102,33 @@ where
                 let val = iter
                     .next()
                     .ok_or_else(|| "--filter requires a filter name or 'auto'".to_string())?;
-                if val.as_ref().eq_ignore_ascii_case("auto") {
+                let val_str = require_utf8_arg("--filter", val)?;
+                if val_str.eq_ignore_ascii_case("auto") {
                     upsampler_policy.filter_override = None;
                 } else {
-                    upsampler_policy.filter_override = Some(FilterArchetype::from_str(val.as_ref())?);
+                    upsampler_policy.filter_override = Some(FilterArchetype::from_str(&val_str)?);
                 }
             }
             "--shaper" => {
                 let val = iter
                     .next()
                     .ok_or_else(|| "--shaper requires a shaper name or 'auto'".to_string())?;
-                if val.as_ref().eq_ignore_ascii_case("auto") {
+                let val_str = require_utf8_arg("--shaper", val)?;
+                if val_str.eq_ignore_ascii_case("auto") {
                     upsampler_policy.shaper_override = None;
                 } else {
                     upsampler_policy.shaper_override =
-                        Some(NoiseShaperProfile::from_str(val.as_ref())?);
+                        Some(NoiseShaperProfile::from_str(&val_str)?);
                 }
             }
             "--max-taps" => {
                 let val = iter
                     .next()
                     .ok_or_else(|| "--max-taps requires a positive integer <= 4000000".to_string())?;
-                let taps = val
-                    .as_ref()
+                let val_str = require_utf8_arg("--max-taps", val)?;
+                let taps = val_str
                     .parse::<usize>()
-                    .map_err(|_| format!("invalid --max-taps '{}'", val.as_ref()))?;
+                    .map_err(|_| format!("invalid --max-taps '{val_str}'"))?;
                 if taps == 0 || taps > MAX_FILTER_TAPS {
                     return Err(format!(
                         "--max-taps must be in 1..={MAX_FILTER_TAPS}, got {taps}"
@@ -127,13 +140,13 @@ where
                 let val = iter
                     .next()
                     .ok_or_else(|| "--conv-dir requires a REW WAV directory path".to_string())?;
-                rew_override = Some(ConvolutionConfig::auto_dir(PathBuf::from(val.as_ref())));
+                rew_override = Some(ConvolutionConfig::auto_dir(PathBuf::from(val)));
             }
             "--conv-file" => {
                 let val = iter
                     .next()
                     .ok_or_else(|| "--conv-file requires a stereo REW WAV file path".to_string())?;
-                rew_override = Some(ConvolutionConfig::explicit_file(PathBuf::from(val.as_ref())));
+                rew_override = Some(ConvolutionConfig::explicit_file(PathBuf::from(val)));
             }
             "--no-conv" => {
                 rew_override = Some(ConvolutionConfig::disabled());
@@ -142,7 +155,8 @@ where
                 let val = iter
                     .next()
                     .ok_or_else(|| "--opt requires normal | high | extreme".to_string())?;
-                optimization = match val.as_ref().to_ascii_lowercase().as_str() {
+                let val_str = require_utf8_arg("--opt", val)?;
+                optimization = match val_str.to_ascii_lowercase().as_str() {
                     "normal" => OptimizationLevel::Normal,
                     "high" => OptimizationLevel::High,
                     "extreme" => OptimizationLevel::Extreme,
@@ -300,5 +314,37 @@ mod tests {
         assert!(parse_args(["audiophile-player", "--filter", "bogus"]).is_err());
         assert!(parse_args(["audiophile-player", "--max-taps", "4000001"]).is_err());
         assert!(parse_args(["audiophile-player", "--bad-flag"]).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn accepts_non_utf8_windows_paths_without_panicking() {
+        use std::os::windows::ffi::OsStringExt;
+
+        // Legal NTFS name containing an unpaired UTF-16 surrogate.
+        let weird_path = OsString::from_wide(&[b'C' as u16, b':' as u16, b'\\' as u16, 0xD800]);
+        let args = vec![
+            OsString::from("audiophile-player"),
+            OsString::from("--music-dir"),
+            weird_path.clone(),
+            OsString::from("--config"),
+            weird_path.clone(),
+        ];
+        let mode = parse_args(args).expect("non-UTF-8 paths should parse cleanly");
+        match mode {
+            RunMode::PlayRandom {
+                music_dir,
+                config_path,
+                ..
+            } => {
+                assert_eq!(music_dir, Some(PathBuf::from(&weird_path)));
+                assert_eq!(config_path, Some(PathBuf::from(&weird_path)));
+            }
+            other => panic!("unexpected mode: {other:?}"),
+        }
+
+        // Non-UTF-8 flag name returns Err instead of panicking.
+        let bad_flag = parse_args(vec![OsString::from("audiophile-player"), weird_path]);
+        assert!(bad_flag.is_err());
     }
 }

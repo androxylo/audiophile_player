@@ -716,7 +716,19 @@ impl WdmKsSink {
         wire_format: DacWireFormat,
         pump: &mut dyn WaveRtPumpSource,
     ) -> Result<PlaybackStats, OutputError> {
-        self.stop_flag.store(false, Ordering::SeqCst);
+        // Never clear `stop_flag` here — the caller arms (clears) it before checking pending
+        // signals/commands so Ctrl+C, Pause, or Next arriving before open is never swallowed.
+        if self.stop_flag.load(Ordering::SeqCst) {
+            return Ok(PlaybackStats {
+                device_name: self.device.friendly_name.clone(),
+                sample_rate_hz,
+                wire_format,
+                frames_played: 0,
+                wavert_buffer_bytes: 0,
+                notifications: 0,
+                mmcss_pro_audio: false,
+            });
+        }
 
         // 1. Elevate thread priority via MMCSS "Pro Audio" (reverted automatically via RAII).
         let mmcss = MmcssGuard::enter_pro_audio(self.optimization);

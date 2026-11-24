@@ -4,11 +4,15 @@
 //! pausing stops playback cleanly and releases the WDM-KS driver pin immediately so
 //! other exclusive players (such as Audirvana) can use the DAC while paused.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::log::ActionLog;
+
+/// Maximum number of queued relative commands (`Next`) before additional clicks are dropped.
+const MAX_QUEUED_COMMANDS: usize = 16;
 
 /// Unified control commands issued by the rudimentary HTTP interface (no volume control).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,7 +67,7 @@ struct InnerState {
     active_folder: PathBuf,
     current_track: Option<String>,
     current_format: Option<String>,
-    pending_command: Option<ControlCommand>,
+    pending_commands: VecDeque<ControlCommand>,
     log: ActionLog,
     sink_stop_flag: Option<Arc<AtomicBool>>,
     shutdown: bool,
@@ -90,7 +94,7 @@ impl SharedControl {
                 active_folder: initial_folder,
                 current_track: None,
                 current_format: None,
-                pending_command: None,
+                pending_commands: VecDeque::new(),
                 log,
                 sink_stop_flag: None,
                 shutdown: false,
@@ -133,17 +137,32 @@ impl SharedControl {
                     .push("Command: Pause (stopping playback & releasing DAC driver)");
             }
         }
-        st.pending_command = Some(cmd);
+        match cmd {
+            // `Next` is a relative command: append it behind any pending `Play*` or earlier
+            // `Next` so rapid clicks advance multiple tracks and never drop a just-clicked
+            // `PlayFile` / `PlaySequential` / `PlayRandom`. If `Pause` is already queued,
+            // keep `Next` after `Pause` so pausing then skipping behaves consistently.
+            ControlCommand::Next => {
+                if st.pending_commands.len() < MAX_QUEUED_COMMANDS {
+                    st.pending_commands.push_back(ControlCommand::Next);
+                }
+            }
+            // Absolute commands (`Play*`, `Pause`) supersede earlier unconsumed commands.
+            other => {
+                st.pending_commands.clear();
+                st.pending_commands.push_back(other);
+            }
+        }
         if let Some(flag) = st.sink_stop_flag.as_ref() {
             flag.store(true, Ordering::SeqCst);
         }
         self.cv.notify_all();
     }
 
-    /// Take any queued command without blocking.
+    /// Take the next queued command in FIFO order without blocking.
     pub fn take_pending_command(&self) -> Option<ControlCommand> {
         let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        st.pending_command.take()
+        st.pending_commands.pop_front()
     }
 
     /// Block cleanly at 0% CPU while paused until either a new command or process shutdown arrives.
@@ -153,7 +172,7 @@ impl SharedControl {
             if st.shutdown {
                 return None;
             }
-            if let Some(cmd) = st.pending_command.take() {
+            if let Some(cmd) = st.pending_commands.pop_front() {
                 return Some(cmd);
             }
             st = self.cv.wait(st).unwrap_or_else(|e| e.into_inner());
@@ -204,5 +223,52 @@ impl SharedControl {
             current_format: st.current_format.clone(),
             recent_actions: st.log.snapshot(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rapid_next_clicks_queue_without_overwriting_play_commands() {
+        let ctrl = SharedControl::new(PathBuf::from(r"C:\Music"), "Test DAC");
+
+        // PlayFile followed immediately by two Next clicks preserves all three in order.
+        ctrl.submit_command(ControlCommand::PlayFile(PathBuf::from(r"C:\Music\01.flac")));
+        ctrl.submit_command(ControlCommand::Next);
+        ctrl.submit_command(ControlCommand::Next);
+
+        assert_eq!(
+            ctrl.take_pending_command(),
+            Some(ControlCommand::PlayFile(PathBuf::from(r"C:\Music\01.flac")))
+        );
+        assert_eq!(ctrl.take_pending_command(), Some(ControlCommand::Next));
+        assert_eq!(ctrl.take_pending_command(), Some(ControlCommand::Next));
+        assert_eq!(ctrl.take_pending_command(), None);
+    }
+
+    #[test]
+    fn absolute_command_supersedes_pending_next_clicks() {
+        let ctrl = SharedControl::new(PathBuf::from(r"C:\Music"), "Test DAC");
+        ctrl.submit_command(ControlCommand::Next);
+        ctrl.submit_command(ControlCommand::Next);
+        ctrl.submit_command(ControlCommand::Pause);
+
+        assert_eq!(ctrl.take_pending_command(), Some(ControlCommand::Pause));
+        assert_eq!(ctrl.take_pending_command(), None);
+    }
+
+    #[test]
+    fn next_queue_is_bounded() {
+        let ctrl = SharedControl::new(PathBuf::from(r"C:\Music"), "Test DAC");
+        for _ in 0..(MAX_QUEUED_COMMANDS + 10) {
+            ctrl.submit_command(ControlCommand::Next);
+        }
+        let mut count = 0;
+        while ctrl.take_pending_command().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, MAX_QUEUED_COMMANDS);
     }
 }

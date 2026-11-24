@@ -229,6 +229,7 @@ pub fn pick_random_flac<'a>(files: &'a [PathBuf]) -> Option<&'a PathBuf> {
 pub struct SequentialFlacCursor {
     root: PathBuf,
     stack: Vec<DirFrame>,
+    recursive: bool,
 }
 
 #[derive(Debug)]
@@ -251,6 +252,82 @@ impl SequentialFlacCursor {
         Ok(Self {
             root,
             stack: vec![first],
+            recursive: true,
+        })
+    }
+
+    /// Create a cursor iterating ONLY the `.flac` files directly inside `root` (no recursion
+    /// into subdirectories), optionally starting immediately after `start_after`.
+    ///
+    /// If `start_after` is missing (e.g. renamed or deleted), falls back to the first file in
+    /// `root` that sorts after `start_after` without walking subdirectories.
+    pub fn new_folder_only(root: PathBuf, start_after: Option<&Path>) -> Result<Self, String> {
+        let mut cursor = Self::new(root)?;
+        cursor.recursive = false;
+        if let (Some(frame), Some(after)) = (cursor.stack.first_mut(), start_after) {
+            frame.flac_idx = index_after_path(&frame.flacs, after);
+        }
+        Ok(cursor)
+    }
+
+    /// Create a recursive sequential cursor positioned immediately after `start_after` in
+    /// `O(depth)` time without scanning unrelated subtrees.
+    ///
+    /// If `start_after` is not inside `root` (or was deleted), positions cleanly at the next
+    /// path sorting after it (or the start of `root` if unrelated) instead of draining the tree.
+    pub fn new_starting_after(root: PathBuf, start_after: &Path) -> Result<Self, String> {
+        if !root.exists() {
+            return Err(format!("music directory does not exist: '{}'", root.display()));
+        }
+        if !root.is_dir() {
+            return Err(format!("music path is not a directory: '{}'", root.display()));
+        }
+
+        let Ok(rel) = start_after.strip_prefix(&root) else {
+            return Self::new(root);
+        };
+        let components: Vec<_> = rel.components().collect();
+        if components.is_empty() {
+            return Self::new(root);
+        }
+
+        // Components 0..n-1 are subdirectories under `root`; the last component is the file.
+        let dir_components = &components[..components.len().saturating_sub(1)];
+        let mut stack = Vec::with_capacity(dir_components.len() + 1);
+        let mut cur_dir = root.clone();
+
+        for comp in dir_components {
+            let mut frame = read_dir_frame(&cur_dir);
+            // All files directly in `cur_dir` come before descending into `next_dir`.
+            frame.flac_idx = frame.flacs.len();
+            let next_dir = cur_dir.join(comp.as_os_str());
+            match frame.subdirs.iter().position(|d| d == &next_dir) {
+                Some(idx) => {
+                    frame.subdir_idx = idx + 1;
+                    stack.push(frame);
+                    cur_dir = next_dir;
+                }
+                None => {
+                    // Subdirectory was deleted/renamed: continue with the first subdir sorting after it.
+                    frame.subdir_idx = index_after_path(&frame.subdirs, &next_dir);
+                    stack.push(frame);
+                    return Ok(Self {
+                        root,
+                        stack,
+                        recursive: true,
+                    });
+                }
+            }
+        }
+
+        let mut leaf = read_dir_frame(&cur_dir);
+        leaf.flac_idx = index_after_path(&leaf.flacs, start_after);
+        stack.push(leaf);
+
+        Ok(Self {
+            root,
+            stack,
+            recursive: true,
         })
     }
 
@@ -269,7 +346,7 @@ impl SequentialFlacCursor {
                 top.flac_idx += 1;
                 return Some(path);
             }
-            if top.subdir_idx < top.subdirs.len() && depth <= MAX_WALK_DEPTH {
+            if self.recursive && top.subdir_idx < top.subdirs.len() && depth <= MAX_WALK_DEPTH {
                 let next_dir = top.subdirs[top.subdir_idx].clone();
                 top.subdir_idx += 1;
                 self.stack.push(read_dir_frame(&next_dir));
@@ -278,6 +355,13 @@ impl SequentialFlacCursor {
             self.stack.pop();
         }
     }
+}
+
+fn index_after_path(sorted: &[PathBuf], target: &Path) -> usize {
+    if let Some(pos) = sorted.iter().position(|p| p.as_path() == target) {
+        return pos + 1;
+    }
+    sorted.partition_point(|p| p.as_path() <= target)
 }
 
 fn read_dir_frame(dir: &Path) -> DirFrame {
