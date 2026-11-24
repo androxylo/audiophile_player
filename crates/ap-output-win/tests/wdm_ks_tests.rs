@@ -27,6 +27,7 @@ use ap_output_win::wdm_ks::{
 };
 
 static HARDWARE_LOCK: Mutex<()> = Mutex::new(());
+static MEMORY_LOCK_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 // ---------------------------------------------------------------------------
 // 1. Offline Pure-Logic Unit Tests (Zero Hardware Required)
@@ -220,6 +221,7 @@ fn mmcss_pro_audio_guard_enters_and_drops_cleanly() {
 
 #[test]
 fn memory_lock_guard_pins_and_releases_pcm_slice_cleanly() {
+    let _mem_lock = MEMORY_LOCK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let buf = vec![[0_i32, 0_i32]; 4096];
     let guard = MemoryLockGuard::lock_slice(&buf);
     #[cfg(windows)]
@@ -830,26 +832,105 @@ fn audio_position_cursor_selector_never_mixes_play_and_write_offset_on_zero_wrap
     assert_eq!(sel_play.select(54, 0), 54);
 }
 
+#[test]
+fn wavert_fade_out_applies_pre_encode_tpdf_dither_on_reduced_depths() {
+    // Review #3 Finding #9: fade-out gain must be applied BEFORE reduced-depth encoding so
+    // Int16 / Int24* paths run TPDF dither once after attenuation rather than re-rounding
+    // already-quantized wire bytes without dither.
+    let quiet_sample = 0x0001_0000_i32; // +1 LSB in Int16 (exact 16-bit input)
+    let frames = vec![[quiet_sample, quiet_sample]; 256];
+
+    // 1. WaveRtFramePump on Int16: fade ramp crosses 0.5 LSB across many frames; undithered
+    // rounding would produce a deterministic flat step (0 or 1), while pre-encode TPDF dither
+    // produces stochastic {-1, 0, +1, +2} distribution across the tail and decorrelated L vs R.
+    let mut pump = WaveRtFramePump::new(&frames, DacWireFormat::Int16);
+    let mut out16 = vec![0u8; frames.len() * 4];
+    let written = pump.fill_fade_out_slice(&mut out16);
+    assert_eq!(written, frames.len());
+    let mut lr_differ_count = 0usize;
+    let mut tail_nonzero = 0usize;
+    for i in 0..frames.len() {
+        let l = i16::from_le_bytes(out16[i * 4..i * 4 + 2].try_into().unwrap());
+        let r = i16::from_le_bytes(out16[i * 4 + 2..i * 4 + 4].try_into().unwrap());
+        if l != r {
+            lr_differ_count += 1;
+        }
+        // In the final 25% of the ramp (gain < 0.25), undithered round(1 * gain) is ALWAYS 0,
+        // whereas TPDF dither occasionally produces ±1 LSB.
+        if i >= (frames.len() * 3) / 4 && (l != 0 || r != 0) {
+            tail_nonzero += 1;
+        }
+    }
+    assert!(
+        lr_differ_count > 30,
+        "expected stereo-decorrelated TPDF dither during Int16 fade-out (lr_differ={lr_differ_count})"
+    );
+    assert!(
+        tail_nonzero > 5,
+        "expected TPDF dither activity in quiet Int16 fade tail (tail_nonzero={tail_nonzero})"
+    );
+
+    // 2. StreamingWaveRtPump on Int24In32: low byte must remain 0 and L/R must be decorrelated.
+    let mut once = Some(InterleavedInt32Buffer {
+        sample_rate_hz: 384_000,
+        frames: vec![[0x0000_0100_i32, 0x0000_0100_i32]; 128], // +1 LSB in 24-bit
+    });
+    let mut spump = StreamingWaveRtPump::new(384_000, DacWireFormat::Int24In32, move || {
+        once.take()
+            .map(StreamBlock::Ready)
+            .unwrap_or(StreamBlock::EndOfTrack)
+    });
+    let mut out24 = vec![0u8; 128 * 8];
+    let sw = spump.fill_fade_out_slice(&mut out24);
+    assert_eq!(sw, 128);
+    let mut lr24_differ = 0usize;
+    for i in 0..128 {
+        let l = i32::from_le_bytes(out24[i * 8..i * 8 + 4].try_into().unwrap());
+        let r = i32::from_le_bytes(out24[i * 8 + 4..i * 8 + 8].try_into().unwrap());
+        assert_eq!(l & 0xFF, 0, "Int24In32 low byte must be zero after dithered fade");
+        assert_eq!(r & 0xFF, 0, "Int24In32 low byte must be zero after dithered fade");
+        if l != r {
+            lr24_differ += 1;
+        }
+    }
+    assert!(
+        lr24_differ > 15,
+        "expected stereo-decorrelated TPDF dither in StreamingWaveRtPump Int24In32 fade-out (lr24_differ={lr24_differ})"
+    );
+}
+
 #[cfg(windows)]
 #[test]
 fn memory_lock_guard_refcounts_shared_pages_across_overlapping_guards() {
+    // Serialize against both other MemoryLockGuard unit tests and live play_full_memory tests
+    // so process-global locked-page count assertions never race (Review #3 Finding #10).
+    let _hw_lock = HARDWARE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _mem_lock = MEMORY_LOCK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let cap = MemoryLockGuard::working_set_growth_cap_bytes();
+    assert!(
+        (512 * 1024 * 1024..=4 * 1024 * 1024 * 1024).contains(&cap),
+        "expected dynamic VirtualLock cap in [512 MiB, 4 GiB], got {cap}"
+    );
+
+    let baseline = MemoryLockGuard::active_locked_page_count();
     let buf = vec![[0_i32, 0_i32]; 2048];
     let g1 = MemoryLockGuard::lock_slice(&buf[0..1024]);
     let g2 = MemoryLockGuard::lock_slice(&buf[512..1536]);
     assert!(g1.is_locked());
     assert!(g2.is_locked());
     let locked_both = MemoryLockGuard::active_locked_page_count();
-    assert!(locked_both > 0);
+    assert!(locked_both > baseline);
     drop(g1);
     assert!(
-        MemoryLockGuard::active_locked_page_count() > 0,
+        MemoryLockGuard::active_locked_page_count() > baseline,
         "dropping first overlapping guard must keep second guard's pages locked"
     );
     drop(g2);
     assert_eq!(
         MemoryLockGuard::active_locked_page_count(),
-        0,
-        "dropping last guard must release all refcounted pages"
+        baseline,
+        "dropping last guard must release all refcounted pages back to baseline"
     );
 }
 

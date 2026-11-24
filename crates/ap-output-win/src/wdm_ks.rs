@@ -325,6 +325,26 @@ impl WireDitherState {
         let q = scaled.round() as i64;
         q.clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16
     }
+
+    /// Dither and quantize an `f64` sample (on the full signed `i32` scale, e.g., after applying
+    /// a stop fade-out gain ramp) directly into top-24-bit MSB-aligned `i32` in a single stage.
+    #[inline]
+    fn quantize_f64_to_top_24(&mut self, sample_i32_scale: f64, ch: usize) -> i32 {
+        self.active = true;
+        let dither = self.next_tpdf_lsb(ch);
+        let q = (sample_i32_scale / 256.0 + dither).round() as i64;
+        (q.clamp(-0x80_0000, 0x7F_FFFF) as i32) << 8
+    }
+
+    /// Dither and quantize an `f64` sample (on the full signed `i32` scale, e.g., after applying
+    /// a stop fade-out gain ramp) directly into signed `i16` in a single stage.
+    #[inline]
+    fn quantize_f64_to_top_16(&mut self, sample_i32_scale: f64, ch: usize) -> i16 {
+        self.active = true;
+        let dither = self.next_tpdf_lsb(ch);
+        let q = (sample_i32_scale / 65536.0 + dither).round() as i64;
+        q.clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16
+    }
 }
 
 /// Shared frame encoder used by both `WaveRtFramePump` and `StreamingWaveRtPump`.
@@ -339,6 +359,57 @@ fn encode_frames_into(
     let mut offset = 0;
     for &[l, r] in frames {
         encode_frame(&mut dst[offset..offset + bpf], l, r, wire_format, dither);
+        offset += bpf;
+    }
+    offset
+}
+
+/// Apply a linear stop fade-out ramp (`1.0 -> 0.0`) directly to MSB-aligned `i32` source samples
+/// *before* wire encoding so reduced-depth `Int24*` and `Int16` formats run TPDF dither once
+/// after gain attenuation rather than re-rounding already-quantized wire bytes.
+fn encode_fade_out_frames_into(
+    dst: &mut [u8],
+    frames: &[[i32; 2]],
+    wire_format: DacWireFormat,
+    dither: &mut WireDitherState,
+) -> usize {
+    let total = frames.len();
+    if total == 0 {
+        return 0;
+    }
+    let bpf = wire_format.bytes_per_frame();
+    let mut offset = 0;
+    for (i, &[l, r]) in frames.iter().enumerate() {
+        let gain = 1.0 - (i as f64) / (total as f64);
+        let lf = f64::from(l) * gain;
+        let rf = f64::from(r) * gain;
+        let slot = &mut dst[offset..offset + bpf];
+        match wire_format {
+            DacWireFormat::Int32 => {
+                let l32 = (lf.round() as i64).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+                let r32 = (rf.round() as i64).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+                slot[0..4].copy_from_slice(&l32.to_le_bytes());
+                slot[4..8].copy_from_slice(&r32.to_le_bytes());
+            }
+            DacWireFormat::Int24In32 => {
+                let l24 = dither.quantize_f64_to_top_24(lf, 0);
+                let r24 = dither.quantize_f64_to_top_24(rf, 1);
+                slot[0..4].copy_from_slice(&l24.to_le_bytes());
+                slot[4..8].copy_from_slice(&r24.to_le_bytes());
+            }
+            DacWireFormat::Int24Packed => {
+                let lb = dither.quantize_f64_to_top_24(lf, 0).to_le_bytes();
+                let rb = dither.quantize_f64_to_top_24(rf, 1).to_le_bytes();
+                slot[0..3].copy_from_slice(&lb[1..4]);
+                slot[3..6].copy_from_slice(&rb[1..4]);
+            }
+            DacWireFormat::Int16 => {
+                let l16 = dither.quantize_f64_to_top_16(lf, 0);
+                let r16 = dither.quantize_f64_to_top_16(rf, 1);
+                slot[0..2].copy_from_slice(&l16.to_le_bytes());
+                slot[2..4].copy_from_slice(&r16.to_le_bytes());
+            }
+        }
         offset += bpf;
     }
     offset
@@ -401,8 +472,27 @@ impl<'a> WaveRtFramePump<'a> {
     }
 
     /// Fill `dst` with a smooth linear fade-out to silence so mid-track stops are click-free.
+    ///
+    /// Applies the linear gain ramp to the MSB-aligned `i32` source frames *before* reduced-depth
+    /// encoding so `Int24*` and `Int16` formats run TPDF dither once after attenuation.
     pub fn fill_fade_out_slice(&mut self, dst: &mut [u8]) -> usize {
-        WaveRtPumpSource::fill_fade_out_slice(self, dst)
+        let bpf = self.bytes_per_frame();
+        let max_frames = dst.len() / bpf;
+        let remaining = self.frames.len().saturating_sub(self.cursor);
+        let to_write = max_frames.min(remaining);
+
+        let offset = encode_fade_out_frames_into(
+            dst,
+            &self.frames[self.cursor..self.cursor + to_write],
+            self.wire_format,
+            &mut self.dither,
+        );
+        self.cursor += to_write;
+
+        if offset < dst.len() {
+            dst[offset..].fill(0);
+        }
+        to_write
     }
 }
 
@@ -438,11 +528,7 @@ pub trait WaveRtPumpSource {
     fn is_eof(&self) -> bool;
     fn fill_slice(&mut self, dst: &mut [u8]) -> usize;
 
-    fn fill_fade_out_slice(&mut self, dst: &mut [u8]) -> usize {
-        let written = self.fill_slice(dst);
-        apply_linear_fade_out_bytes(dst, written, self.wire_format());
-        written
-    }
+    fn fill_fade_out_slice(&mut self, dst: &mut [u8]) -> usize;
 
     fn take_error(&mut self) -> Option<OutputError> {
         None
@@ -464,6 +550,10 @@ impl WaveRtPumpSource for WaveRtFramePump<'_> {
 
     fn fill_slice(&mut self, dst: &mut [u8]) -> usize {
         WaveRtFramePump::fill_slice(self, dst)
+    }
+
+    fn fill_fade_out_slice(&mut self, dst: &mut [u8]) -> usize {
+        WaveRtFramePump::fill_fade_out_slice(self, dst)
     }
 }
 
@@ -597,6 +687,35 @@ where
             dst[used_bytes..].fill(0);
         }
         written_total
+    }
+
+    fn fill_fade_out_slice(&mut self, dst: &mut [u8]) -> usize {
+        let bpf = self.bytes_per_frame();
+        let max_frames = dst.len() / bpf;
+        let mut raw_frames: Vec<[i32; 2]> = Vec::with_capacity(max_frames);
+
+        while raw_frames.len() < max_frames {
+            if !self.ensure_current() {
+                break;
+            }
+            let buf = self.current.as_ref().unwrap();
+            let remaining = buf.frames.len() - self.cursor;
+            let to_copy = (max_frames - raw_frames.len()).min(remaining);
+            raw_frames.extend_from_slice(&buf.frames[self.cursor..self.cursor + to_copy]);
+            self.cursor += to_copy;
+            self.total_frames_written += to_copy;
+        }
+
+        let offset = encode_fade_out_frames_into(
+            dst,
+            &raw_frames,
+            self.wire_format,
+            &mut self.dither,
+        );
+        if offset < dst.len() {
+            dst[offset..].fill(0);
+        }
+        raw_frames.len()
     }
 
     fn take_error(&mut self) -> Option<OutputError> {
@@ -1178,6 +1297,7 @@ impl WaveRtLoopController {
 /// Round an MSB-aligned signed 32-bit PCM sample to its top 24 bits (unbiased round-to-nearest-even)
 /// with the low 8 bits guaranteed zero and positive full-scale clamped cleanly without wraparound.
 /// Already-quantized 24-bit samples (low byte == 0) pass through bit-identically.
+#[cfg(test)]
 #[inline]
 fn round_i32_to_top_24(sample: i32) -> i32 {
     let mut q = i64::from(sample) >> 8;
@@ -1232,50 +1352,6 @@ fn encode_frame(
             let r16 = dither.quantize_to_top_16(r, 1);
             dst[0..2].copy_from_slice(&l16.to_le_bytes());
             dst[2..4].copy_from_slice(&r16.to_le_bytes());
-        }
-    }
-}
-
-fn apply_linear_fade_out_bytes(dst: &mut [u8], written: usize, wire_format: DacWireFormat) {
-    if written == 0 {
-        return;
-    }
-    let bpf = wire_format.bytes_per_frame();
-    for i in 0..written {
-        let gain = 1.0 - (i as f64) / (written as f64);
-        let off = i * bpf;
-        match wire_format {
-            DacWireFormat::Int32 => {
-                let l = i32::from_le_bytes(dst[off..off + 4].try_into().unwrap());
-                let r = i32::from_le_bytes(dst[off + 4..off + 8].try_into().unwrap());
-                let lf = ((l as f64) * gain).round() as i32;
-                let rf = ((r as f64) * gain).round() as i32;
-                dst[off..off + 4].copy_from_slice(&lf.to_le_bytes());
-                dst[off + 4..off + 8].copy_from_slice(&rf.to_le_bytes());
-            }
-            DacWireFormat::Int24In32 => {
-                let l = i32::from_le_bytes(dst[off..off + 4].try_into().unwrap());
-                let r = i32::from_le_bytes(dst[off + 4..off + 8].try_into().unwrap());
-                let lf = round_i32_to_top_24(((l as f64) * gain).round() as i32);
-                let rf = round_i32_to_top_24(((r as f64) * gain).round() as i32);
-                dst[off..off + 4].copy_from_slice(&lf.to_le_bytes());
-                dst[off + 4..off + 8].copy_from_slice(&rf.to_le_bytes());
-            }
-            DacWireFormat::Int24Packed => {
-                for ch_off in [off, off + 3] {
-                    let s =
-                        i32::from_le_bytes([0, dst[ch_off], dst[ch_off + 1], dst[ch_off + 2]]);
-                    let sf = round_i32_to_top_24(((s as f64) * gain).round() as i32).to_le_bytes();
-                    dst[ch_off..ch_off + 3].copy_from_slice(&sf[1..4]);
-                }
-            }
-            DacWireFormat::Int16 => {
-                for ch_off in [off, off + 2] {
-                    let s = i16::from_le_bytes(dst[ch_off..ch_off + 2].try_into().unwrap());
-                    let sf = ((s as f64) * gain).round() as i16;
-                    dst[ch_off..ch_off + 2].copy_from_slice(&sf.to_le_bytes());
-                }
-            }
         }
     }
 }

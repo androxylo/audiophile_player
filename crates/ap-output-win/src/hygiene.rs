@@ -205,14 +205,33 @@ fn lock_tracker() -> &'static Mutex<MemoryLockTracker> {
     TRACKER.get_or_init(|| Mutex::new(MemoryLockTracker::default()))
 }
 
+#[cfg(windows)]
+fn max_working_set_growth_bytes() -> usize {
+    static MAX_GROWTH: OnceLock<usize> = OnceLock::new();
+    *MAX_GROWTH.get_or_init(|| {
+        const MIN_CAP_BYTES: usize = 512 * 1024 * 1024;
+        const MAX_CAP_BYTES: usize = 4 * 1024 * 1024 * 1024;
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        let mut status: MEMORYSTATUSEX = unsafe { core::mem::zeroed() };
+        status.dwLength = core::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        if unsafe { GlobalMemoryStatusEx(&mut status) } != 0 && status.ullTotalPhys > 0 {
+            let quarter_phys = (status.ullTotalPhys / 4).min(usize::MAX as u64) as usize;
+            quarter_phys.clamp(MIN_CAP_BYTES, MAX_CAP_BYTES)
+        } else {
+            MIN_CAP_BYTES
+        }
+    })
+}
+
 /// Best-effort RAII guard pinning an active RAM audio buffer with Win32 `VirtualLock`
 /// so Windows does not page out playing audio frames mid-track.
 ///
 /// - Tracks locked OS pages with an internal page-level reference count so concurrent or
 ///   adjacent slices sharing an OS page never prematurely unlock each other on drop.
 /// - When `VirtualLock` hits `ERROR_WORKING_SET_QUOTA`, grows the process minimum working
-///   set only by the actual shortfall (capped at 512 MiB above the original minimum) and
-///   restores the original working-set bounds once the last active guard drops.
+///   set only by the actual shortfall (capped dynamically at 25% of total physical RAM,
+///   clamped to `[512 MiB, 4 GiB]`) and restores the original working-set bounds once the
+///   last active guard drops.
 pub struct MemoryLockGuard {
     #[cfg(windows)]
     first_page: usize,
@@ -224,6 +243,12 @@ pub struct MemoryLockGuard {
 }
 
 impl MemoryLockGuard {
+    /// Dynamic upper bound (bytes) on process working-set growth for RAM pinning.
+    #[cfg(windows)]
+    pub fn working_set_growth_cap_bytes() -> usize {
+        max_working_set_growth_bytes()
+    }
+
     /// Attempt to lock `[ptr, ptr + byte_len)` in physical RAM (best-effort; never fails playback).
     #[cfg(windows)]
     pub fn lock_slice<T>(slice: &[T]) -> Self {
@@ -233,8 +258,8 @@ impl MemoryLockGuard {
             GetCurrentProcess, GetProcessWorkingSetSize, SetProcessWorkingSetSize,
         };
 
-        const MAX_WORKING_SET_GROWTH_BYTES: usize = 512 * 1024 * 1024;
         const WORKING_SET_HEADROOM_BYTES: usize = 4 * 1024 * 1024;
+        let max_growth_bytes = max_working_set_growth_bytes();
 
         let byte_len = core::mem::size_of_val(slice);
         if byte_len == 0 {
@@ -278,6 +303,7 @@ impl MemoryLockGuard {
         // relative to the saved original minimum working set and retry once.
         let mut locked_runs: Vec<(usize, usize)> = Vec::new();
         let mut all_ok = true;
+        let mut last_err: u32 = 0;
         for &(run_first, run_len) in &new_runs {
             let run_ptr = (run_first * page_size) as *const core::ffi::c_void;
             let run_bytes = run_len * page_size;
@@ -285,13 +311,13 @@ impl MemoryLockGuard {
 
             if !ok {
                 let err = unsafe { GetLastError() };
+                last_err = err;
                 let total_after_bytes = tracker
                     .page_refcounts
                     .len()
                     .saturating_add(new_pages)
                     .saturating_mul(page_size);
-                if err == ERROR_WORKING_SET_QUOTA && total_after_bytes <= MAX_WORKING_SET_GROWTH_BYTES
-                {
+                if err == ERROR_WORKING_SET_QUOTA && total_after_bytes <= max_growth_bytes {
                     let proc = unsafe { GetCurrentProcess() };
                     let mut cur_min: usize = 0;
                     let mut cur_max: usize = 0;
@@ -302,7 +328,7 @@ impl MemoryLockGuard {
                             .saturating_add(total_after_bytes)
                             .saturating_add(WORKING_SET_HEADROOM_BYTES);
                         let capped_min =
-                            desired_min.min(orig_min.saturating_add(MAX_WORKING_SET_GROWTH_BYTES));
+                            desired_min.min(orig_min.saturating_add(max_growth_bytes));
                         if capped_min > cur_min {
                             let desired_max =
                                 orig_max.max(cur_max).max(capped_min.saturating_add(64 * 1024 * 1024));
@@ -310,6 +336,11 @@ impl MemoryLockGuard {
                                 != 0
                             {
                                 ok = unsafe { VirtualLock(run_ptr, run_bytes) } != 0;
+                                if !ok {
+                                    last_err = unsafe { GetLastError() };
+                                }
+                            } else {
+                                last_err = unsafe { GetLastError() };
                             }
                         }
                     }
@@ -335,6 +366,12 @@ impl MemoryLockGuard {
             if tracker.page_refcounts.is_empty() {
                 restore_working_set_if_needed(&mut tracker);
             }
+            eprintln!(
+                "Warning: VirtualLock could not pin {:.1} MiB audio buffer in RAM \
+                 (cap {:.0} MiB, Win32 error {last_err}); continuing unlocked.",
+                byte_len as f64 / (1024.0 * 1024.0),
+                max_growth_bytes as f64 / (1024.0 * 1024.0),
+            );
             return Self {
                 first_page: 0,
                 page_count: 0,
