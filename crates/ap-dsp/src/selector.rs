@@ -36,20 +36,28 @@ pub const SIMPLE_TEST_DEFAULT_TAPS_PER_PHASE: usize = 256;
 /// Minimum allowed even taps per polyphase branch for `SimpleTest`.
 pub const SIMPLE_TEST_MIN_TAPS_PER_PHASE: usize = 8;
 
+/// Recommended quality floor (taps per polyphase branch) for `SimpleTest` below which
+/// stopband attenuation and transition sharpness visibly degrade.
+pub const SIMPLE_TEST_QUALITY_FLOOR_TAPS_PER_PHASE: usize = 64;
+
 /// Error prefix used when a track's sample rate cannot be processed by the active DSP pipeline
 /// (allows the playback engine to skip unsupported tracks cleanly in Random/Sequential modes).
 pub const UNSUPPORTED_SAMPLE_RATE_PREFIX: &str = "unsupported source sample rate:";
 
 /// Derive the exact even taps-per-phase count used by [`FilterArchetype::SimpleTest`] for a given
 /// integer upsampling `ratio` and `max_taps` ceiling so `SelectedDspPlan::tap_budget` and the
-/// constructed polyphase kernel always agree.
-pub fn simple_test_taps_per_phase(ratio: usize, max_taps: usize) -> usize {
+/// constructed polyphase kernel always agree and never silently exceed `max_taps`.
+///
+/// Returns `None` when `max_taps < SIMPLE_TEST_MIN_TAPS_PER_PHASE * ratio`.
+pub fn simple_test_taps_per_phase(ratio: usize, max_taps: usize) -> Option<usize> {
     let cap = max_taps.min(MAX_FILTER_TAPS);
     let max_for_ratio = cap / ratio.max(1);
     let even = max_for_ratio & !1;
-    SIMPLE_TEST_DEFAULT_TAPS_PER_PHASE
-        .min(even)
-        .max(SIMPLE_TEST_MIN_TAPS_PER_PHASE)
+    if even < SIMPLE_TEST_MIN_TAPS_PER_PHASE {
+        None
+    } else {
+        Some(SIMPLE_TEST_DEFAULT_TAPS_PER_PHASE.min(even))
+    }
 }
 
 /// Per-track source attributes inspected by [`UpsamplerPicker`] before each track plays.
@@ -150,7 +158,8 @@ impl FilterArchetype {
             UpsampleRatio::Arbitrary => 8,
         };
         if self == Self::SimpleTest {
-            return simple_test_taps_per_phase(mult, cap).saturating_mul(mult);
+            return simple_test_taps_per_phase(mult, cap)
+                .map_or(0, |m| m.saturating_mul(mult));
         }
         let desired = match self {
             Self::Null => 0,
@@ -409,11 +418,32 @@ impl UpsamplerPicker {
         };
 
         let tap_budget = filter.default_taps(ratio, self.policy.max_taps);
-        let reason = if shaper_overridden {
+        let mut reason = if shaper_overridden {
             format!("{filter_reason}; cli --shaper {shaper}")
         } else {
             filter_reason
         };
+        if filter == FilterArchetype::SimpleTest {
+            if let UpsampleRatio::Integer(r) = ratio {
+                let mult = r as usize;
+                match simple_test_taps_per_phase(mult, self.policy.max_taps) {
+                    None => {
+                        reason.push_str(&format!(
+                            " [error: --max-taps {} below {}x minimum {} taps]",
+                            self.policy.max_taps,
+                            mult,
+                            mult * SIMPLE_TEST_MIN_TAPS_PER_PHASE
+                        ));
+                    }
+                    Some(tpp) if tpp < SIMPLE_TEST_QUALITY_FLOOR_TAPS_PER_PHASE => {
+                        reason.push_str(&format!(
+                            " [warn: {tpp} taps/phase below {SIMPLE_TEST_QUALITY_FLOOR_TAPS_PER_PHASE}-tap quality floor]"
+                        ));
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
 
         let resolved_target_hz = if filter == FilterArchetype::Null {
             source.sample_rate_hz

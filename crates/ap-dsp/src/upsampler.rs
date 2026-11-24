@@ -14,9 +14,40 @@ use ap_core::buffer::StereoF64Buffer;
 use crate::MAX_FILTER_TAPS;
 use crate::selector::{
     FilterArchetype, MAX_SUPPORTED_SOURCE_RATE_HZ, MAX_UPSAMPLE_RATIO,
-    MIN_SUPPORTED_SOURCE_RATE_HZ, SelectedDspPlan, UNSUPPORTED_SAMPLE_RATE_PREFIX, UpsampleRatio,
+    MIN_SUPPORTED_SOURCE_RATE_HZ, SIMPLE_TEST_DEFAULT_TAPS_PER_PHASE,
+    SIMPLE_TEST_MIN_TAPS_PER_PHASE, SelectedDspPlan, UNSUPPORTED_SAMPLE_RATE_PREFIX, UpsampleRatio,
     simple_test_taps_per_phase,
 };
+
+/// Unpadded trailing FIR input history carried between consecutive equal-rate gapless tracks
+/// so interpolation across track boundaries matches a single continuous one-shot upsample
+/// with zero boundary dip or click.
+#[derive(Debug, Clone)]
+pub struct UpsamplerCarryover {
+    pub source_rate_hz: u32,
+    pub target_rate_hz: u32,
+    pub ratio: usize,
+    pub taps_per_phase: usize,
+    pub hist_l: Vec<f64>,
+    pub hist_r: Vec<f64>,
+}
+
+impl UpsamplerCarryover {
+    /// Flush the carried unpadded FIR history against trailing zeros into `f64` samples
+    /// (used when a gapless sequence ends, switches sample rate, or encounters an error).
+    pub fn flush_to_f64(self) -> StereoF64Buffer {
+        if self.hist_l.is_empty() || self.ratio == 0 || self.taps_per_phase < 2 {
+            return StereoF64Buffer::empty(self.target_rate_hz);
+        }
+        let mut up =
+            SimpleWindowedSincUpsampler::new(self.source_rate_hz, self.ratio, self.taps_per_phase);
+        up.hist_l = self.hist_l;
+        up.hist_r = self.hist_r;
+        up.total_in_frames = 1; // enable trailing zero flush
+        up.flush()
+            .unwrap_or_else(|_| StereoF64Buffer::empty(self.target_rate_hz))
+    }
+}
 
 /// Pluggable stateful floating-point upsampler (`StereoF64Buffer -> StereoF64Buffer`).
 pub trait Upsampler: Send {
@@ -30,6 +61,22 @@ pub trait Upsampler: Send {
 
     /// Flush trailing FIR overlap tail at end-of-track (emits remaining exact samples).
     fn flush(&mut self) -> Result<StereoF64Buffer, String>;
+
+    /// Attach unpadded FIR history from the preceding equal-rate gapless track instead of
+    /// leading zeros. Returns `Err(carryover)` if the carryover is incompatible with this
+    /// upsampler's source rate, ratio, or filter length.
+    fn set_incoming_carryover(
+        &mut self,
+        carryover: UpsamplerCarryover,
+    ) -> Result<(), UpsamplerCarryover> {
+        Err(carryover)
+    }
+
+    /// End a track for gapless continuity: skip trailing zero-padding and hand the unpadded
+    /// FIR history to the next equal-rate session so there is zero boundary discontinuity.
+    fn flush_for_gapless(&mut self) -> Result<(StereoF64Buffer, Option<UpsamplerCarryover>), String> {
+        self.flush().map(|buf| (buf, None))
+    }
 }
 
 /// Build the concrete stateful floating-point [`Upsampler`] for a [`SelectedDspPlan`].
@@ -70,7 +117,13 @@ pub fn build_upsampler(plan: &SelectedDspPlan) -> Result<Box<dyn Upsampler>, Str
                 ));
             }
             let ratio = ratio_u32 as usize;
-            let taps_per_phase = simple_test_taps_per_phase(ratio, plan.tap_budget);
+            let taps_per_phase = simple_test_taps_per_phase(ratio, plan.tap_budget).ok_or_else(|| {
+                format!(
+                    "--max-taps budget is too small for {ratio}x simple-test upsampling \
+                     (minimum is {} taps = {SIMPLE_TEST_MIN_TAPS_PER_PHASE} taps/phase)",
+                    ratio * SIMPLE_TEST_MIN_TAPS_PER_PHASE
+                )
+            })?;
             let total_taps = ratio.checked_mul(taps_per_phase).ok_or_else(|| {
                 format!(
                     "upsampler tap count overflow (ratio={ratio}, taps_per_phase={taps_per_phase})"
@@ -292,6 +345,50 @@ impl Upsampler for SimpleWindowedSincUpsampler {
             right,
         })
     }
+
+    fn set_incoming_carryover(
+        &mut self,
+        carryover: UpsamplerCarryover,
+    ) -> Result<(), UpsamplerCarryover> {
+        if self.flushed
+            || self.total_in_frames != 0
+            || carryover.source_rate_hz != self.source_rate_hz
+            || carryover.ratio != self.ratio
+            || carryover.taps_per_phase != self.taps_per_phase
+            || carryover.hist_l.len() != carryover.hist_r.len()
+            || carryover.hist_l.len() >= self.taps_per_phase
+        {
+            return Err(carryover);
+        }
+        self.hist_l = carryover.hist_l;
+        self.hist_r = carryover.hist_r;
+        Ok(())
+    }
+
+    fn flush_for_gapless(&mut self) -> Result<(StereoF64Buffer, Option<UpsamplerCarryover>), String> {
+        let out_rate = self.source_rate_hz * (self.ratio as u32);
+        if self.flushed || self.total_in_frames == 0 {
+            self.flushed = true;
+            return Ok((StereoF64Buffer::empty(out_rate), None));
+        }
+        self.flushed = true;
+        let hist_l = core::mem::take(&mut self.hist_l);
+        let hist_r = core::mem::take(&mut self.hist_r);
+        if hist_l.is_empty() {
+            return Ok((StereoF64Buffer::empty(out_rate), None));
+        }
+        Ok((
+            StereoF64Buffer::empty(out_rate),
+            Some(UpsamplerCarryover {
+                source_rate_hz: self.source_rate_hz,
+                target_rate_hz: out_rate,
+                ratio: self.ratio,
+                taps_per_phase: self.taps_per_phase,
+                hist_l,
+                hist_r,
+            }),
+        ))
+    }
 }
 
 /// Zeroth-order modified Bessel function of the first kind `I_0(x)` computed in pure `f64`
@@ -313,6 +410,30 @@ fn bessel_i0(x: f64) -> f64 {
     sum
 }
 
+/// Choose Kaiser `(cutoff, beta)` for a given taps-per-phase length `m`.
+///
+/// At the default `256` taps/phase, returns exact `(0.955, 12.0)` (`< 0.01 dB` 20 kHz droop,
+/// `> 115 dB` ultrasonic stopband). For smaller user-capped `--max-taps` budgets, scales target
+/// stopband attenuation `A` and Kaiser `beta(A)` smoothly with `m` so the transition band does
+/// not collapse into severe audible passband droop.
+fn kaiser_params_for_taps_per_phase(m: usize) -> (f64, f64) {
+    if m >= SIMPLE_TEST_DEFAULT_TAPS_PER_PHASE {
+        return (0.955_f64, 12.0_f64);
+    }
+    let m_f = (m.max(SIMPLE_TEST_MIN_TAPS_PER_PHASE)) as f64;
+    let a_db = (18.0 + 0.85 * m_f).clamp(28.0, 118.0);
+    let beta = if a_db > 50.0 {
+        0.1102 * (a_db - 8.7)
+    } else if a_db >= 21.0 {
+        0.5842 * (a_db - 21.0).powf(0.4) + 0.07886 * (a_db - 21.0)
+    } else {
+        0.0
+    };
+    let half_tw_nyq = ((a_db - 8.0) / (7.1785 * m_f)) * 0.5;
+    let cutoff = (0.91 + half_tw_nyq).clamp(0.955, 0.995);
+    (cutoff, beta)
+}
+
 /// Build an exact linear-phase Kaiser-windowed sinc polyphase bank (`ratio` phases x `m` taps).
 ///
 /// Using tap grid `j = -half + 1 ..= half` with strict window support `|dt| < half`:
@@ -321,8 +442,7 @@ fn bessel_i0(x: f64) -> f64 {
 ///   precision, yielding an exact odd-length Type-I zero-phase prototype filter.
 fn build_polyphase_bank(ratio: usize, m: usize) -> Vec<Vec<f64>> {
     let half = (m / 2) as isize;
-    let cutoff = 0.955_f64; // 21.06 kHz @ 44.1 kHz -> flat through 20 kHz, >115 dB by 22.05 kHz
-    let beta = 12.0_f64; // ~118 dB Kaiser stopband attenuation
+    let (cutoff, beta) = kaiser_params_for_taps_per_phase(m);
     let inv_i0_beta = 1.0 / bessel_i0(beta);
     let radius = (m as f64) * 0.5;
 

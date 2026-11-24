@@ -27,7 +27,29 @@ use crate::selector::{
     NoiseShaperProfile, SelectedDspPlan, TrackSourceInfo, UNSUPPORTED_SAMPLE_RATE_PREFIX,
     UpsamplerPicker, UpsamplerPolicy,
 };
-use crate::upsampler::{Upsampler, build_upsampler};
+use crate::upsampler::{Upsampler, UpsamplerCarryover, build_upsampler};
+
+/// Stateful DSP carryover transferred across consecutive equal-rate gapless tracks so both the
+/// polyphase upsampler FIR history and the REW UPOLS convolution tail continue seamlessly with
+/// zero boundary discontinuity or silence gap.
+///
+/// If no compatible next track follows (end of queue, sample-rate change, or next-track error),
+/// call [`AudioPipeline::drain_gapless_carryover`] to flush the carried state cleanly through
+/// convolution, delay, and quantization instead of truncating the end of the track.
+#[derive(Debug, Clone)]
+pub struct GaplessCarryover {
+    pub output_rate_hz: u32,
+    pub output_bits: u8,
+    pub effective_shaper: NoiseShaperProfile,
+    pub upsampler: Option<UpsamplerCarryover>,
+    pub convolver: Option<ConvolutionTail>,
+}
+
+impl GaplessCarryover {
+    pub fn is_empty(&self) -> bool {
+        self.upsampler.is_none() && self.convolver.is_none()
+    }
+}
 
 /// Extra safety margin (dB) required on ReplayGain sample peak for `0 dB` headroom whenever the
 /// steep windowed-sinc upsampler is active, protecting against inter-sample peaks (`~+3 dB` on
@@ -141,6 +163,33 @@ impl StreamingPipelineSession {
         self.convolver.set_incoming_tail(tail);
     }
 
+    /// Attach full gapless carryover (unpadded upsampler FIR history + REW convolution tail) from
+    /// the preceding track.
+    ///
+    /// Returns `Ok(())` when the carryover's output rate and upsampler geometry match this track
+    /// (so both FIR interpolation and REW convolution continue seamlessly across the boundary).
+    /// Returns `Err(carryover)` untouched when incompatible (e.g. sample-rate or ratio change),
+    /// allowing the caller to flush the previous track's tail via
+    /// [`AudioPipeline::drain_gapless_carryover`] before starting this track.
+    pub fn set_incoming_gapless_carryover(
+        &mut self,
+        mut carryover: GaplessCarryover,
+    ) -> Result<(), GaplessCarryover> {
+        if carryover.output_rate_hz != self.report.output_rate_hz {
+            return Err(carryover);
+        }
+        if let Some(up) = carryover.upsampler.take() {
+            if let Err(rejected_up) = self.upsampler.set_incoming_carryover(up) {
+                carryover.upsampler = Some(rejected_up);
+                return Err(carryover);
+            }
+        }
+        if let Some(conv) = carryover.convolver.take() {
+            self.convolver.set_incoming_tail(conv);
+        }
+        Ok(())
+    }
+
     /// Flush all stateful FIR / convolution / delay tails cleanly at end-of-track (emits the full
     /// decaying convolution tail — ideal for single-file playback and end-of-queue).
     pub fn flush(&mut self) -> Result<InterleavedInt32Buffer, String> {
@@ -180,17 +229,18 @@ impl StreamingPipelineSession {
         })
     }
 
-    /// Flush end-of-track audio for gapless album continuity: emits the exact remaining samples
-    /// of the current track and returns the decaying REW convolution tail separately so the next
-    /// equal-rate track can overlap-add it without inserting a multi-second silence gap.
+    /// Flush end-of-track audio for gapless album continuity: skips trailing zero-padding on the
+    /// polyphase upsampler, emits the exact convolved frames ready so far, and returns the
+    /// unpadded upsampler FIR history + decaying REW convolution tail as [`GaplessCarryover`] so
+    /// the next equal-rate track continues with zero boundary dip, click, or silence gap.
     pub fn flush_for_gapless(
         &mut self,
-    ) -> Result<(InterleavedInt32Buffer, Option<ConvolutionTail>), String> {
+    ) -> Result<(InterleavedInt32Buffer, Option<GaplessCarryover>), String> {
         let mut frames = Vec::new();
         let rate = self.report.output_rate_hz;
 
-        // 1. Flush upsampler tail -> feed through convolver -> delayer -> quantizer.
-        let up_tail = self.upsampler.flush()?;
+        // 1. Hand off unpadded upsampler FIR history (no trailing zero-pad for equal-rate gapless).
+        let (up_tail, up_carry) = self.upsampler.flush_for_gapless()?;
         if !up_tail.is_empty() {
             let c_out = self.convolver.process_block(up_tail)?;
             if !c_out.is_empty() {
@@ -201,8 +251,8 @@ impl StreamingPipelineSession {
             }
         }
 
-        // 2. Complete the current track's exact sample count and split off the decaying room tail.
-        let (track_end, carried_tail) = self.convolver.flush_split_tail()?;
+        // 2. Complete the already-fed sample count through the convolver and split off its tail.
+        let (track_end, conv_tail) = self.convolver.flush_split_tail()?;
         if !track_end.is_empty() {
             let d_out = self.delayer.process_block(track_end)?;
             if !d_out.is_empty() {
@@ -216,12 +266,24 @@ impl StreamingPipelineSession {
             frames.extend(self.quantizer.quantize_block(&delay_tail).frames);
         }
 
+        let carryover = if up_carry.is_some() || conv_tail.is_some() {
+            Some(GaplessCarryover {
+                output_rate_hz: rate,
+                output_bits: self.report.output_bits,
+                effective_shaper: self.report.effective_shaper,
+                upsampler: up_carry,
+                convolver: conv_tail,
+            })
+        } else {
+            None
+        };
+
         Ok((
             InterleavedInt32Buffer {
                 sample_rate_hz: rate,
                 frames,
             },
-            carried_tail,
+            carryover,
         ))
     }
 }
@@ -350,6 +412,61 @@ impl AudioPipeline {
             convolver,
             delayer,
             quantizer,
+        })
+    }
+
+    /// Drain an unconsumed [`GaplessCarryover`] (upsampler FIR tail + REW convolution tail)
+    /// cleanly into integer PCM at its native `output_rate_hz`.
+    ///
+    /// Called at end-of-queue, before a sample-rate/ratio change, or when the next track fails
+    /// to open so the end of the preceding track and its room reverb decay are never truncated.
+    pub fn drain_gapless_carryover(
+        &self,
+        carryover: GaplessCarryover,
+    ) -> Result<InterleavedInt32Buffer, String> {
+        let rate = carryover.output_rate_hz;
+        if carryover.is_empty() {
+            return Ok(InterleavedInt32Buffer::empty(rate));
+        }
+
+        let mut convolver = self.convolver_factory.create_for_rate(rate)?;
+        if let Some(conv_tail) = carryover.convolver {
+            convolver.set_incoming_tail(conv_tail);
+        }
+        let mut delayer = self.delayer_factory.create_for_rate(rate)?;
+        let mut quantizer =
+            StreamingQuantizer::new(carryover.effective_shaper, carryover.output_bits)?;
+
+        let mut frames = Vec::new();
+        if let Some(up_carry) = carryover.upsampler {
+            let up_tail = up_carry.flush_to_f64();
+            if !up_tail.is_empty() {
+                let c_out = convolver.process_block(up_tail)?;
+                if !c_out.is_empty() {
+                    let d_out = delayer.process_block(c_out)?;
+                    if !d_out.is_empty() {
+                        frames.extend(quantizer.quantize_block(&d_out).frames);
+                    }
+                }
+            }
+        }
+
+        let conv_tail = convolver.flush()?;
+        if !conv_tail.is_empty() {
+            let d_out = delayer.process_block(conv_tail)?;
+            if !d_out.is_empty() {
+                frames.extend(quantizer.quantize_block(&d_out).frames);
+            }
+        }
+
+        let delay_tail = delayer.flush()?;
+        if !delay_tail.is_empty() {
+            frames.extend(quantizer.quantize_block(&delay_tail).frames);
+        }
+
+        Ok(InterleavedInt32Buffer {
+            sample_rate_hz: rate,
+            frames,
         })
     }
 

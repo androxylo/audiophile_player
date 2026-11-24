@@ -289,3 +289,83 @@ fn streaming_pipeline_session_matches_oneshot_bit_for_bit_across_blocks() {
 
     assert_eq!(streamed_frames, oneshot.pcm.frames);
 }
+
+#[test]
+fn gapless_pipeline_sessions_eliminate_boundary_dip_and_drain_on_rate_change() {
+    let pipeline = AudioPipeline::new(UpsamplerPolicy::default()).unwrap();
+    let spec_44 = StreamSpec {
+        sample_rate_hz: 44_100,
+        bits_per_sample: 16,
+        channels: 2,
+    };
+    let spec_48 = StreamSpec {
+        sample_rate_hz: 48_000,
+        bits_per_sample: 24,
+        channels: 2,
+    };
+    let meta = TrackPeakMetadata::default();
+    let n_a = 512_usize;
+    let n_b = 512_usize;
+
+    // 1. Two equal-rate gapless tracks carrying constant DC 0.5: boundary must be completely flat!
+    let mut sess_a = pipeline.start_track(spec_44, &meta, false).unwrap();
+    let mut combined = sess_a
+        .process_block(StereoF64Buffer {
+            sample_rate_hz: 44_100,
+            left: vec![0.5; n_a],
+            right: vec![-0.5; n_a],
+        })
+        .unwrap()
+        .frames;
+    let (tail_a, carry_a) = sess_a.flush_for_gapless().unwrap();
+    combined.extend(tail_a.frames);
+    let carry_a = carry_a.expect("expected gapless carryover from 44.1 kHz upsampler");
+
+    // Verify incompatible 48 kHz track rejects the 44.1 kHz carryover and drain_gapless_carryover
+    // recovers the exact missing upsampler tail so total Track A frames == n_a * 8.
+    let mut sess_48 = pipeline.start_track(spec_48, &meta, false).unwrap();
+    let rejected = sess_48
+        .set_incoming_gapless_carryover(carry_a.clone())
+        .expect_err("48 kHz session must reject 44.1 kHz carryover");
+    let drained_a = pipeline.drain_gapless_carryover(rejected).unwrap();
+    assert_eq!(drained_a.sample_rate_hz, 352_800);
+    assert_eq!(
+        combined.len() + drained_a.frames.len(),
+        n_a * 8,
+        "draining unconsumed carryover must restore Track A's exact full length"
+    );
+
+    // Now test compatible 44.1 kHz Track B accepting carry_a.
+    let mut sess_b = pipeline.start_track(spec_44, &meta, false).unwrap();
+    sess_b
+        .set_incoming_gapless_carryover(carry_a)
+        .expect("equal-rate 44.1 kHz session must accept carryover");
+    combined.extend(
+        sess_b
+            .process_block(StereoF64Buffer {
+                sample_rate_hz: 44_100,
+                left: vec![0.5; n_b],
+                right: vec![-0.5; n_b],
+            })
+            .unwrap()
+            .frames,
+    );
+    combined.extend(sess_b.flush().unwrap().frames);
+
+    assert_eq!(combined.len(), (n_a + n_b) * 8);
+    let expected_l_24 = (0.5_f64 * 10.0_f64.powf(-3.0 / 20.0) * (1_u64 << 23) as f64).round() as i64;
+    let boundary = n_a * 8;
+    for idx in (boundary - 128)..(boundary + 128) {
+        let got_l = i64::from(combined[idx][0] >> 8);
+        let got_r = i64::from(combined[idx][1] >> 8);
+        assert!(
+            (got_l - expected_l_24).abs() <= 1,
+            "gapless pipeline boundary L dip at {idx}: got {got_l}, expected {expected_l_24} +/- 1"
+        );
+        assert!(
+            (got_r + expected_l_24).abs() <= 1,
+            "gapless pipeline boundary R dip at {idx}: got {got_r}, expected {} +/- 1",
+            -expected_l_24
+        );
+    }
+}
