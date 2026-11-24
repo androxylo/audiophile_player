@@ -19,6 +19,24 @@ pub enum DacWireFormat {
     Int16,
 }
 
+impl DacWireFormat {
+    /// Bytes per individual channel sample on the wire.
+    #[inline]
+    pub const fn bytes_per_sample(self) -> usize {
+        match self {
+            Self::Int32 | Self::Int24In32 => 4,
+            Self::Int24Packed => 3,
+            Self::Int16 => 2,
+        }
+    }
+
+    /// Bytes per stereo (2-channel) PCM frame on the wire.
+    #[inline]
+    pub const fn bytes_per_frame(self) -> usize {
+        self.bytes_per_sample() * 2
+    }
+}
+
 /// Metadata describing an audio stream's sample rate and bit depth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamSpec {

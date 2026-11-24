@@ -8,8 +8,10 @@
 //! Bypasses BOTH `audiodg.exe` (Windows audio mixer) AND `AudioSes.dll` (WASAPI).
 //! Windows Shared Mode is intentionally unimplemented and impossible to fall back to.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering, fence};
+#[cfg(windows)]
+use std::sync::OnceLock;
+use std::sync::Arc;
 
 use ap_core::buffer::InterleavedInt32Buffer;
 use ap_core::format::DacWireFormat;
@@ -28,8 +30,9 @@ use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ACCESS_DENIED, ERROR_BUSY, ERROR_GEN_FAILURE, ERROR_INSUFFICIENT_BUFFER,
-    ERROR_NO_MORE_ITEMS, ERROR_NO_SYSTEM_RESOURCES, ERROR_NOT_READY, ERROR_SHARING_VIOLATION,
-    GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+    ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_NO_SYSTEM_RESOURCES, ERROR_NOT_READY,
+    ERROR_SHARING_VIOLATION, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
+    INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
 };
 #[cfg(windows)]
 use windows_sys::Win32::Media::Audio::{WAVEFORMATEX, WAVEFORMATEXTENSIBLE, WAVEFORMATEXTENSIBLE_0};
@@ -58,9 +61,13 @@ use windows_sys::Win32::Storage::FileSystem::{
 #[cfg(windows)]
 use windows_sys::Win32::System::IO::DeviceIoControl;
 #[cfg(windows)]
-use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows_sys::Win32::System::LibraryLoader::{
+    GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+};
 #[cfg(windows)]
-use windows_sys::Win32::System::Registry::{KEY_READ, RegCloseKey, RegQueryValueExW};
+use windows_sys::Win32::System::Registry::{
+    KEY_READ, REG_EXPAND_SZ, REG_SZ, RegCloseKey, RegQueryValueExW,
+};
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
@@ -110,56 +117,70 @@ impl KsPinConnectBlob {
             KSINTERFACE_STANDARD_STREAMING
         };
 
-        let connect = KSPIN_CONNECT {
-            Interface: ks_identifier(KSINTERFACESETID_Standard, iface_id as u32, 0),
-            Medium: ks_identifier(KSMEDIUMSETID_Standard, KSMEDIUM_STANDARD_DEVIO as u32, 0),
-            PinId: pin_id,
-            PinToHandle: core::ptr::null_mut(),
-            Priority: KSPRIORITY {
-                PriorityClass: KSPRIORITY_NORMAL,
-                PrioritySubClass: 1,
-            },
-        };
-
-        let data_format = KSDATAFORMAT {
-            Anonymous: KSDATAFORMAT_0 {
-                FormatSize: format_size,
-                Flags: 0,
-                SampleSize: u32::from(block_align),
-                Reserved: 0,
-                MajorFormat: KSDATAFORMAT_TYPE_AUDIO,
-                SubFormat: KSDATAFORMAT_SUBTYPE_PCM,
-                Specifier: KSDATAFORMAT_SPECIFIER_WAVEFORMATEX,
-            },
-        };
-
         let channel_mask = if channels == 2 {
             SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT
+        } else if channels == 0 {
+            0
         } else {
-            (1_u32 << channels).saturating_sub(1)
+            1_u32
+                .checked_shl(u32::from(channels))
+                .map(|v| v - 1)
+                .unwrap_or(u32::MAX)
         };
 
-        let wave_format = WAVEFORMATEXTENSIBLE {
-            Format: WAVEFORMATEX {
-                wFormatTag: WAVE_FORMAT_EXTENSIBLE as u16,
-                nChannels: channels,
-                nSamplesPerSec: sample_rate_hz,
-                nAvgBytesPerSec: avg_bytes_per_sec,
-                nBlockAlign: block_align,
-                wBitsPerSample: bits_per_sample,
-                cbSize: 22,
-            },
-            Samples: WAVEFORMATEXTENSIBLE_0 {
-                wValidBitsPerSample: valid_bits,
-            },
-            dwChannelMask: channel_mask,
-            SubFormat: KSDATAFORMAT_SUBTYPE_PCM,
-        };
+        // Zero-initialize the entire blob first and write individual fields in place so every
+        // padding byte (such as bytes 52..56 after `KSPIN_CONNECT.PinId` on x64) is guaranteed
+        // initialized to 0, keeping `as_bytes()` completely sound.
+        let mut uninit = core::mem::MaybeUninit::<Self>::zeroed();
+        let ptr = uninit.as_mut_ptr();
+        unsafe {
+            core::ptr::addr_of_mut!((*ptr).connect.Interface).write(ks_identifier(
+                KSINTERFACESETID_Standard,
+                iface_id as u32,
+                0,
+            ));
+            core::ptr::addr_of_mut!((*ptr).connect.Medium).write(ks_identifier(
+                KSMEDIUMSETID_Standard,
+                KSMEDIUM_STANDARD_DEVIO as u32,
+                0,
+            ));
+            core::ptr::addr_of_mut!((*ptr).connect.PinId).write(pin_id);
+            core::ptr::addr_of_mut!((*ptr).connect.PinToHandle).write(core::ptr::null_mut());
+            core::ptr::addr_of_mut!((*ptr).connect.Priority).write(KSPRIORITY {
+                PriorityClass: KSPRIORITY_NORMAL,
+                PrioritySubClass: 1,
+            });
 
-        Self {
-            connect,
-            data_format,
-            wave_format,
+            core::ptr::addr_of_mut!((*ptr).data_format).write(KSDATAFORMAT {
+                Anonymous: KSDATAFORMAT_0 {
+                    FormatSize: format_size,
+                    Flags: 0,
+                    SampleSize: u32::from(block_align),
+                    Reserved: 0,
+                    MajorFormat: KSDATAFORMAT_TYPE_AUDIO,
+                    SubFormat: KSDATAFORMAT_SUBTYPE_PCM,
+                    Specifier: KSDATAFORMAT_SPECIFIER_WAVEFORMATEX,
+                },
+            });
+
+            core::ptr::addr_of_mut!((*ptr).wave_format).write(WAVEFORMATEXTENSIBLE {
+                Format: WAVEFORMATEX {
+                    wFormatTag: WAVE_FORMAT_EXTENSIBLE as u16,
+                    nChannels: channels,
+                    nSamplesPerSec: sample_rate_hz,
+                    nAvgBytesPerSec: avg_bytes_per_sec,
+                    nBlockAlign: block_align,
+                    wBitsPerSample: bits_per_sample,
+                    cbSize: 22,
+                },
+                Samples: WAVEFORMATEXTENSIBLE_0 {
+                    wValidBitsPerSample: valid_bits,
+                },
+                dwChannelMask: channel_mask,
+                SubFormat: KSDATAFORMAT_SUBTYPE_PCM,
+            });
+
+            uninit.assume_init()
         }
     }
 
@@ -226,11 +247,7 @@ impl<'a> WaveRtFramePump<'a> {
     }
 
     pub fn bytes_per_frame(&self) -> usize {
-        match self.wire_format {
-            DacWireFormat::Int32 | DacWireFormat::Int24In32 => 8,
-            DacWireFormat::Int24Packed => 6,
-            DacWireFormat::Int16 => 4,
-        }
+        self.wire_format.bytes_per_frame()
     }
 
     pub fn is_exhausted(&self) -> bool {
@@ -251,25 +268,7 @@ impl<'a> WaveRtFramePump<'a> {
 
         let mut offset = 0;
         for &[l, r] in &self.frames[self.cursor..self.cursor + to_write] {
-            match self.wire_format {
-                DacWireFormat::Int32 | DacWireFormat::Int24In32 => {
-                    dst[offset..offset + 4].copy_from_slice(&l.to_le_bytes());
-                    dst[offset + 4..offset + 8].copy_from_slice(&r.to_le_bytes());
-                }
-                DacWireFormat::Int24Packed => {
-                    // Top 24 bits of MSB-aligned i32 are little-endian bytes [1..4].
-                    let lb = l.to_le_bytes();
-                    let rb = r.to_le_bytes();
-                    dst[offset..offset + 3].copy_from_slice(&lb[1..4]);
-                    dst[offset + 3..offset + 6].copy_from_slice(&rb[1..4]);
-                }
-                DacWireFormat::Int16 => {
-                    let l16 = (l >> 16) as i16;
-                    let r16 = (r >> 16) as i16;
-                    dst[offset..offset + 2].copy_from_slice(&l16.to_le_bytes());
-                    dst[offset + 2..offset + 4].copy_from_slice(&r16.to_le_bytes());
-                }
-            }
+            encode_frame(&mut dst[offset..offset + bpf], l, r, self.wire_format);
             offset += bpf;
         }
         self.cursor += to_write;
@@ -283,43 +282,7 @@ impl<'a> WaveRtFramePump<'a> {
     /// Fill `dst` with a smooth linear fade-out to silence so mid-track stops are click-free.
     pub fn fill_fade_out_slice(&mut self, dst: &mut [u8]) -> usize {
         let written = self.fill_slice(dst);
-        if written == 0 {
-            return 0;
-        }
-        let bpf = self.bytes_per_frame();
-        for i in 0..written {
-            let gain = 1.0 - (i as f64) / (written as f64);
-            let off = i * bpf;
-            match self.wire_format {
-                DacWireFormat::Int32 | DacWireFormat::Int24In32 => {
-                    let l = i32::from_le_bytes(dst[off..off + 4].try_into().unwrap());
-                    let r = i32::from_le_bytes(dst[off + 4..off + 8].try_into().unwrap());
-                    let lf = ((l as f64) * gain).round() as i32;
-                    let rf = ((r as f64) * gain).round() as i32;
-                    dst[off..off + 4].copy_from_slice(&lf.to_le_bytes());
-                    dst[off + 4..off + 8].copy_from_slice(&rf.to_le_bytes());
-                }
-                DacWireFormat::Int24Packed => {
-                    for ch_off in [off, off + 3] {
-                        let s = i32::from_le_bytes([
-                            0,
-                            dst[ch_off],
-                            dst[ch_off + 1],
-                            dst[ch_off + 2],
-                        ]);
-                        let sf = (((s as f64) * gain).round() as i32).to_le_bytes();
-                        dst[ch_off..ch_off + 3].copy_from_slice(&sf[1..4]);
-                    }
-                }
-                DacWireFormat::Int16 => {
-                    for ch_off in [off, off + 2] {
-                        let s = i16::from_le_bytes(dst[ch_off..ch_off + 2].try_into().unwrap());
-                        let sf = ((s as f64) * gain).round() as i16;
-                        dst[ch_off..ch_off + 2].copy_from_slice(&sf.to_le_bytes());
-                    }
-                }
-            }
-        }
+        apply_linear_fade_out_bytes(dst, written, self.wire_format);
         written
     }
 }
@@ -330,6 +293,9 @@ pub trait WaveRtPumpSource {
     fn frames_written(&self) -> usize;
     fn fill_slice(&mut self, dst: &mut [u8]) -> usize;
     fn fill_fade_out_slice(&mut self, dst: &mut [u8]) -> usize;
+    fn take_error(&mut self) -> Option<OutputError> {
+        None
+    }
 }
 
 impl WaveRtPumpSource for WaveRtFramePump<'_> {
@@ -359,23 +325,27 @@ where
     next_block: F,
     current: Option<InterleavedInt32Buffer>,
     cursor: usize,
+    expected_sample_rate_hz: u32,
     wire_format: DacWireFormat,
     total_frames_written: usize,
     eof: bool,
+    pending_error: Option<OutputError>,
 }
 
 impl<F> StreamingWaveRtPump<F>
 where
     F: FnMut() -> Option<InterleavedInt32Buffer>,
 {
-    pub fn new(wire_format: DacWireFormat, next_block: F) -> Self {
+    pub fn new(expected_sample_rate_hz: u32, wire_format: DacWireFormat, next_block: F) -> Self {
         Self {
             next_block,
             current: None,
             cursor: 0,
+            expected_sample_rate_hz,
             wire_format,
             total_frames_written: 0,
             eof: false,
+            pending_error: None,
         }
     }
 
@@ -388,6 +358,16 @@ where
             }
             match (self.next_block)() {
                 Some(buf) if !buf.frames.is_empty() => {
+                    if buf.sample_rate_hz != self.expected_sample_rate_hz {
+                        self.current = None;
+                        self.cursor = 0;
+                        self.eof = true;
+                        self.pending_error = Some(OutputError::InvalidBuffer(format!(
+                            "stream block sample rate mismatch: pin is {} Hz, block is {} Hz",
+                            self.expected_sample_rate_hz, buf.sample_rate_hz
+                        )));
+                        return false;
+                    }
                     self.current = Some(buf);
                     self.cursor = 0;
                     return true;
@@ -410,11 +390,7 @@ where
     F: FnMut() -> Option<InterleavedInt32Buffer>,
 {
     fn bytes_per_frame(&self) -> usize {
-        match self.wire_format {
-            DacWireFormat::Int32 | DacWireFormat::Int24In32 => 8,
-            DacWireFormat::Int24Packed => 6,
-            DacWireFormat::Int16 => 4,
-        }
+        self.wire_format.bytes_per_frame()
     }
 
     fn frames_written(&self) -> usize {
@@ -456,24 +432,60 @@ where
         apply_linear_fade_out_bytes(dst, written, self.wire_format);
         written
     }
+
+    fn take_error(&mut self) -> Option<OutputError> {
+        self.pending_error.take()
+    }
+}
+
+/// Round an MSB-aligned signed 32-bit PCM sample to its top 24 bits (unbiased round-to-nearest-even)
+/// with the low 8 bits guaranteed zero and positive full-scale clamped cleanly without wraparound.
+/// Already-quantized 24-bit samples (low byte == 0) pass through bit-identically.
+#[inline]
+fn round_i32_to_top_24(sample: i32) -> i32 {
+    let mut q = i64::from(sample) >> 8;
+    let rem = sample & 0xFF;
+    if rem > 0x80 || (rem == 0x80 && (q & 1) != 0) {
+        q += 1;
+    }
+    let clamped = q.clamp(-0x80_0000, 0x7F_FFFF) as i32;
+    clamped << 8
+}
+
+/// Round an MSB-aligned signed 32-bit PCM sample to signed 16-bit (unbiased round-to-nearest-even)
+/// with clean saturation. Already-quantized 16-bit samples (low 16 bits == 0) pass through bit-identically.
+#[inline]
+fn round_i32_to_top_16(sample: i32) -> i16 {
+    let mut q = i64::from(sample) >> 16;
+    let rem = sample & 0xFFFF;
+    if rem > 0x8000 || (rem == 0x8000 && (q & 1) != 0) {
+        q += 1;
+    }
+    q.clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16
 }
 
 #[inline]
 fn encode_frame(dst: &mut [u8], l: i32, r: i32, wire_format: DacWireFormat) {
     match wire_format {
-        DacWireFormat::Int32 | DacWireFormat::Int24In32 => {
+        DacWireFormat::Int32 => {
             dst[0..4].copy_from_slice(&l.to_le_bytes());
             dst[4..8].copy_from_slice(&r.to_le_bytes());
         }
+        DacWireFormat::Int24In32 => {
+            let l24 = round_i32_to_top_24(l);
+            let r24 = round_i32_to_top_24(r);
+            dst[0..4].copy_from_slice(&l24.to_le_bytes());
+            dst[4..8].copy_from_slice(&r24.to_le_bytes());
+        }
         DacWireFormat::Int24Packed => {
-            let lb = l.to_le_bytes();
-            let rb = r.to_le_bytes();
+            let lb = round_i32_to_top_24(l).to_le_bytes();
+            let rb = round_i32_to_top_24(r).to_le_bytes();
             dst[0..3].copy_from_slice(&lb[1..4]);
             dst[3..6].copy_from_slice(&rb[1..4]);
         }
         DacWireFormat::Int16 => {
-            let l16 = (l >> 16) as i16;
-            let r16 = (r >> 16) as i16;
+            let l16 = round_i32_to_top_16(l);
+            let r16 = round_i32_to_top_16(r);
             dst[0..2].copy_from_slice(&l16.to_le_bytes());
             dst[2..4].copy_from_slice(&r16.to_le_bytes());
         }
@@ -484,16 +496,12 @@ fn apply_linear_fade_out_bytes(dst: &mut [u8], written: usize, wire_format: DacW
     if written == 0 {
         return;
     }
-    let bpf = match wire_format {
-        DacWireFormat::Int32 | DacWireFormat::Int24In32 => 8,
-        DacWireFormat::Int24Packed => 6,
-        DacWireFormat::Int16 => 4,
-    };
+    let bpf = wire_format.bytes_per_frame();
     for i in 0..written {
         let gain = 1.0 - (i as f64) / (written as f64);
         let off = i * bpf;
         match wire_format {
-            DacWireFormat::Int32 | DacWireFormat::Int24In32 => {
+            DacWireFormat::Int32 => {
                 let l = i32::from_le_bytes(dst[off..off + 4].try_into().unwrap());
                 let r = i32::from_le_bytes(dst[off + 4..off + 8].try_into().unwrap());
                 let lf = ((l as f64) * gain).round() as i32;
@@ -501,11 +509,19 @@ fn apply_linear_fade_out_bytes(dst: &mut [u8], written: usize, wire_format: DacW
                 dst[off..off + 4].copy_from_slice(&lf.to_le_bytes());
                 dst[off + 4..off + 8].copy_from_slice(&rf.to_le_bytes());
             }
+            DacWireFormat::Int24In32 => {
+                let l = i32::from_le_bytes(dst[off..off + 4].try_into().unwrap());
+                let r = i32::from_le_bytes(dst[off + 4..off + 8].try_into().unwrap());
+                let lf = round_i32_to_top_24(((l as f64) * gain).round() as i32);
+                let rf = round_i32_to_top_24(((r as f64) * gain).round() as i32);
+                dst[off..off + 4].copy_from_slice(&lf.to_le_bytes());
+                dst[off + 4..off + 8].copy_from_slice(&rf.to_le_bytes());
+            }
             DacWireFormat::Int24Packed => {
                 for ch_off in [off, off + 3] {
                     let s =
                         i32::from_le_bytes([0, dst[ch_off], dst[ch_off + 1], dst[ch_off + 2]]);
-                    let sf = (((s as f64) * gain).round() as i32).to_le_bytes();
+                    let sf = round_i32_to_top_24(((s as f64) * gain).round() as i32).to_le_bytes();
                     dst[ch_off..ch_off + 3].copy_from_slice(&sf[1..4]);
                 }
             }
@@ -586,15 +602,25 @@ pub fn select_wdm_ks_device(
         ));
     }
 
+    let wavert_devices: Vec<&KsRenderDevice> = devices
+        .iter()
+        .filter(|d| d.supports_looped_wavert)
+        .collect();
+    if wavert_devices.is_empty() {
+        return Err(OutputError::DeviceNotFound(
+            "no Windows WDM-KS looped WaveRT audio render devices found".to_string(),
+        ));
+    }
+
     if let Some(filter) = device_filter {
         let needle = filter.to_lowercase();
-        return devices
-            .iter()
+        return wavert_devices
+            .into_iter()
             .find(|d| d.friendly_name.to_lowercase().contains(&needle))
             .cloned()
             .ok_or_else(|| {
                 OutputError::DeviceNotFound(format!(
-                    "no WDM-KS render device matching '{filter}'"
+                    "no WDM-KS looped WaveRT render device matching '{filter}'"
                 ))
             });
     }
@@ -621,8 +647,8 @@ pub fn select_wdm_ks_device(
         s
     };
 
-    devices
-        .iter()
+    wavert_devices
+        .into_iter()
         .max_by_key(|d| score(d))
         .cloned()
         .ok_or_else(|| OutputError::DeviceNotFound("no WDM-KS render device available".to_string()))
@@ -683,12 +709,13 @@ impl WdmKsSink {
         wire_format: DacWireFormat,
     ) -> Result<(), OutputError> {
         let filter = open_ks_filter(&self.device.device_path)?;
+        // Probe with the exact same looped WaveRT interface used during playback.
         let _pin = create_ks_render_pin(
             filter.raw(),
             &self.device,
             sample_rate_hz,
             wire_format,
-            self.device.supports_looped_wavert,
+            true,
         )?;
         Ok(())
     }
@@ -705,7 +732,7 @@ impl WdmKsSink {
     where
         F: FnMut() -> Option<InterleavedInt32Buffer>,
     {
-        let mut pump = StreamingWaveRtPump::new(wire_format, next_block);
+        let mut pump = StreamingWaveRtPump::new(sample_rate_hz, wire_format, next_block);
         self.run_wavert_pump(sample_rate_hz, wire_format, &mut pump)
     }
 
@@ -773,7 +800,13 @@ impl WdmKsSink {
         let cyclic_slice =
             unsafe { core::slice::from_raw_parts_mut(rt_buf.BufferAddress.cast::<u8>(), buf_len) };
         pump.fill_slice(&mut cyclic_slice[0..half_len]);
+        if let Some(err) = pump.take_error() {
+            return Err(err);
+        }
         pump.fill_slice(&mut cyclic_slice[half_len..half_len * 2]);
+        if let Some(err) = pump.take_error() {
+            return Err(err);
+        }
         if call_barrier {
             fence(Ordering::SeqCst);
         }
@@ -788,6 +821,7 @@ impl WdmKsSink {
         let mut trailing_silent_halves: usize = 0;
         let mut stopping_fade_done = false;
         let mut notifications: usize = 0;
+        let mut pump_error: Option<OutputError> = None;
 
         loop {
             let wait_res = unsafe { WaitForSingleObject(event_handle.raw(), 1500) };
@@ -827,6 +861,11 @@ impl WdmKsSink {
             }
             next_half ^= 1;
 
+            if let Some(err) = pump.take_error() {
+                pump_error = Some(err);
+                break;
+            }
+
             if written == 0 {
                 trailing_silent_halves += 1;
                 if trailing_silent_halves >= 2 {
@@ -838,6 +877,10 @@ impl WdmKsSink {
         // 9. Clean stop: PAUSE -> STOP (then RAII drops unregister event, close pin & filter).
         let _ = state_guard.set_state(KSSTATE_PAUSE);
         let _ = state_guard.set_state(KSSTATE_STOP);
+
+        if let Some(err) = pump_error {
+            return Err(err);
+        }
 
         Ok(PlaybackStats {
             device_name: self.device.friendly_name.clone(),
@@ -1157,6 +1200,49 @@ fn create_auto_reset_event() -> Result<OwnedHandle, OutputError> {
 }
 
 #[cfg(windows)]
+type KsCreatePinFn =
+    unsafe extern "system" fn(HANDLE, *const KSPIN_CONNECT, u32, *mut HANDLE) -> u32;
+
+#[cfg(windows)]
+fn resolve_ks_create_pin() -> Result<KsCreatePinFn, OutputError> {
+    static KS_CREATE_PIN: OnceLock<Result<KsCreatePinFn, (&'static str, u32, &'static str)>> =
+        OnceLock::new();
+    match *KS_CREATE_PIN.get_or_init(|| {
+        let dll_name: Vec<u16> = "ksuser.dll\0".encode_utf16().collect();
+        // Load once strictly from System32 to avoid DLL search-order planting and refcount leaks.
+        let module = unsafe {
+            LoadLibraryExW(
+                dll_name.as_ptr(),
+                core::ptr::null_mut(),
+                LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+        };
+        if module.is_null() {
+            return Err((
+                "LoadLibraryExW(ksuser.dll)",
+                unsafe { GetLastError() },
+                "failed to load ksuser.dll from System32",
+            ));
+        }
+        let Some(sym) = (unsafe { GetProcAddress(module, c"KsCreatePin".as_ptr().cast()) }) else {
+            return Err((
+                "GetProcAddress(KsCreatePin)",
+                unsafe { GetLastError() },
+                "KsCreatePin export missing from ksuser.dll",
+            ));
+        };
+        Ok(unsafe { core::mem::transmute::<_, KsCreatePinFn>(sym) })
+    }) {
+        Ok(f) => Ok(f),
+        Err((operation, code, detail)) => Err(OutputError::Win32 {
+            operation,
+            code,
+            detail: detail.to_string(),
+        }),
+    }
+}
+
+#[cfg(windows)]
 fn create_ks_render_pin(
     filter: HANDLE,
     device: &KsRenderDevice,
@@ -1164,22 +1250,7 @@ fn create_ks_render_pin(
     wire_format: DacWireFormat,
     looped_wavert: bool,
 ) -> Result<OwnedHandle, OutputError> {
-    type KsCreatePinFn =
-        unsafe extern "system" fn(HANDLE, *const KSPIN_CONNECT, u32, *mut HANDLE) -> u32;
-
-    let dll_name: Vec<u16> = "ksuser.dll\0".encode_utf16().collect();
-    let module = unsafe { LoadLibraryW(dll_name.as_ptr()) };
-    if module.is_null() {
-        return Err(win32_err("LoadLibraryW(ksuser.dll)"));
-    }
-    let sym = unsafe { GetProcAddress(module, c"KsCreatePin".as_ptr().cast()) }.ok_or_else(|| {
-        OutputError::Win32 {
-            operation: "GetProcAddress(KsCreatePin)",
-            code: unsafe { GetLastError() },
-            detail: "KsCreatePin export missing from ksuser.dll".to_string(),
-        }
-    })?;
-    let ks_create_pin: KsCreatePinFn = unsafe { core::mem::transmute(sym) };
+    let ks_create_pin = resolve_ks_create_pin()?;
 
     let blob = KsPinConnectBlob::new_pcm(
         device.render_pin_id,
@@ -1290,17 +1361,23 @@ fn find_render_pin(filter: HANDLE) -> Option<(u32, bool)> {
     .ok()?;
 
     for pin_id in 0..pin_count {
-        let dataflow = query_pin_u32(filter, pin_id, KSPROPERTY_PIN_DATAFLOW as u32)?;
+        let Some(dataflow) = query_pin_u32(filter, pin_id, KSPROPERTY_PIN_DATAFLOW as u32) else {
+            continue;
+        };
         if dataflow != KSPIN_DATAFLOW_IN as u32 {
             continue;
         }
-        let comm = query_pin_u32(filter, pin_id, KSPROPERTY_PIN_COMMUNICATION as u32)?;
+        let Some(comm) = query_pin_u32(filter, pin_id, KSPROPERTY_PIN_COMMUNICATION as u32) else {
+            continue;
+        };
         if comm != KSPIN_COMMUNICATION_SINK as u32 && comm != KSPIN_COMMUNICATION_BOTH as u32 {
             continue;
         }
-        let (has_streaming, has_looped) = query_pin_streaming_interfaces(filter, pin_id);
-        if has_streaming || has_looped {
-            return Some((pin_id, has_looped));
+        let (_has_streaming, has_looped) = query_pin_streaming_interfaces(filter, pin_id);
+        // Playback exclusively uses looped WaveRT streaming; skip non-WaveRT pins so a
+        // WaveCyclic/WavePci pin never wins selection or probes OK then fails playback.
+        if has_looped {
+            return Some((pin_id, true));
         }
     }
     None
@@ -1327,6 +1404,8 @@ fn query_pin_u32(filter: HANDLE, pin_id: u32, prop_id: u32) -> Option<u32> {
 
 #[cfg(windows)]
 fn query_pin_streaming_interfaces(filter: HANDLE, pin_id: u32) -> (bool, bool) {
+    const MAX_INTERFACES_BYTES: usize = 64 * 1024;
+
     let ksp = KSP_PIN {
         Property: ks_identifier(
             KSPROPSETID_Pin,
@@ -1336,20 +1415,87 @@ fn query_pin_streaming_interfaces(filter: HANDLE, pin_id: u32) -> (bool, bool) {
         PinId: pin_id,
         Anonymous: KSP_PIN_0 { Reserved: 0 },
     };
-    let mut buf = vec![0u8; 512];
-    let Ok(bytes) = ks_ioctl(
-        filter,
-        &ksp,
-        buf.as_mut_ptr().cast(),
-        buf.len() as u32,
-        "KSPROPERTY_PIN_INTERFACES",
-    ) else {
-        return (true, true);
+
+    // Step 1: two-step size probe with a 0-length output buffer.
+    let mut required_bytes: u32 = 0;
+    let probe_ok = unsafe {
+        DeviceIoControl(
+            filter,
+            IOCTL_KS_PROPERTY,
+            (&ksp as *const KSP_PIN).cast(),
+            core::mem::size_of::<KSP_PIN>() as u32,
+            core::ptr::null_mut(),
+            0,
+            &mut required_bytes,
+            core::ptr::null_mut(),
+        )
     };
-    if (bytes as usize) < core::mem::size_of::<KSMULTIPLE_ITEM>() {
+    let probe_err = if probe_ok == 0 {
+        unsafe { GetLastError() }
+    } else {
+        0
+    };
+
+    let mut alloc_bytes = if (probe_ok != 0
+        || probe_err == ERROR_MORE_DATA
+        || probe_err == ERROR_INSUFFICIENT_BUFFER)
+        && (required_bytes as usize) >= core::mem::size_of::<KSMULTIPLE_ITEM>()
+    {
+        (required_bytes as usize).min(MAX_INTERFACES_BYTES)
+    } else {
+        // Fallback initial buffer for drivers that reject 0-length size probes.
+        512
+    };
+
+    // Back with `Vec<u64>` so the buffer is 8-byte aligned for KSMULTIPLE_ITEM / KSIDENTIFIER.
+    let mut buf = vec![0u64; (alloc_bytes + 7) / 8];
+    let mut bytes_returned: u32 = 0;
+    let mut ok = unsafe {
+        DeviceIoControl(
+            filter,
+            IOCTL_KS_PROPERTY,
+            (&ksp as *const KSP_PIN).cast(),
+            core::mem::size_of::<KSP_PIN>() as u32,
+            buf.as_mut_ptr().cast(),
+            (buf.len() * 8) as u32,
+            &mut bytes_returned,
+            core::ptr::null_mut(),
+        )
+    };
+
+    // Retry once if the fallback 512-byte buffer was too small and the driver reported the exact size.
+    if ok == 0 {
+        let err = unsafe { GetLastError() };
+        if (err == ERROR_MORE_DATA || err == ERROR_INSUFFICIENT_BUFFER)
+            && (bytes_returned as usize) > buf.len() * 8
+            && (bytes_returned as usize) <= MAX_INTERFACES_BYTES
+        {
+            alloc_bytes = bytes_returned as usize;
+            buf = vec![0u64; (alloc_bytes + 7) / 8];
+            bytes_returned = 0;
+            ok = unsafe {
+                DeviceIoControl(
+                    filter,
+                    IOCTL_KS_PROPERTY,
+                    (&ksp as *const KSP_PIN).cast(),
+                    core::mem::size_of::<KSP_PIN>() as u32,
+                    buf.as_mut_ptr().cast(),
+                    (buf.len() * 8) as u32,
+                    &mut bytes_returned,
+                    core::ptr::null_mut(),
+                )
+            };
+        }
+    }
+
+    if ok == 0 || (bytes_returned as usize) < core::mem::size_of::<KSMULTIPLE_ITEM>() {
+        // Never assume looped WaveRT support when the interface query fails.
         return (false, false);
     }
-    let header = unsafe { &*(buf.as_ptr().cast::<KSMULTIPLE_ITEM>()) };
+
+    let valid_bytes = (bytes_returned as usize).min(buf.len() * 8);
+    let raw_bytes = buf.as_ptr().cast::<u8>();
+    let header = unsafe { core::ptr::read_unaligned(raw_bytes.cast::<KSMULTIPLE_ITEM>()) };
     let count = header.Count as usize;
     let item_size = core::mem::size_of::<KSIDENTIFIER>();
     let base = core::mem::size_of::<KSMULTIPLE_ITEM>();
@@ -1357,11 +1503,11 @@ fn query_pin_streaming_interfaces(filter: HANDLE, pin_id: u32) -> (bool, bool) {
     let mut has_streaming = false;
     let mut has_looped = false;
     for i in 0..count {
-        let off = base + i * item_size;
-        if off + item_size > bytes as usize {
+        let off = base.saturating_add(i.saturating_mul(item_size));
+        if off.saturating_add(item_size) > valid_bytes {
             break;
         }
-        let ident = unsafe { &*(buf.as_ptr().add(off).cast::<KSIDENTIFIER>()) };
+        let ident = unsafe { core::ptr::read_unaligned(raw_bytes.add(off).cast::<KSIDENTIFIER>()) };
         let (set, id) = unsafe { (ident.Anonymous.Anonymous.Set, ident.Anonymous.Anonymous.Id) };
         if guid_eq(set, KSINTERFACESETID_Standard) {
             if id == KSINTERFACE_STANDARD_STREAMING as u32 {
@@ -1427,7 +1573,11 @@ fn get_interface_device_path(
     }
 
     let path_ptr = unsafe { core::ptr::addr_of!((*detail).DevicePath).cast::<u16>() };
-    Some(wide_cstr_to_string(path_ptr))
+    let path_offset = (path_ptr as usize).saturating_sub(detail as usize);
+    let max_bytes = (required as usize).min(buf.len() * 4).saturating_sub(path_offset);
+    let max_units = max_bytes / 2;
+    let slice = unsafe { core::slice::from_raw_parts(path_ptr, max_units) };
+    Some(wide_slice_to_string(slice))
 }
 
 #[cfg(windows)]
@@ -1466,21 +1616,25 @@ fn get_friendly_name(
 fn query_reg_sz(hkey: windows_sys::Win32::System::Registry::HKEY, value_name: &str) -> Option<String> {
     let wide_name: Vec<u16> = value_name.encode_utf16().chain(core::iter::once(0)).collect();
     let mut buf = vec![0u16; 256];
-    let mut byte_len = (buf.len() * 2) as u32;
+    let mut reg_type: u32 = 0;
+    // Leave at least one guaranteed trailing u16 slot and always slice by `byte_len / 2` so a
+    // non-NUL-terminated REG_SZ can never read out of bounds.
+    let mut byte_len = ((buf.len() - 1) * 2) as u32;
     let status = unsafe {
         RegQueryValueExW(
             hkey,
             wide_name.as_ptr(),
             core::ptr::null(),
-            core::ptr::null_mut(),
+            &mut reg_type,
             buf.as_mut_ptr().cast(),
             &mut byte_len,
         )
     };
-    if status != 0 || byte_len < 2 {
+    if status != 0 || byte_len < 2 || (reg_type != REG_SZ && reg_type != REG_EXPAND_SZ) {
         return None;
     }
-    Some(wide_cstr_to_string(buf.as_ptr()))
+    let units = (byte_len as usize / 2).min(buf.len());
+    Some(wide_slice_to_string(&buf[..units]))
 }
 
 #[cfg(windows)]
@@ -1490,31 +1644,73 @@ fn query_dev_registry_string(
     prop: u32,
 ) -> Option<String> {
     let mut buf = vec![0u16; 256];
+    let mut reg_type: u32 = 0;
     let mut required: u32 = 0;
     let ok = unsafe {
         SetupDiGetDeviceRegistryPropertyW(
             dev_info,
             dev_data,
             prop,
-            core::ptr::null_mut(),
+            &mut reg_type,
             buf.as_mut_ptr().cast(),
-            (buf.len() * 2) as u32,
+            ((buf.len() - 1) * 2) as u32,
             &mut required,
         )
     };
-    if ok == 0 {
+    if ok == 0 || required < 2 || (reg_type != REG_SZ && reg_type != REG_EXPAND_SZ) {
         return None;
     }
-    Some(wide_cstr_to_string(buf.as_ptr()))
+    let units = (required as usize / 2).min(buf.len());
+    Some(wide_slice_to_string(&buf[..units]))
 }
 
-#[cfg(windows)]
-fn wide_cstr_to_string(ptr: *const u16) -> String {
-    let mut len = 0;
-    unsafe {
-        while *ptr.add(len) != 0 {
-            len += 1;
-        }
-        String::from_utf16_lossy(core::slice::from_raw_parts(ptr, len))
+fn wide_slice_to_string(slice: &[u16]) -> String {
+    let end = slice.iter().position(|&c| c == 0).unwrap_or(slice.len());
+    String::from_utf16_lossy(&slice[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{round_i32_to_top_16, round_i32_to_top_24, wide_slice_to_string};
+
+    #[test]
+    fn wide_slice_to_string_handles_unterminated_and_embedded_nul_buffers() {
+        let unterminated: Vec<u16> = "Gungnir2".encode_utf16().collect();
+        assert_eq!(wide_slice_to_string(&unterminated), "Gungnir2");
+
+        let mut with_nul: Vec<u16> = "Gungnir2\0junk".encode_utf16().collect();
+        assert_eq!(wide_slice_to_string(&with_nul), "Gungnir2");
+
+        with_nul.clear();
+        assert_eq!(wide_slice_to_string(&with_nul), "");
+    }
+
+    #[test]
+    fn reduced_depth_rounding_is_unbiased_and_saturating() {
+        // Exact multiples pass through bit-identically.
+        assert_eq!(round_i32_to_top_24(0x1234_5600), 0x1234_5600);
+        assert_eq!(round_i32_to_top_24(-0x0001_0000), -0x0001_0000);
+        assert_eq!(round_i32_to_top_16(0x1234_0000), 0x1234);
+        assert_eq!(round_i32_to_top_16(-0x0001_0000), -1);
+
+        // Halfway ties round to even (eliminating -0.5 LSB DC bias).
+        assert_eq!(round_i32_to_top_24(0x1234_5680), 0x1234_5600); // even stays
+        assert_eq!(round_i32_to_top_24(0x1234_5780), 0x1234_5800); // odd rounds up
+        assert_eq!(round_i32_to_top_24(0x1234_5681), 0x1234_5700);
+        assert_eq!(round_i32_to_top_24(-127), 0);
+        assert_eq!(round_i32_to_top_24(-128), 0); // -0.5 -> 0 (even)
+        assert_eq!(round_i32_to_top_24(-129), -256);
+
+        assert_eq!(round_i32_to_top_16(0x1234_8000), 0x1234);
+        assert_eq!(round_i32_to_top_16(0x1235_8000), 0x1236);
+        assert_eq!(round_i32_to_top_16(0x1234_8001), 0x1235);
+        assert_eq!(round_i32_to_top_16(-32767), 0);
+        assert_eq!(round_i32_to_top_16(-32769), -1);
+
+        // Full-scale saturation never wraps around.
+        assert_eq!(round_i32_to_top_24(i32::MAX), 0x7FFF_FF00);
+        assert_eq!(round_i32_to_top_24(i32::MIN), i32::MIN);
+        assert_eq!(round_i32_to_top_16(i32::MAX), i16::MAX);
+        assert_eq!(round_i32_to_top_16(i32::MIN), i16::MIN);
     }
 }

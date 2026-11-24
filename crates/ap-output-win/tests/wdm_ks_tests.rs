@@ -147,7 +147,7 @@ fn streaming_wavert_pump_bridges_uneven_blocks_seamlessly_without_gaps() {
         },
     ];
     let mut iter = blocks.into_iter();
-    let mut pump = StreamingWaveRtPump::new(DacWireFormat::Int32, move || iter.next());
+    let mut pump = StreamingWaveRtPump::new(384_000, DacWireFormat::Int32, move || iter.next());
 
     // Pull 3 frames at a time across 2 + 1 + 2 uneven blocks -> must bridge seamlessly!
     let mut half0 = vec![0xFF_u8; 3 * 8];
@@ -221,6 +221,127 @@ fn memory_lock_guard_pins_and_releases_pcm_slice_cleanly() {
     #[cfg(windows)]
     assert!(guard.is_locked(), "expected VirtualLock to succeed for 32 KiB PCM slice");
     drop(guard);
+}
+
+#[test]
+fn ks_pin_connect_blob_padding_is_zeroed_and_channel_mask_handles_high_channels() {
+    let blob = KsPinConnectBlob::new_pcm(0, 384_000, 2, DacWireFormat::Int32, true);
+    let bytes = blob.as_bytes();
+    // Bytes 52..56 are the x64 alignment padding after KSPIN_CONNECT.PinId.
+    assert_eq!(&bytes[52..56], &[0, 0, 0, 0]);
+
+    // 32+ channels must not overflow shift.
+    let b32 = KsPinConnectBlob::new_pcm(0, 48_000, 32, DacWireFormat::Int32, true);
+    assert_eq!(b32.channel_mask(), u32::MAX);
+    let b0 = KsPinConnectBlob::new_pcm(0, 48_000, 0, DacWireFormat::Int32, true);
+    assert_eq!(b0.channel_mask(), 0);
+}
+
+#[test]
+fn wavert_frame_pump_rounds_reduced_depths_and_zeros_int24_in_32_low_byte() {
+    assert_eq!(DacWireFormat::Int32.bytes_per_frame(), 8);
+    assert_eq!(DacWireFormat::Int24In32.bytes_per_frame(), 8);
+    assert_eq!(DacWireFormat::Int24Packed.bytes_per_frame(), 6);
+    assert_eq!(DacWireFormat::Int16.bytes_per_frame(), 4);
+
+    // Non-zero low bytes that round up cleanly without truncation bias.
+    let frames = vec![[0x1234_56C0_i32, 0x7FFF_FFFF_i32]];
+
+    let mut p24_32 = WaveRtFramePump::new(&frames, DacWireFormat::Int24In32);
+    let mut out24_32 = vec![0xAA_u8; 8];
+    assert_eq!(p24_32.fill_slice(&mut out24_32), 1);
+    let l = i32::from_le_bytes(out24_32[0..4].try_into().unwrap());
+    let r = i32::from_le_bytes(out24_32[4..8].try_into().unwrap());
+    assert_eq!(l & 0xFF, 0, "Int24In32 low byte must be zeroed");
+    assert_eq!(r & 0xFF, 0, "Int24In32 low byte must be zeroed");
+    assert_eq!(l, 0x1234_5700);
+    assert_eq!(r, 0x7FFF_FF00);
+
+    // Fade-out on Int24In32 must also keep low byte zero on every frame.
+    let fade_frames = vec![[0x4000_0000_i32, -0x4000_0000_i32]; 16];
+    let mut pf = WaveRtFramePump::new(&fade_frames, DacWireFormat::Int24In32);
+    let mut out_f = vec![0u8; 16 * 8];
+    assert_eq!(pf.fill_fade_out_slice(&mut out_f), 16);
+    for i in 0..16 {
+        assert_eq!(out_f[i * 8], 0, "Int24In32 faded L low byte must be 0");
+        assert_eq!(out_f[i * 8 + 4], 0, "Int24In32 faded R low byte must be 0");
+    }
+
+    // Int16 rounding: 0x1234_C000 rounds up to 0x1235 instead of truncating to 0x1234.
+    let frames16 = vec![[0x1234_C000_i32, i32::MAX]];
+    let mut p16 = WaveRtFramePump::new(&frames16, DacWireFormat::Int16);
+    let mut out16 = vec![0u8; 4];
+    assert_eq!(p16.fill_slice(&mut out16), 1);
+    assert_eq!(i16::from_le_bytes(out16[0..2].try_into().unwrap()), 0x1235);
+    assert_eq!(i16::from_le_bytes(out16[2..4].try_into().unwrap()), i16::MAX);
+}
+
+#[test]
+fn streaming_wavert_pump_rejects_sample_rate_mismatch() {
+    let blocks = vec![
+        InterleavedInt32Buffer {
+            sample_rate_hz: 384_000,
+            frames: vec![[10, -10]],
+        },
+        InterleavedInt32Buffer {
+            sample_rate_hz: 352_800, // mismatched!
+            frames: vec![[20, -20]],
+        },
+    ];
+    let mut iter = blocks.into_iter();
+    let mut pump = StreamingWaveRtPump::new(384_000, DacWireFormat::Int32, move || iter.next());
+    let mut out = vec![0xFF_u8; 2 * 8];
+    let written = pump.fill_slice(&mut out);
+    assert_eq!(written, 1, "must stop before writing mismatched-rate block");
+    assert_eq!(&out[8..16], &[0u8; 8], "tail must be zero-filled");
+    let err = pump
+        .take_error()
+        .expect("expected sample rate mismatch error");
+    assert!(
+        err.to_string().contains("384000") && err.to_string().contains("352800"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn auto_device_selector_requires_looped_wavert_support() {
+    let devices = vec![
+        KsRenderDevice {
+            friendly_name: "Gungnir 2 Non-WaveRT".to_string(),
+            device_path: r"\\?\usb#vid_30be&pid_1022\msft_wave".to_string(),
+            render_pin_id: 0,
+            supports_looped_wavert: false,
+        },
+        KsRenderDevice {
+            friendly_name: "Real WaveRT DAC".to_string(),
+            device_path: r"\\?\usb#vid_1234&pid_5678\wave".to_string(),
+            render_pin_id: 1,
+            supports_looped_wavert: true,
+        },
+    ];
+    // Even though "Gungnir 2" scores higher, non-WaveRT devices must be rejected.
+    let best = select_wdm_ks_device(&devices, None).unwrap();
+    assert_eq!(best.friendly_name, "Real WaveRT DAC");
+    assert!(select_wdm_ks_device(&devices, Some("Gungnir")).is_err());
+}
+
+#[cfg(windows)]
+#[test]
+fn mmcss_pro_audio_guard_restores_prior_thread_priority_on_drop() {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadPriority};
+    // Run on a dedicated thread so priority changes don't affect the test harness thread.
+    let handle = std::thread::spawn(|| {
+        let before = unsafe { GetThreadPriority(GetCurrentThread()) };
+        {
+            let guard = MmcssGuard::enter_pro_audio(OptimizationLevel::Extreme);
+            assert!(guard.is_active());
+            let during = unsafe { GetThreadPriority(GetCurrentThread()) };
+            assert_ne!(during, before, "Extreme optimization should elevate thread priority");
+        }
+        let after = unsafe { GetThreadPriority(GetCurrentThread()) };
+        assert_eq!(after, before, "MmcssGuard::drop must restore prior thread priority");
+    });
+    handle.join().unwrap();
 }
 
 // ---------------------------------------------------------------------------
