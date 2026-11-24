@@ -10,7 +10,7 @@ use ap_core::config::ConvolutionConfig;
 use ap_core::format::StreamSpec;
 use ap_core::headroom::{HeadroomMode, TrackPeakMetadata};
 use ap_dsp::convolution::{
-    PartitionedStereoConvolver, PreparedStereoIr, RewConvolverFactory, StereoConvolver,
+    MAX_IR_TAPS, PartitionedStereoConvolver, PreparedStereoIr, RewConvolverFactory, StereoConvolver,
     StereoConvolverFactory, WavSampleEncoding, discover_latest_rew_wav, load_stereo_wav,
     probe_wav_header,
 };
@@ -940,6 +940,250 @@ fn synthetic_4m_tap_ir_prepares_and_streams_cleanly() {
     assert!((full_r[100 + 300_000] - 0.1).abs() < 1e-12);
     assert!(full_l.iter().all(|v| v.is_finite()));
     assert!(full_r.iter().all(|v| v.is_finite()));
+}
+
+#[test]
+fn rejects_oversized_ir_wav_and_handles_zero_sized_or_reordered_data_chunks_safely() {
+    let tmp = std::env::temp_dir().join(format!(
+        "ap_dsp_wav_limits_test_{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(&tmp).unwrap();
+
+    // 1. Oversized WAV (> MAX_IR_TAPS frames): must be rejected in probe_wav_header BEFORE any allocation!
+    let huge_path = tmp.join("huge_384k.wav");
+    {
+        let huge_frames: u64 = (MAX_IR_TAPS as u64) + 16;
+        let data_bytes: u32 = (huge_frames * 4) as u32; // 16-bit stereo = 4 B/frame (~33.5 MiB)
+        let mut f = File::create(&huge_path).unwrap();
+        let riff_size = 36_u32 + data_bytes;
+        f.write_all(b"RIFF").unwrap();
+        f.write_all(&riff_size.to_le_bytes()).unwrap();
+        f.write_all(b"WAVE").unwrap();
+        f.write_all(b"fmt ").unwrap();
+        f.write_all(&16u32.to_le_bytes()).unwrap();
+        f.write_all(&1u16.to_le_bytes()).unwrap(); // PCM
+        f.write_all(&2u16.to_le_bytes()).unwrap(); // stereo
+        f.write_all(&384_000u32.to_le_bytes()).unwrap();
+        f.write_all(&(384_000u32 * 4).to_le_bytes()).unwrap();
+        f.write_all(&4u16.to_le_bytes()).unwrap();
+        f.write_all(&16u16.to_le_bytes()).unwrap();
+        f.write_all(b"data").unwrap();
+        f.write_all(&data_bytes.to_le_bytes()).unwrap();
+        f.set_len(44 + u64::from(data_bytes)).unwrap();
+    }
+    let huge_err = probe_wav_header(&huge_path)
+        .err()
+        .expect("oversized WAV must be rejected before allocation");
+    assert!(
+        huge_err.contains("exceeds maximum supported"),
+        "unexpected oversized WAV error: {huge_err}"
+    );
+    // Discovery must skip the oversized WAV rather than failing or OOMing.
+    assert!(discover_latest_rew_wav(&tmp, 384_000).unwrap().is_none());
+    let _ = fs::remove_file(&huge_path);
+
+    // 2. Genuinely empty data chunk (size == 0) followed by a 200-byte LIST metadata chunk:
+    //    must report num_frames == 0 (NEVER parse trailing LIST bytes as IR audio taps!).
+    let empty_with_list = tmp.join("empty_list_384k.wav");
+    {
+        let mut f = File::create(&empty_with_list).unwrap();
+        let list_payload = vec![0x42u8; 200];
+        let riff_size: u32 = 4 + (8 + 16) + 8 + (8 + 200);
+        f.write_all(b"RIFF").unwrap();
+        f.write_all(&riff_size.to_le_bytes()).unwrap();
+        f.write_all(b"WAVE").unwrap();
+        f.write_all(b"fmt ").unwrap();
+        f.write_all(&16u32.to_le_bytes()).unwrap();
+        f.write_all(&3u16.to_le_bytes()).unwrap(); // IEEE float
+        f.write_all(&2u16.to_le_bytes()).unwrap();
+        f.write_all(&384_000u32.to_le_bytes()).unwrap();
+        f.write_all(&(384_000u32 * 8).to_le_bytes()).unwrap();
+        f.write_all(&8u16.to_le_bytes()).unwrap();
+        f.write_all(&32u16.to_le_bytes()).unwrap();
+        f.write_all(b"data").unwrap();
+        f.write_all(&0u32.to_le_bytes()).unwrap(); // 0 bytes!
+        f.write_all(b"LIST").unwrap();
+        f.write_all(&200u32.to_le_bytes()).unwrap();
+        f.write_all(&list_payload).unwrap();
+    }
+    let hdr_empty = probe_wav_header(&empty_with_list).unwrap();
+    assert_eq!(hdr_empty.num_frames, 0, "empty data chunk must NOT absorb trailing LIST chunk");
+    assert!(load_stereo_wav(&empty_with_list).is_err());
+
+    // 3. Empty data chunk (size == 0) BEFORE fmt chunk: must advance cleanly to fmt without
+    //    misinterpreting audio bytes as chunk headers.
+    let data_before_fmt = tmp.join("data_before_fmt_384k.wav");
+    {
+        let mut f = File::create(&data_before_fmt).unwrap();
+        let riff_size: u32 = 4 + 8 + (8 + 16);
+        f.write_all(b"RIFF").unwrap();
+        f.write_all(&riff_size.to_le_bytes()).unwrap();
+        f.write_all(b"WAVE").unwrap();
+        f.write_all(b"data").unwrap();
+        f.write_all(&0u32.to_le_bytes()).unwrap();
+        f.write_all(b"fmt ").unwrap();
+        f.write_all(&16u32.to_le_bytes()).unwrap();
+        f.write_all(&3u16.to_le_bytes()).unwrap();
+        f.write_all(&2u16.to_le_bytes()).unwrap();
+        f.write_all(&384_000u32.to_le_bytes()).unwrap();
+        f.write_all(&(384_000u32 * 8).to_le_bytes()).unwrap();
+        f.write_all(&8u16.to_le_bytes()).unwrap();
+        f.write_all(&32u16.to_le_bytes()).unwrap();
+    }
+    let hdr_reordered = probe_wav_header(&data_before_fmt).unwrap();
+    assert_eq!(hdr_reordered.num_frames, 0);
+    assert_eq!(hdr_reordered.sample_rate_hz, 384_000);
+
+    // 4. Streaming 0xFFFFFFFF data placeholder is accepted ONLY when RIFF size is also 0xFFFFFFFF.
+    let bad_stream = tmp.join("bad_placeholder.wav");
+    {
+        let mut f = File::create(&bad_stream).unwrap();
+        f.write_all(b"RIFF").unwrap();
+        f.write_all(&100u32.to_le_bytes()).unwrap(); // NOT 0xFFFFFFFF
+        f.write_all(b"WAVE").unwrap();
+        f.write_all(b"fmt ").unwrap();
+        f.write_all(&16u32.to_le_bytes()).unwrap();
+        f.write_all(&3u16.to_le_bytes()).unwrap();
+        f.write_all(&2u16.to_le_bytes()).unwrap();
+        f.write_all(&384_000u32.to_le_bytes()).unwrap();
+        f.write_all(&(384_000u32 * 8).to_le_bytes()).unwrap();
+        f.write_all(&8u16.to_le_bytes()).unwrap();
+        f.write_all(&32u16.to_le_bytes()).unwrap();
+        f.write_all(b"data").unwrap();
+        f.write_all(&u32::MAX.to_le_bytes()).unwrap();
+        f.write_all(&0.5f32.to_le_bytes()).unwrap();
+        f.write_all(&0.5f32.to_le_bytes()).unwrap();
+    }
+    assert!(probe_wav_header(&bad_stream).is_err());
+
+    let ok_stream = tmp.join("ok_placeholder.wav");
+    {
+        let mut f = File::create(&ok_stream).unwrap();
+        f.write_all(b"RIFF").unwrap();
+        f.write_all(&u32::MAX.to_le_bytes()).unwrap();
+        f.write_all(b"WAVE").unwrap();
+        f.write_all(b"fmt ").unwrap();
+        f.write_all(&16u32.to_le_bytes()).unwrap();
+        f.write_all(&3u16.to_le_bytes()).unwrap();
+        f.write_all(&2u16.to_le_bytes()).unwrap();
+        f.write_all(&384_000u32.to_le_bytes()).unwrap();
+        f.write_all(&(384_000u32 * 8).to_le_bytes()).unwrap();
+        f.write_all(&8u16.to_le_bytes()).unwrap();
+        f.write_all(&32u16.to_le_bytes()).unwrap();
+        f.write_all(b"data").unwrap();
+        f.write_all(&u32::MAX.to_le_bytes()).unwrap();
+        f.write_all(&0.5f32.to_le_bytes()).unwrap();
+        f.write_all(&0.25f32.to_le_bytes()).unwrap();
+    }
+    let hdr_ok = probe_wav_header(&ok_stream).unwrap();
+    assert_eq!(hdr_ok.num_frames, 1);
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn gapless_tail_is_preserved_at_end_of_queue_and_across_rate_change() {
+    let tmp = std::env::temp_dir().join(format!(
+        "ap_dsp_tail_drain_test_{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(&tmp).unwrap();
+
+    // Build two stereo IRs (352.8 kHz and 384 kHz) with main tap at 0 and an echo at tap 500
+    // (total 501 taps -> flush_tail_samples == 500).
+    let ir_taps = 501_usize;
+    let mut ir_samples = vec![0.0_f32; ir_taps * 2];
+    ir_samples[0] = 0.5;
+    ir_samples[1] = 0.5;
+    ir_samples[500 * 2] = 0.25;
+    ir_samples[500 * 2 + 1] = -0.25;
+
+    let ir_352 = tmp.join("ir_352800.wav");
+    let ir_384 = tmp.join("ir_384000.wav");
+    write_wav_f32(&ir_352, 352_800, 2, &ir_samples, false);
+    write_wav_f32(&ir_384, 384_000, 2, &ir_samples, false);
+
+    let pipeline = AudioPipeline::with_rew_config(
+        UpsamplerPolicy::default(),
+        ConvolutionConfig::auto_dir(tmp.clone()),
+    )
+    .unwrap();
+
+    let spec_44 = StreamSpec {
+        sample_rate_hz: 44_100,
+        bits_per_sample: 16,
+        channels: 2,
+    };
+    let spec_48 = StreamSpec {
+        sample_rate_hz: 48_000,
+        bits_per_sample: 24,
+        channels: 2,
+    };
+    let meta = TrackPeakMetadata::default();
+    let n_a = 400_usize;
+    let n_b = 400_usize;
+
+    // Track A (44.1 kHz -> 352.8 kHz, 8x): ends with flush_for_gapless holding upsampler + 500-tap tail.
+    let mut sess_a = pipeline.start_track(spec_44, &meta, false).unwrap();
+    let mut frames_a = sess_a
+        .process_block(StereoF64Buffer {
+            sample_rate_hz: 44_100,
+            left: vec![0.5; n_a],
+            right: vec![0.5; n_a],
+        })
+        .unwrap()
+        .frames;
+    let (end_a, carry_a) = sess_a.flush_for_gapless().unwrap();
+    frames_a.extend(end_a.frames);
+    let carry_a = carry_a.expect("Track A must produce gapless carryover");
+
+    // Track B (48 kHz -> 384 kHz) rejects the 352.8 kHz carryover; draining it restores Track A's
+    // exact N_A * 8 + 500 frames (zero truncation across the 352.8k -> 384k rate change!).
+    let mut sess_b = pipeline.start_track(spec_48, &meta, false).unwrap();
+    let rejected_a = sess_b
+        .set_incoming_gapless_carryover(carry_a)
+        .expect_err("384 kHz session must reject 352.8 kHz carryover");
+    let drained_a = pipeline.drain_gapless_carryover(rejected_a).unwrap();
+    assert_eq!(drained_a.sample_rate_hz, 352_800);
+    frames_a.extend(drained_a.frames);
+    assert_eq!(
+        frames_a.len(),
+        n_a * 8 + (ir_taps - 1),
+        "Track A total frames across rate change must equal N*8 + flush_tail"
+    );
+    // Verify the delayed echo tail near the end of Track A is non-zero (not truncated!).
+    let tail_energy_a: i64 = frames_a[(n_a * 8 + 100)..(n_a * 8 + 400)]
+        .iter()
+        .map(|f| i64::from(f[0]).abs())
+        .sum();
+    assert!(tail_energy_a > 0, "Track A REW tail energy was lost");
+
+    // Track B ends at end-of-queue: draining its carryover restores exact N_B * 8 + 500 frames!
+    let mut frames_b = sess_b
+        .process_block(StereoF64Buffer {
+            sample_rate_hz: 48_000,
+            left: vec![0.5; n_b],
+            right: vec![0.5; n_b],
+        })
+        .unwrap()
+        .frames;
+    let (end_b, carry_b) = sess_b.flush_for_gapless().unwrap();
+    frames_b.extend(end_b.frames);
+    let drained_b = pipeline
+        .drain_gapless_carryover(carry_b.expect("Track B must produce gapless carryover"))
+        .unwrap();
+    assert_eq!(drained_b.sample_rate_hz, 384_000);
+    frames_b.extend(drained_b.frames);
+    assert_eq!(
+        frames_b.len(),
+        n_b * 8 + (ir_taps - 1),
+        "Track B total frames at end-of-queue must equal N*8 + flush_tail"
+    );
+
+    let _ = fs::remove_dir_all(&tmp);
 }
 
 #[test]

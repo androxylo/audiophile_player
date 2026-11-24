@@ -1353,4 +1353,132 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn producer_loop_drains_rew_tail_across_rate_change_and_at_end_of_queue() {
+        use flac_codec::encode::{FlacSampleWriter, Options};
+        use std::fs::{self, File};
+        use std::io::Write as _;
+
+        let root = std::env::temp_dir().join(format!(
+            "ap_cli_engine_tail_drain_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let ir_dir = root.join("ir");
+        let music_dir = root.join("music");
+        fs::create_dir_all(&ir_dir).unwrap();
+        fs::create_dir_all(&music_dir).unwrap();
+
+        // Write 501-tap stereo IRs for 352.8 kHz and 384 kHz (flush_tail_samples = 500).
+        let ir_taps = 501_usize;
+        let write_ir = |path: &Path, rate: u32| {
+            let mut ir = vec![0.0_f32; ir_taps * 2];
+            ir[0] = 0.5;
+            ir[1] = 0.5;
+            ir[500 * 2] = 0.25;
+            ir[500 * 2 + 1] = -0.25;
+            let data_bytes = (ir.len() * 4) as u32;
+            let mut f = File::create(path).unwrap();
+            f.write_all(b"RIFF").unwrap();
+            f.write_all(&(36u32 + data_bytes).to_le_bytes()).unwrap();
+            f.write_all(b"WAVE").unwrap();
+            f.write_all(b"fmt ").unwrap();
+            f.write_all(&16u32.to_le_bytes()).unwrap();
+            f.write_all(&3u16.to_le_bytes()).unwrap();
+            f.write_all(&2u16.to_le_bytes()).unwrap();
+            f.write_all(&rate.to_le_bytes()).unwrap();
+            f.write_all(&(rate * 8).to_le_bytes()).unwrap();
+            f.write_all(&8u16.to_le_bytes()).unwrap();
+            f.write_all(&32u16.to_le_bytes()).unwrap();
+            f.write_all(b"data").unwrap();
+            f.write_all(&data_bytes.to_le_bytes()).unwrap();
+            for s in ir {
+                f.write_all(&s.to_le_bytes()).unwrap();
+            }
+        };
+        write_ir(&ir_dir.join("ir_352800.wav"), 352_800);
+        write_ir(&ir_dir.join("ir_384000.wav"), 384_000);
+
+        // Write Track 1 (44.1 kHz, 400 frames) and Track 2 (48 kHz, 400 frames).
+        let n_frames = 400_usize;
+        let write_flac = |path: &Path, rate: u32| {
+            let mut w =
+                FlacSampleWriter::create(path, Options::default(), rate, 16, 2, None).unwrap();
+            let samples: Vec<i32> = (0..(n_frames * 2))
+                .map(|i| if i % 2 == 0 { 10_000 } else { -10_000 })
+                .collect();
+            w.write(&samples).unwrap();
+            w.finalize().unwrap();
+        };
+        write_flac(&music_dir.join("01_44k.flac"), 44_100);
+        write_flac(&music_dir.join("02_48k.flac"), 48_000);
+
+        let pipeline = AudioPipeline::with_rew_config(
+            UpsamplerPolicy::default(),
+            ConvolutionConfig::auto_dir(ir_dir),
+        )
+        .unwrap();
+        let shared = SharedControl::new(music_dir.clone(), "Mock DAC");
+        let buf = BoundedBlockStreamBuffer::new(DEFAULT_MAX_BUFFERED_FRAMES);
+        let ep = buf.reset_and_flush();
+        let ctrl = ProducerControl::new(
+            ep,
+            ProducerDirective::Active(PlayDirective::Sequential {
+                root: music_dir.clone(),
+                seq_gen: 1,
+                start_after: None,
+                folder_only: false,
+            }),
+        );
+
+        let p_ctrl = Arc::clone(&ctrl);
+        let p_buf = Arc::clone(&buf);
+        let p_shared = Arc::clone(&shared);
+        let handle = thread::spawn(move || producer_loop(pipeline, p_ctrl, p_buf, p_shared));
+
+        let mut track_counts: Vec<(u32, usize)> = Vec::new();
+        let mut saw_end_of_queue = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            match buf.pop_for_epoch_timeout(ep, Duration::from_millis(50)) {
+                Some(StreamEvent::TrackStart { report, .. }) => {
+                    let rate = report.output_rate_hz;
+                    let mut frames = 0_usize;
+                    loop {
+                        match buf.try_pop_track_pcm_block(ep) {
+                            PopBlockResult::Block(b) => {
+                                assert_eq!(b.sample_rate_hz, rate);
+                                frames += b.frames.len();
+                            }
+                            PopBlockResult::Underrun => thread::sleep(Duration::from_millis(2)),
+                            PopBlockResult::TrackEnd | PopBlockResult::StaleOrClosed => break,
+                        }
+                    }
+                    track_counts.push((rate, frames));
+                }
+                Some(StreamEvent::EndOfQueue(_)) => {
+                    saw_end_of_queue = true;
+                    break;
+                }
+                Some(StreamEvent::FatalError(err)) => panic!("unexpected FatalError: {err}"),
+                _ => {}
+            }
+        }
+
+        buf.close();
+        ctrl.set(ep + 1, ProducerDirective::Shutdown);
+        handle.join().unwrap();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(saw_end_of_queue, "expected EndOfQueue after 2 sequential tracks");
+        assert_eq!(
+            track_counts,
+            vec![
+                (352_800, n_frames * 8 + (ir_taps - 1)),
+                (384_000, n_frames * 8 + (ir_taps - 1)),
+            ],
+            "both rate-change track and final end-of-queue track must preserve full N*8 + flush_tail"
+        );
+    }
 }

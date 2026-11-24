@@ -43,6 +43,14 @@ use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 const MIN_PARTITION_BLOCK: usize = 1_024;
 const MAX_PARTITION_BLOCK: usize = 65_536;
 
+/// Maximum supported impulse-response length (`2^23 = 8,388,608` taps per channel, ~21.8 s at
+/// 384 kHz — 2x standard 4M-tap REW exports). Prevents stray multi-GB WAV files in a watched
+/// convolution directory from exhausting RAM or aborting on FFT/spectrum allocation.
+pub const MAX_IR_TAPS: usize = 1 << 23;
+
+/// Hard cap on WAV `data` payload bytes (`MAX_IR_TAPS` stereo `f64` frames = 128 MiB).
+pub const MAX_IR_DATA_BYTES: u64 = (MAX_IR_TAPS as u64) * 16;
+
 /// Flush-tail threshold (`-200 dB`, 56 dB below 24-bit PCM) applied only when an IR exceeds
 /// `MAX_PARTITION_BLOCK` taps, preventing multi-second sub-`-250 dB` float noise gaps between
 /// tracks while convolving 100% of all non-zero taps during active playback.
@@ -195,6 +203,7 @@ pub fn probe_wav_header(path: &Path) -> Result<WavHeaderInfo, String> {
     if &riff_hdr[0..4] != b"RIFF" || &riff_hdr[8..12] != b"WAVE" {
         return Err(format!("not a standard RIFF/WAVE file: '{}'", path.display()));
     }
+    let riff_size = u32::from_le_bytes([riff_hdr[4], riff_hdr[5], riff_hdr[6], riff_hdr[7]]);
 
     let mut fmt_parsed: Option<(WavSampleEncoding, u16, u32, u16)> = None;
     let mut data_info: Option<(u64, u64)> = None;
@@ -264,9 +273,22 @@ pub fn probe_wav_header(path: &Path) -> Result<WavHeaderInfo, String> {
             fmt_parsed = Some((encoding, channels, sample_rate_hz, bits_per_sample));
         } else if chunk_id == b"data" {
             let remaining = file_len.saturating_sub(payload_start);
-            let data_bytes = if chunk_size == 0 || chunk_size == u32::MAX as u64 {
-                // Streaming / RF64 placeholder sizes (0 or 0xFFFFFFFF): accept remaining bytes.
-                remaining
+            let data_bytes = if chunk_size == u32::MAX as u64 {
+                // Accept 0xFFFFFFFF streaming/RF64 placeholder ONLY when the RIFF header size is
+                // also 0xFFFFFFFF and `fmt ` has already been parsed (making `data` the last chunk).
+                if riff_size == u32::MAX && fmt_parsed.is_some() {
+                    remaining
+                } else {
+                    return Err(format!(
+                        "invalid streaming placeholder data chunk in '{}'",
+                        path.display()
+                    ));
+                }
+            } else if chunk_size == 0 {
+                // A 0-byte data chunk is treated as genuinely empty (never "rest of file") so
+                // trailing LIST/id3 chunks or in-progress unfinalized exports are never parsed
+                // as IR audio taps, and scanning advances cleanly if `fmt ` appears later.
+                0
             } else if chunk_size > remaining {
                 return Err(format!(
                     "truncated WAV '{}': data chunk declares {} bytes, but only {} bytes remain",
@@ -301,9 +323,23 @@ pub fn probe_wav_header(path: &Path) -> Result<WavHeaderInfo, String> {
         ));
     }
 
+    if data_bytes > MAX_IR_DATA_BYTES {
+        return Err(format!(
+            "REW WAV '{}' data payload ({data_bytes} bytes) exceeds maximum supported limit ({MAX_IR_DATA_BYTES} bytes / {MAX_IR_TAPS} taps)",
+            path.display()
+        ));
+    }
+
     let bytes_per_sample = (bits_per_sample / 8) as u64;
     let frame_bytes = bytes_per_sample * (channels as u64);
-    let num_frames = (data_bytes / frame_bytes) as usize;
+    let num_frames_u64 = data_bytes / frame_bytes;
+    if num_frames_u64 > MAX_IR_TAPS as u64 {
+        return Err(format!(
+            "REW WAV '{}' length ({num_frames_u64} taps) exceeds maximum supported IR length ({MAX_IR_TAPS} taps)",
+            path.display()
+        ));
+    }
+    let num_frames = num_frames_u64 as usize;
 
     Ok(WavHeaderInfo {
         encoding,
@@ -328,6 +364,12 @@ pub fn load_stereo_wav(path: &Path) -> Result<StereoImpulseWav, String> {
     }
     if info.num_frames == 0 {
         return Err(format!("REW WAV '{}' contains 0 frames", path.display()));
+    }
+    if info.num_frames > MAX_IR_TAPS || info.data_bytes > MAX_IR_DATA_BYTES {
+        return Err(format!(
+            "REW WAV '{}' exceeds maximum supported IR length ({MAX_IR_TAPS} taps)",
+            path.display()
+        ));
     }
 
     let mut file = File::open(path)

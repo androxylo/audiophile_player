@@ -16,3 +16,6 @@ ap-source.workspace = true
 ap-dsp.workspace = true
 ap-output-win.workspace = true
 ap-control.workspace = true
+
+[dev-dependencies]
+flac-codec = "1.3"
