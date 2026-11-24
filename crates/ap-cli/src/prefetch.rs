@@ -37,6 +37,9 @@ pub enum StreamEvent {
         mode_label: PlayModeLabel,
         report: PipelineReport,
         total_duration_s: Option<f64>,
+        /// True when the preceding track's gapless upsampler/REW tail was overlap-added onto this
+        /// track's opening; prevents a mid-track skip from leaking the skipped track's ending decay.
+        had_gapless_carryover: bool,
     },
     /// One ready-to-play bounded integer PCM block.
     PcmBlock(InterleavedInt32Buffer),
@@ -241,20 +244,34 @@ impl BoundedBlockStreamBuffer {
                         | StreamEvent::ErrorThresholdPause { .. }
                 )
             }) {
-                let mut drop_frames = 0usize;
-                let mut drop_dur_ns = 0u128;
-                let mut drop_terms = 0usize;
-                for ev in st.events.drain(..next_idx) {
-                    let (frames, dur_ns, term) = event_metrics(&ev);
-                    drop_frames += frames;
-                    drop_dur_ns = drop_dur_ns.saturating_add(dur_ns);
-                    drop_terms += term;
+                // Review #3 Finding #21: if we are actually skipping unplayed audio from the
+                // preceding track (`next_idx > 0` or we just dropped a front TrackStart) AND the
+                // buffered next track already has the skipped track's ending REW/upsampler tail
+                // baked into its opening, flush instead of reusing so the user never hears the
+                // skipped track's ending decay at the start of the next track.
+                let next_has_baked_carryover = matches!(
+                    st.events.get(next_idx),
+                    Some(StreamEvent::TrackStart {
+                        had_gapless_carryover: true,
+                        ..
+                    })
+                );
+                if !(next_has_baked_carryover && (next_idx > 0 || skipped_front_path.is_some())) {
+                    let mut drop_frames = 0usize;
+                    let mut drop_dur_ns = 0u128;
+                    let mut drop_terms = 0usize;
+                    for ev in st.events.drain(..next_idx) {
+                        let (frames, dur_ns, term) = event_metrics(&ev);
+                        drop_frames += frames;
+                        drop_dur_ns = drop_dur_ns.saturating_add(dur_ns);
+                        drop_terms += term;
+                    }
+                    st.buffered_frames = st.buffered_frames.saturating_sub(drop_frames);
+                    st.buffered_duration_ns = st.buffered_duration_ns.saturating_sub(drop_dur_ns);
+                    st.terminal_markers = st.terminal_markers.saturating_sub(drop_terms);
+                    self.cv.notify_all();
+                    return (true, st.epoch, skipped_front_path);
                 }
-                st.buffered_frames = st.buffered_frames.saturating_sub(drop_frames);
-                st.buffered_duration_ns = st.buffered_duration_ns.saturating_sub(drop_dur_ns);
-                st.terminal_markers = st.terminal_markers.saturating_sub(drop_terms);
-                self.cv.notify_all();
-                return (true, st.epoch, skipped_front_path);
             }
         }
         let ep = st.flush_locked();
