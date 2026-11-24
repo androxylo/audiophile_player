@@ -13,15 +13,17 @@
 //! is reported clearly without falling back to the Windows mixer.
 
 use std::sync::Mutex;
+use std::time::Duration;
 
 use ap_core::buffer::InterleavedInt32Buffer;
 use ap_core::format::DacWireFormat;
 use ap_output_win::hygiene::{MemoryLockGuard, MmcssGuard, OptimizationLevel};
 use ap_output_win::sink::ZeroMixerAudioSink;
 use ap_output_win::wdm_ks::{
-    KsPinConnectBlob, KsRenderDevice, StreamBlock, StreamingWaveRtPump, WaveRtFramePump,
-    WaveRtLoopController, WaveRtPumpSource, WaveRtRingLayout, WaveRtStepOutcome, WdmKsSink,
-    classify_ks_pin_error, enumerate_wdm_ks_render_devices, select_wdm_ks_device,
+    AudioPositionCursorSelector, KsPinConnectBlob, KsRenderDevice, PositionWrapMode, StreamBlock,
+    StreamingWaveRtPump, WaveRtFramePump, WaveRtLoopController, WaveRtPumpSource, WaveRtRingLayout,
+    WaveRtStepOutcome, WdmKsSink, classify_ks_pin_error, enumerate_wdm_ks_render_devices,
+    select_wdm_ks_device,
 };
 
 static HARDWARE_LOCK: Mutex<()> = Mutex::new(());
@@ -644,6 +646,188 @@ fn wavert_loop_controller_handles_lagging_play_offset_and_boundary_jitter_withou
         .unwrap();
     assert_eq!(r3, 1, "wrapping register full-ring coalesce must resync to safe half 1");
     assert_eq!(ctrl3.frames_played(), 16);
+}
+
+#[test]
+fn wavert_loop_controller_does_not_misclassify_late_non_coalesced_wake_as_coalesced() {
+    // Review #3 Finding #1: ring 64 B (half_len = 32, 4 frames/half).
+    let layout = WaveRtRingLayout::new(64, 8).unwrap();
+    let frames = vec![[11_i32, -11_i32]; 64];
+    let mut ring = vec![0u8; 64];
+
+    // Scenario A: normal wake 1 at pos=36 (writes half 0), then LATE wake 2 at pos=86
+    // (DMA is at 86%64=22, inside half 0 -> only 1 boundary crossed!).
+    // Old rounded-delta heuristic saw delta=50>=48, falsely classified 2 halves, overwrote half 0,
+    // falsely credited half 0's unplayed frames, and inverted the toggle permanently.
+    let mut pump = WaveRtFramePump::new(&frames, DacWireFormat::Int32);
+    let mut ctrl = WaveRtLoopController::new(layout);
+    ctrl.prefill(&mut ring, &mut pump).unwrap();
+
+    let (h1, _) = ctrl.on_notification(&mut ring, &mut pump, false, Some(36)).unwrap();
+    assert_eq!(h1, 0);
+    assert_eq!(ctrl.frames_played(), 4);
+
+    let (h2, _) = ctrl.on_notification(&mut ring, &mut pump, false, Some(86)).unwrap();
+    assert_eq!(h2, 1, "DMA is at byte 22 in half 0 -> MUST write safe half 1");
+    assert_eq!(
+        ctrl.frames_played(),
+        8,
+        "only 1 boundary crossed -> must credit 4 frames, NOT 8"
+    );
+
+    // Next on-time wake at pos=98 (DMA in half 1) must stay in sync and write half 0.
+    let (h3, _) = ctrl.on_notification(&mut ring, &mut pump, false, Some(98)).unwrap();
+    assert_eq!(h3, 0);
+    assert_eq!(ctrl.frames_played(), 12);
+
+    // Scenario B: first wake late at pos=50 (DMA in half 1 -> boundary 1, NOT 2).
+    let mut pump2 = WaveRtFramePump::new(&frames, DacWireFormat::Int32);
+    let mut ctrl2 = WaveRtLoopController::new(layout);
+    ctrl2.prefill(&mut ring, &mut pump2).unwrap();
+
+    let (f1, _) = ctrl2.on_notification(&mut ring, &mut pump2, false, Some(50)).unwrap();
+    assert_eq!(f1, 0, "DMA is at byte 50 in half 1 -> MUST write safe half 0");
+    assert_eq!(ctrl2.frames_played(), 4, "first wake late at 50 crossed 1 boundary, not 2");
+    let (f2, _) = ctrl2.on_notification(&mut ring, &mut pump2, false, Some(68)).unwrap();
+    assert_eq!(f2, 1);
+    assert_eq!(ctrl2.frames_played(), 8);
+}
+
+#[test]
+fn wavert_loop_controller_resyncs_coalesced_first_wake_on_modular_and_unavailable_sources() {
+    let layout = WaveRtRingLayout::new(64, 8).unwrap();
+    let frames = vec![[22_i32, -22_i32]; 64];
+    let mut ring = vec![0u8; 64];
+    let half_dur = Duration::from_millis(50);
+
+    // Review #3 Finding #6A: Modular position source, first wake coalesced (real pos=70 -> mod 64 = 6).
+    let mut pump = WaveRtFramePump::new(&frames, DacWireFormat::Int32);
+    let mut ctrl = WaveRtLoopController::new(layout)
+        .with_half_duration(half_dur)
+        .with_wrap_mode(PositionWrapMode::Modular);
+    ctrl.prefill(&mut ring, &mut pump).unwrap();
+
+    let (h1, _) = ctrl
+        .on_notification_at(
+            &mut ring,
+            &mut pump,
+            false,
+            Some(6),
+            Some(Duration::from_millis(110)), // 2.2 halves elapsed
+        )
+        .unwrap();
+    assert_eq!(h1, 1, "DMA wrapped into half 0 at pos=6 -> must write safe half 1");
+    assert_eq!(ctrl.frames_played(), 8, "coalesced first wake completed both halves");
+
+    // Subsequent normal wake at pos=36 (half 1) -> writes half 0; half 1 is still playing so
+    // frames_played remains 8 until half 1 completes on wake 3.
+    let (h2, _) = ctrl
+        .on_notification_at(
+            &mut ring,
+            &mut pump,
+            false,
+            Some(36),
+            Some(Duration::from_millis(156)),
+        )
+        .unwrap();
+    assert_eq!(h2, 0);
+    assert_eq!(ctrl.frames_played(), 8);
+
+    // Wake 3 at pos=4 (half 0): half 1 written on wake 1 has now completed DMA -> 12 frames played.
+    let (h3, _) = ctrl
+        .on_notification_at(
+            &mut ring,
+            &mut pump,
+            false,
+            Some(4),
+            Some(Duration::from_millis(206)),
+        )
+        .unwrap();
+    assert_eq!(h3, 1);
+    assert_eq!(ctrl.frames_played(), 12);
+
+    // Review #3 Finding #6B: Unavailable position source uses wall-clock boundary stepping so a
+    // coalesced wake resyncs instead of permanently inverting, while a late wake does NOT misfire.
+    let mut pump2 = WaveRtFramePump::new(&frames, DacWireFormat::Int32);
+    let mut ctrl2 = WaveRtLoopController::new(layout).with_half_duration(half_dur);
+    ctrl2.prefill(&mut ring, &mut pump2).unwrap();
+
+    // Wake 1 on time (50 ms) -> half 0.
+    let (u1, _) = ctrl2
+        .on_notification_at(&mut ring, &mut pump2, false, None, Some(Duration::from_millis(52)))
+        .unwrap();
+    assert_eq!(u1, 0);
+    assert_eq!(ctrl2.frames_played(), 4);
+
+    // Wake 2 late by 35 ms (135 ms = 2.7 halves -> 1.7 halves since boundary 1 -> NOT coalesced!).
+    let (u2, _) = ctrl2
+        .on_notification_at(&mut ring, &mut pump2, false, None, Some(Duration::from_millis(135)))
+        .unwrap();
+    assert_eq!(u2, 1, "late-but-not-coalesced wake on Unavailable source must NOT invert");
+    assert_eq!(ctrl2.frames_played(), 8);
+
+    // Wake 3 coalesced (missed boundary 3 at 150 ms, arrives at 205 ms = boundary 4 -> 2 halves since boundary 2!).
+    let (u3, _) = ctrl2
+        .on_notification_at(&mut ring, &mut pump2, false, None, Some(Duration::from_millis(205)))
+        .unwrap();
+    assert_eq!(u3, 1, "coalesced wake on Unavailable source must skip to boundary 4 -> half 1");
+    assert_eq!(ctrl2.frames_played(), 16);
+}
+
+#[test]
+fn wavert_loop_controller_lagging_modular_play_offset_does_not_false_trigger_wrap_override() {
+    // Review #3 Finding #25: modular PlayOffset-only driver with constant 12 B lag on 64 B ring.
+    let layout = WaveRtRingLayout::new(64, 8).unwrap();
+    let frames = vec![[33_i32, -33_i32]; 64];
+    let mut ring = vec![0u8; 64];
+    let half_dur = Duration::from_millis(50);
+
+    let mut pump = WaveRtFramePump::new(&frames, DacWireFormat::Int32);
+    let mut ctrl = WaveRtLoopController::new(layout).with_half_duration(half_dur);
+    ctrl.prefill(&mut ring, &mut pump).unwrap();
+
+    // Wake 1 (real 32, lag 12 -> reports 20) -> writes half 0.
+    let (h1, _) = ctrl
+        .on_notification_at(&mut ring, &mut pump, false, Some(20), Some(Duration::from_millis(50)))
+        .unwrap();
+    // Wake 2 (real 64, lag 12 -> reports 52) -> writes half 1.
+    let (h2, _) = ctrl
+        .on_notification_at(&mut ring, &mut pump, false, Some(52), Some(Duration::from_millis(100)))
+        .unwrap();
+    // Wake 3 late (real 126 = 64 + 62, lag 12 -> 114 % 64 = 50) -> wrapped, writes half 0.
+    let (h3, _) = ctrl
+        .on_notification_at(&mut ring, &mut pump, false, Some(50), Some(Duration::from_millis(197)))
+        .unwrap();
+    // Wake 4 on time (real 129, lag 12 -> 117 % 64 = 53, raw_delta = 3 < 16) -> MUST write half 1, NOT coalesce!
+    let (h4, _) = ctrl
+        .on_notification_at(&mut ring, &mut pump, false, Some(53), Some(Duration::from_millis(202)))
+        .unwrap();
+
+    assert_eq!([h1, h2, h3, h4], [0, 1, 0, 1]);
+    assert_eq!(ctrl.frames_played(), 16, "no false coalescing credit on lagging wrap sequence");
+}
+
+#[test]
+fn audio_position_cursor_selector_never_mixes_play_and_write_offset_on_zero_wrap() {
+    // Review #3 Finding #26: once WriteOffset is observed non-zero, legitimate modulo wrap to 0
+    // MUST return 0 (WriteOffset), never fall back to lagging PlayOffset.
+    let mut sel = AudioPositionCursorSelector::new();
+    assert_eq!(sel.select(0, 0), 0);
+    assert_eq!(sel.select(140_000, 153_600), 153_600);
+    assert!(sel.is_write_offset());
+    // Wrap boundary: WriteOffset wraps to 0 while PlayOffset still lags at 290_000!
+    assert_eq!(
+        sel.select(290_000, 0),
+        0,
+        "must NOT fall back to PlayOffset when WriteOffset wraps to 0"
+    );
+    assert_eq!(sel.select(140_000, 153_600), 153_600);
+
+    // Driver where WriteOffset is always 0: locks onto PlayOffset permanently.
+    let mut sel_play = AudioPositionCursorSelector::new();
+    assert_eq!(sel_play.select(22, 0), 22);
+    assert!(!sel_play.is_write_offset());
+    assert_eq!(sel_play.select(54, 0), 54);
 }
 
 #[cfg(windows)]

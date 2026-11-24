@@ -13,6 +13,9 @@ use std::sync::atomic::{AtomicBool, Ordering, fence};
 #[cfg(windows)]
 use std::sync::OnceLock;
 use std::sync::Arc;
+use std::time::Duration;
+#[cfg(windows)]
+use std::time::Instant;
 
 use ap_core::buffer::InterleavedInt32Buffer;
 use ap_core::format::DacWireFormat;
@@ -697,12 +700,80 @@ pub enum WaveRtStepOutcome {
     Finished,
 }
 
+/// Whether the hardware DMA position cursor wraps modulo `buf_len` or increases monotonically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PositionWrapMode {
+    /// Auto-detect wrapping if a position reading ever decreases within `0..buf_len`.
+    Auto,
+    /// Known to wrap modulo `buf_len` (e.g., `KSPROPERTY_RTAUDIO_POSITIONREGISTER`).
+    Modular,
+    /// Known to be a monotonically increasing cumulative byte counter.
+    Monotonic,
+}
+
+/// Locks onto a single `KSAUDIO_POSITION` cursor (`WriteOffset` vs `PlayOffset`) on the first
+/// non-zero sample so modulo-`buf_len` wraps to `0` never mix two cursors with different latency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioPositionCursorSelector {
+    mode: AudioPositionCursorMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AudioPositionCursorMode {
+    Undecided,
+    WriteOffset,
+    PlayOffset,
+}
+
+impl Default for AudioPositionCursorSelector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AudioPositionCursorSelector {
+    pub fn new() -> Self {
+        Self {
+            mode: AudioPositionCursorMode::Undecided,
+        }
+    }
+
+    /// Select a consistent byte cursor from `(play_offset, write_offset)`.
+    ///
+    /// Once `write_offset > 0` is observed, `WriteOffset` is locked for the lifetime of the stream
+    /// (including legitimate `0` readings on modulo wrap). If only `play_offset > 0` is observed,
+    /// `PlayOffset` is locked for the lifetime of the stream.
+    pub fn select(&mut self, play_offset: u64, write_offset: u64) -> u64 {
+        match self.mode {
+            AudioPositionCursorMode::Undecided => {
+                if write_offset > 0 {
+                    self.mode = AudioPositionCursorMode::WriteOffset;
+                    write_offset
+                } else if play_offset > 0 {
+                    self.mode = AudioPositionCursorMode::PlayOffset;
+                    play_offset
+                } else {
+                    0
+                }
+            }
+            AudioPositionCursorMode::WriteOffset => write_offset,
+            AudioPositionCursorMode::PlayOffset => play_offset,
+        }
+    }
+
+    pub fn is_write_offset(&self) -> bool {
+        self.mode == AudioPositionCursorMode::WriteOffset
+    }
+}
+
 /// Pure, hardware-independent WaveRT cyclic half-buffer state machine.
 ///
 /// Manages:
-/// - Toggle-primary half scheduling with unwrapped-position coalescing detection and a 1/4-half
-///   boundary guard band, immune to `usbaudio2.sys` `PlayOffset` lag and coarse position jitter
-///   while still resynchronizing accurately after genuine coalesced notifications.
+/// - Position-authoritative, lag-compensated half-boundary tracking with a 1/4-half pre-boundary
+///   guard band and wall-clock (`Instant`) sanity checks. Late-but-not-coalesced wakes never
+///   trigger false coalescing or invert half phase, genuine coalesced wakes resynchronize on
+///   every wake (self-healing), and `Unavailable` position sources fall back to wall-clock
+///   boundary tracking when timing is provided.
 /// - Stop fade-out that waits for the fade half to finish playing (`trailing_silent_halves >= 2`).
 /// - Non-blocking underrun handling (emits digital silence without ending playback).
 /// - Accurate `frames_played` counting only real audio frames whose half completed DMA playback.
@@ -710,7 +781,14 @@ pub struct WaveRtLoopController {
     layout: WaveRtRingLayout,
     next_expected_half: usize,
     last_written_half: Option<usize>,
-    last_position_bytes: Option<u64>,
+    last_raw_pos: Option<u64>,
+    last_unwrapped_pos: Option<u64>,
+    last_boundary_idx: u64,
+    lag_bytes: u64,
+    wrap_mode: PositionWrapMode,
+    observed_wrap: bool,
+    half_duration: Option<Duration>,
+    last_boundary_instant: Option<Duration>,
     half_audio_frames: [usize; 2],
     completed_audio_frames: usize,
     trailing_silent_halves: usize,
@@ -723,12 +801,34 @@ impl WaveRtLoopController {
             layout,
             next_expected_half: 0,
             last_written_half: None,
-            last_position_bytes: None,
+            last_raw_pos: None,
+            last_unwrapped_pos: None,
+            last_boundary_idx: 0,
+            lag_bytes: 0,
+            wrap_mode: PositionWrapMode::Auto,
+            observed_wrap: false,
+            half_duration: None,
+            last_boundary_instant: None,
             half_audio_frames: [0, 0],
             completed_audio_frames: 0,
             trailing_silent_halves: 0,
             stopping_fade_done: false,
         }
+    }
+
+    /// Configure the nominal duration of one half-buffer (for wall-clock wrap disambiguation and
+    /// `Unavailable` position-reader coalescing recovery).
+    pub fn with_half_duration(mut self, half_duration: Duration) -> Self {
+        if !half_duration.is_zero() {
+            self.half_duration = Some(half_duration);
+        }
+        self
+    }
+
+    /// Configure whether the hardware position cursor wraps modulo `buf_len` or is monotonic.
+    pub fn with_wrap_mode(mut self, wrap_mode: PositionWrapMode) -> Self {
+        self.wrap_mode = wrap_mode;
+        self
     }
 
     pub fn layout(&self) -> WaveRtRingLayout {
@@ -758,84 +858,241 @@ impl WaveRtLoopController {
         }
         self.half_audio_frames = [w0, w1];
         self.last_written_half = Some(1);
-        self.last_position_bytes = None;
+        self.last_raw_pos = None;
+        self.last_unwrapped_pos = None;
+        self.last_boundary_idx = 0;
+        self.lag_bytes = 0;
+        self.observed_wrap = false;
+        self.last_boundary_instant = Some(Duration::ZERO);
         Ok(())
+    }
+
+    fn boundary_idx_for_byte(&self, unwrapped_byte: u64) -> u64 {
+        let buf = self.layout.buf_len() as u64;
+        let half = self.layout.half_len() as u64;
+        let rings = unwrapped_byte / buf;
+        let rem = unwrapped_byte % buf;
+        rings
+            .saturating_mul(2)
+            .saturating_add(u64::from(rem >= half))
+    }
+
+    fn boundary_byte(&self, boundary_idx: u64) -> u64 {
+        let buf = self.layout.buf_len() as u64;
+        let half = self.layout.half_len() as u64;
+        (boundary_idx / 2)
+            .saturating_mul(buf)
+            .saturating_add((boundary_idx % 2) * half)
+    }
+
+    fn advance_boundary_clock(
+        &mut self,
+        now_since_run: Option<Duration>,
+        halves_advanced: u64,
+    ) {
+        let (Some(now), Some(half_dur)) = (now_since_run, self.half_duration) else {
+            return;
+        };
+        let prev_t = self.last_boundary_instant.unwrap_or(Duration::ZERO);
+        let step = half_dur.saturating_mul(halves_advanced.min(u32::MAX as u64) as u32);
+        let ideal = prev_t.saturating_add(step);
+        let new_t = if now < ideal {
+            // Wake arrived slightly before estimated boundary (crystal faster than QPC or jitter).
+            now
+        } else {
+            let overshoot = now.saturating_sub(ideal);
+            if overshoot <= half_dur / 4 {
+                // On-time wake: gently PLL-track crystal drift without reacting to late spikes.
+                ideal.saturating_add(overshoot / 8)
+            } else {
+                // Late wake: keep the nominal boundary reference intact so the next on-time wake
+                // sees the true inter-boundary elapsed interval.
+                ideal
+            }
+        };
+        self.last_boundary_instant = Some(new_t);
+    }
+
+    fn step_wall_clock_fallback(&mut self, now_since_run: Option<Duration>) -> (usize, bool) {
+        let halves_elapsed = match (now_since_run, self.half_duration) {
+            (Some(now), Some(half_dur)) => {
+                let prev_t = self.last_boundary_instant.unwrap_or(Duration::ZERO);
+                let since = now.saturating_sub(prev_t);
+                let two_halves = half_dur.saturating_mul(2);
+                if since >= two_halves {
+                    ((since.as_nanos() / half_dur.as_nanos()) as u64).max(2)
+                } else {
+                    1
+                }
+            }
+            _ => 1,
+        };
+        self.advance_boundary_clock(now_since_run, halves_elapsed);
+        self.last_boundary_idx = self.last_boundary_idx.saturating_add(halves_elapsed);
+        let write_half = ((self.last_boundary_idx as usize) & 1) ^ 1;
+        (write_half, halves_elapsed >= 2)
     }
 
     /// Decide which half to write and whether at least one notification was coalesced.
     ///
-    /// Uses the toggle (`next_expected_half`) as the primary schedule so constant `PlayOffset`
-    /// latency or boundary jitter never overwrites the active DMA half or falsely credits frames.
-    /// Overrides the toggle and reports coalescing only when the unwrapped hardware position
-    /// advances by `>= 1.5` halves (or a wrapping hardware register completes a full ring inside
-    /// the override guard band).
-    fn select_write_half(&mut self, play_offset_bytes: Option<u64>) -> (usize, bool) {
-        let toggle_half = self.next_expected_half;
+    /// Tracks unwrapped, lag-compensated DMA byte position and counts actual half-boundary
+    /// crossings rather than rounding position deltas. A late-but-not-coalesced wake (still in
+    /// the expected DMA half) writes the opposite half and does NOT falsely credit unplayed
+    /// frames. Coalesced wakes (whether on monotonic or modular cursors, including wake #1)
+    /// self-heal immediately and keep `next_expected_half` locked to hardware DMA.
+    fn select_write_half(
+        &mut self,
+        play_offset_bytes: Option<u64>,
+        now_since_run: Option<Duration>,
+    ) -> (usize, bool) {
         let Some(pos) = play_offset_bytes else {
-            return (toggle_half, false);
+            return self.step_wall_clock_fallback(now_since_run);
         };
 
-        let half_u64 = self.layout.half_len() as u64;
-        let buf_u64 = self.layout.buf_len() as u64;
-        let coalesce_threshold = half_u64.saturating_add(half_u64 / 2);
-        let min_normal_step = half_u64 / 2;
+        let half = self.layout.half_len() as u64;
+        let buf = self.layout.buf_len() as u64;
+        let guard = (self.layout.half_len() / 4).max(self.layout.bytes_per_frame()) as u64;
 
-        let result = match self.last_position_bytes {
-            None => {
-                // First notification after KSSTATE_RUN (DMA started at byte 0).
-                // Any position < 1.5 halves (including lagging PlayOffset < half_len) is a normal
-                // first half completion; only >= 1.5 halves indicates an already-coalesced wake.
-                if pos >= coalesce_threshold {
-                    let halves_elapsed = ((pos.saturating_add(half_u64 / 2)) / half_u64).max(2);
-                    let write_half = toggle_half ^ (((halves_elapsed - 1) as usize) & 1);
-                    (write_half, true)
+        let clock_since_boundary = match (now_since_run, self.half_duration) {
+            (Some(now), Some(half_dur)) => {
+                let prev_t = self.last_boundary_instant.unwrap_or(Duration::ZERO);
+                Some((now.saturating_sub(prev_t), half_dur))
+            }
+            _ => None,
+        };
+        let clock_allows_full_ring_wrap: Option<bool> = clock_since_boundary.map(|(since, hd)| {
+            // Require >= 1.5 halves since last boundary before treating a small modular delta
+            // as a full-ring (2-half) wrap.
+            let threshold = hd.saturating_add(hd / 2);
+            since >= threshold
+        });
+
+        let unwrapped: u64 = match (self.last_raw_pos, self.last_unwrapped_pos) {
+            (None, _) => {
+                // First wake after KSSTATE_RUN (DMA started at byte 0).
+                if pos < half {
+                    let is_coalesced_modular_first_wake = match clock_allows_full_ring_wrap {
+                        Some(true) => true,
+                        Some(false) => false,
+                        None => {
+                            self.wrap_mode == PositionWrapMode::Modular
+                                && pos < half.saturating_sub(guard)
+                        }
+                    };
+                    if is_coalesced_modular_first_wake {
+                        self.lag_bytes = 0;
+                        self.observed_wrap = true;
+                        buf.saturating_add(pos)
+                    } else {
+                        // Normal first wake with a lagging PlayOffset cursor (e.g. usbaudio2.sys).
+                        self.lag_bytes = half - pos;
+                        pos
+                    }
                 } else {
-                    (toggle_half, false)
+                    self.lag_bytes = 0;
+                    pos
                 }
             }
-            Some(prev) => {
-                if pos >= prev {
-                    let delta = pos - prev;
-                    if delta >= coalesce_threshold {
-                        // Monotonic cumulative position jumped >= 1.5 halves: genuine coalescing.
-                        // Computing elapsed halves from the delta cancels any constant PlayOffset lag.
-                        let halves_elapsed =
-                            ((delta.saturating_add(half_u64 / 2)) / half_u64).max(2);
-                        let write_half = toggle_half ^ (((halves_elapsed - 1) as usize) & 1);
-                        (write_half, true)
-                    } else if prev < buf_u64
-                        && pos < buf_u64
-                        && delta < min_normal_step
-                        && self.layout.is_clearly_inside_half(toggle_half, pos)
-                    {
-                        // Modulo-buf_len hardware POSITIONREGISTER wrapped a full ring period
-                        // back into the active half we would otherwise write.
-                        (self.layout.safe_write_half_for_play_byte(pos), true)
-                    } else {
-                        (toggle_half, false)
-                    }
-                } else if prev < buf_u64 && pos < buf_u64 {
-                    // Modulo-buf_len hardware POSITIONREGISTER wrapped around buf_len.
-                    let ring_delta = (buf_u64 - prev).saturating_add(pos);
-                    if ring_delta >= coalesce_threshold
-                        && self.layout.is_clearly_inside_half(toggle_half, pos)
-                    {
-                        (self.layout.safe_write_half_for_play_byte(pos), true)
-                    } else {
-                        (toggle_half, false)
-                    }
-                } else {
-                    // 32-bit counter wrap or non-monotonic driver quirk: trust toggle.
-                    (toggle_half, false)
+            (Some(prev_raw), Some(prev_unwrapped)) => {
+                // Stuck-at-zero cursor guard: degrade cleanly to wall-clock / toggle fallback.
+                if prev_raw == 0 && pos == 0 && self.lag_bytes == half {
+                    self.last_raw_pos = Some(pos);
+                    return self.step_wall_clock_fallback(now_since_run);
                 }
+                let is_modular = self.wrap_mode == PositionWrapMode::Modular || self.observed_wrap;
+                if pos >= prev_raw {
+                    let raw_delta = pos - prev_raw;
+                    let is_full_ring_wrap = prev_raw < buf
+                        && pos < buf
+                        && raw_delta < half / 2
+                        && self.wrap_mode != PositionWrapMode::Monotonic
+                        && match clock_allows_full_ring_wrap {
+                            Some(true) => is_modular || self.lag_bytes == 0,
+                            Some(false) => false,
+                            None => {
+                                is_modular
+                                    && self.lag_bytes == 0
+                                    && self.layout.is_clearly_inside_half(
+                                        self.next_expected_half,
+                                        pos,
+                                    )
+                            }
+                        };
+                    if is_full_ring_wrap {
+                        let extra_rings = match clock_since_boundary {
+                            Some((since, hd)) => {
+                                let h = (since.as_nanos() / hd.as_nanos()) as u64;
+                                (h / 2).max(1)
+                            }
+                            None => 1,
+                        };
+                        self.observed_wrap = true;
+                        prev_unwrapped
+                            .saturating_add(raw_delta)
+                            .saturating_add(extra_rings.saturating_mul(buf))
+                    } else {
+                        prev_unwrapped.saturating_add(raw_delta)
+                    }
+                } else if prev_raw < buf && pos < buf && self.wrap_mode != PositionWrapMode::Monotonic
+                {
+                    // Modular wrap around buf_len.
+                    self.observed_wrap = true;
+                    let ring_delta = (buf - prev_raw).saturating_add(pos);
+                    let extra_rings = match clock_since_boundary {
+                        Some((since, hd)) if since >= hd.saturating_mul(3) => {
+                            let h = (since.as_nanos() / hd.as_nanos()) as u64;
+                            let base_halves = if ring_delta >= half { 1 } else { 0 };
+                            h.saturating_sub(base_halves) / 2
+                        }
+                        _ => 0,
+                    };
+                    prev_unwrapped
+                        .saturating_add(ring_delta)
+                        .saturating_add(extra_rings.saturating_mul(buf))
+                } else {
+                    // 32-bit counter wrap or non-monotonic quirk: step 1 half cleanly.
+                    self.boundary_byte(self.last_boundary_idx.saturating_add(1))
+                        .saturating_sub(self.lag_bytes)
+                }
+            }
+            _ => pos,
+        };
+
+        let adj_pos = unwrapped.saturating_add(self.lag_bytes);
+        let raw_bidx = self.boundary_idx_for_byte(adj_pos);
+        let next_expected_bidx = self.last_boundary_idx.saturating_add(1);
+        let next_expected_byte = self.boundary_byte(next_expected_bidx);
+
+        let (new_bidx, coalesced) = if raw_bidx >= next_expected_bidx.saturating_add(1) {
+            // Crossed >= 2 half boundaries: genuine coalescing; resync directly to DMA half.
+            (raw_bidx, true)
+        } else if raw_bidx == next_expected_bidx {
+            // Exactly 1 half boundary crossed (including late-but-not-coalesced wakes).
+            (raw_bidx, false)
+        } else {
+            // Position is still short of `next_expected_byte`.
+            let shortfall = next_expected_byte.saturating_sub(adj_pos);
+            if shortfall <= guard {
+                // Inside pre-boundary jitter guard band: trust expected half boundary.
+                (next_expected_bidx, false)
+            } else {
+                // Clearly inside `raw_bidx`'s half (outside guard band): self-heal by writing
+                // the half opposite DMA rather than overwriting the active DMA half.
+                (raw_bidx, false)
             }
         };
 
-        self.last_position_bytes = Some(pos);
-        result
+        let halves_advanced = new_bidx.saturating_sub(self.last_boundary_idx).max(1);
+        self.advance_boundary_clock(now_since_run, halves_advanced);
+        self.last_raw_pos = Some(pos);
+        self.last_unwrapped_pos = Some(unwrapped);
+        self.last_boundary_idx = new_bidx;
+
+        let write_half = ((new_bidx as usize) & 1) ^ 1;
+        (write_half, coalesced)
     }
 
-    /// Process one WaveRT half-buffer completion notification.
+    /// Process one WaveRT half-buffer completion notification without wall-clock timing.
     ///
     /// Returns the half index that was written alongside `Continue` / `Finished`.
     pub fn on_notification(
@@ -845,11 +1102,24 @@ impl WaveRtLoopController {
         stop_requested: bool,
         play_offset_bytes: Option<u64>,
     ) -> Result<(usize, WaveRtStepOutcome), OutputError> {
-        let (write_half, coalesced) = self.select_write_half(play_offset_bytes);
+        self.on_notification_at(cyclic_slice, pump, stop_requested, play_offset_bytes, None)
+    }
+
+    /// Process one WaveRT half-buffer completion notification with monotonic wall-clock time
+    /// elapsed since `KSSTATE_RUN`.
+    pub fn on_notification_at(
+        &mut self,
+        cyclic_slice: &mut [u8],
+        pump: &mut dyn WaveRtPumpSource,
+        stop_requested: bool,
+        play_offset_bytes: Option<u64>,
+        now_since_run: Option<Duration>,
+    ) -> Result<(usize, WaveRtStepOutcome), OutputError> {
+        let (write_half, coalesced) = self.select_write_half(play_offset_bytes, now_since_run);
         self.next_expected_half = write_half ^ 1;
 
         if coalesced {
-            // Coalesced notification (>= 1.5 halves elapsed): both halves completed DMA.
+            // Coalesced notification (>= 2 boundaries crossed): both halves completed DMA.
             self.completed_audio_frames += self.half_audio_frames[0] + self.half_audio_frames[1];
             self.half_audio_frames = [0, 0];
         } else {
@@ -1279,7 +1549,7 @@ impl WdmKsSink {
 
         let ev_run = create_auto_reset_event()?;
         let _notif = WaveRtNotificationGuard::register(pin.raw(), ev_run.raw())?;
-        let pos_reader = WaveRtPositionReader::open(pin.raw());
+        let mut pos_reader = WaveRtPositionReader::open(pin.raw());
         let mut state_guard = KsPinStateGuard::new(pin.raw());
         state_guard.set_state(KSSTATE_ACQUIRE)?;
         state_guard.set_state(KSSTATE_PAUSE)?;
@@ -1363,8 +1633,8 @@ impl WdmKsSink {
         let event_handle = create_auto_reset_event()?;
         let _notif_guard = WaveRtNotificationGuard::register(pin.raw(), event_handle.raw())?;
 
-        // 5. Probe hardware play-cursor reader (POSITIONREGISTER -> AUDIO_POSITION -> toggle fallback).
-        let pos_reader = WaveRtPositionReader::open(pin.raw());
+        // 5. Probe hardware play-cursor reader (POSITIONREGISTER -> AUDIO_POSITION -> wall-clock fallback).
+        let mut pos_reader = WaveRtPositionReader::open(pin.raw());
 
         // 6. Ensure pin returns to KSSTATE_STOP even if an error occurs mid-stream.
         let mut state_guard = KsPinStateGuard::new(pin.raw());
@@ -1373,7 +1643,16 @@ impl WdmKsSink {
         let cyclic_slice = unsafe {
             core::slice::from_raw_parts_mut(rt_buf.BufferAddress.cast::<u8>(), layout.buf_len())
         };
-        let mut controller = WaveRtLoopController::new(layout);
+        let half_frames = layout.half_len() / layout.bytes_per_frame();
+        let half_duration =
+            Duration::from_secs_f64(half_frames as f64 / f64::from(sample_rate_hz.max(1)));
+        let mut controller = WaveRtLoopController::new(layout)
+            .with_half_duration(half_duration)
+            .with_wrap_mode(if pos_reader.is_modular() {
+                PositionWrapMode::Modular
+            } else {
+                PositionWrapMode::Auto
+            });
         controller.prefill(cyclic_slice, pump)?;
         if call_barrier {
             fence(Ordering::SeqCst);
@@ -1383,6 +1662,7 @@ impl WdmKsSink {
         state_guard.set_state(KSSTATE_ACQUIRE)?;
         state_guard.set_state(KSSTATE_PAUSE)?;
         state_guard.set_state(KSSTATE_RUN)?;
+        let run_start = Instant::now();
 
         // 9. Event-driven WaveRT loop: each notification signals a completed half-buffer.
         let mut notifications: usize = 0;
@@ -1401,8 +1681,15 @@ impl WdmKsSink {
 
             let stop_requested = self.stop_flag.load(Ordering::SeqCst);
             let play_offset = pos_reader.read_position_bytes();
+            let now_since_run = run_start.elapsed();
 
-            match controller.on_notification(cyclic_slice, pump, stop_requested, play_offset) {
+            match controller.on_notification_at(
+                cyclic_slice,
+                pump,
+                stop_requested,
+                play_offset,
+                Some(now_since_run),
+            ) {
                 Ok((_, outcome)) => {
                     if call_barrier {
                         fence(Ordering::SeqCst);
@@ -1755,6 +2042,7 @@ enum WaveRtPositionReader {
     },
     AudioPositionIoctl {
         pin: HANDLE,
+        selector: AudioPositionCursorSelector,
     },
     Unavailable,
 }
@@ -1765,31 +2053,33 @@ impl WaveRtPositionReader {
         if let Some((ptr, width_bits)) = query_position_register(pin) {
             return Self::Register { ptr, width_bits };
         }
-        if query_audio_position(pin).is_some() {
-            return Self::AudioPositionIoctl { pin };
+        if let Some(initial) = query_audio_position(pin) {
+            let mut selector = AudioPositionCursorSelector::new();
+            let _ = selector.select(initial.PlayOffset, initial.WriteOffset);
+            return Self::AudioPositionIoctl { pin, selector };
         }
         Self::Unavailable
     }
 
-    fn read_position_bytes(&self) -> Option<u64> {
-        match *self {
+    fn is_modular(&self) -> bool {
+        matches!(self, Self::Register { .. })
+    }
+
+    fn read_position_bytes(&mut self) -> Option<u64> {
+        match self {
             Self::Register { ptr, width_bits } => unsafe {
-                match width_bits {
-                    32 => Some(u64::from(core::ptr::read_volatile(ptr.cast::<u32>()))),
-                    64 => Some(core::ptr::read_volatile(ptr.cast::<u64>())),
+                match *width_bits {
+                    32 => Some(u64::from(core::ptr::read_volatile((*ptr).cast::<u32>()))),
+                    64 => Some(core::ptr::read_volatile((*ptr).cast::<u64>())),
                     _ => None,
                 }
             },
-            Self::AudioPositionIoctl { pin } => query_audio_position(pin).map(|pos| {
-                // Prefer WriteOffset (the driver's DMA/read cursor that drives WaveRT
-                // half-buffer notifications) over PlayOffset (which lags by USB/DAC latency)
-                // whenever WriteOffset is populated; fall back to PlayOffset if zero.
-                if pos.WriteOffset > 0 {
-                    pos.WriteOffset
-                } else {
-                    pos.PlayOffset
-                }
-            }),
+            Self::AudioPositionIoctl { pin, selector } => {
+                // Lock onto one consistent cursor (`WriteOffset` once seen non-zero, otherwise
+                // `PlayOffset`) so legitimate modulo wraps to 0 never mix two cursors.
+                query_audio_position(*pin)
+                    .map(|pos| selector.select(pos.PlayOffset, pos.WriteOffset))
+            }
             Self::Unavailable => None,
         }
     }
