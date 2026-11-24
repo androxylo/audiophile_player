@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ap_source::flac::{
     AudioBlockSource, FlacBlockReader, MAX_PREALLOC_FRAMES, UNSUPPORTED_CHANNEL_LAYOUT_PREFIX,
     capped_prealloc_frames, decode_flac_full_memory, decode_flac_full_memory_int32,
-    parse_peak_metadata_fields,
+    parse_peak_metadata_fields, validate_flac_stream_params,
 };
 use flac_codec::encode::{FlacSampleWriter, Options};
 
@@ -265,12 +265,13 @@ fn caps_untrusted_streaminfo_total_samples_preallocation() {
 
 #[test]
 fn parses_true_peak_tags_in_linear_and_dbtp_forms_separately_from_sample_peak() {
+    // Mathematically consistent pair: sample peak 0.65 (-3.74 dBFS), true peak -3.5 dBTP (0.6683).
     let fields_db = vec![
-        "REPLAYGAIN_TRACK_PEAK=0.70".to_string(),
+        "REPLAYGAIN_TRACK_PEAK=0.65".to_string(),
         "TRUE_PEAK=-3.5 dBTP".to_string(),
     ];
     let m1 = parse_peak_metadata_fields(&fields_db);
-    assert_eq!(m1.replaygain_track_peak, Some(0.70));
+    assert_eq!(m1.replaygain_track_peak, Some(0.65));
     assert!(m1.has_verified_true_peak());
     let expected_tp = 10.0_f64.powf(-3.5 / 20.0);
     assert!((m1.true_peak_linear.unwrap() - expected_tp).abs() < 1e-12);
@@ -278,16 +279,50 @@ fn parses_true_peak_tags_in_linear_and_dbtp_forms_separately_from_sample_peak() 
     assert_eq!(tag, "TRUE_PEAK");
     assert!((eff - expected_tp).abs() < 1e-12);
 
-    // Linear true peak (> 0.0) without dB suffix is stored as linear amplitude directly.
-    let fields_lin = vec!["REPLAYGAIN_TRACK_TRUE_PEAK=0.625".to_string()];
-    let m2 = parse_peak_metadata_fields(&fields_lin);
+    // Explicit positive dBTP (+0.3 dBTP) converts cleanly to > 1.0 linear (hot master).
+    let m_hot = parse_peak_metadata_fields(&["TRUE_PEAK=+0.3 dBTP".to_string()]);
+    assert!((m_hot.true_peak_linear.unwrap() - 10.0_f64.powf(0.3 / 20.0)).abs() < 1e-12);
+
+    // Review #3 Finding #7: ambiguous bare positive TRUE_PEAK ("0.3" or "+0.3") MUST NOT be
+    // parsed as quiet linear amplitude 0.3 (-10.46 dBFS)!
+    let m_ambig_1 = parse_peak_metadata_fields(&["TRUE_PEAK=0.3".to_string()]);
+    assert_eq!(m_ambig_1.true_peak_linear, None);
+    assert!(!m_ambig_1.has_verified_true_peak());
+    let m_ambig_2 = parse_peak_metadata_fields(&["TRUE_PEAK=+0.3".to_string()]);
+    assert_eq!(m_ambig_2.true_peak_linear, None);
+
+    // Unambiguous bare negative TRUE_PEAK in [-120, 0] is accepted as dBTP; Q7.8-like -768 is rejected.
+    let m_neg = parse_peak_metadata_fields(&["TRUE_PEAK=-4.2".to_string()]);
+    assert!((m_neg.true_peak_linear.unwrap() - 10.0_f64.powf(-4.2 / 20.0)).abs() < 1e-12);
+    let m_q78_tp = parse_peak_metadata_fields(&["TRUE_PEAK=-768".to_string()]);
+    assert_eq!(m_q78_tp.true_peak_linear, None);
+
+    // REPLAYGAIN_TRACK_TRUE_PEAK uses linear amplitude by spec (rejecting '+0.3' dBTP syntax).
+    let m2 = parse_peak_metadata_fields(&["REPLAYGAIN_TRACK_TRUE_PEAK=0.625".to_string()]);
     assert_eq!(m2.true_peak_linear, Some(0.625));
     assert!(m2.has_verified_true_peak());
+    let m2_plus = parse_peak_metadata_fields(&["REPLAYGAIN_TRACK_TRUE_PEAK=+0.3".to_string()]);
+    assert_eq!(m2_plus.true_peak_linear, None);
 
-    // Bare negative R128_TRACK_TRUE_PEAK converts dBTP -> linear.
-    let fields_r128 = vec!["R128_TRACK_TRUE_PEAK=-6.0".to_string()];
-    let m3 = parse_peak_metadata_fields(&fields_r128);
-    assert!((m3.true_peak_linear.unwrap() - 10.0_f64.powf(-6.0 / 20.0)).abs() < 1e-12);
+    // R128_TRACK_TRUE_PEAK requires explicit dB/dBTP suffix so bare Q7.8 integer '-768' is rejected.
+    let m3_bad = parse_peak_metadata_fields(&["R128_TRACK_TRUE_PEAK=-768".to_string()]);
+    assert_eq!(m3_bad.true_peak_linear, None);
+    let m3_bare = parse_peak_metadata_fields(&["R128_TRACK_TRUE_PEAK=-6.0".to_string()]);
+    assert_eq!(m3_bare.true_peak_linear, None);
+    let m3_ok = parse_peak_metadata_fields(&["R128_TRACK_TRUE_PEAK=-6.0 dBTP".to_string()]);
+    assert!((m3_ok.true_peak_linear.unwrap() - 10.0_f64.powf(-6.0 / 20.0)).abs() < 1e-12);
+
+    // Cross-check against REPLAYGAIN_TRACK_PEAK: mathematically impossible TP < sample_peak is discarded!
+    let m_impossible = parse_peak_metadata_fields(&[
+        "REPLAYGAIN_TRACK_PEAK=0.95".to_string(),
+        "TRUE_PEAK=-6.0 dBTP".to_string(), // 0.501 < 0.95!
+    ]);
+    assert_eq!(m_impossible.true_peak_linear, None);
+    assert!(!m_impossible.has_verified_true_peak());
+    assert_eq!(
+        m_impossible.effective_peak_linear(),
+        Some((0.95, "REPLAYGAIN_TRACK_PEAK"))
+    );
 }
 
 #[test]
@@ -334,6 +369,15 @@ fn read_next_block_preserves_valid_prefix_before_mid_block_error() {
 
 #[test]
 fn rejects_zero_hz_streaminfo_flac_cleanly() {
+    // Review #3 Finding #24: directly test the open_validated guard so deleting the
+    // sample_rate_hz == 0 check cannot hide behind flac-codec's parser error.
+    let err_direct = validate_flac_stream_params(2, 0, 16, std::path::Path::new("zero.flac"))
+        .expect_err("validate_flac_stream_params must explicitly reject 0 Hz");
+    assert!(
+        err_direct.contains("invalid FLAC sample rate 0 Hz"),
+        "expected explicit 0 Hz error, got: {err_direct}"
+    );
+
     let path = make_temp_flac_path("zero_hz_streaminfo");
     let samples = vec![0_i32; 64 * 2];
     let mut enc = FlacSampleWriter::create(

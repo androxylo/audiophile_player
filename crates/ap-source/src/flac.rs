@@ -54,16 +54,14 @@ struct ValidatedFlac {
     shift: u32,
 }
 
-fn open_validated(path: &Path) -> Result<ValidatedFlac, String> {
-    let file = File::open(path)
-        .map_err(|e| format!("failed to open FLAC '{}': {e}", path.display()))?;
-    let reader = FlacSampleReader::new(BufReader::new(file))
-        .map_err(|e| format!("failed to parse FLAC '{}': {e}", path.display()))?;
-
-    let source_channels = reader.channel_count();
-    let sample_rate_hz = reader.sample_rate();
-    let bits_per_sample = reader.bits_per_sample();
-
+/// Validate decoded FLAC STREAMINFO parameters (channels, sample rate, bit depth) and build
+/// the canonical stereo `StreamSpec` (mono is duplicated into dual-mono stereo downstream).
+pub fn validate_flac_stream_params(
+    source_channels: u8,
+    sample_rate_hz: u32,
+    bits_per_sample: u32,
+    path: &Path,
+) -> Result<StreamSpec, String> {
     match source_channels {
         1 | 2 => {}
         _ => {
@@ -86,13 +84,26 @@ fn open_validated(path: &Path) -> Result<ValidatedFlac, String> {
         ));
     }
 
-    // Mono sources are duplicated into dual-mono stereo (L == R) so downstream stereo DSP
-    // and DAC stages always receive 2-channel frames.
-    let spec = StreamSpec {
+    Ok(StreamSpec {
         sample_rate_hz,
         bits_per_sample: bits_per_sample as u16,
         channels: 2,
-    };
+    })
+}
+
+fn open_validated(path: &Path) -> Result<ValidatedFlac, String> {
+    let file = File::open(path)
+        .map_err(|e| format!("failed to open FLAC '{}': {e}", path.display()))?;
+    let reader = FlacSampleReader::new(BufReader::new(file))
+        .map_err(|e| format!("failed to parse FLAC '{}': {e}", path.display()))?;
+
+    let source_channels = reader.channel_count();
+    let sample_rate_hz = reader.sample_rate();
+    let bits_per_sample = reader.bits_per_sample();
+
+    // Mono sources are duplicated into dual-mono stereo (L == R) so downstream stereo DSP
+    // and DAC stages always receive 2-channel frames.
+    let spec = validate_flac_stream_params(source_channels, sample_rate_hz, bits_per_sample, path)?;
     let peak_meta = parse_peak_metadata(reader.metadata().get::<VorbisComment>());
     let total_frames = reader.total_samples();
     let shift = 32 - bits_per_sample;
@@ -251,24 +262,71 @@ pub struct DecodedFlacInt32 {
     pub pcm: InterleavedInt32Buffer,
 }
 
-/// Parse a True Peak Vorbis comment value, accepting either linear amplitude (`> 0.0`, e.g.
-/// `0.7079`) or dBTP (`<= 0.0` or suffixed with `dB` / `dBTP`, e.g. `-3.0 dBTP`).
-fn parse_true_peak_linear(raw: &str) -> Option<f64> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TruePeakTagUnit {
+    /// `REPLAYGAIN_*_TRUE_PEAK`: ReplayGain convention is linear amplitude (`> 0.0`, no `'+'`),
+    /// or explicit `dB` / `dBTP` suffix.
+    ReplayGainLinearOrExplicitDb,
+    /// `TRUE_PEAK`: explicit `dB` / `dBTP` suffix, or unambiguous bare negative dBTP in
+    /// `[-120.0, 0.0]`. Bare positive values (`0.3`, `+0.3`) are ambiguous between hot dBTP and
+    /// quiet linear amplitude and are rejected safely (`None` -> fail-safe `-3 dB`).
+    TruePeakDbOnly,
+    /// `R128_*_TRUE_PEAK`: require explicit `dB` / `dBTP` suffix so R128 Q7.8 integers (e.g.
+    /// `-768`) are never misparsed as `-768 dBTP` (`10^-38.4`).
+    ExplicitDbOnly,
+}
+
+/// Parse a True Peak Vorbis comment value with strict unit disambiguation so a hot master
+/// tagged as unitless positive dBTP (`+0.3` / `0.3`) or an R128 Q7.8 integer (`-768`) can NEVER
+/// be misinterpreted as a quiet linear peak.
+fn parse_true_peak_linear(raw: &str, unit: TruePeakTagUnit) -> Option<f64> {
     let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
     let lower = trimmed.to_ascii_lowercase();
-    let is_db = lower.contains("db");
-    let num_token = trimmed
-        .split(|c: char| c.is_whitespace() || c.is_ascii_alphabetic())
-        .find(|s| !s.is_empty())?;
-    let val = num_token.parse::<f64>().ok()?;
+    let (num_str, has_db_suffix) = if let Some(s) = lower.strip_suffix("dbtp") {
+        (s.trim_end(), true)
+    } else if let Some(s) = lower.strip_suffix("db") {
+        (s.trim_end(), true)
+    } else {
+        (trimmed, false)
+    };
+    if num_str.is_empty() {
+        return None;
+    }
+    let val = num_str.parse::<f64>().ok()?;
     if !val.is_finite() {
         return None;
     }
-    if is_db || val <= 0.0 {
-        // dBTP (e.g. -3.0 dBTP, +0.5 dBTP, or bare -4.2) -> linear amplitude
-        Some(10.0_f64.powf(val / 20.0))
+
+    if has_db_suffix {
+        if (-120.0..=24.0).contains(&val) {
+            Some(10.0_f64.powf(val / 20.0))
+        } else {
+            None
+        }
     } else {
-        Some(val)
+        match unit {
+            TruePeakTagUnit::ReplayGainLinearOrExplicitDb => {
+                // Reject leading '+' (almost certainly dBTP) and implausible amplitudes.
+                if !num_str.starts_with('+') && val > 0.0 && val <= 16.0 {
+                    Some(val)
+                } else {
+                    None
+                }
+            }
+            TruePeakTagUnit::TruePeakDbOnly => {
+                // Only unambiguous bare negative dBTP (e.g. `-4.2`); reject bare positive (`0.3`,
+                // `+0.3`, `0.0`) and Q7.8-like `< -120.0`.
+                if num_str.starts_with('-') && (-120.0..=0.0).contains(&val) {
+                    Some(10.0_f64.powf(val / 20.0))
+                } else {
+                    None
+                }
+            }
+            TruePeakTagUnit::ExplicitDbOnly => None,
+        }
     }
 }
 
@@ -288,15 +346,34 @@ pub fn parse_peak_metadata_fields(fields: &[String]) -> TrackPeakMetadata {
         match key.as_str() {
             "REPLAYGAIN_TRACK_GAIN" => meta.replaygain_track_gain_db = val_num,
             "REPLAYGAIN_TRACK_PEAK" => meta.replaygain_track_peak = val_num,
-            "TRUE_PEAK" | "REPLAYGAIN_TRACK_TRUE_PEAK" | "R128_TRACK_TRUE_PEAK" => {
-                if let Some(lin) = parse_true_peak_linear(v) {
+            "TRUE_PEAK" => {
+                if let Some(lin) = parse_true_peak_linear(v, TruePeakTagUnit::TruePeakDbOnly) {
+                    meta.true_peak_linear = Some(lin);
+                }
+            }
+            "REPLAYGAIN_TRACK_TRUE_PEAK" => {
+                if let Some(lin) =
+                    parse_true_peak_linear(v, TruePeakTagUnit::ReplayGainLinearOrExplicitDb)
+                {
+                    meta.true_peak_linear = Some(lin);
+                }
+            }
+            "R128_TRACK_TRUE_PEAK" => {
+                if let Some(lin) = parse_true_peak_linear(v, TruePeakTagUnit::ExplicitDbOnly) {
                     meta.true_peak_linear = Some(lin);
                 }
             }
             "REPLAYGAIN_ALBUM_GAIN" => meta.replaygain_album_gain_db = val_num,
             "REPLAYGAIN_ALBUM_PEAK" => meta.replaygain_album_peak = val_num,
-            "REPLAYGAIN_ALBUM_TRUE_PEAK" | "R128_ALBUM_TRUE_PEAK" => {
-                if let Some(lin) = parse_true_peak_linear(v) {
+            "REPLAYGAIN_ALBUM_TRUE_PEAK" => {
+                if let Some(lin) =
+                    parse_true_peak_linear(v, TruePeakTagUnit::ReplayGainLinearOrExplicitDb)
+                {
+                    album_true_peak = Some(lin);
+                }
+            }
+            "R128_ALBUM_TRUE_PEAK" => {
+                if let Some(lin) = parse_true_peak_linear(v, TruePeakTagUnit::ExplicitDbOnly) {
                     album_true_peak = Some(lin);
                 }
             }
@@ -312,6 +389,16 @@ pub fn parse_peak_metadata_fields(fields: &[String]) -> TrackPeakMetadata {
     if meta.true_peak_linear.is_none() {
         meta.true_peak_linear = album_true_peak;
     }
+
+    // Mathematical sanity cross-check: True Peak can never be lower than discrete sample peak.
+    // If a mis-tagged or mis-unit-ed True Peak falls below the track's sample peak (beyond 0.5%
+    // tag-rounding tolerance), discard `true_peak_linear` so headroom falls back safely.
+    if let (Some(tp), Some(sp)) = (meta.true_peak_linear, meta.replaygain_track_peak) {
+        if sp.is_finite() && sp > 0.0 && tp < sp * 0.995 {
+            meta.true_peak_linear = None;
+        }
+    }
+
     meta
 }
 
