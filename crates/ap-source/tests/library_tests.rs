@@ -339,12 +339,20 @@ fn natural_sorting_orders_case_insensitively_with_numeric_digit_runs() {
 }
 
 #[test]
-fn skips_appledouble_dotfiles_recycle_bin_system_volume_and_windows_hidden_entries() {
+fn skips_appledouble_metadata_recycle_bin_and_hidden_while_keeping_ellipsis_albums() {
     let root = make_temp_tree("skip_hidden");
     fs::write(root.join("._01.flac"), b"appledouble").unwrap();
-    fs::write(root.join(".hidden.flac"), b"dotfile").unwrap();
+    fs::write(root.join(".DS_Store"), b"finder").unwrap();
     fs::write(root.join("01.flac"), b"").unwrap();
     fs::write(root.join("02.flac"), b"").unwrap();
+    // Real leading-dot music titles MUST NOT be hidden!
+    fs::write(root.join("...Baby One More Time.flac"), b"").unwrap();
+    fs::create_dir_all(root.join("...And Justice for All")).unwrap();
+    fs::write(
+        root.join("...And Justice for All").join("01_blackened.flac"),
+        b"",
+    )
+    .unwrap();
 
     fs::create_dir_all(root.join(".Trash")).unwrap();
     fs::write(root.join(".Trash").join("trashed.flac"), b"").unwrap();
@@ -376,32 +384,62 @@ fn skips_appledouble_dotfiles_recycle_bin_system_volume_and_windows_hidden_entri
     }
 
     let frame = read_dir_frame(&root).unwrap();
-    assert!(frame.subdirs.is_empty(), "expected no subdirs, got {:?}", frame.subdirs);
+    let subdir_names: Vec<_> = frame
+        .subdirs
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(subdir_names, vec!["...And Justice for All"]);
     let flac_names: Vec<_> = frame
         .flacs
         .iter()
         .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
         .collect();
-    assert_eq!(flac_names, vec!["01.flac", "02.flac"]);
+    assert_eq!(
+        flac_names,
+        vec!["...Baby One More Time.flac", "01.flac", "02.flac"]
+    );
 
     let discovered: Vec<_> = discover_flac_files(&root)
         .unwrap()
         .into_iter()
         .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
         .collect();
-    assert_eq!(discovered, vec!["01.flac", "02.flac"]);
+    assert_eq!(
+        discovered,
+        vec![
+            "01_blackened.flac",
+            "...Baby One More Time.flac",
+            "01.flac",
+            "02.flac"
+        ]
+    );
 
     let mut cur = SequentialFlacCursor::new(root.clone()).unwrap();
     let mut seq = Vec::new();
     while let Some(p) = cur.next_track() {
         seq.push(p.file_name().unwrap().to_string_lossy().to_string());
     }
-    assert_eq!(seq, vec!["01.flac", "02.flac"]);
+    assert_eq!(
+        seq,
+        vec![
+            "...Baby One More Time.flac",
+            "01.flac",
+            "02.flac",
+            "01_blackened.flac"
+        ]
+    );
 
     for seed in 0..30_u64 {
         let picked = pick_random_flac_walk_with_seed(&root, seed).unwrap();
         let name = picked.file_name().unwrap().to_string_lossy().to_string();
-        assert!(name == "01.flac" || name == "02.flac", "unexpected hidden pick: {name}");
+        assert!(
+            matches!(
+                name.as_str(),
+                "01.flac" | "02.flac" | "...Baby One More Time.flac" | "01_blackened.flac"
+            ),
+            "unexpected hidden pick: {name}"
+        );
     }
 
     let _ = fs::remove_dir_all(&root);
@@ -498,6 +536,10 @@ fn walk_picker_weights_large_folders_and_here_slot_fairly() {
 
     fs::write(root.join("loose.flac"), b"").unwrap();
     fs::write(single.join("lone.flac"), b"").unwrap();
+    // Non-FLAC artwork/logs inside SingleFolder must NOT inflate its weight above BigCollection!
+    for i in 1..=80 {
+        fs::write(single.join(format!("cover_{i:02}.jpg")), b"").unwrap();
+    }
     for i in 1..=20 {
         fs::write(big.join(format!("track_{i:02}.flac")), b"").unwrap();
     }

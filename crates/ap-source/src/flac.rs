@@ -73,6 +73,12 @@ fn open_validated(path: &Path) -> Result<ValidatedFlac, String> {
             ));
         }
     }
+    if sample_rate_hz == 0 {
+        return Err(format!(
+            "invalid FLAC sample rate 0 Hz (non-audio stream) in '{}'",
+            path.display()
+        ));
+    }
     if bits_per_sample == 0 || bits_per_sample > 32 {
         return Err(format!(
             "unsupported FLAC bit depth {bits_per_sample} in '{}'",
@@ -115,6 +121,7 @@ pub struct FlacBlockReader {
     shift: u32,
     scratch: Vec<i32>,
     eof: bool,
+    pending_error: Option<String>,
 }
 
 impl FlacBlockReader {
@@ -129,6 +136,7 @@ impl FlacBlockReader {
             shift: validated.shift,
             scratch: Vec::new(),
             eof: false,
+            pending_error: None,
         })
     }
 
@@ -156,6 +164,10 @@ impl AudioBlockSource for FlacBlockReader {
     }
 
     fn read_next_block(&mut self, max_frames: usize) -> Result<Option<StereoF64Buffer>, String> {
+        if let Some(err) = self.pending_error.take() {
+            self.eof = true;
+            return Err(err);
+        }
         if self.eof || max_frames == 0 {
             return Ok(None);
         }
@@ -168,15 +180,27 @@ impl AudioBlockSource for FlacBlockReader {
 
         let mut filled = 0;
         while filled < target_samples {
-            let n = self
-                .reader
-                .read(&mut self.scratch[filled..target_samples])
-                .map_err(|e| format!("FLAC stream decode error: {e}"))?;
-            if n == 0 {
-                self.eof = true;
-                break;
+            match self.reader.read(&mut self.scratch[filled..target_samples]) {
+                Ok(0) => {
+                    self.eof = true;
+                    break;
+                }
+                Ok(n) => {
+                    filled += n;
+                }
+                Err(e) => {
+                    let msg = format!("FLAC stream decode error: {e}");
+                    if filled >= ch {
+                        // Return the valid frames already decoded before the error and surface
+                        // the error on the next `read_next_block()` call so truncated or
+                        // partially corrupt tracks never discard up to 65,536 frames (~1.5 s).
+                        self.pending_error = Some(msg);
+                        break;
+                    }
+                    self.eof = true;
+                    return Err(msg);
+                }
             }
-            filled += n;
         }
 
         let frames = filled / ch;

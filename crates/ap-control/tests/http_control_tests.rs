@@ -581,6 +581,7 @@ fn browser_listing_uses_natural_order_and_skips_hidden_and_appledouble_entries()
     fs::create_dir_all(root.join("abba")).unwrap();
     fs::create_dir_all(root.join("Disc 10")).unwrap();
     fs::create_dir_all(root.join("Disc 2")).unwrap();
+    fs::create_dir_all(root.join("...And Justice for All")).unwrap();
     fs::create_dir_all(root.join(".Trash")).unwrap();
     fs::create_dir_all(root.join("$RECYCLE.BIN")).unwrap();
     fs::create_dir_all(root.join("System Volume Information")).unwrap();
@@ -589,7 +590,7 @@ fn browser_listing_uses_natural_order_and_skips_hidden_and_appledouble_entries()
     fs::write(root.join("1.flac"), b"").unwrap();
     fs::write(root.join("2.flac"), b"").unwrap();
     fs::write(root.join("._01.flac"), b"").unwrap();
-    fs::write(root.join(".hidden.flac"), b"").unwrap();
+    fs::write(root.join(".DS_Store"), b"").unwrap();
 
     #[cfg(windows)]
     {
@@ -615,7 +616,10 @@ fn browser_listing_uses_natural_order_and_skips_hidden_and_appledouble_entries()
         .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
         .collect();
 
-    assert_eq!(dir_names, vec!["abba", "Disc 2", "Disc 10", "Zappa"]);
+    assert_eq!(
+        dir_names,
+        vec!["...And Justice for All", "abba", "Disc 2", "Disc 10", "Zappa"]
+    );
     assert_eq!(flac_names, vec!["1.flac", "2.flac", "10.flac"]);
 
     let _ = fs::remove_dir_all(&root);

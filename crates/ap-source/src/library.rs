@@ -14,25 +14,28 @@
 //!   (numeric digit runs compared by value) shared with `ap-control`'s folder browser.
 
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static SEED_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 const MAX_WALK_DEPTH: usize = 32;
-/// Maximum number of immediate subdirectories for which [`walk_pick_recursive`] performs a cheap
-/// one-level shallow entry-count peek to approximate subtree weight.
+/// Maximum number of immediate subdirectories for which [`walk_pick_recursive`] performs a
+/// one-time cached shallow FLAC/subdir weight peek on a cold directory.
 const MAX_SHALLOW_PEEK_SUBDIRS: usize = 32;
-/// Cap on entries counted during a shallow peek so huge flat folders stay bounded-time.
-const MAX_SHALLOW_PEEK_ENTRIES: usize = 10_000;
-/// Fallback per-subdirectory weight when a directory has more than [`MAX_SHALLOW_PEEK_SUBDIRS`]
-/// immediate subfolders (keeps one loose `.flac` from outweighing an average album folder).
+/// Fallback per-subdirectory weight for unvisited subdirectories when a directory has more than
+/// [`MAX_SHALLOW_PEEK_SUBDIRS`] immediate subfolders (updated lazily once visited).
 const DEFAULT_SUBDIR_WEIGHT: u64 = 10;
+/// Maximum cached directory weight entries before evicting the cache to keep RAM bounded.
+const MAX_WEIGHT_CACHE_ENTRIES: usize = 8_192;
+/// Maximum symlink/junction chain hops resolved when checking for unsafe UNC/device targets.
+const MAX_SYMLINK_HOPS: usize = 8;
 
 /// Immediate subdirectories and `.flac` files in one directory after hidden/system filtering
 /// and case-insensitive natural sorting.
@@ -56,12 +59,35 @@ pub fn is_flac_path(path: &Path) -> bool {
 }
 
 /// Returns `true` if a directory entry name should be excluded from library walks and browsing:
-/// - dotfiles & macOS AppleDouble resource forks (`.` / `._*`)
-/// - Windows system/trash roots (`$RECYCLE.BIN`, `System Volume Information`)
+/// - macOS AppleDouble resource forks (`._*`)
+/// - known OS/indexer metadata files & folders (`.DS_Store`, `.AppleDouble`, `.Trash`,
+///   `.Trashes`, `.Spotlight-V100`, `.fseventsd`, `.TemporaryItems`, `.git`, `.svn`, `.hg`,
+///   `$RECYCLE.BIN`, `System Volume Information`, `Thumbs.db`, `desktop.ini`)
+///
+/// Intentionally does **not** reject arbitrary leading-`.` names so real albums and tracks such
+/// as `...And Justice for All`, `...Like Clockwork`, and `...Baby One More Time.flac` remain
+/// visible; real hidden entries on Windows are filtered via `FILE_ATTRIBUTE_HIDDEN`/`SYSTEM`.
 fn is_excluded_entry_name(name: &str) -> bool {
-    name.starts_with('.')
-        || name.eq_ignore_ascii_case("$RECYCLE.BIN")
-        || name.eq_ignore_ascii_case("System Volume Information")
+    if name.starts_with("._") {
+        return true;
+    }
+    const EXCLUDED: &[&str] = &[
+        ".DS_Store",
+        ".AppleDouble",
+        ".Trash",
+        ".Trashes",
+        ".Spotlight-V100",
+        ".fseventsd",
+        ".TemporaryItems",
+        ".git",
+        ".svn",
+        ".hg",
+        "$RECYCLE.BIN",
+        "System Volume Information",
+        "Thumbs.db",
+        "desktop.ini",
+    ];
+    EXCLUDED.iter().any(|ex| name.eq_ignore_ascii_case(ex))
 }
 
 /// Returns `true` if a `DirEntry` should be skipped due to name or Windows `HIDDEN`/`SYSTEM`
@@ -182,17 +208,97 @@ fn natural_full_path_cmp(a: &Path, b: &Path) -> CmpOrdering {
     }
 }
 
+/// Extract the normalized `\\server\share` (lowercased) prefix if `path` is a UNC path
+/// (either `\\server\share...` or `\\?\UNC\server\share...`), or `None` for local paths.
+fn unc_share_prefix(path: &Path) -> Option<String> {
+    let raw = path.to_string_lossy();
+    let rest = if let Some(r) = raw.strip_prefix(r"\\?\UNC\").or_else(|| raw.strip_prefix(r"\\?\unc\")) {
+        r
+    } else if raw.starts_with(r"\\") && !raw.starts_with(r"\\?\") && !raw.starts_with(r"\\.\") {
+        &raw[2..]
+    } else {
+        return None;
+    };
+    let mut parts = rest.split(['\\', '/']).filter(|s| !s.is_empty());
+    let server = parts.next()?;
+    let share = parts.next()?;
+    Some(format!(
+        "\\\\{}\\{}",
+        server.to_ascii_lowercase(),
+        share.to_ascii_lowercase()
+    ))
+}
+
+/// Returns `true` if `target` points to a Win32 device namespace (`\\.\`, `\??\`, `\\?\Pipe\`)
+/// or a UNC share that does not match `allowed_unc_share` (preventing NetNTLM SMB leaks when
+/// reading directory entries containing malicious symlinks or chained links).
+fn is_unsafe_link_target(target: &Path, allowed_unc_share: Option<&str>) -> bool {
+    let raw = target.to_string_lossy();
+    let lower = raw.to_ascii_lowercase();
+    if lower.starts_with(r"\\.\")
+        || lower.starts_with(r"\??\")
+        || lower.starts_with(r"\\?\pipe\")
+        || lower.starts_with(r"\\?\globalroot\")
+    {
+        return true;
+    }
+    if let Some(target_share) = unc_share_prefix(target) {
+        return allowed_unc_share != Some(target_share.as_str());
+    }
+    // Unparseable bare `\\...` or `//...` UNC-like prefix without a valid share is always unsafe.
+    if (raw.starts_with(r"\\") || raw.starts_with("//")) && !raw.starts_with(r"\\?\") {
+        return true;
+    }
+    false
+}
+
+/// Walk a symlink/junction chain starting at `link_path` up to [`MAX_SYMLINK_HOPS`] hops
+/// WITHOUT calling `fs::metadata` on unsafe hops. Returns `true` only if every hop target is
+/// safe (local or within `allowed_unc_share`) and the chain terminates without exceeding hops.
+fn symlink_chain_is_safe(link_path: &Path, allowed_unc_share: Option<&str>) -> bool {
+    let mut current = link_path.to_path_buf();
+    for _ in 0..MAX_SYMLINK_HOPS {
+        let Ok(target) = fs::read_link(&current) else {
+            return false;
+        };
+        if is_unsafe_link_target(&target, allowed_unc_share) {
+            return false;
+        }
+        let next = if target.is_absolute() {
+            target
+        } else {
+            current
+                .parent()
+                .map(|p| p.join(&target))
+                .unwrap_or(target)
+        };
+        // Check if `next` itself is another symlink/junction (without following it!).
+        let Ok(meta) = fs::symlink_metadata(&next) else {
+            return false;
+        };
+        if !meta.file_type().is_symlink() {
+            return true;
+        }
+        current = next;
+    }
+    false
+}
+
 /// Read ONLY the immediate subdirectories and `.flac` files of `dir`.
 ///
-/// - Follows Windows NTFS junctions, volume mount points, and symlinks via `fs::metadata`.
-/// - Skips hidden/system entries (`.`-prefixed dotfiles & macOS AppleDouble `._*`,
-///   `$RECYCLE.BIN`, `System Volume Information`, and Windows `HIDDEN`/`SYSTEM` entries).
+/// - Uses `entry.file_type()` directly from directory enumeration (avoiding per-entry `CreateFile`
+///   syscalls on Windows/SMB) and only resolves `fs::metadata` on actual symlinks / NTFS junctions
+///   AFTER verifying the entire link chain does not target untrusted UNC or Win32 device paths.
+/// - Skips excluded metadata entries (`._*`, `.DS_Store`, `.Trash`, `$RECYCLE.BIN`,
+///   `System Volume Information`, Windows `HIDDEN`/`SYSTEM`) while preserving real dot-prefixed
+///   albums and tracks (e.g. `...And Justice for All`).
 /// - Sorts both `subdirs` and `flacs` in deterministic case-insensitive natural order.
 ///
 /// Shared by [`pick_random_flac_walk`], [`discover_flac_files`], [`SequentialFlacCursor`], and
 /// `ap-control`'s HTTP folder browser so filtering and ordering never drift.
 pub fn read_dir_frame(dir: &Path) -> io::Result<DirEntries> {
     let entries = fs::read_dir(dir)?;
+    let allowed_unc_share = unc_share_prefix(dir);
     let mut subdirs = Vec::new();
     let mut flacs = Vec::new();
 
@@ -200,14 +306,27 @@ pub fn read_dir_frame(dir: &Path) -> io::Result<DirEntries> {
         if should_skip_dir_entry(&entry) {
             continue;
         }
-        let path = entry.path();
-        // Follow Windows NTFS junctions / volume mount points / symlinks via fs::metadata.
-        let Ok(meta) = fs::metadata(&path) else {
+        let Ok(ft) = entry.file_type() else {
             continue;
         };
-        if meta.is_dir() {
+        let path = entry.path();
+        if ft.is_symlink() {
+            // Inspect link chain BEFORE calling fs::metadata so a malicious symlink to
+            // `\\attacker\share` (direct or chained) never triggers outbound SMB auth.
+            if !symlink_chain_is_safe(&path, allowed_unc_share.as_deref()) {
+                continue;
+            }
+            let Ok(meta) = fs::metadata(&path) else {
+                continue;
+            };
+            if meta.is_dir() {
+                subdirs.push(path);
+            } else if meta.is_file() && is_flac_path(&path) {
+                flacs.push(path);
+            }
+        } else if ft.is_dir() {
             subdirs.push(path);
-        } else if meta.is_file() && is_flac_path(&path) {
+        } else if ft.is_file() && is_flac_path(&path) {
             flacs.push(path);
         }
     }
@@ -222,17 +341,56 @@ fn canonical_dir_id(dir: &Path) -> PathBuf {
     fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
 }
 
-/// Cheap one-level shallow count of non-excluded immediate entries inside `dir`, capped at
-/// [`MAX_SHALLOW_PEEK_ENTRIES`]. Returns `0` for empty or unreadable directories.
-fn shallow_entry_weight(dir: &Path) -> u64 {
-    let Ok(entries) = fs::read_dir(dir) else {
+#[derive(Debug, Clone, Copy)]
+struct CachedDirWeight {
+    modified: Option<SystemTime>,
+    weight: u64,
+}
+
+fn dir_weight_cache() -> &'static Mutex<HashMap<PathBuf, CachedDirWeight>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedDirWeight>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn dir_mtime(dir: &Path) -> Option<SystemTime> {
+    fs::metadata(dir).ok().and_then(|m| m.modified().ok())
+}
+
+fn lookup_cached_weight(dir: &Path, mtime: Option<SystemTime>) -> Option<u64> {
+    let cache = dir_weight_cache().lock().unwrap_or_else(|e| e.into_inner());
+    cache.get(dir).and_then(|entry| {
+        if entry.modified == mtime {
+            Some(entry.weight)
+        } else {
+            None
+        }
+    })
+}
+
+fn store_cached_weight(dir: PathBuf, modified: Option<SystemTime>, weight: u64) {
+    let mut cache = dir_weight_cache().lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= MAX_WEIGHT_CACHE_ENTRIES {
+        cache.clear();
+    }
+    cache.insert(dir, CachedDirWeight { modified, weight });
+}
+
+/// Compute or fetch the cached FLAC-aware weight for `dir` (counting only `.flac` files and
+/// non-excluded subdirectories, never `cover.jpg`/`.cue`/`.log`), avoiding repeated directory
+/// scans across consecutive random picks on NAS/SMB libraries.
+fn cached_shallow_flac_weight(dir: &Path) -> u64 {
+    let mtime = dir_mtime(dir);
+    if let Some(w) = lookup_cached_weight(dir, mtime) {
+        return w;
+    }
+    let Ok(frame) = read_dir_frame(dir) else {
         return 0;
     };
-    entries
-        .flatten()
-        .filter(|e| !should_skip_dir_entry(e))
-        .take(MAX_SHALLOW_PEEK_ENTRIES)
-        .count() as u64
+    let flac_w = frame.flacs.len() as u64;
+    let sub_w = (frame.subdirs.len() as u64).saturating_mul(DEFAULT_SUBDIR_WEIGHT);
+    let weight = flac_w.saturating_add(sub_w);
+    store_cached_weight(dir.to_path_buf(), mtime, weight);
+    weight
 }
 
 /// Fast, scalable `O(depth)` random FLAC picker resilient to 20,000+ track libraries.
@@ -293,16 +451,24 @@ fn walk_pick_recursive(
     if !flacs.is_empty() {
         candidates.push((Choice::Here, flacs.len() as u64));
     }
+    let mut learned_total = flacs.len() as u64;
     for sub in subdirs {
         let weight = if peek_subdirs {
-            shallow_entry_weight(&sub)
+            cached_shallow_flac_weight(&sub)
         } else {
-            DEFAULT_SUBDIR_WEIGHT
+            // For directories with >32 subfolders, reuse any previously learned cached weight
+            // without triggering an upfront scan of all subfolders.
+            let mtime = dir_mtime(&sub);
+            lookup_cached_weight(&sub, mtime).unwrap_or(DEFAULT_SUBDIR_WEIGHT)
         };
+        learned_total = learned_total.saturating_add(weight);
         if weight > 0 {
             candidates.push((Choice::Subdir(sub), weight));
         }
     }
+    // Refine this directory's cached weight from its actual FLACs + child weights so future
+    // picks at parent levels converge toward true subtree sizes in O(depth) time.
+    store_cached_weight(dir.to_path_buf(), dir_mtime(dir), learned_total);
 
     // Weighted random selection without replacement so we descend into ONE weighted-random
     // branch on the happy path and backtrack cleanly only if a chosen branch has no `.flac` files.

@@ -289,3 +289,79 @@ fn parses_true_peak_tags_in_linear_and_dbtp_forms_separately_from_sample_peak() 
     let m3 = parse_peak_metadata_fields(&fields_r128);
     assert!((m3.true_peak_linear.unwrap() - 10.0_f64.powf(-6.0 / 20.0)).abs() < 1e-12);
 }
+
+#[test]
+fn read_next_block_preserves_valid_prefix_before_mid_block_error() {
+    let path = make_temp_flac_path("partial_block_prefix");
+    let frames = 128_usize;
+    let samples: Vec<i32> = (0..frames * 2).map(|i| ((i as i32) * 31) - 1000).collect();
+    let mut enc = FlacSampleWriter::create(
+        &path,
+        Options::default(),
+        44_100,
+        16,
+        2,
+        Some(samples.len() as u64),
+    )
+    .unwrap();
+    enc.write(&samples).unwrap();
+    enc.finalize().unwrap();
+
+    // Patch STREAMINFO total_samples upward so flac-codec hits early-EOF error after decoding the
+    // 128 valid frames inside a 65,536-frame read request.
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[24] = 0x10;
+    bytes[25] = 0x00;
+    fs::write(&path, &bytes).unwrap();
+
+    let mut reader = FlacBlockReader::open(&path).unwrap();
+    // First call must return the 128 valid decoded frames instead of discarding them!
+    let first = reader
+        .read_next_block(65_536)
+        .expect("valid prefix before mid-block error must not be discarded")
+        .expect("expected partial block with 128 frames");
+    assert_eq!(first.len(), frames);
+    // Second call surfaces the deferred decode error cleanly.
+    let err = reader
+        .read_next_block(65_536)
+        .expect_err("deferred error must surface on subsequent read_next_block");
+    assert!(err.contains("FLAC stream decode error"), "unexpected err: {err}");
+    // Subsequent call after error returns clean EOF (Ok(None)).
+    assert!(reader.read_next_block(65_536).unwrap().is_none());
+
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn rejects_zero_hz_streaminfo_flac_cleanly() {
+    let path = make_temp_flac_path("zero_hz_streaminfo");
+    let samples = vec![0_i32; 64 * 2];
+    let mut enc = FlacSampleWriter::create(
+        &path,
+        Options::default(),
+        44_100,
+        16,
+        2,
+        Some(samples.len() as u64),
+    )
+    .unwrap();
+    enc.write(&samples).unwrap();
+    enc.finalize().unwrap();
+
+    // STREAMINFO bytes 18..20 + top 4 bits of byte 20 store the 20-bit sample rate.
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[18] = 0;
+    bytes[19] = 0;
+    bytes[20] &= 0x0F;
+    fs::write(&path, &bytes).unwrap();
+
+    let err = FlacBlockReader::open(&path)
+        .err()
+        .expect("0 Hz FLAC STREAMINFO must be rejected cleanly");
+    assert!(
+        err.contains("sample rate") || err.contains("failed to parse FLAC"),
+        "unexpected error for 0 Hz FLAC: {err}"
+    );
+
+    let _ = fs::remove_file(&path);
+}
