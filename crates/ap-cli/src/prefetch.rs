@@ -46,6 +46,12 @@ pub enum StreamEvent {
     EndOfQueue(String),
     /// Configuration or fatal source error -> pause & log cleanly.
     FatalError(String),
+    /// Producer paused after consecutive unreadable/unsupported files; carries the last attempted
+    /// path so a subsequent `Next` resumes *after* the bad run instead of replaying it.
+    ErrorThresholdPause {
+        message: String,
+        last_attempted: PathBuf,
+    },
 }
 
 /// Result of popping the next PCM block for an active track.
@@ -64,7 +70,10 @@ pub enum PopBlockResult {
 fn is_terminal_marker(ev: &StreamEvent) -> bool {
     matches!(
         ev,
-        StreamEvent::TrackEnd | StreamEvent::EndOfQueue(_) | StreamEvent::FatalError(_)
+        StreamEvent::TrackEnd
+            | StreamEvent::EndOfQueue(_)
+            | StreamEvent::FatalError(_)
+            | StreamEvent::ErrorThresholdPause { .. }
     )
 }
 
@@ -229,6 +238,7 @@ impl BoundedBlockStreamBuffer {
                     StreamEvent::TrackStart { .. }
                         | StreamEvent::EndOfQueue(_)
                         | StreamEvent::FatalError(_)
+                        | StreamEvent::ErrorThresholdPause { .. }
                 )
             }) {
                 let mut drop_frames = 0usize;
@@ -470,16 +480,29 @@ mod tests {
             }
         });
 
-        // Give producer time to fill up to the time cap and block on backpressure.
-        thread::sleep(Duration::from_millis(60));
+        // Poll deterministically until the producer reaches the 12 s backpressure cap
+        // (up to 2 s deadline — never flaky on loaded CI hosts) and confirm it stays blocked.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if buf.buffered_frames() >= 44_100 * 12 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        // Brief settle to verify the producer is genuinely blocked at the cap and not pushing more.
+        thread::sleep(Duration::from_millis(20));
         let buffered = buf.buffered_frames();
         assert!(
             buffered <= 44_100 * 12,
             "44.1 kHz buffer should cap at <= 12 s (529,200 frames), got {buffered}"
         );
         assert!(
-            buffered >= 44_100 * 10,
-            "producer should have filled close to 12 s, got {buffered}"
+            buffered >= 44_100 * 11,
+            "producer should have filled up to the 12 s cap, got {buffered}"
+        );
+        assert!(
+            !producer.is_finished(),
+            "producer should remain blocked on backpressure until buffer is drained or closed"
         );
 
         buf.close();

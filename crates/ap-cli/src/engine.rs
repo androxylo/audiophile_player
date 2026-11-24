@@ -62,6 +62,9 @@ enum PlayDirective {
         /// When true (`SingleFile` -> `Next`), iterate only `root`'s direct `.flac` files
         /// without descending into subdirectories.
         folder_only: bool,
+        /// Additional tracks to skip after `start_after` (supports rapid chained flush-`Next`
+        /// clicks before the producer buffers the next `TrackStart`).
+        skip_count: usize,
     },
     SingleFile {
         file: PathBuf,
@@ -78,6 +81,10 @@ enum ProducerDirective {
 struct ProducerControl {
     state: Mutex<(u64, ProducerDirective)>,
     cv: Condvar,
+    #[cfg(test)]
+    before_pause_enter: Option<Arc<std::sync::Barrier>>,
+    #[cfg(test)]
+    before_pause_release: Option<Arc<std::sync::Barrier>>,
 }
 
 impl ProducerControl {
@@ -85,6 +92,25 @@ impl ProducerControl {
         Arc::new(Self {
             state: Mutex::new((initial_epoch, initial)),
             cv: Condvar::new(),
+            #[cfg(test)]
+            before_pause_enter: None,
+            #[cfg(test)]
+            before_pause_release: None,
+        })
+    }
+
+    #[cfg(test)]
+    fn new_with_pause_barriers(
+        initial_epoch: u64,
+        initial: ProducerDirective,
+        enter: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new((initial_epoch, initial)),
+            cv: Condvar::new(),
+            before_pause_enter: Some(enter),
+            before_pause_release: Some(release),
         })
     }
 
@@ -102,6 +128,14 @@ impl ProducerControl {
     /// requested and the control epoch still equals `expected_epoch`. Prevents stale producer
     /// exits from overwriting `Shutdown` (Ctrl+C hang) or a newer `Next`/play directive.
     fn pause_if_epoch(&self, expected_epoch: u64) -> bool {
+        #[cfg(test)]
+        if let Some(b) = &self.before_pause_enter {
+            b.wait();
+        }
+        #[cfg(test)]
+        if let Some(b) = &self.before_pause_release {
+            b.wait();
+        }
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if matches!(st.1, ProducerDirective::Shutdown) || st.0 != expected_epoch {
             return false;
@@ -134,14 +168,18 @@ struct EngineState<'a> {
     is_paused: bool,
     active_epoch: u64,
     last_play: PlayDirective,
-    /// Path from the most recent `TrackStart` actually started by the consumer.
-    /// Used as `start_after` when resuming/skipping `Sequential` mode so prefetched-but-unplayed
-    /// tracks are never silently skipped.
+    /// Path from the most recent `TrackStart` started/skipped by the consumer (or the last
+    /// attempted path when an error-threshold auto-pause occurred).
     last_started_track: Option<PathBuf>,
     /// True after a `Next` skip until the next track actually starts playing, so rapid chained
     /// `Next` clicks advance past a pre-buffered front `TrackStart` without double-skipping on
     /// a late `Next` right after a natural track end.
     just_skipped_track: bool,
+    /// Number of extra tracks to skip past `last_started_track` when consecutive flush-`Next`
+    /// clicks arrive before the producer delivers the next `TrackStart`.
+    pending_flush_skips: usize,
+    /// True while a flush-`Next` restart is in flight and no new `TrackStart` has started yet.
+    awaiting_post_skip_start: bool,
     next_seq_gen: u64,
     buf: &'a BoundedBlockStreamBuffer,
     prod_ctrl: &'a ProducerControl,
@@ -166,6 +204,8 @@ impl<'a> EngineState<'a> {
             last_play: initial_dir,
             last_started_track: None,
             just_skipped_track: false,
+            pending_flush_skips: 0,
+            awaiting_post_skip_start: false,
             next_seq_gen,
             buf,
             prod_ctrl,
@@ -179,11 +219,19 @@ impl<'a> EngineState<'a> {
         g
     }
 
+    fn record_anchor(&mut self, path: PathBuf) {
+        self.last_started_track = Some(path);
+        self.pending_flush_skips = 0;
+        self.awaiting_post_skip_start = false;
+    }
+
     fn start_directive(&mut self, dir: PlayDirective, reset_started_track: bool) {
         let ep = self.buf.reset_and_flush();
         if reset_started_track {
             self.last_started_track = None;
         }
+        self.pending_flush_skips = 0;
+        self.awaiting_post_skip_start = false;
         self.last_play = dir.clone();
         self.active_epoch = ep;
         self.is_paused = false;
@@ -196,19 +244,28 @@ impl<'a> EngineState<'a> {
         self.active_epoch = ep;
         self.is_paused = true;
         self.just_skipped_track = false;
+        self.pending_flush_skips = 0;
+        self.awaiting_post_skip_start = false;
         self.prod_ctrl.set(ep, ProducerDirective::Paused);
         self.shared.set_paused(msg.into());
     }
 
     /// Rebuild a `Sequential` directive positioned strictly after `last_started_track` (if any),
-    /// using a fresh `seq_gen` so the producer's decode-ahead cursor can never skip an unplayed track.
-    fn sequential_after_last_started(&mut self, root: PathBuf, folder_only: bool) -> PlayDirective {
+    /// skipping `skip_count` additional tracks and using a fresh `seq_gen` so the producer's
+    /// decode-ahead cursor can never skip an unplayed track or collapse consecutive Nexts.
+    fn sequential_after_last_started(
+        &mut self,
+        root: PathBuf,
+        folder_only: bool,
+        skip_count: usize,
+    ) -> PlayDirective {
         let seq_gen = self.alloc_seq_gen();
         PlayDirective::Sequential {
             root,
             seq_gen,
             start_after: self.last_started_track.clone(),
             folder_only,
+            skip_count,
         }
     }
 
@@ -225,6 +282,7 @@ impl<'a> EngineState<'a> {
                         seq_gen,
                         start_after: None,
                         folder_only: false,
+                        skip_count: 0,
                     },
                     true,
                 );
@@ -249,7 +307,9 @@ impl<'a> EngineState<'a> {
                 println!("  [next] Skipping to next track...");
                 let _ = io::stdout().flush();
 
-                // From SingleFile, advance sequentially to the next file in that folder only.
+                // From SingleFile, advance sequentially to the next file in that folder only,
+                // anchoring `last_started_track = Some(file)` so a rapid second `Next` skips
+                // further forward instead of jumping back to the first file in the folder.
                 if let PlayDirective::SingleFile { file } = self.last_play.clone() {
                     let parent = file
                         .parent()
@@ -260,10 +320,14 @@ impl<'a> EngineState<'a> {
                     let dir = PlayDirective::Sequential {
                         root: parent,
                         seq_gen,
-                        start_after: Some(file),
+                        start_after: Some(file.clone()),
                         folder_only: true,
+                        skip_count: 0,
                     };
                     self.start_directive(dir, false);
+                    self.last_started_track = Some(file);
+                    self.awaiting_post_skip_start = true;
+                    self.just_skipped_track = true;
                     return;
                 }
 
@@ -272,19 +336,27 @@ impl<'a> EngineState<'a> {
                         .buf
                         .skip_to_next_track_or_flush(self.active_epoch, self.just_skipped_track);
                     if let Some(skipped_path) = skipped_front {
-                        self.last_started_track = Some(skipped_path);
+                        self.record_anchor(skipped_path);
                     }
                     self.active_epoch = ep;
                     self.just_skipped_track = true;
                     if reused_prebuffered {
                         return;
                     }
-                    // Non-reuse flush: rebuild Sequential cursor strictly after the last track
-                    // actually started by the consumer so decode-ahead never drops N+1.
+                    // Non-reuse flush: if another flush-Next already ran before a new TrackStart
+                    // started, increment `pending_flush_skips` so consecutive Next clicks advance
+                    // k tracks instead of collapsing onto the same restart anchor.
+                    if self.awaiting_post_skip_start {
+                        self.pending_flush_skips = self.pending_flush_skips.saturating_add(1);
+                    } else {
+                        self.pending_flush_skips = 0;
+                        self.awaiting_post_skip_start = true;
+                    }
+                    let skip_count = self.pending_flush_skips;
                     let restart_dir = match self.last_play.clone() {
                         PlayDirective::Sequential {
                             root, folder_only, ..
-                        } => self.sequential_after_last_started(root, folder_only),
+                        } => self.sequential_after_last_started(root, folder_only, skip_count),
                         other => other,
                     };
                     self.last_play = restart_dir.clone();
@@ -294,14 +366,16 @@ impl<'a> EngineState<'a> {
 
                 // Paused -> Next: resume the next track in the last active mode/folder, anchored
                 // at `last_started_track` for Sequential so prefetched tracks discarded on Pause
-                // are played instead of skipped.
+                // are played instead of skipped (and error-threshold pauses resume past bad runs).
                 let resume_dir = match self.last_play.clone() {
                     PlayDirective::Sequential {
                         root, folder_only, ..
-                    } => self.sequential_after_last_started(root, folder_only),
+                    } => self.sequential_after_last_started(root, folder_only, 0),
                     other => other,
                 };
                 self.start_directive(resume_dir, false);
+                self.awaiting_post_skip_start = true;
+                self.just_skipped_track = true;
             }
             ControlCommand::Pause => {
                 self.pause_with_message(
@@ -436,6 +510,13 @@ pub fn run_random_music_player(
             StreamEvent::EndOfQueue(msg) | StreamEvent::FatalError(msg) => {
                 state.pause_with_message(msg);
             }
+            StreamEvent::ErrorThresholdPause {
+                message,
+                last_attempted,
+            } => {
+                state.record_anchor(last_attempted);
+                state.pause_with_message(message);
+            }
             StreamEvent::PcmBlock(_) | StreamEvent::TrackEnd => {
                 // Orphaned block/marker from an interrupted track — ignore safely.
                 continue;
@@ -458,6 +539,11 @@ pub fn run_random_music_player(
                         break;
                     }
                     if let Some(cmd) = shared.take_pending_command() {
+                        if matches!(cmd, ControlCommand::Next) {
+                            // User clicked Next while this TrackStart was already popped and
+                            // prebuffering -> anchor at `path` so we skip past it cleanly!
+                            state.record_anchor(path.clone());
+                        }
                         state.dispatch(cmd);
                         aborted_prebuffer = true;
                         break;
@@ -497,12 +583,15 @@ pub fn run_random_music_player(
                     break;
                 }
                 if let Some(cmd) = shared.take_pending_command() {
+                    if matches!(cmd, ControlCommand::Next) {
+                        state.record_anchor(path.clone());
+                    }
                     state.dispatch(cmd);
                     continue;
                 }
 
                 // Record the track actually started by the consumer (not producer decode-ahead).
-                state.last_started_track = Some(path.clone());
+                state.record_anchor(path.clone());
                 state.just_skipped_track = false;
 
                 let fmt_str = report.format_summary(total_duration_s);
@@ -540,9 +629,10 @@ pub fn run_random_music_player(
         }
     }
 
-    // Teardown: on CTRL_CLOSE/LOGOFF/SHUTDOWN (where Windows only grants ~3 s before forced
-    // termination), release HTTP and the audio sink FIRST, then give the producer a bounded
-    // join window so cleanup banners and `mark_cleanup_complete` always finish in time.
+    // Teardown: release HTTP and the audio sink FIRST, then give the producer a bounded join
+    // window for EVERY signal (shorter when a console close / logoff / shutdown has arrived,
+    // including escalation after an initial Ctrl+C) so a blocked NAS read or filter prep can
+    // never hang process exit.
     stream_buf.close();
     prod_ctrl.set(
         state.active_epoch.wrapping_add(1),
@@ -551,20 +641,12 @@ pub fn run_random_music_player(
     http_server.shutdown();
     drop(sink);
 
-    let fast_teardown = controller
-        .current_signal()
-        .is_some_and(|s| s.requires_handler_wait());
-    if fast_teardown {
-        let deadline = Instant::now() + Duration::from_millis(1500);
-        while !producer_thread.is_finished() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(15));
-        }
-        if producer_thread.is_finished() {
-            let _ = producer_thread.join();
-        }
-    } else {
-        let _ = producer_thread.join();
-    }
+    let _ = join_producer_bounded(
+        producer_thread,
+        controller,
+        Duration::from_millis(2500),
+        Duration::from_millis(1200),
+    );
 
     if let Some(sig) = controller.current_signal() {
         print_shutdown_banner(sig);
@@ -574,6 +656,35 @@ pub fn run_random_music_player(
     }
 
     Ok(())
+}
+
+/// Wait up to `normal_timeout` (or `fast_timeout` if a Windows console-close / logoff / shutdown
+/// signal has arrived or escalates mid-wait) for the producer thread to finish, joining cleanly
+/// if it exits in time and detaching cleanly if blocked in an uninterruptible OS call.
+///
+/// Returns `true` if the producer exited and was joined within the bounded deadline.
+fn join_producer_bounded(
+    producer_thread: thread::JoinHandle<()>,
+    controller: &ShutdownController,
+    normal_timeout: Duration,
+    fast_timeout: Duration,
+) -> bool {
+    let started = Instant::now();
+    loop {
+        if producer_thread.is_finished() {
+            let _ = producer_thread.join();
+            return true;
+        }
+        let budget = if controller.fast_teardown_requested() {
+            fast_timeout
+        } else {
+            normal_timeout
+        };
+        if started.elapsed() >= budget {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(15));
+    }
 }
 
 /// Outcome of decoding and streaming one chosen FLAC track inside `producer_loop`.
@@ -682,6 +793,7 @@ fn producer_loop(
                 seq_gen,
                 start_after,
                 folder_only,
+                skip_count,
             } => {
                 let needs_init = seq_cursor.as_ref().is_none_or(|(g, _)| *g != seq_gen);
                 if needs_init {
@@ -696,7 +808,14 @@ fn producer_loop(
                         SequentialFlacCursor::new(root.clone())
                     };
                     match cursor_res {
-                        Ok(c) => seq_cursor = Some((seq_gen, c)),
+                        Ok(mut c) => {
+                            for _ in 0..skip_count {
+                                if c.next_track().is_none() {
+                                    break;
+                                }
+                            }
+                            seq_cursor = Some((seq_gen, c));
+                        }
                         Err(err) => {
                             finalize_prev_track(
                                 &pipeline,
@@ -835,9 +954,12 @@ fn producer_loop(
                     );
                     let _ = buf.push_for_epoch(
                         epoch,
-                        StreamEvent::FatalError(format!(
-                            "Paused after {MAX_CONSECUTIVE_UNSUPPORTED} consecutive unsupported FLACs — DAC released"
-                        )),
+                        StreamEvent::ErrorThresholdPause {
+                            message: format!(
+                                "Paused after {MAX_CONSECUTIVE_UNSUPPORTED} consecutive unsupported FLACs — DAC released"
+                            ),
+                            last_attempted: chosen.clone(),
+                        },
                     );
                     ctrl.pause_if_epoch(epoch);
                     consecutive_unsupported = 0;
@@ -864,10 +986,12 @@ fn producer_loop(
                     );
                     let _ = buf.push_for_epoch(
                         epoch,
-                        StreamEvent::FatalError(
-                            "Paused after 10 consecutive unreadable/unplayable FLACs — DAC released"
-                                .into(),
-                        ),
+                        StreamEvent::ErrorThresholdPause {
+                            message:
+                                "Paused after 10 consecutive unreadable/unplayable FLACs — DAC released"
+                                    .into(),
+                            last_attempted: chosen.clone(),
+                        },
                     );
                     ctrl.pause_if_epoch(epoch);
                     consecutive_errors = 0;
@@ -1182,6 +1306,7 @@ mod tests {
                 seq_gen: 1,
                 start_after: None,
                 folder_only: false,
+                skip_count: 0,
             }),
         );
         assert!(
@@ -1211,42 +1336,312 @@ mod tests {
 
     #[test]
     fn producer_loop_joins_promptly_when_shutdown_races_with_end_of_queue_pause() {
-        // Point producer at a nonexistent directory so it immediately hits error -> pause_if_epoch.
-        // Run concurrently with Shutdown to verify `producer_loop` NEVER hangs in `wait_active`.
-        for _ in 0..20 {
-            let buf = BoundedBlockStreamBuffer::new(DEFAULT_MAX_BUFFERED_FRAMES);
-            let ep = buf.current_epoch();
-            let ctrl = ProducerControl::new(
-                ep,
-                ProducerDirective::Active(PlayDirective::Sequential {
-                    root: PathBuf::from(r"C:\__definitely_nonexistent_ap_test_dir__"),
-                    seq_gen: 1,
-                    start_after: None,
-                    folder_only: false,
-                }),
+        // Use deterministic barriers to pause the producer RIGHT at `pause_if_epoch(ep)`, then
+        // publish `Shutdown` BEFORE releasing it into `pause_if_epoch`'s body. If `pause_if_epoch`
+        // were not shutdown-sticky, the producer would overwrite `Shutdown` with `Paused` and hang
+        // forever in `wait_active()`.
+        let enter = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+
+        let buf = BoundedBlockStreamBuffer::new(DEFAULT_MAX_BUFFERED_FRAMES);
+        let ep = buf.current_epoch();
+        let ctrl = ProducerControl::new_with_pause_barriers(
+            ep,
+            ProducerDirective::Active(PlayDirective::Sequential {
+                root: PathBuf::from(r"C:\__definitely_nonexistent_ap_test_dir__"),
+                seq_gen: 1,
+                start_after: None,
+                folder_only: false,
+                skip_count: 0,
+            }),
+            Arc::clone(&enter),
+            Arc::clone(&release),
+        );
+        let shared = SharedControl::new(PathBuf::from(r"C:\Music"), "Test DAC");
+        let pipeline = AudioPipeline::new(UpsamplerPolicy::default()).unwrap();
+
+        let buf_bg = Arc::clone(&buf);
+        let ctrl_bg = Arc::clone(&ctrl);
+        let shared_bg = Arc::clone(&shared);
+        let handle =
+            thread::spawn(move || producer_loop(pipeline, ctrl_bg, buf_bg, shared_bg));
+
+        // 1. Wait until producer has actually entered its end-of-queue/error `pause_if_epoch` path!
+        enter.wait();
+        // 2. Publish Shutdown on the SAME epoch while producer is poised inside `pause_if_epoch`.
+        buf.close();
+        ctrl.set(ep, ProducerDirective::Shutdown);
+        // 3. Release producer into `pause_if_epoch(ep)` — must NOT overwrite Shutdown with Paused!
+        release.wait();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !handle.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "producer_loop hung instead of exiting on Shutdown"
             );
-            let shared = SharedControl::new(PathBuf::from(r"C:\Music"), "Test DAC");
-            let pipeline = AudioPipeline::new(UpsamplerPolicy::default()).unwrap();
-
-            let buf_bg = Arc::clone(&buf);
-            let ctrl_bg = Arc::clone(&ctrl);
-            let shared_bg = Arc::clone(&shared);
-            let handle =
-                thread::spawn(move || producer_loop(pipeline, ctrl_bg, buf_bg, shared_bg));
-
-            buf.close();
-            ctrl.set(ep.wrapping_add(1), ProducerDirective::Shutdown);
-
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while !handle.is_finished() {
-                assert!(
-                    Instant::now() < deadline,
-                    "producer_loop hung instead of exiting on Shutdown"
-                );
-                thread::sleep(Duration::from_millis(5));
-            }
-            handle.join().unwrap();
+            thread::sleep(Duration::from_millis(5));
         }
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn consecutive_flush_nexts_and_single_file_double_next_skip_multiple_tracks_without_jumping_back()
+    {
+        let buf = BoundedBlockStreamBuffer::new(DEFAULT_MAX_BUFFERED_FRAMES);
+        let ep0 = buf.current_epoch();
+        let root = PathBuf::from(r"C:\Music\Album");
+        let t1 = root.join("01.flac");
+        let init = PlayDirective::Sequential {
+            root: root.clone(),
+            seq_gen: 1,
+            start_after: None,
+            folder_only: false,
+            skip_count: 0,
+        };
+        let ctrl = ProducerControl::new(ep0, ProducerDirective::Active(init.clone()));
+        let shared = SharedControl::new(root.clone(), "Test DAC");
+
+        let mut state = EngineState::new(ep0, init, &buf, &ctrl, &shared);
+        state.record_anchor(t1.clone());
+
+        // Scenario (a): Mid-track 01, buffer empty (no prebuffered TrackStart). Double-click Next!
+        state.dispatch(ControlCommand::Next);
+        match &state.last_play {
+            PlayDirective::Sequential {
+                start_after,
+                skip_count,
+                ..
+            } => {
+                assert_eq!(start_after.as_ref(), Some(&t1));
+                assert_eq!(*skip_count, 0, "first flush-Next plays N+1 (0 extra skips)");
+            }
+            other => panic!("expected Sequential, got {other:?}"),
+        }
+        state.dispatch(ControlCommand::Next);
+        match &state.last_play {
+            PlayDirective::Sequential {
+                start_after,
+                skip_count,
+                ..
+            } => {
+                assert_eq!(start_after.as_ref(), Some(&t1));
+                assert_eq!(*skip_count, 1, "second flush-Next must skip N+1 and play N+2");
+            }
+            other => panic!("expected Sequential, got {other:?}"),
+        }
+
+        // Scenario (b): PlayFile 05.flac -> rapid double Next while 05 is still prebuffering.
+        // Must anchor at 05.flac and skip forward (NEVER reset start_after to None -> 01.flac!).
+        let f05 = root.join("05.flac");
+        state.start_directive(PlayDirective::SingleFile { file: f05.clone() }, true);
+        state.dispatch(ControlCommand::Next);
+        match &state.last_play {
+            PlayDirective::Sequential {
+                start_after,
+                folder_only,
+                skip_count,
+                ..
+            } => {
+                assert_eq!(start_after.as_ref(), Some(&f05));
+                assert!(*folder_only);
+                assert_eq!(*skip_count, 0);
+            }
+            other => panic!("expected folder-only Sequential after 05, got {other:?}"),
+        }
+        state.dispatch(ControlCommand::Next);
+        match &state.last_play {
+            PlayDirective::Sequential {
+                start_after,
+                folder_only,
+                skip_count,
+                ..
+            } => {
+                assert_eq!(
+                    start_after.as_ref(),
+                    Some(&f05),
+                    "second Next after PlayFile must stay anchored at 05.flac, not None"
+                );
+                assert!(*folder_only);
+                assert_eq!(*skip_count, 1, "second Next after PlayFile must advance to 07.flac");
+            }
+            other => panic!("expected folder-only Sequential skipping 1, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pause_then_next_after_error_threshold_resumes_past_bad_run() {
+        use flac_codec::encode::{FlacSampleWriter, Options};
+        use std::fs;
+
+        let dir = std::env::temp_dir().join(format!(
+            "ap_cli_bad_run_recovery_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let write_good_flac = |path: &Path| {
+            let mut w =
+                FlacSampleWriter::create(path, Options::default(), 44_100, 16, 2, None).unwrap();
+            let samples = vec![1000_i32; 400 * 2];
+            w.write(&samples).unwrap();
+            w.finalize().unwrap();
+        };
+
+        // Folder: 01.flac (good), 02..11.flac (10 corrupt files), 12.flac (good).
+        let f01 = dir.join("01.flac");
+        let f11 = dir.join("11.flac");
+        let f12 = dir.join("12.flac");
+        write_good_flac(&f01);
+        for i in 2..=11 {
+            fs::write(dir.join(format!("{i:02}.flac")), b"not a valid flac").unwrap();
+        }
+        write_good_flac(&f12);
+
+        let pipeline = AudioPipeline::new(UpsamplerPolicy::default()).unwrap();
+        let shared = SharedControl::new(dir.clone(), "Mock DAC");
+        let buf = BoundedBlockStreamBuffer::new(DEFAULT_MAX_BUFFERED_FRAMES);
+        let ep = buf.reset_and_flush();
+        let init_dir = PlayDirective::Sequential {
+            root: dir.clone(),
+            seq_gen: 1,
+            start_after: None,
+            folder_only: false,
+            skip_count: 0,
+        };
+        let ctrl = ProducerControl::new(ep, ProducerDirective::Active(init_dir.clone()));
+
+        let p_ctrl = Arc::clone(&ctrl);
+        let p_buf = Arc::clone(&buf);
+        let p_shared = Arc::clone(&shared);
+        let handle = thread::spawn(move || producer_loop(pipeline, p_ctrl, p_buf, p_shared));
+
+        let mut state = EngineState::new(ep, init_dir, &buf, &ctrl, &shared);
+
+        // 1. Drain 01.flac (TrackStart + PCM + TrackEnd) and then observe ErrorThresholdPause.
+        let mut saw_01 = false;
+        let mut saw_threshold_pause = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            match buf.pop_for_epoch_timeout(state.active_epoch, Duration::from_millis(50)) {
+                Some(StreamEvent::TrackStart { path, .. }) => {
+                    assert_eq!(path, f01);
+                    state.record_anchor(path);
+                    saw_01 = true;
+                    // Drain 01.flac PCM until TrackEnd.
+                    loop {
+                        match buf.try_pop_track_pcm_block(state.active_epoch) {
+                            PopBlockResult::Block(_) => {}
+                            PopBlockResult::Underrun => thread::sleep(Duration::from_millis(2)),
+                            PopBlockResult::TrackEnd | PopBlockResult::StaleOrClosed => break,
+                        }
+                    }
+                }
+                Some(StreamEvent::ErrorThresholdPause {
+                    message,
+                    last_attempted,
+                }) => {
+                    assert_eq!(
+                        last_attempted, f11,
+                        "error-threshold pause must report the last bad file (11.flac)"
+                    );
+                    state.record_anchor(last_attempted);
+                    state.pause_with_message(message);
+                    saw_threshold_pause = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_01, "expected 01.flac to stream");
+        assert!(saw_threshold_pause, "expected ErrorThresholdPause after 10 corrupt files");
+        assert!(state.is_paused);
+
+        // 2. User clicks Next: must resume AFTER 11.flac and immediately produce 12.flac!
+        state.dispatch(ControlCommand::Next);
+        let mut saw_12 = false;
+        let deadline2 = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline2 {
+            match buf.pop_for_epoch_timeout(state.active_epoch, Duration::from_millis(50)) {
+                Some(StreamEvent::TrackStart { path, .. }) => {
+                    assert_eq!(path, f12, "Next after error pause must advance to 12.flac!");
+                    saw_12 = true;
+                    break;
+                }
+                Some(StreamEvent::ErrorThresholdPause { .. }) => {
+                    panic!("Next replayed the corrupt run instead of advancing to 12.flac!");
+                }
+                _ => {}
+            }
+        }
+
+        buf.close();
+        ctrl.set(state.active_epoch.wrapping_add(1), ProducerDirective::Shutdown);
+        handle.join().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(saw_12, "expected 12.flac to play after Next");
+    }
+
+    #[test]
+    fn bounded_producer_join_detaches_stuck_producer_and_honors_console_close_escalation() {
+        // 1. Promptly exiting producer joins immediately.
+        let ctrl_ok = ShutdownController::new();
+        let h_ok = thread::spawn(|| {});
+        assert!(join_producer_bounded(
+            h_ok,
+            &ctrl_ok,
+            Duration::from_millis(500),
+            Duration::from_millis(100),
+        ));
+
+        // 2. Stuck producer on Ctrl+C detaches cleanly at normal_timeout instead of hanging forever.
+        let ctrl_stuck = ShutdownController::new();
+        ctrl_stuck.trigger(ShutdownSignal::CtrlC);
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let h_stuck = thread::spawn(move || {
+            let _ = rx.recv_timeout(Duration::from_secs(5));
+        });
+        let t0 = Instant::now();
+        let joined = join_producer_bounded(
+            h_stuck,
+            &ctrl_stuck,
+            Duration::from_millis(120),
+            Duration::from_millis(40),
+        );
+        let elapsed = t0.elapsed();
+        let _ = tx.send(());
+        assert!(!joined, "stuck producer should detach on bounded timeout");
+        assert!(elapsed >= Duration::from_millis(100) && elapsed < Duration::from_millis(600));
+
+        // 3. Ctrl+C followed by ConsoleClose mid-wait switches dynamically to fast_timeout!
+        let ctrl_esc = Arc::new(ShutdownController::new());
+        ctrl_esc.trigger(ShutdownSignal::CtrlC);
+        assert!(!ctrl_esc.fast_teardown_requested());
+        let (tx2, rx2) = std::sync::mpsc::channel::<()>();
+        let h_stuck2 = thread::spawn(move || {
+            let _ = rx2.recv_timeout(Duration::from_secs(5));
+        });
+        let esc_bg = Arc::clone(&ctrl_esc);
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            esc_bg.trigger(ShutdownSignal::ConsoleClose);
+        });
+        let t1 = Instant::now();
+        let joined2 = join_producer_bounded(
+            h_stuck2,
+            &ctrl_esc,
+            Duration::from_secs(5),
+            Duration::from_millis(80),
+        );
+        let elapsed2 = t1.elapsed();
+        let _ = tx2.send(());
+        assert!(!joined2);
+        assert!(ctrl_esc.fast_teardown_requested());
+        assert!(
+            elapsed2 < Duration::from_millis(500),
+            "ConsoleClose escalation should cut 5 s normal budget down to fast timeout, took {elapsed2:?}"
+        );
     }
 
     #[test]
@@ -1286,6 +1681,7 @@ mod tests {
             seq_gen: 1,
             start_after: None,
             folder_only: false,
+            skip_count: 0,
         };
         let ctrl = ProducerControl::new(ep0, ProducerDirective::Active(init.clone()));
         let shared = SharedControl::new(root.clone(), "Test DAC");
@@ -1306,11 +1702,13 @@ mod tests {
                 seq_gen,
                 start_after,
                 folder_only,
+                skip_count,
             } => {
                 assert_eq!(r, &root);
                 assert_ne!(*seq_gen, 1, "must allocate fresh seq_gen to rebuild cursor");
                 assert_eq!(start_after.as_ref(), Some(&t1));
                 assert!(!*folder_only);
+                assert_eq!(*skip_count, 0);
             }
             other => panic!("expected Sequential resume, got {other:?}"),
         }
@@ -1438,6 +1836,7 @@ mod tests {
                 seq_gen: 1,
                 start_after: None,
                 folder_only: false,
+                skip_count: 0,
             }),
         );
 

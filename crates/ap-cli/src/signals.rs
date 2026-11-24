@@ -71,6 +71,7 @@ use ap_control::state::SharedControl;
 pub struct ShutdownController {
     signal: Mutex<Option<ShutdownSignal>>,
     signal_cv: Condvar,
+    fast_teardown: AtomicBool,
     cleanup_done: Mutex<bool>,
     cleanup_cv: Condvar,
     active_stop_flag: Mutex<Option<Arc<AtomicBool>>>,
@@ -120,8 +121,17 @@ impl ShutdownController {
         *self.signal.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// True if any received signal (even a subsequent `CTRL_CLOSE_EVENT` after an earlier
+    /// `CTRL_C_EVENT`) requires fast bounded teardown before OS termination.
+    pub fn fast_teardown_requested(&self) -> bool {
+        self.fast_teardown.load(Ordering::SeqCst)
+    }
+
     /// Record the first shutdown signal, trip any attached sink stop flag, and wake waiters.
     pub fn trigger(&self, sig: ShutdownSignal) {
+        if sig.requires_handler_wait() {
+            self.fast_teardown.store(true, Ordering::SeqCst);
+        }
         let mut guard = self.signal.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
             *guard = Some(sig);
