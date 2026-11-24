@@ -56,6 +56,31 @@ impl GaplessCarryover {
             .as_ref()
             .map_or(0.0, ConvolutionTail::peak_linear)
     }
+
+    /// Maximum absolute amplitude (`0.0` if absent) of any carried unpadded upsampler FIR history.
+    pub fn upsampler_history_peak_linear(&self) -> f64 {
+        self.upsampler
+            .as_ref()
+            .map_or(0.0, UpsamplerCarryover::peak_linear)
+    }
+}
+
+/// Outcome of attaching a preceding track's [`GaplessCarryover`] to a new streaming session.
+#[derive(Debug)]
+pub enum GaplessAttachOutcome {
+    /// Output rate and upsampler geometry both matched: upsampler FIR history AND REW convolution
+    /// tail were seamlessly handed off into the new session with zero extra drain frames.
+    FullHandoff,
+    /// Output sample rate matched (e.g. `44.1k -> 88.2k` or `44.1k -> native 352.8k`, both at
+    /// `352.8k`), while the upsampler ratio/filter differed: only the short upsampler FIR history
+    /// was flushed into `upsampler_tail_pcm` (to close Track A), and the resulting REW convolution
+    /// tail was seamlessly attached to Track B without inserting a multi-second IR drain gap.
+    ConvolverOnlyHandoff {
+        upsampler_tail_pcm: InterleavedInt32Buffer,
+    },
+    /// Output sample rate changed (e.g. `352.8k -> 384k`): nothing was attached to Track B and the
+    /// untouched carryover is returned so the caller can drain it completely onto Track A.
+    IncompatibleRate(GaplessCarryover),
 }
 
 /// Extra safety margin (dB) required on ReplayGain sample peak for `0 dB` headroom whenever the
@@ -347,6 +372,32 @@ impl AudioPipeline {
         self.start_track_with_tail_hint(spec, peak_meta, is_streaming_source, None)
     }
 
+    /// Open a fresh stateful [`StreamingPipelineSession`], inspecting an optional incoming
+    /// [`GaplessCarryover`] so Track B's `0 dB` headroom decision accurately accounts for BOTH
+    /// any carried REW convolution tail AND any carried upsampler FIR history that will be
+    /// convolved onto Track B's opening — and never penalizes Track B when output rates differ.
+    pub fn start_track_for_carryover(
+        &self,
+        spec: StreamSpec,
+        peak_meta: &TrackPeakMetadata,
+        is_streaming_source: bool,
+        incoming: Option<&GaplessCarryover>,
+    ) -> Result<StreamingPipelineSession, String> {
+        let hint = incoming.and_then(|c| {
+            let conv_peak = c.convolver_tail_peak_linear();
+            let up_peak = c.upsampler_history_peak_linear();
+            if conv_peak <= 0.0 && up_peak <= 0.0 {
+                return None;
+            }
+            // Conservative combined tail bound: if a REW convolver tail is present, also include
+            // the carried upsampler history peak (scaled by active convolver L1 inside
+            // start_track_with_tail_hint) so Track A's un-convolved final ~half-window samples
+            // cannot push a 0 dB Track B over full scale.
+            Some((c.output_rate_hz, conv_peak, up_peak, c.convolver.is_some()))
+        });
+        self.start_track_internal(spec, peak_meta, is_streaming_source, hint)
+    }
+
     /// Open a fresh stateful [`StreamingPipelineSession`], accounting for an optional incoming
     /// gapless REW convolution tail `(tail_rate_hz, tail_peak_linear)` so Track B's `0 dB`
     /// headroom decision cannot clip when Track A's decaying tail overlap-adds onto Track B's
@@ -357,6 +408,17 @@ impl AudioPipeline {
         peak_meta: &TrackPeakMetadata,
         is_streaming_source: bool,
         incoming_tail_hint: Option<(u32, f64)>,
+    ) -> Result<StreamingPipelineSession, String> {
+        let hint = incoming_tail_hint.map(|(rate, peak)| (rate, peak, 0.0, peak > 0.0));
+        self.start_track_internal(spec, peak_meta, is_streaming_source, hint)
+    }
+
+    fn start_track_internal(
+        &self,
+        spec: StreamSpec,
+        peak_meta: &TrackPeakMetadata,
+        is_streaming_source: bool,
+        incoming_tail_hint: Option<(u32, f64, f64, bool)>,
     ) -> Result<StreamingPipelineSession, String> {
         if !(MIN_SUPPORTED_SOURCE_RATE_HZ..=MAX_SUPPORTED_SOURCE_RATE_HZ)
             .contains(&spec.sample_rate_hz)
@@ -395,32 +457,41 @@ impl AudioPipeline {
         );
 
         // If an equal-rate decaying REW tail from the previous track will overlap-add onto this
-        // track's opening, ensure `next_track_peak * conv_and_isp_bound + tail_peak <= 1.0`; if
-        // `0 dB` would risk exceeding full scale, safely fall back to hardcoded `-3 dB`.
+        // track's opening (either via full handoff or convolver-only handoff), ensure
+        // `next_track_peak * conv_and_isp_bound + tail_peak <= 1.0`; if `0 dB` would risk
+        // exceeding full scale, safely fall back to hardcoded `-3 dB`.
         if headroom.mode == HeadroomMode::ZeroDb {
-            if let Some((tail_rate_hz, tail_peak_lin)) = incoming_tail_hint {
-                if tail_rate_hz == dsp_plan.target_rate_hz
-                    && tail_peak_lin.is_finite()
-                    && tail_peak_lin > 1e-6
-                {
-                    let track_peak_lin = peak_meta
-                        .effective_peak_linear()
-                        .map_or(1.0, |(p, _)| p);
-                    let bound_lin = 10.0_f64.powf(
-                        (convolver.peak_gain_bound_db() + upsampler_isp_margin_db) / 20.0,
-                    );
-                    let combined_peak = track_peak_lin * bound_lin + tail_peak_lin;
-                    if combined_peak > 1.0 {
-                        headroom = HeadroomDecision {
-                            mode: HeadroomMode::Minus3Db,
-                            peak_dbfs: headroom.peak_dbfs,
-                            reason: format!(
-                                "incoming gapless REW tail ({:.3}) + track peak bound ({:.3}) = {:.3} > 1.0 -> -3 dB",
-                                tail_peak_lin,
-                                track_peak_lin * bound_lin,
-                                combined_peak
-                            ),
-                        };
+            if let Some((tail_rate_hz, conv_tail_peak, up_hist_peak, has_conv_tail)) =
+                incoming_tail_hint
+            {
+                if tail_rate_hz == dsp_plan.target_rate_hz {
+                    let conv_l1_lin = 10.0_f64.powf(convolver.peak_gain_bound_db() / 20.0);
+                    let extra_up_reverb = if has_conv_tail || convolver.name() != "null-convolver" {
+                        up_hist_peak * conv_l1_lin
+                    } else {
+                        0.0
+                    };
+                    let total_tail_peak = conv_tail_peak + extra_up_reverb;
+                    if total_tail_peak.is_finite() && total_tail_peak > 1e-6 {
+                        let track_peak_lin = peak_meta
+                            .effective_peak_linear()
+                            .map_or(1.0, |(p, _)| p);
+                        let bound_lin = 10.0_f64.powf(
+                            (convolver.peak_gain_bound_db() + upsampler_isp_margin_db) / 20.0,
+                        );
+                        let combined_peak = track_peak_lin * bound_lin + total_tail_peak;
+                        if combined_peak > 1.0 {
+                            headroom = HeadroomDecision {
+                                mode: HeadroomMode::Minus3Db,
+                                peak_dbfs: headroom.peak_dbfs,
+                                reason: format!(
+                                    "incoming gapless REW tail ({:.3}) + track peak bound ({:.3}) = {:.3} > 1.0 -> -3 dB",
+                                    total_tail_peak,
+                                    track_peak_lin * bound_lin,
+                                    combined_peak
+                                ),
+                            };
+                        }
                     }
                 }
             }
@@ -470,6 +541,76 @@ impl AudioPipeline {
             delayer,
             quantizer,
         })
+    }
+
+    /// Attach a previous track's [`GaplessCarryover`] to `session`:
+    /// - Same output rate AND compatible upsampler geometry -> [`GaplessAttachOutcome::FullHandoff`].
+    /// - Same output rate with different upsampler geometry (e.g. `44.1k -> 88.2k` or `44.1k ->
+    ///   native 352.8k`) -> drains ONLY the short upsampler FIR history into `upsampler_tail_pcm`
+    ///   and attaches the updated REW [`ConvolutionTail`] onto `session`
+    ///   ([`GaplessAttachOutcome::ConvolverOnlyHandoff`]), avoiding multi-second IR drain gaps.
+    /// - Different output rate (e.g. `352.8k -> 384k`) -> returns
+    ///   [`GaplessAttachOutcome::IncompatibleRate`] untouched so the caller can drain it completely.
+    pub fn attach_gapless_carryover(
+        &self,
+        session: &mut StreamingPipelineSession,
+        carryover: GaplessCarryover,
+    ) -> Result<GaplessAttachOutcome, String> {
+        let rate = session.report().output_rate_hz;
+        if carryover.output_rate_hz != rate {
+            return Ok(GaplessAttachOutcome::IncompatibleRate(carryover));
+        }
+
+        match session.set_incoming_gapless_carryover(carryover) {
+            Ok(()) => Ok(GaplessAttachOutcome::FullHandoff),
+            Err(mut rejected) => {
+                let mut frames = Vec::new();
+                if let Some(up_carry) = rejected.upsampler.take() {
+                    let up_tail_f64 = up_carry.flush_to_f64();
+                    let mut conv = self.convolver_factory.create_for_rate(rate)?;
+                    if let Some(conv_tail) = rejected.convolver.take() {
+                        conv.set_incoming_tail(conv_tail);
+                    }
+                    let mut delayer = self.delayer_factory.create_for_rate(rate)?;
+                    let mut quantizer =
+                        StreamingQuantizer::new(rejected.effective_shaper, rejected.output_bits)?;
+
+                    if !up_tail_f64.is_empty() {
+                        let c_out = conv.process_block(up_tail_f64)?;
+                        if !c_out.is_empty() {
+                            let d_out = delayer.process_block(c_out)?;
+                            if !d_out.is_empty() {
+                                frames.extend(quantizer.quantize_block(&d_out).frames);
+                            }
+                        }
+                    }
+
+                    let (conv_immediate, updated_tail) = conv.flush_split_tail()?;
+                    if !conv_immediate.is_empty() {
+                        let d_out = delayer.process_block(conv_immediate)?;
+                        if !d_out.is_empty() {
+                            frames.extend(quantizer.quantize_block(&d_out).frames);
+                        }
+                    }
+                    let delay_tail = delayer.flush()?;
+                    if !delay_tail.is_empty() {
+                        frames.extend(quantizer.quantize_block(&delay_tail).frames);
+                    }
+                    if let Some(tail) = updated_tail {
+                        session.set_incoming_convolver_tail(tail);
+                    }
+                } else if let Some(conv_tail) = rejected.convolver.take() {
+                    session.set_incoming_convolver_tail(conv_tail);
+                }
+
+                Ok(GaplessAttachOutcome::ConvolverOnlyHandoff {
+                    upsampler_tail_pcm: InterleavedInt32Buffer {
+                        sample_rate_hz: rate,
+                        frames,
+                    },
+                })
+            }
+        }
     }
 
     /// Drain an unconsumed [`GaplessCarryover`] (upsampler FIR tail + REW convolution tail)

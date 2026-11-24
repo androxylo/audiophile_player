@@ -397,7 +397,22 @@ fn upsampler_honors_max_taps_budget_and_matches_plan_tap_budget() {
     assert!(err10.contains("too small"), "unexpected err: {err10}");
 
     // Adaptive Kaiser design at --max-taps 512 (64 taps/phase) must maintain flat 20 kHz passband
-    // (< 0.30 dB droop) and > 55 dB image rejection at 24.1 kHz.
+    // (< 0.30 dB droop) AND > 55 dB stopband image rejection at 24.1 kHz (Review #3 Finding #19).
+    let dft_mag_at_hz = |samples: &[f64], fs: f64, freq_hz: f64| -> f64 {
+        let n = samples.len();
+        let mut re = 0.0_f64;
+        let mut im = 0.0_f64;
+        let mut win_sum = 0.0_f64;
+        for (i, &x) in samples.iter().enumerate() {
+            let w = 0.5 * (1.0 - (2.0 * std::f64::consts::PI * (i as f64) / (n as f64)).cos());
+            let ang = 2.0 * std::f64::consts::PI * freq_hz * (i as f64) / fs;
+            re += x * w * ang.cos();
+            im -= x * w * ang.sin();
+            win_sum += w;
+        }
+        2.0 * (re * re + im * im).sqrt() / win_sum
+    };
+
     let n_in = 4096;
     let sig: Vec<f64> = (0..n_in)
         .map(|i| 0.5 * (2.0 * std::f64::consts::PI * 20_000.0 * (i as f64) / 44_100.0).sin())
@@ -417,6 +432,36 @@ fn upsampler_honors_max_taps_budget_and_matches_plan_tap_budget() {
     assert!(
         gain_db.abs() < 0.30,
         "adaptive 64-tap/phase Kaiser should keep 20 kHz within 0.30 dB, got {gain_db:+.3} dB"
+    );
+
+    let fund_20k = dft_mag_at_hz(seg, 352_800.0, 20_000.0);
+    let img_24_1k = dft_mag_at_hz(seg, 352_800.0, 24_100.0);
+    let rej_24_1k_db = 20.0 * (fund_20k / img_24_1k.max(1e-15)).log10();
+    assert!(
+        rej_24_1k_db > 55.0,
+        "adaptive 64-tap/phase Kaiser must reject 24.1 kHz image by > 55 dB, got {rej_24_1k_db:.2} dB"
+    );
+
+    // Also verify the warned low-tap plan (12 taps/phase = 96 taps) still suppresses ultrasonic
+    // images well above rectangular-window leakage (test 10 kHz tone -> first image at 34.1 kHz).
+    let sig10k: Vec<f64> = (0..n_in)
+        .map(|i| 0.5 * (2.0 * std::f64::consts::PI * 10_000.0 * (i as f64) / 44_100.0).sin())
+        .collect();
+    let out100 = run_oneshot(
+        &p100,
+        StereoF64Buffer {
+            sample_rate_hz: 44_100,
+            left: sig10k.clone(),
+            right: sig10k,
+        },
+    );
+    let seg100 = &out100.left[margin..(out100.left.len() - margin)];
+    let fund_10k = dft_mag_at_hz(seg100, 352_800.0, 10_000.0);
+    let img_34_1k = dft_mag_at_hz(seg100, 352_800.0, 34_100.0);
+    let rej_34_1k_db = 20.0 * (fund_10k / img_34_1k.max(1e-15)).log10();
+    assert!(
+        rej_34_1k_db > 30.0,
+        "warned 12-tap/phase Kaiser must still reject 34.1 kHz image by > 30 dB, got {rej_34_1k_db:.2} dB"
     );
 }
 

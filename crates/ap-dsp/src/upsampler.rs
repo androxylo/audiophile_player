@@ -33,6 +33,23 @@ pub struct UpsamplerCarryover {
 }
 
 impl UpsamplerCarryover {
+    /// Maximum absolute sample amplitude present in the carried unpadded FIR history (`0.0` if empty).
+    pub fn peak_linear(&self) -> f64 {
+        let max_l = self
+            .hist_l
+            .iter()
+            .copied()
+            .map(f64::abs)
+            .fold(0.0_f64, f64::max);
+        let max_r = self
+            .hist_r
+            .iter()
+            .copied()
+            .map(f64::abs)
+            .fold(0.0_f64, f64::max);
+        max_l.max(max_r)
+    }
+
     /// Flush the carried unpadded FIR history against trailing zeros into `f64` samples
     /// (used when a gapless sequence ends, switches sample rate, or encounters an error).
     pub fn flush_to_f64(self) -> StereoF64Buffer {

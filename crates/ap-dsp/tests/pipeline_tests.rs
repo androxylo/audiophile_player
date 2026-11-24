@@ -1,9 +1,16 @@
 //! TDD end-to-end tests for the tidy 5-stage `AudioPipeline` (with null convolver & delay).
 
+use std::sync::Arc;
+
 use ap_core::buffer::StereoF64Buffer;
 use ap_core::format::StreamSpec;
 use ap_core::headroom::{HeadroomMode, TrackPeakMetadata};
-use ap_dsp::pipeline::AudioPipeline;
+use ap_dsp::convolution::{
+    NullConvolverFactory, PartitionedStereoConvolver, PreparedStereoIr, StereoConvolver,
+    StereoConvolverFactory,
+};
+use ap_dsp::delay::NullChannelDelayerFactory;
+use ap_dsp::pipeline::{AudioPipeline, GaplessAttachOutcome};
 use ap_dsp::selector::{
     FilterArchetype, NoiseShaperProfile, UNSUPPORTED_SAMPLE_RATE_PREFIX, UpsamplerPolicy,
 };
@@ -410,4 +417,132 @@ fn gapless_pipeline_sessions_eliminate_boundary_dip_and_drain_on_rate_change() {
             -expected_l_24
         );
     }
+}
+
+struct FixedRateEchoConvolverFactory {
+    ir_352: Arc<PreparedStereoIr>,
+}
+
+impl StereoConvolverFactory for FixedRateEchoConvolverFactory {
+    fn create_for_rate(&self, target_rate_hz: u32) -> Result<Box<dyn StereoConvolver>, String> {
+        if target_rate_hz == 352_800 {
+            Ok(Box::new(PartitionedStereoConvolver::new(Arc::clone(
+                &self.ir_352,
+            ))))
+        } else {
+            NullConvolverFactory.create_for_rate(target_rate_hz)
+        }
+    }
+}
+
+#[test]
+fn same_output_rate_different_upsampler_ratio_hands_off_rew_tail_without_gap() {
+    // Review #3 Findings #18 & #12:
+    // Track A is 44.1 kHz (8x -> 352.8 kHz) with an active 4096-tap REW echo IR (echo at +3000
+    // output samples). Track B is 88.2 kHz (4x -> 352.8 kHz, same output rate, different ratio!).
+    // attach_gapless_carryover MUST drain only the short upsampler history (~1024 samples) and
+    // seamlessly overlap-add Track A's REW echo onto Track B with ZERO 3000-sample silence gap!
+    let mut h = vec![0.0_f64; 4096];
+    h[0] = 0.5;
+    h[3000] = 0.25; // max|H| <= 0.75 (0 dB), L1 = 0.75 (0 dB), echo 3000 samples later
+    let ir_352 = Arc::new(PreparedStereoIr::from_stereo_ir("echo-352k", 352_800, &h, &h).unwrap());
+
+    let pipeline = AudioPipeline::with_factories(
+        UpsamplerPolicy::default(),
+        Box::new(FixedRateEchoConvolverFactory { ir_352 }),
+        Box::new(NullChannelDelayerFactory),
+    )
+    .unwrap();
+
+    let spec_44 = StreamSpec {
+        sample_rate_hz: 44_100,
+        bits_per_sample: 16,
+        channels: 2,
+    };
+    let spec_88 = StreamSpec {
+        sample_rate_hz: 88_200,
+        bits_per_sample: 24,
+        channels: 2,
+    };
+    let spec_48 = StreamSpec {
+        sample_rate_hz: 48_000,
+        bits_per_sample: 24,
+        channels: 2,
+    };
+
+    // Track A (44.1 kHz): 512 frames ending with a strong impulse near the end (sample 500 -> output ~4000).
+    let n_a = 512_usize;
+    let mut a_sig = vec![0.0_f64; n_a];
+    a_sig[500] = 0.8;
+    let mut sess_a = pipeline
+        .start_track(spec_44, &TrackPeakMetadata::default(), false)
+        .unwrap();
+    let mut a_frames = sess_a
+        .process_block(StereoF64Buffer {
+            sample_rate_hz: 44_100,
+            left: a_sig.clone(),
+            right: a_sig,
+        })
+        .unwrap()
+        .frames;
+    let (a_flush, carry_a) = sess_a.flush_for_gapless().unwrap();
+    a_frames.extend(a_flush.frames);
+    let carry_a = carry_a.expect("expected gapless carryover from 44.1k REW track");
+    assert!(carry_a.upsampler.is_some());
+    assert!(carry_a.convolver.is_some());
+
+    // Verify incompatible output rate (48k -> 384k) does NOT demote a quiet Track C to -3 dB!
+    let quiet_meta = TrackPeakMetadata {
+        true_peak_linear: Some(0.65), // -3.74 dBTP -> qualifies for 0 dB
+        ..TrackPeakMetadata::default()
+    };
+    let sess_48 = pipeline
+        .start_track_for_carryover(spec_48, &quiet_meta, false, Some(&carry_a))
+        .unwrap();
+    assert_eq!(
+        sess_48.report().headroom.mode,
+        HeadroomMode::ZeroDb,
+        "mismatched output rate (352.8k vs 384k) must NOT demote Track C to -3 dB"
+    );
+
+    // Track B (88.2 kHz -> 352.8 kHz): same output rate, different upsampler ratio (4x vs 8x).
+    let mut sess_b = pipeline
+        .start_track_for_carryover(spec_88, &TrackPeakMetadata::default(), false, Some(&carry_a))
+        .unwrap();
+    let outcome = pipeline
+        .attach_gapless_carryover(&mut sess_b, carry_a)
+        .unwrap();
+    let up_tail_pcm = match outcome {
+        GaplessAttachOutcome::ConvolverOnlyHandoff { upsampler_tail_pcm } => upsampler_tail_pcm,
+        other => panic!("expected ConvolverOnlyHandoff for 44.1k->88.2k, got {other:?}"),
+    };
+    a_frames.extend(up_tail_pcm.frames);
+    assert_eq!(
+        a_frames.len(),
+        n_a * 8,
+        "Track A must have EXACTLY n_a * 8 frames (only short upsampler tail drained, NO 3000-sample REW gap!)"
+    );
+
+    // Feed silence into Track B (88.2k -> 352.8k): Track A's +3000-sample echo from sample 500
+    // (output index 4000, so echo lands at global index 7000 = index 7000 - 4096 = 2904 in Track B!)
+    // must appear cleanly inside Track B!
+    let n_b = 1024_usize; // 4096 output frames at 4x
+    let mut b_frames = sess_b
+        .process_block(StereoF64Buffer {
+            sample_rate_hz: 88_200,
+            left: vec![0.0; n_b],
+            right: vec![0.0; n_b],
+        })
+        .unwrap()
+        .frames;
+    b_frames.extend(sess_b.flush().unwrap().frames);
+
+    let peak_near_echo = b_frames[2880..2930]
+        .iter()
+        .map(|&[l, _]| (l as f64).abs() / 2_147_483_648.0)
+        .fold(0.0_f64, f64::max);
+    assert!(
+        peak_near_echo > 0.10,
+        "Track A's REW echo must decay seamlessly into Track B around index 2904, got peak {peak_near_echo:.5}"
+    );
 }
