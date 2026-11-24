@@ -8,6 +8,7 @@
 //! Bypasses BOTH `audiodg.exe` (Windows audio mixer) AND `AudioSes.dll` (WASAPI).
 //! Windows Shared Mode is intentionally unimplemented and impossible to fall back to.
 
+use core::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering, fence};
 #[cfg(windows)]
 use std::sync::OnceLock;
@@ -38,21 +39,23 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Media::Audio::{WAVEFORMATEX, WAVEFORMATEXTENSIBLE, WAVEFORMATEXTENSIBLE_0};
 #[cfg(windows)]
 use windows_sys::Win32::Media::KernelStreaming::{
-    IOCTL_KS_PROPERTY, KSCATEGORY_AUDIO, KSDATAFORMAT, KSDATAFORMAT_0,
+    IOCTL_KS_PROPERTY, KSAUDIO_POSITION, KSCATEGORY_AUDIO, KSDATAFORMAT, KSDATAFORMAT_0,
     KSDATAFORMAT_SPECIFIER_WAVEFORMATEX, KSDATAFORMAT_SUBTYPE_PCM, KSDATAFORMAT_TYPE_AUDIO,
     KSIDENTIFIER, KSIDENTIFIER_0, KSIDENTIFIER_0_0, KSINTERFACE_STANDARD_LOOPED_STREAMING,
     KSINTERFACE_STANDARD_STREAMING, KSINTERFACESETID_Standard, KSMEDIUM_STANDARD_DEVIO,
     KSMEDIUMSETID_Standard, KSMULTIPLE_ITEM, KSP_PIN, KSP_PIN_0, KSPIN_CINSTANCES,
     KSPIN_COMMUNICATION_BOTH, KSPIN_COMMUNICATION_SINK, KSPIN_CONNECT, KSPIN_DATAFLOW_IN,
-    KSPRIORITY, KSPRIORITY_NORMAL, KSPROPERTY_CONNECTION_STATE, KSPROPERTY_PIN_CINSTANCES,
-    KSPROPERTY_PIN_COMMUNICATION, KSPROPERTY_PIN_CTYPES, KSPROPERTY_PIN_DATAFLOW,
-    KSPROPERTY_PIN_INTERFACES, KSPROPERTY_RTAUDIO_BUFFER_WITH_NOTIFICATION,
+    KSPRIORITY, KSPRIORITY_NORMAL, KSPROPERTY_AUDIO_POSITION, KSPROPERTY_CONNECTION_STATE,
+    KSPROPERTY_PIN_CINSTANCES, KSPROPERTY_PIN_COMMUNICATION, KSPROPERTY_PIN_CTYPES,
+    KSPROPERTY_PIN_DATAFLOW, KSPROPERTY_PIN_INTERFACES,
+    KSPROPERTY_RTAUDIO_BUFFER_WITH_NOTIFICATION, KSPROPERTY_RTAUDIO_POSITIONREGISTER,
     KSPROPERTY_RTAUDIO_REGISTER_NOTIFICATION_EVENT,
     KSPROPERTY_RTAUDIO_UNREGISTER_NOTIFICATION_EVENT, KSPROPERTY_TYPE_GET, KSPROPERTY_TYPE_SET,
-    KSPROPSETID_Connection, KSPROPSETID_Pin, KSPROPSETID_RtAudio, KSRTAUDIO_BUFFER,
-    KSRTAUDIO_BUFFER_PROPERTY_WITH_NOTIFICATION, KSRTAUDIO_NOTIFICATION_EVENT_PROPERTY,
-    KSSTATE_ACQUIRE, KSSTATE_PAUSE, KSSTATE_RUN, KSSTATE_STOP, SPEAKER_FRONT_LEFT,
-    SPEAKER_FRONT_RIGHT, WAVE_FORMAT_EXTENSIBLE,
+    KSPROPSETID_Audio, KSPROPSETID_Connection, KSPROPSETID_Pin, KSPROPSETID_RtAudio,
+    KSRTAUDIO_BUFFER, KSRTAUDIO_BUFFER_PROPERTY_WITH_NOTIFICATION, KSRTAUDIO_HWREGISTER,
+    KSRTAUDIO_HWREGISTER_PROPERTY, KSRTAUDIO_NOTIFICATION_EVENT_PROPERTY, KSSTATE_ACQUIRE,
+    KSSTATE_PAUSE, KSSTATE_RUN, KSSTATE_STOP, SPEAKER_FRONT_LEFT, SPEAKER_FRONT_RIGHT,
+    WAVE_FORMAT_EXTENSIBLE,
 };
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
@@ -287,10 +290,31 @@ impl<'a> WaveRtFramePump<'a> {
     }
 }
 
+/// Non-blocking result returned by a streaming PCM block source for WaveRT playback.
+#[derive(Debug)]
+pub enum StreamBlock {
+    /// A ready block of PCM frames at the pin's sample rate.
+    Ready(InterleavedInt32Buffer),
+    /// Producer temporarily has no block ready (underrun) — output silence without ending the track.
+    Underrun,
+    /// Clean end-of-track (or playback epoch closed).
+    EndOfTrack,
+}
+
+impl From<Option<InterleavedInt32Buffer>> for StreamBlock {
+    fn from(opt: Option<InterleavedInt32Buffer>) -> Self {
+        match opt {
+            Some(buf) => Self::Ready(buf),
+            None => Self::EndOfTrack,
+        }
+    }
+}
+
 /// Internal chunk source abstraction shared by `play_full_memory` and `play_block_stream`.
 pub trait WaveRtPumpSource {
     fn bytes_per_frame(&self) -> usize;
     fn frames_written(&self) -> usize;
+    fn is_eof(&self) -> bool;
     fn fill_slice(&mut self, dst: &mut [u8]) -> usize;
     fn fill_fade_out_slice(&mut self, dst: &mut [u8]) -> usize;
     fn take_error(&mut self) -> Option<OutputError> {
@@ -307,6 +331,10 @@ impl WaveRtPumpSource for WaveRtFramePump<'_> {
         WaveRtFramePump::frames_written(self)
     }
 
+    fn is_eof(&self) -> bool {
+        WaveRtFramePump::is_exhausted(self)
+    }
+
     fn fill_slice(&mut self, dst: &mut [u8]) -> usize {
         WaveRtFramePump::fill_slice(self, dst)
     }
@@ -317,10 +345,12 @@ impl WaveRtPumpSource for WaveRtFramePump<'_> {
 }
 
 /// Streaming WaveRT ring-buffer pump that pulls bounded `InterleavedInt32Buffer` blocks
-/// lazily across block boundaries with zero gaps and click-free fade-out on stop.
-pub struct StreamingWaveRtPump<F>
+/// lazily across block boundaries with zero gaps, non-blocking underrun silence, and
+/// click-free fade-out on stop.
+pub struct StreamingWaveRtPump<F, B = StreamBlock>
 where
-    F: FnMut() -> Option<InterleavedInt32Buffer>,
+    F: FnMut() -> B,
+    B: Into<StreamBlock>,
 {
     next_block: F,
     current: Option<InterleavedInt32Buffer>,
@@ -330,11 +360,13 @@ where
     total_frames_written: usize,
     eof: bool,
     pending_error: Option<OutputError>,
+    _marker: PhantomData<fn() -> B>,
 }
 
-impl<F> StreamingWaveRtPump<F>
+impl<F, B> StreamingWaveRtPump<F, B>
 where
-    F: FnMut() -> Option<InterleavedInt32Buffer>,
+    F: FnMut() -> B,
+    B: Into<StreamBlock>,
 {
     pub fn new(expected_sample_rate_hz: u32, wire_format: DacWireFormat, next_block: F) -> Self {
         Self {
@@ -346,6 +378,7 @@ where
             total_frames_written: 0,
             eof: false,
             pending_error: None,
+            _marker: PhantomData,
         }
     }
 
@@ -356,8 +389,8 @@ where
                     return true;
                 }
             }
-            match (self.next_block)() {
-                Some(buf) if !buf.frames.is_empty() => {
+            match (self.next_block)().into() {
+                StreamBlock::Ready(buf) if !buf.frames.is_empty() => {
                     if buf.sample_rate_hz != self.expected_sample_rate_hz {
                         self.current = None;
                         self.cursor = 0;
@@ -372,8 +405,15 @@ where
                     self.cursor = 0;
                     return true;
                 }
-                Some(_) => continue, // skip empty block
-                None => {
+                StreamBlock::Ready(_) => continue, // skip empty block
+                StreamBlock::Underrun => {
+                    // Temporary non-blocking underrun: emit silence for this half without
+                    // marking EOF so playback recovers seamlessly once the producer catches up.
+                    self.current = None;
+                    self.cursor = 0;
+                    return false;
+                }
+                StreamBlock::EndOfTrack => {
                     self.current = None;
                     self.cursor = 0;
                     self.eof = true;
@@ -385,9 +425,10 @@ where
     }
 }
 
-impl<F> WaveRtPumpSource for StreamingWaveRtPump<F>
+impl<F, B> WaveRtPumpSource for StreamingWaveRtPump<F, B>
 where
-    F: FnMut() -> Option<InterleavedInt32Buffer>,
+    F: FnMut() -> B,
+    B: Into<StreamBlock>,
 {
     fn bytes_per_frame(&self) -> usize {
         self.wire_format.bytes_per_frame()
@@ -395,6 +436,10 @@ where
 
     fn frames_written(&self) -> usize {
         self.total_frames_written
+    }
+
+    fn is_eof(&self) -> bool {
+        self.eof
     }
 
     fn fill_slice(&mut self, dst: &mut [u8]) -> usize {
@@ -435,6 +480,218 @@ where
 
     fn take_error(&mut self) -> Option<OutputError> {
         self.pending_error.take()
+    }
+}
+
+/// Frame-aligned two-half layout for a cyclic WaveRT DMA buffer.
+///
+/// Guarantees both halves (`[0..half_len]` and `[half_len..buf_len]`) start and end on exact
+/// frame boundaries and cover 100% of `[0..buf_len)` with zero unwritten gap bytes, even when a
+/// driver returns an odd number of frames. Rejects sizes that are not a multiple of `bpf`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaveRtRingLayout {
+    buf_len: usize,
+    half_len: usize,
+    bpf: usize,
+}
+
+impl WaveRtRingLayout {
+    pub fn new(buf_len: usize, bpf: usize) -> Result<Self, OutputError> {
+        if bpf == 0 || buf_len < bpf * 2 || buf_len % bpf != 0 {
+            return Err(OutputError::Win32 {
+                operation: "KSPROPERTY_RTAUDIO_BUFFER_WITH_NOTIFICATION",
+                code: 0,
+                detail: format!(
+                    "driver returned non-frame-aligned or too-small WaveRT buffer (size={buf_len}, bytes_per_frame={bpf})"
+                ),
+            });
+        }
+        let half_len = (buf_len / 2) / bpf * bpf;
+        if half_len == 0 || buf_len - half_len < bpf {
+            return Err(OutputError::Win32 {
+                operation: "KSPROPERTY_RTAUDIO_BUFFER_WITH_NOTIFICATION",
+                code: 0,
+                detail: format!(
+                    "driver returned degenerate WaveRT half size (size={buf_len}, half_len={half_len}, bpf={bpf})"
+                ),
+            });
+        }
+        Ok(Self {
+            buf_len,
+            half_len,
+            bpf,
+        })
+    }
+
+    pub fn buf_len(&self) -> usize {
+        self.buf_len
+    }
+
+    pub fn half_len(&self) -> usize {
+        self.half_len
+    }
+
+    pub fn bytes_per_frame(&self) -> usize {
+        self.bpf
+    }
+
+    pub fn half_range(&self, half_idx: usize) -> core::ops::Range<usize> {
+        if half_idx == 0 {
+            0..self.half_len
+        } else {
+            self.half_len..self.buf_len
+        }
+    }
+
+    /// Given the hardware DMA play cursor byte offset, return the half index that DMA is
+    /// NOT currently reading (safe to overwrite without tearing or in-phase ticking).
+    pub fn safe_write_half_for_play_byte(&self, play_offset_bytes: u64) -> usize {
+        let pos = (play_offset_bytes % (self.buf_len as u64)) as usize;
+        if pos < self.half_len {
+            1 // DMA is reading half 0 -> safely write half 1
+        } else {
+            0 // DMA is reading half 1 -> safely write half 0
+        }
+    }
+}
+
+/// Outcome of processing one WaveRT hardware notification event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaveRtStepOutcome {
+    Continue,
+    Finished,
+}
+
+/// Pure, hardware-independent WaveRT cyclic half-buffer state machine.
+///
+/// Manages:
+/// - Hardware-position-driven safe half selection (resynchronizes after any coalesced event).
+/// - Stop fade-out that waits for the fade half to finish playing (`trailing_silent_halves >= 2`).
+/// - Non-blocking underrun handling (emits digital silence without ending playback).
+/// - Accurate `frames_played` counting only real audio frames whose half completed DMA playback.
+pub struct WaveRtLoopController {
+    layout: WaveRtRingLayout,
+    next_fallback_half: usize,
+    last_written_half: Option<usize>,
+    half_audio_frames: [usize; 2],
+    completed_audio_frames: usize,
+    trailing_silent_halves: usize,
+    stopping_fade_done: bool,
+}
+
+impl WaveRtLoopController {
+    pub fn new(layout: WaveRtRingLayout) -> Self {
+        Self {
+            layout,
+            next_fallback_half: 0,
+            last_written_half: None,
+            half_audio_frames: [0, 0],
+            completed_audio_frames: 0,
+            trailing_silent_halves: 0,
+            stopping_fade_done: false,
+        }
+    }
+
+    pub fn layout(&self) -> WaveRtRingLayout {
+        self.layout
+    }
+
+    /// Number of real audio frames whose DMA half has finished playing to the DAC.
+    pub fn frames_played(&self) -> usize {
+        self.completed_audio_frames
+    }
+
+    /// Pre-fill both cyclic halves before transitioning the KS pin to `KSSTATE_RUN`.
+    pub fn prefill(
+        &mut self,
+        cyclic_slice: &mut [u8],
+        pump: &mut dyn WaveRtPumpSource,
+    ) -> Result<(), OutputError> {
+        let r0 = self.layout.half_range(0);
+        let w0 = pump.fill_slice(&mut cyclic_slice[r0]);
+        if let Some(err) = pump.take_error() {
+            return Err(err);
+        }
+        let r1 = self.layout.half_range(1);
+        let w1 = pump.fill_slice(&mut cyclic_slice[r1]);
+        if let Some(err) = pump.take_error() {
+            return Err(err);
+        }
+        self.half_audio_frames = [w0, w1];
+        self.last_written_half = Some(1);
+        Ok(())
+    }
+
+    /// Process one WaveRT half-buffer completion notification.
+    ///
+    /// Returns the half index that was written alongside `Continue` / `Finished`.
+    pub fn on_notification(
+        &mut self,
+        cyclic_slice: &mut [u8],
+        pump: &mut dyn WaveRtPumpSource,
+        stop_requested: bool,
+        play_offset_bytes: Option<u64>,
+    ) -> Result<(usize, WaveRtStepOutcome), OutputError> {
+        let write_half = match play_offset_bytes {
+            Some(pos) => self.layout.safe_write_half_for_play_byte(pos),
+            None => self.next_fallback_half,
+        };
+        self.next_fallback_half = write_half ^ 1;
+
+        if self.last_written_half == Some(write_half) {
+            // Coalesced notification (a full ring period elapsed): both halves completed DMA.
+            self.completed_audio_frames += self.half_audio_frames[0] + self.half_audio_frames[1];
+            self.half_audio_frames = [0, 0];
+        } else {
+            self.completed_audio_frames += self.half_audio_frames[write_half];
+            self.half_audio_frames[write_half] = 0;
+        }
+        self.last_written_half = Some(write_half);
+
+        let range = self.layout.half_range(write_half);
+
+        if stop_requested {
+            if !self.stopping_fade_done {
+                let written = pump.fill_fade_out_slice(&mut cyclic_slice[range]);
+                self.half_audio_frames[write_half] = written;
+                self.stopping_fade_done = true;
+                self.trailing_silent_halves = 0;
+                return Ok((write_half, WaveRtStepOutcome::Continue));
+            }
+            cyclic_slice[range].fill(0);
+            self.half_audio_frames[write_half] = 0;
+            self.trailing_silent_halves += 1;
+            let outcome = if self.trailing_silent_halves >= 2 {
+                WaveRtStepOutcome::Finished
+            } else {
+                WaveRtStepOutcome::Continue
+            };
+            return Ok((write_half, outcome));
+        }
+
+        let written = pump.fill_slice(&mut cyclic_slice[range]);
+        self.half_audio_frames[write_half] = written;
+
+        if let Some(err) = pump.take_error() {
+            return Err(err);
+        }
+
+        if written == 0 {
+            if pump.is_eof() {
+                self.trailing_silent_halves += 1;
+                if self.trailing_silent_halves >= 2 {
+                    return Ok((write_half, WaveRtStepOutcome::Finished));
+                }
+            } else {
+                // Non-blocking producer underrun: digital silence was written into this half;
+                // stay alive until audio resumes or stop_requested becomes true.
+                self.trailing_silent_halves = 0;
+            }
+        } else {
+            self.trailing_silent_halves = 0;
+        }
+
+        Ok((write_half, WaveRtStepOutcome::Continue))
     }
 }
 
@@ -722,18 +979,114 @@ impl WdmKsSink {
     /// Stream bounded `InterleavedInt32Buffer` blocks from `next_block` directly to the DAC
     /// via Windows Kernel Streaming (`WDM-KS` WaveRT) without ever requiring the entire track
     /// to live in RAM at once. Closes/releases the kernel pin cleanly via RAII on return.
+    ///
+    /// `next_block` may return either `StreamBlock` (recommended for non-blocking RT loops with
+    /// explicit `Underrun` silence recovery) or `Option<InterleavedInt32Buffer>`.
     #[cfg(windows)]
-    pub fn play_block_stream<F>(
+    pub fn play_block_stream<F, B>(
         &mut self,
         sample_rate_hz: u32,
         wire_format: DacWireFormat,
         next_block: F,
     ) -> Result<PlaybackStats, OutputError>
     where
-        F: FnMut() -> Option<InterleavedInt32Buffer>,
+        F: FnMut() -> B,
+        B: Into<StreamBlock>,
     {
         let mut pump = StreamingWaveRtPump::new(sample_rate_hz, wire_format, next_block);
         self.run_wavert_pump(sample_rate_hz, wire_format, &mut pump)
+    }
+
+    /// Empirically probe live WaveRT notification (`GET` vs `SET`) and hardware position
+    /// properties (`POSITIONREGISTER` and `KSPROPERTY_AUDIO_POSITION`) on the opened DAC.
+    #[cfg(windows)]
+    pub fn probe_wavert_hardware_properties(
+        &self,
+        sample_rate_hz: u32,
+        wire_format: DacWireFormat,
+    ) -> Result<WaveRtHardwareProbe, OutputError> {
+        let filter = open_ks_filter(&self.device.device_path)?;
+        let pin = create_ks_render_pin(
+            filter.raw(),
+            &self.device,
+            sample_rate_hz,
+            wire_format,
+            true,
+        )?;
+        let bpf = wire_format.bytes_per_frame() as u32;
+        let requested_bytes = ((sample_rate_hz / 10).max(256)) * bpf;
+        let rt_buf = allocate_wavert_buffer_with_notification(pin.raw(), requested_bytes, 2)?;
+        let layout = WaveRtRingLayout::new(rt_buf.ActualBufferSize as usize, bpf as usize)?;
+
+        let ev_get = create_auto_reset_event()?;
+        let reg_get = register_notification_event_raw(pin.raw(), ev_get.raw(), KSPROPERTY_TYPE_GET);
+        let unreg_get = if reg_get.is_ok() {
+            unregister_notification_event_raw(pin.raw(), ev_get.raw(), KSPROPERTY_TYPE_GET)
+        } else {
+            Err(OutputError::Win32 {
+                operation: "UnregisterNotificationEvent(GET)",
+                code: 0,
+                detail: "skipped because REGISTER(GET) failed".to_string(),
+            })
+        };
+
+        let ev_set = create_auto_reset_event()?;
+        let reg_set = register_notification_event_raw(pin.raw(), ev_set.raw(), KSPROPERTY_TYPE_SET);
+        let unreg_set = if reg_set.is_ok() {
+            unregister_notification_event_raw(pin.raw(), ev_set.raw(), KSPROPERTY_TYPE_SET)
+        } else {
+            Err(OutputError::Win32 {
+                operation: "UnregisterNotificationEvent(SET)",
+                code: 0,
+                detail: "skipped because REGISTER(SET) failed".to_string(),
+            })
+        };
+
+        let position_register_supported = query_position_register(pin.raw()).is_some();
+        let audio_position_supported = query_audio_position_bytes(pin.raw()).is_some();
+
+        // Stream 4 silent notifications to observe live PlayOffset % buf_len behavior.
+        let cyclic_slice = unsafe {
+            core::slice::from_raw_parts_mut(rt_buf.BufferAddress.cast::<u8>(), layout.buf_len())
+        };
+        cyclic_slice.fill(0);
+        if rt_buf.CallMemoryBarrier != 0 {
+            fence(Ordering::SeqCst);
+        }
+
+        let ev_run = create_auto_reset_event()?;
+        let _notif = WaveRtNotificationGuard::register(pin.raw(), ev_run.raw())?;
+        let pos_reader = WaveRtPositionReader::open(pin.raw());
+        let mut state_guard = KsPinStateGuard::new(pin.raw());
+        state_guard.set_state(KSSTATE_ACQUIRE)?;
+        state_guard.set_state(KSSTATE_PAUSE)?;
+        state_guard.set_state(KSSTATE_RUN)?;
+
+        let mut sample_play_offsets = Vec::with_capacity(4);
+        for _ in 0..4 {
+            let wait_res = unsafe { WaitForSingleObject(ev_run.raw(), 1500) };
+            if wait_res != WAIT_OBJECT_0 {
+                break;
+            }
+            if let Some(pos) = pos_reader.read_play_offset_bytes() {
+                sample_play_offsets.push((pos, layout.safe_write_half_for_play_byte(pos)));
+            }
+        }
+
+        let _ = state_guard.set_state(KSSTATE_PAUSE);
+        let _ = state_guard.set_state(KSSTATE_STOP);
+
+        Ok(WaveRtHardwareProbe {
+            buffer_bytes: layout.buf_len(),
+            half_bytes: layout.half_len(),
+            register_get_ok: reg_get.is_ok(),
+            unregister_get_ok: unreg_get.is_ok(),
+            register_set_ok: reg_set.is_ok(),
+            unregister_set_ok: unreg_set.is_ok(),
+            position_register_supported,
+            audio_position_supported,
+            sample_play_offsets,
+        })
     }
 
     #[cfg(windows)]
@@ -774,52 +1127,45 @@ impl WdmKsSink {
         let bpf = pump.bytes_per_frame() as u32;
         let requested_bytes = ((sample_rate_hz / 10).max(256)) * bpf;
         let rt_buf = allocate_wavert_buffer_with_notification(pin.raw(), requested_bytes, 2)?;
-        if rt_buf.BufferAddress.is_null() || rt_buf.ActualBufferSize < bpf * 2 {
+        if rt_buf.BufferAddress.is_null() {
             return Err(OutputError::Win32 {
                 operation: "KSPROPERTY_RTAUDIO_BUFFER_WITH_NOTIFICATION",
                 code: 0,
                 detail: format!(
-                    "driver returned invalid WaveRT buffer (ptr={:p}, size={})",
-                    rt_buf.BufferAddress, rt_buf.ActualBufferSize
+                    "driver returned null WaveRT buffer (size={})",
+                    rt_buf.ActualBufferSize
                 ),
             });
         }
-
-        let buf_len = rt_buf.ActualBufferSize as usize;
-        let half_len = buf_len / 2;
+        let layout = WaveRtRingLayout::new(rt_buf.ActualBufferSize as usize, bpf as usize)?;
         let call_barrier = rt_buf.CallMemoryBarrier != 0;
 
         // 4. Create & register Win32 hardware notification event (RAII unregistered on drop).
         let event_handle = create_auto_reset_event()?;
         let _notif_guard = WaveRtNotificationGuard::register(pin.raw(), event_handle.raw())?;
 
-        // 5. Ensure pin returns to KSSTATE_STOP even if an error occurs mid-stream.
+        // 5. Probe hardware play-cursor reader (POSITIONREGISTER -> AUDIO_POSITION -> toggle fallback).
+        let pos_reader = WaveRtPositionReader::open(pin.raw());
+
+        // 6. Ensure pin returns to KSSTATE_STOP even if an error occurs mid-stream.
         let mut state_guard = KsPinStateGuard::new(pin.raw());
 
-        // 6. Pre-fill BOTH halves of the cyclic WaveRT buffer before starting hardware DMA.
-        let cyclic_slice =
-            unsafe { core::slice::from_raw_parts_mut(rt_buf.BufferAddress.cast::<u8>(), buf_len) };
-        pump.fill_slice(&mut cyclic_slice[0..half_len]);
-        if let Some(err) = pump.take_error() {
-            return Err(err);
-        }
-        pump.fill_slice(&mut cyclic_slice[half_len..half_len * 2]);
-        if let Some(err) = pump.take_error() {
-            return Err(err);
-        }
+        // 7. Pre-fill BOTH frame-aligned halves before starting hardware DMA.
+        let cyclic_slice = unsafe {
+            core::slice::from_raw_parts_mut(rt_buf.BufferAddress.cast::<u8>(), layout.buf_len())
+        };
+        let mut controller = WaveRtLoopController::new(layout);
+        controller.prefill(cyclic_slice, pump)?;
         if call_barrier {
             fence(Ordering::SeqCst);
         }
 
-        // 7. Transition pin: ACQUIRE -> PAUSE -> RUN.
+        // 8. Transition pin: ACQUIRE -> PAUSE -> RUN.
         state_guard.set_state(KSSTATE_ACQUIRE)?;
         state_guard.set_state(KSSTATE_PAUSE)?;
         state_guard.set_state(KSSTATE_RUN)?;
 
-        // 8. Event-driven WaveRT loop: each notification signals one completed half-buffer.
-        let mut next_half: usize = 0;
-        let mut trailing_silent_halves: usize = 0;
-        let mut stopping_fade_done = false;
+        // 9. Event-driven WaveRT loop: each notification signals a completed half-buffer.
         let mut notifications: usize = 0;
         let mut pump_error: Option<OutputError> = None;
 
@@ -834,47 +1180,29 @@ impl WdmKsSink {
             }
             notifications += 1;
 
-            let start = next_half * half_len;
-            let end = start + half_len;
+            let stop_requested = self.stop_flag.load(Ordering::SeqCst);
+            let play_offset = pos_reader.read_play_offset_bytes();
 
-            if self.stop_flag.load(Ordering::SeqCst) {
-                if !stopping_fade_done {
-                    pump.fill_fade_out_slice(&mut cyclic_slice[start..end]);
-                    stopping_fade_done = true;
-                } else {
-                    cyclic_slice[start..end].fill(0);
-                    trailing_silent_halves += 1;
+            match controller.on_notification(cyclic_slice, pump, stop_requested, play_offset) {
+                Ok((_, outcome)) => {
+                    if call_barrier {
+                        fence(Ordering::SeqCst);
+                    }
+                    if outcome == WaveRtStepOutcome::Finished {
+                        break;
+                    }
                 }
-                if call_barrier {
-                    fence(Ordering::SeqCst);
-                }
-                next_half ^= 1;
-                if trailing_silent_halves >= 1 {
-                    break;
-                }
-                continue;
-            }
-
-            let written = pump.fill_slice(&mut cyclic_slice[start..end]);
-            if call_barrier {
-                fence(Ordering::SeqCst);
-            }
-            next_half ^= 1;
-
-            if let Some(err) = pump.take_error() {
-                pump_error = Some(err);
-                break;
-            }
-
-            if written == 0 {
-                trailing_silent_halves += 1;
-                if trailing_silent_halves >= 2 {
+                Err(err) => {
+                    if call_barrier {
+                        fence(Ordering::SeqCst);
+                    }
+                    pump_error = Some(err);
                     break;
                 }
             }
         }
 
-        // 9. Clean stop: PAUSE -> STOP (then RAII drops unregister event, close pin & filter).
+        // 10. Clean stop: PAUSE -> STOP (then RAII drops unregister event, close pin & filter).
         let _ = state_guard.set_state(KSSTATE_PAUSE);
         let _ = state_guard.set_state(KSSTATE_STOP);
 
@@ -886,7 +1214,7 @@ impl WdmKsSink {
             device_name: self.device.friendly_name.clone(),
             sample_rate_hz,
             wire_format,
-            frames_played: pump.frames_written(),
+            frames_played: controller.frames_played(),
             wavert_buffer_bytes: rt_buf.ActualBufferSize,
             notifications,
             mmcss_pro_audio: mmcss.is_active(),
@@ -1063,44 +1391,173 @@ impl Drop for OwnedHandle {
     }
 }
 
+/// Empirical probe summary of a live WDM-KS WaveRT driver's notification & position support.
+#[derive(Debug, Clone)]
+pub struct WaveRtHardwareProbe {
+    pub buffer_bytes: usize,
+    pub half_bytes: usize,
+    pub register_get_ok: bool,
+    pub unregister_get_ok: bool,
+    pub register_set_ok: bool,
+    pub unregister_set_ok: bool,
+    pub position_register_supported: bool,
+    pub audio_position_supported: bool,
+    pub sample_play_offsets: Vec<(u64, usize)>,
+}
+
+#[cfg(windows)]
+fn register_notification_event_raw(
+    pin: HANDLE,
+    event: HANDLE,
+    flags: u32,
+) -> Result<(), OutputError> {
+    let prop = KSRTAUDIO_NOTIFICATION_EVENT_PROPERTY {
+        Property: ks_identifier(
+            KSPROPSETID_RtAudio,
+            KSPROPERTY_RTAUDIO_REGISTER_NOTIFICATION_EVENT as u32,
+            flags,
+        ),
+        NotificationEvent: event,
+    };
+    ks_ioctl(pin, &prop, core::ptr::null_mut(), 0, "RegisterNotificationEvent")?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn unregister_notification_event_raw(
+    pin: HANDLE,
+    event: HANDLE,
+    flags: u32,
+) -> Result<(), OutputError> {
+    let prop = KSRTAUDIO_NOTIFICATION_EVENT_PROPERTY {
+        Property: ks_identifier(
+            KSPROPSETID_RtAudio,
+            KSPROPERTY_RTAUDIO_UNREGISTER_NOTIFICATION_EVENT as u32,
+            flags,
+        ),
+        NotificationEvent: event,
+    };
+    ks_ioctl(pin, &prop, core::ptr::null_mut(), 0, "UnregisterNotificationEvent")?;
+    Ok(())
+}
+
 #[cfg(windows)]
 struct WaveRtNotificationGuard {
     pin: HANDLE,
     event: HANDLE,
+    property_flags: u32,
 }
 #[cfg(windows)]
 impl WaveRtNotificationGuard {
     fn register(pin: HANDLE, event: HANDLE) -> Result<Self, OutputError> {
-        let prop = KSRTAUDIO_NOTIFICATION_EVENT_PROPERTY {
-            Property: ks_identifier(
-                KSPROPSETID_RtAudio,
-                KSPROPERTY_RTAUDIO_REGISTER_NOTIFICATION_EVENT as u32,
-                KSPROPERTY_TYPE_SET,
-            ),
-            NotificationEvent: event,
-        };
-        ks_ioctl(pin, &prop, core::ptr::null_mut(), 0, "RegisterNotificationEvent")?;
-        Ok(Self { pin, event })
+        // Per the WDK WaveRT property usage table (Get: Yes, Set: No) and PortAudio pa_win_wdmks,
+        // KSPROPERTY_RTAUDIO_REGISTER_NOTIFICATION_EVENT is a GET property. Try KSPROPERTY_TYPE_GET
+        // first, falling back to KSPROPERTY_TYPE_SET only if a driver rejects GET, and reuse the
+        // accepted flag for UNREGISTER on drop.
+        match register_notification_event_raw(pin, event, KSPROPERTY_TYPE_GET) {
+            Ok(()) => Ok(Self {
+                pin,
+                event,
+                property_flags: KSPROPERTY_TYPE_GET,
+            }),
+            Err(get_err) => match register_notification_event_raw(pin, event, KSPROPERTY_TYPE_SET) {
+                Ok(()) => Ok(Self {
+                    pin,
+                    event,
+                    property_flags: KSPROPERTY_TYPE_SET,
+                }),
+                Err(_) => Err(get_err),
+            },
+        }
     }
 }
 #[cfg(windows)]
 impl Drop for WaveRtNotificationGuard {
     fn drop(&mut self) {
-        let prop = KSRTAUDIO_NOTIFICATION_EVENT_PROPERTY {
-            Property: ks_identifier(
-                KSPROPSETID_RtAudio,
-                KSPROPERTY_RTAUDIO_UNREGISTER_NOTIFICATION_EVENT as u32,
-                KSPROPERTY_TYPE_SET,
-            ),
-            NotificationEvent: self.event,
-        };
-        let _ = ks_ioctl(
-            self.pin,
-            &prop,
-            core::ptr::null_mut(),
-            0,
-            "UnregisterNotificationEvent",
-        );
+        let _ = unregister_notification_event_raw(self.pin, self.event, self.property_flags);
+    }
+}
+
+#[cfg(windows)]
+fn query_position_register(pin: HANDLE) -> Option<(*const core::ffi::c_void, u32)> {
+    let prop = KSRTAUDIO_HWREGISTER_PROPERTY {
+        Property: ks_identifier(
+            KSPROPSETID_RtAudio,
+            KSPROPERTY_RTAUDIO_POSITIONREGISTER as u32,
+            KSPROPERTY_TYPE_GET,
+        ),
+        BaseAddress: core::ptr::null_mut(),
+    };
+    let mut reg: KSRTAUDIO_HWREGISTER = unsafe { core::mem::zeroed() };
+    let ok = ks_ioctl(
+        pin,
+        &prop,
+        (&mut reg as *mut KSRTAUDIO_HWREGISTER).cast(),
+        core::mem::size_of::<KSRTAUDIO_HWREGISTER>() as u32,
+        "KSPROPERTY_RTAUDIO_POSITIONREGISTER",
+    );
+    if ok.is_ok() && !reg.Register.is_null() && matches!(reg.Width, 32 | 64) {
+        Some((reg.Register.cast_const(), reg.Width))
+    } else {
+        None
+    }
+}
+
+#[cfg(windows)]
+fn query_audio_position_bytes(pin: HANDLE) -> Option<u64> {
+    let prop = ks_identifier(
+        KSPROPSETID_Audio,
+        KSPROPERTY_AUDIO_POSITION as u32,
+        KSPROPERTY_TYPE_GET,
+    );
+    let mut pos: KSAUDIO_POSITION = unsafe { core::mem::zeroed() };
+    let ok = ks_ioctl(
+        pin,
+        &prop,
+        (&mut pos as *mut KSAUDIO_POSITION).cast(),
+        core::mem::size_of::<KSAUDIO_POSITION>() as u32,
+        "KSPROPERTY_AUDIO_POSITION",
+    );
+    ok.ok().map(|_| pos.PlayOffset)
+}
+
+/// Hardware play-cursor reader for a live WaveRT KS pin (must not outlive `pin`).
+#[cfg(windows)]
+enum WaveRtPositionReader {
+    Register {
+        ptr: *const core::ffi::c_void,
+        width_bits: u32,
+    },
+    AudioPositionIoctl {
+        pin: HANDLE,
+    },
+    Unavailable,
+}
+
+#[cfg(windows)]
+impl WaveRtPositionReader {
+    fn open(pin: HANDLE) -> Self {
+        if let Some((ptr, width_bits)) = query_position_register(pin) {
+            return Self::Register { ptr, width_bits };
+        }
+        if query_audio_position_bytes(pin).is_some() {
+            return Self::AudioPositionIoctl { pin };
+        }
+        Self::Unavailable
+    }
+
+    fn read_play_offset_bytes(&self) -> Option<u64> {
+        match *self {
+            Self::Register { ptr, width_bits } => unsafe {
+                match width_bits {
+                    32 => Some(u64::from(core::ptr::read_volatile(ptr.cast::<u32>()))),
+                    64 => Some(core::ptr::read_volatile(ptr.cast::<u64>())),
+                    _ => None,
+                }
+            },
+            Self::AudioPositionIoctl { pin } => query_audio_position_bytes(pin),
+            Self::Unavailable => None,
+        }
     }
 }
 

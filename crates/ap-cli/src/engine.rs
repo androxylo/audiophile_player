@@ -499,17 +499,12 @@ pub fn run_random_music_player(
 
                 let ep_for_stream = state.active_epoch;
                 let buf_for_stream = Arc::clone(&stream_buf);
-                let stop_for_stream = Arc::clone(&stop_handle);
-                match sink.play_block_stream(out_rate, DacWireFormat::Int32, move || loop {
-                    match buf_for_stream
-                        .pop_track_pcm_block(ep_for_stream, Duration::from_millis(50))
-                    {
-                        PopBlockResult::Block(b) => return Some(b),
-                        PopBlockResult::TrackEnd | PopBlockResult::StaleOrClosed => return None,
-                        PopBlockResult::Underrun => {
-                            if stop_for_stream.load(Ordering::Acquire) {
-                                return None;
-                            }
+                match sink.play_block_stream(out_rate, DacWireFormat::Int32, move || {
+                    match buf_for_stream.try_pop_track_pcm_block(ep_for_stream) {
+                        PopBlockResult::Block(b) => ap_output_win::wdm_ks::StreamBlock::Ready(b),
+                        PopBlockResult::Underrun => ap_output_win::wdm_ks::StreamBlock::Underrun,
+                        PopBlockResult::TrackEnd | PopBlockResult::StaleOrClosed => {
+                            ap_output_win::wdm_ks::StreamBlock::EndOfTrack
                         }
                     }
                 }) {

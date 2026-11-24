@@ -337,11 +337,25 @@ impl BoundedBlockStreamBuffer {
         Some(st.is_prebuffer_ready(target_frames))
     }
 
+    /// Consumer side (real-time WaveRT audio thread): immediately pop the next PCM block
+    /// for this track without ever sleeping on the condvar.
+    ///
+    /// Returns `PopBlockResult::Underrun` immediately when the queue is empty so the RT loop
+    /// can emit digital silence instead of blocking hardware DMA notifications.
+    pub fn try_pop_track_pcm_block(&self, expected_epoch: u64) -> PopBlockResult {
+        let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if st.closed || st.epoch != expected_epoch {
+            return PopBlockResult::StaleOrClosed;
+        }
+        self.pop_track_pcm_locked(&mut st)
+    }
+
     /// Consumer side (inside active track playback): pop the next PCM block for this track.
     ///
     /// Explicitly distinguishes clean `TrackEnd` from `Underrun` (timeout while producer is
     /// still decoding) and `StaleOrClosed` (epoch change / shutdown), so a temporary producer
     /// stall never silently truncates a track.
+    #[allow(dead_code)]
     pub fn pop_track_pcm_block(
         &self,
         expected_epoch: u64,
@@ -363,6 +377,10 @@ impl BoundedBlockStreamBuffer {
         if st.events.is_empty() && wait_res.timed_out() {
             return PopBlockResult::Underrun;
         }
+        self.pop_track_pcm_locked(&mut st)
+    }
+
+    fn pop_track_pcm_locked(&self, st: &mut BufferInner) -> PopBlockResult {
         match st.events.front() {
             Some(StreamEvent::PcmBlock(_)) => {
                 if let Some(StreamEvent::PcmBlock(b)) = st.pop_front_event() {
@@ -562,6 +580,40 @@ mod tests {
         assert!(matches!(
             buf.pop_for_epoch_timeout(ep1, Duration::from_millis(50)),
             Some(StreamEvent::EndOfQueue(ref s)) if s == "requeued"
+        ));
+    }
+
+    #[test]
+    fn try_pop_track_pcm_block_is_nonblocking_and_recovers_from_underrun() {
+        let buf = BoundedBlockStreamBuffer::new(100_000);
+        let ep = buf.current_epoch();
+
+        // Empty queue returns Underrun immediately (no condvar sleep).
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            buf.try_pop_track_pcm_block(ep),
+            PopBlockResult::Underrun
+        ));
+        assert!(started.elapsed() < Duration::from_millis(20));
+
+        // Once producer pushes a block and TrackEnd, non-blocking pops drain them in order.
+        assert!(buf.push_for_epoch(ep, StreamEvent::PcmBlock(make_block(128))));
+        assert!(buf.push_for_epoch(ep, StreamEvent::TrackEnd));
+
+        match buf.try_pop_track_pcm_block(ep) {
+            PopBlockResult::Block(b) => assert_eq!(b.frames.len(), 128),
+            other => panic!("expected Block, got {other:?}"),
+        }
+        assert!(matches!(
+            buf.try_pop_track_pcm_block(ep),
+            PopBlockResult::TrackEnd
+        ));
+
+        // Epoch mismatch or close reports StaleOrClosed immediately.
+        let _ = buf.reset_and_flush();
+        assert!(matches!(
+            buf.try_pop_track_pcm_block(ep),
+            PopBlockResult::StaleOrClosed
         ));
     }
 }

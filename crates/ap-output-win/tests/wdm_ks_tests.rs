@@ -19,8 +19,9 @@ use ap_core::format::DacWireFormat;
 use ap_output_win::hygiene::{MemoryLockGuard, MmcssGuard, OptimizationLevel};
 use ap_output_win::sink::ZeroMixerAudioSink;
 use ap_output_win::wdm_ks::{
-    KsPinConnectBlob, KsRenderDevice, StreamingWaveRtPump, WaveRtFramePump, WaveRtPumpSource,
-    WdmKsSink, classify_ks_pin_error, enumerate_wdm_ks_render_devices, select_wdm_ks_device,
+    KsPinConnectBlob, KsRenderDevice, StreamBlock, StreamingWaveRtPump, WaveRtFramePump,
+    WaveRtLoopController, WaveRtPumpSource, WaveRtRingLayout, WaveRtStepOutcome, WdmKsSink,
+    classify_ks_pin_error, enumerate_wdm_ks_render_devices, select_wdm_ks_device,
 };
 
 static HARDWARE_LOCK: Mutex<()> = Mutex::new(());
@@ -344,9 +345,203 @@ fn mmcss_pro_audio_guard_restores_prior_thread_priority_on_drop() {
     handle.join().unwrap();
 }
 
+#[test]
+fn wavert_ring_layout_aligns_odd_frame_counts_and_rejects_unaligned_sizes() {
+    // Int24Packed (bpf = 6) with page-rounded 28672 bytes (28672 % 6 == 2) must be rejected.
+    assert!(WaveRtRingLayout::new(28_672, 6).is_err());
+    // Too small (< 2 frames) or bpf == 0 must be rejected.
+    assert!(WaveRtRingLayout::new(8, 8).is_err());
+    assert!(WaveRtRingLayout::new(64, 0).is_err());
+
+    // Odd frame count (5 frames * 6 bytes = 30 bytes): half 0 = 2 frames (0..12), half 1 = 3 frames (12..30).
+    let odd = WaveRtRingLayout::new(30, 6).expect("odd frame count should align cleanly");
+    assert_eq!(odd.half_len(), 12);
+    assert_eq!(odd.half_range(0), 0..12);
+    assert_eq!(odd.half_range(1), 12..30);
+    assert_eq!(odd.half_range(0).len() % 6, 0);
+    assert_eq!(odd.half_range(1).len() % 6, 0);
+    assert_eq!(odd.safe_write_half_for_play_byte(0), 1);
+    assert_eq!(odd.safe_write_half_for_play_byte(11), 1);
+    assert_eq!(odd.safe_write_half_for_play_byte(12), 0);
+    assert_eq!(odd.safe_write_half_for_play_byte(29), 0);
+    assert_eq!(odd.safe_write_half_for_play_byte(30), 1); // wraps cleanly
+}
+
+#[test]
+fn wavert_loop_controller_plays_full_stop_fade_out_before_finishing() {
+    // 8 frames per half (64 B per half, 128 B ring), 40 full-scale source frames.
+    let layout = WaveRtRingLayout::new(128, 8).unwrap();
+    let frames = vec![[1_000_000_000_i32, -1_000_000_000_i32]; 40];
+    let mut pump = WaveRtFramePump::new(&frames, DacWireFormat::Int32);
+    let mut ring = vec![0xAA_u8; 128];
+    let mut ctrl = WaveRtLoopController::new(layout);
+
+    // Prefill fills half 0 (8 frames) and half 1 (8 frames); 0 frames have finished DMA yet.
+    ctrl.prefill(&mut ring, &mut pump).unwrap();
+    assert_eq!(ctrl.frames_played(), 0);
+
+    // Event E_k: DMA finishes half 0 and starts half 1; stop is requested now.
+    // Must write fade-out into half 0 and CONTINUE (half 1 is still playing; fade hasn't played).
+    let (h, outcome) = ctrl
+        .on_notification(&mut ring, &mut pump, true, Some(64))
+        .unwrap();
+    assert_eq!(h, 0);
+    assert_eq!(outcome, WaveRtStepOutcome::Continue);
+    assert_eq!(ctrl.frames_played(), 8, "only half 0 finished DMA so far");
+    // Verify half 0 actually contains a ramp down (first sample high, last sample near zero).
+    let fade_first = i32::from_le_bytes(ring[0..4].try_into().unwrap());
+    let fade_last = i32::from_le_bytes(ring[7 * 8..7 * 8 + 4].try_into().unwrap());
+    assert_eq!(fade_first, 1_000_000_000);
+    assert!(fade_last.abs() < fade_first.abs() / 4);
+
+    // Event E_{k+1}: DMA finishes half 1 and JUST STARTS half 0 (the fade-out!).
+    // Must zero half 1 and CONTINUE so the fade-out half actually plays through DMA.
+    let (h, outcome) = ctrl
+        .on_notification(&mut ring, &mut pump, true, Some(128))
+        .unwrap();
+    assert_eq!(h, 1);
+    assert_eq!(outcome, WaveRtStepOutcome::Continue);
+    assert_eq!(&ring[64..128], &[0u8; 64]);
+    assert_eq!(ctrl.frames_played(), 16, "half 0 + half 1 completed; fade half now playing");
+
+    // Event E_{k+2}: DMA finishes half 0 (the fade-out!) and enters half 1 (silence).
+    // Now it is click-free to finish and transition to KSSTATE_PAUSE / STOP.
+    let (h, outcome) = ctrl
+        .on_notification(&mut ring, &mut pump, true, Some(192))
+        .unwrap();
+    assert_eq!(h, 0);
+    assert_eq!(outcome, WaveRtStepOutcome::Finished);
+    assert_eq!(&ring[0..64], &[0u8; 64]);
+    assert_eq!(
+        ctrl.frames_played(),
+        24,
+        "exact frames played = half 0 (8) + half 1 (8) + fade half (8)"
+    );
+}
+
+#[test]
+fn wavert_loop_controller_resyncs_from_hardware_position_after_coalesced_notification() {
+    let layout = WaveRtRingLayout::new(64, 8).unwrap(); // 4 frames per half
+    let frames = vec![[100_i32, -100_i32]; 20];
+    let mut pump = WaveRtFramePump::new(&frames, DacWireFormat::Int32);
+    let mut ring = vec![0u8; 64];
+    let mut ctrl = WaveRtLoopController::new(layout);
+
+    ctrl.prefill(&mut ring, &mut pump).unwrap();
+
+    // Normal wake #1: play cursor in half 1 (pos = 36) -> writes half 0.
+    let (h1, _) = ctrl
+        .on_notification(&mut ring, &mut pump, false, Some(36))
+        .unwrap();
+    assert_eq!(h1, 0);
+    assert_eq!(ctrl.frames_played(), 4);
+
+    // Coalesced notification! Two half-periods elapsed so play cursor is back in half 1 (pos = 100 % 64 = 36).
+    // Blind toggle would wrongly pick half 1 (which DMA is currently reading!); hardware position picks half 0.
+    let (h2, _) = ctrl
+        .on_notification(&mut ring, &mut pump, false, Some(100))
+        .unwrap();
+    assert_eq!(h2, 0, "must pick safe half opposite DMA play cursor");
+    // Both half 1 (from prefill) and half 0 (from wake #1) played during the coalesced interval.
+    assert_eq!(ctrl.frames_played(), 12);
+}
+
+#[test]
+fn wavert_loop_controller_recovers_from_nonblocking_underrun_without_truncating_track() {
+    let layout = WaveRtRingLayout::new(64, 8).unwrap(); // 4 frames per half
+    let mut sequence = vec![
+        StreamBlock::Ready(InterleavedInt32Buffer {
+            sample_rate_hz: 384_000,
+            frames: vec![[1, -1]; 8], // fills both prefill halves
+        }),
+        StreamBlock::Underrun, // wake 1: silent half, NOT EOF
+        StreamBlock::Underrun, // wake 2: silent half, NOT EOF
+        StreamBlock::Ready(InterleavedInt32Buffer {
+            sample_rate_hz: 384_000,
+            frames: vec![[2, -2]; 4], // wake 3: recovers seamlessly!
+        }),
+        StreamBlock::EndOfTrack,
+    ]
+    .into_iter();
+
+    let mut pump = StreamingWaveRtPump::new(384_000, DacWireFormat::Int32, move || {
+        sequence.next().unwrap_or(StreamBlock::EndOfTrack)
+    });
+    let mut ring = vec![0xFF_u8; 64];
+    let mut ctrl = WaveRtLoopController::new(layout);
+
+    ctrl.prefill(&mut ring, &mut pump).unwrap();
+
+    // Wake 1 (half 0): underrun -> fills half 0 with silence, MUST Continue!
+    let (h1, out1) = ctrl
+        .on_notification(&mut ring, &mut pump, false, Some(32))
+        .unwrap();
+    assert_eq!(h1, 0);
+    assert_eq!(out1, WaveRtStepOutcome::Continue);
+    assert_eq!(&ring[0..32], &[0u8; 32]);
+    assert_eq!(ctrl.frames_played(), 4);
+
+    // Wake 2 (half 1): second underrun -> fills half 1 with silence, MUST still Continue!
+    let (h2, out2) = ctrl
+        .on_notification(&mut ring, &mut pump, false, Some(64))
+        .unwrap();
+    assert_eq!(h2, 1);
+    assert_eq!(out2, WaveRtStepOutcome::Continue);
+    assert_eq!(&ring[32..64], &[0u8; 32]);
+    assert_eq!(ctrl.frames_played(), 8);
+
+    // Wake 3 (half 0): producer recovers with 4 frames of [2, -2]!
+    let (h3, out3) = ctrl
+        .on_notification(&mut ring, &mut pump, false, Some(96))
+        .unwrap();
+    assert_eq!(h3, 0);
+    assert_eq!(out3, WaveRtStepOutcome::Continue);
+    assert_eq!(&ring[0..4], &2_i32.to_le_bytes());
+
+    // Wake 4 (half 1): EndOfTrack -> trailing_silent_halves = 1, Continue while recovered half 0 plays.
+    let (_, out4) = ctrl
+        .on_notification(&mut ring, &mut pump, false, Some(128))
+        .unwrap();
+    assert_eq!(out4, WaveRtStepOutcome::Continue);
+
+    // Wake 5 (half 0): recovered half 0 finished DMA -> trailing_silent_halves = 2 -> Finished!
+    let (_, out5) = ctrl
+        .on_notification(&mut ring, &mut pump, false, Some(160))
+        .unwrap();
+    assert_eq!(out5, WaveRtStepOutcome::Finished);
+    assert_eq!(ctrl.frames_played(), 12, "all 8 + 4 audio frames must play cleanly");
+}
+
 // ---------------------------------------------------------------------------
 // 2. Live Windows Kernel Streaming (WDM-KS) Hardware Tests (Schiit Gungnir 2)
 // ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+#[test]
+fn live_wdm_ks_probes_notification_get_and_hardware_position_on_gungnir2() {
+    let _lock = HARDWARE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let sink = WdmKsSink::open("Gungnir 2").expect("failed to locate Gungnir 2 WDM-KS device");
+    let probe = sink
+        .probe_wavert_hardware_properties(384_000, DacWireFormat::Int32)
+        .expect("live WaveRT hardware probe failed on Gungnir 2");
+    println!("=== Live Gungnir 2 WaveRT Hardware Probe ===");
+    println!("  {probe:?}");
+    assert_eq!(probe.buffer_bytes % 8, 0);
+    assert_eq!(probe.half_bytes % 8, 0);
+    assert!(
+        probe.register_get_ok && probe.unregister_get_ok,
+        "expected WDK-standard KSPROPERTY_TYPE_GET notification register/unregister to succeed on Gungnir 2"
+    );
+    assert!(
+        probe.position_register_supported || probe.audio_position_supported,
+        "expected hardware WaveRT position query support on Gungnir 2"
+    );
+    assert_eq!(
+        probe.sample_play_offsets.len(),
+        4,
+        "expected 4 live hardware play-offset samples"
+    );
+}
 
 #[cfg(windows)]
 #[test]
