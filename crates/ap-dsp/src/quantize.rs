@@ -40,12 +40,18 @@ pub struct StreamingQuantizer {
 }
 
 impl StreamingQuantizer {
-    pub fn new(shaper: NoiseShaperProfile, dac_bits: u8) -> Self {
-        Self {
+    pub fn new(shaper: NoiseShaperProfile, dac_bits: u8) -> Result<Self, String> {
+        if !shaper.is_implemented() {
+            return Err(format!(
+                "noise shaper '{shaper}' is not implemented yet (pending INV-04 algorithm research); \
+                 use 'auto', 'tpdf', or 'bypass' for now"
+            ));
+        }
+        Ok(Self {
             shaper,
             dac_bits: dac_bits.clamp(16, 32),
             rng_state: 0x2026_0401_9E37_79B9,
-        }
+        })
     }
 
     #[inline]
@@ -64,7 +70,15 @@ impl StreamingQuantizer {
         let max_int = ((1_i64 << (bits - 1)) - 1) as f64;
         let min_int = -(1_i64 << (bits - 1)) as f64;
         let shift = 32 - u32::from(bits);
-        let use_tpdf = self.shaper != NoiseShaperProfile::Bypass;
+        let use_tpdf = match self.shaper {
+            NoiseShaperProfile::Bypass => false,
+            NoiseShaperProfile::TpdfDither => true,
+            NoiseShaperProfile::Ns5Multibit
+            | NoiseShaperProfile::Lns15Smooth
+            | NoiseShaperProfile::PggbOptimal => {
+                unreachable!("unimplemented noise shapers are rejected in StreamingQuantizer::new")
+            }
+        };
 
         let n = audio.left.len().min(audio.right.len());
         let mut frames = Vec::with_capacity(n);
@@ -95,7 +109,7 @@ pub fn quantize_to_int32(
     audio: &StereoF64Buffer,
     shaper: NoiseShaperProfile,
     dac_bits: u8,
-) -> InterleavedInt32Buffer {
-    let mut q = StreamingQuantizer::new(shaper, dac_bits);
-    q.quantize_block(audio)
+) -> Result<InterleavedInt32Buffer, String> {
+    let mut q = StreamingQuantizer::new(shaper, dac_bits)?;
+    Ok(q.quantize_block(audio))
 }

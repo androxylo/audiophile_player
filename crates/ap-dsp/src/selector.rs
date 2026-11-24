@@ -19,6 +19,39 @@ use ap_core::format::{StreamSpec, TargetDspRate};
 
 use crate::MAX_FILTER_TAPS;
 
+/// Minimum sane source sample rate accepted by the DSP pipeline (protects against corrupt
+/// ultra-low-rate headers causing extreme upsampling ratios and OOM allocations).
+pub const MIN_SUPPORTED_SOURCE_RATE_HZ: u32 = 8_000;
+
+/// Maximum supported source sample rate (player never downsamples; DAC ceiling is `384 kHz`).
+pub const MAX_SUPPORTED_SOURCE_RATE_HZ: u32 = 384_000;
+
+/// Hard ceiling on integer upsampling ratios (`8 kHz -> 384 kHz` is `48x <= 64`).
+pub const MAX_UPSAMPLE_RATIO: u32 = 64;
+
+/// Default taps per polyphase branch for `SimpleTest` (Kaiser-windowed sinc, flat through 20 kHz
+/// at `44.1 -> 352.8 kHz` with `> 110 dB` stopband attenuation).
+pub const SIMPLE_TEST_DEFAULT_TAPS_PER_PHASE: usize = 256;
+
+/// Minimum allowed even taps per polyphase branch for `SimpleTest`.
+pub const SIMPLE_TEST_MIN_TAPS_PER_PHASE: usize = 8;
+
+/// Error prefix used when a track's sample rate cannot be processed by the active DSP pipeline
+/// (allows the playback engine to skip unsupported tracks cleanly in Random/Sequential modes).
+pub const UNSUPPORTED_SAMPLE_RATE_PREFIX: &str = "unsupported source sample rate:";
+
+/// Derive the exact even taps-per-phase count used by [`FilterArchetype::SimpleTest`] for a given
+/// integer upsampling `ratio` and `max_taps` ceiling so `SelectedDspPlan::tap_budget` and the
+/// constructed polyphase kernel always agree.
+pub fn simple_test_taps_per_phase(ratio: usize, max_taps: usize) -> usize {
+    let cap = max_taps.min(MAX_FILTER_TAPS);
+    let max_for_ratio = cap / ratio.max(1);
+    let even = max_for_ratio & !1;
+    SIMPLE_TEST_DEFAULT_TAPS_PER_PHASE
+        .min(even)
+        .max(SIMPLE_TEST_MIN_TAPS_PER_PHASE)
+}
+
 /// Per-track source attributes inspected by [`UpsamplerPicker`] before each track plays.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrackSourceInfo {
@@ -116,9 +149,12 @@ impl FilterArchetype {
             UpsampleRatio::Integer(n) => n as usize,
             UpsampleRatio::Arbitrary => 8,
         };
+        if self == Self::SimpleTest {
+            return simple_test_taps_per_phase(mult, cap).saturating_mul(mult);
+        }
         let desired = match self {
             Self::Null => 0,
-            Self::SimpleTest => 64 * mult,       // 512 @ 8x, 256 @ 4x, 128 @ 2x (fast initial kernel)
+            Self::SimpleTest => unreachable!(),
             Self::GaussApod4M => 262_144 * mult, // 2.1M @ 8x, 1.05M @ 4x, 524k @ 2x
             Self::SincSteep4M => 500_000 * mult, // 4.0M @ 8x, 2.0M @ 4x, 1.0M @ 2x
             Self::GaussLongLp => 32_768 * mult,
@@ -181,6 +217,11 @@ impl NoiseShaperProfile {
             Self::PggbOptimal => "pggb-optimal",
         }
     }
+
+    /// True if this quantizer / noise-shaper profile is currently implemented in `ap-dsp`.
+    pub fn is_implemented(self) -> bool {
+        matches!(self, Self::Bypass | Self::TpdfDither)
+    }
 }
 
 impl fmt::Display for NoiseShaperProfile {
@@ -240,7 +281,9 @@ impl UpsamplerPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectedDspPlan {
     pub source_rate_hz: u32,
-    pub target_rate: TargetDspRate,
+    /// `Some(TargetDspRate)` when `target_rate_hz` is an `8fS` rate (`352,800` or `384,000 Hz`),
+    /// or `None` when `--filter null` passes through a non-`8fS` native source rate.
+    pub target_rate: Option<TargetDspRate>,
     pub target_rate_hz: u32,
     pub ratio: UpsampleRatio,
     /// Active filter selected to execute right now.
@@ -269,18 +312,28 @@ impl SelectedDspPlan {
     }
 }
 
-/// Map any input sample rate to its exact integer-family `8fS` target (`352.8` or `384 kHz`).
+/// Map a sane input sample rate (`8 kHz..=384 kHz`) to its exact integer-family `8fS` target
+/// (`352.8` or `384 kHz`), enforcing `ratio <= MAX_UPSAMPLE_RATIO`.
+///
+/// Out-of-range rates (`< 8 kHz` or `> 384 kHz`) and non-integer divisors map to
+/// [`UpsampleRatio::Arbitrary`] so crafted low-rate headers cannot trigger extreme OOM ratios.
 pub fn select_target_rate(sample_rate_hz: u32) -> (TargetDspRate, UpsampleRatio) {
     match sample_rate_hz {
         352_800 => (TargetDspRate::Hz352800, UpsampleRatio::Bypass1x),
         384_000 => (TargetDspRate::Hz384000, UpsampleRatio::Bypass1x),
-        r if r > 0 && 352_800 % r == 0 => {
+        r if (MIN_SUPPORTED_SOURCE_RATE_HZ..=MAX_SUPPORTED_SOURCE_RATE_HZ).contains(&r)
+            && 352_800 % r == 0
+            && (352_800 / r) <= MAX_UPSAMPLE_RATIO =>
+        {
             (TargetDspRate::Hz352800, UpsampleRatio::Integer(352_800 / r))
         }
-        r if r > 0 && 384_000 % r == 0 => {
+        r if (MIN_SUPPORTED_SOURCE_RATE_HZ..=MAX_SUPPORTED_SOURCE_RATE_HZ).contains(&r)
+            && 384_000 % r == 0
+            && (384_000 / r) <= MAX_UPSAMPLE_RATIO =>
+        {
             (TargetDspRate::Hz384000, UpsampleRatio::Integer(384_000 / r))
         }
-        r if r % 44_100 == 0 => (TargetDspRate::Hz352800, UpsampleRatio::Arbitrary),
+        r if r > 0 && r % 44_100 == 0 => (TargetDspRate::Hz352800, UpsampleRatio::Arbitrary),
         _ => (TargetDspRate::Hz384000, UpsampleRatio::Arbitrary),
     }
 }
@@ -289,6 +342,14 @@ fn target_rate_hz(target: TargetDspRate) -> u32 {
     match target {
         TargetDspRate::Hz352800 => 352_800,
         TargetDspRate::Hz384000 => 384_000,
+    }
+}
+
+fn target_rate_from_hz(hz: u32) -> Option<TargetDspRate> {
+    match hz {
+        352_800 => Some(TargetDspRate::Hz352800),
+        384_000 => Some(TargetDspRate::Hz384000),
+        _ => None,
     }
 }
 
@@ -354,14 +415,16 @@ impl UpsamplerPicker {
             filter_reason
         };
 
+        let resolved_target_hz = if filter == FilterArchetype::Null {
+            source.sample_rate_hz
+        } else {
+            t_hz
+        };
+
         SelectedDspPlan {
             source_rate_hz: source.sample_rate_hz,
-            target_rate,
-            target_rate_hz: if filter == FilterArchetype::Null {
-                source.sample_rate_hz
-            } else {
-                t_hz
-            },
+            target_rate: target_rate_from_hz(resolved_target_hz),
+            target_rate_hz: resolved_target_hz,
             ratio,
             filter,
             target_audiophile_filter: target_audiophile,

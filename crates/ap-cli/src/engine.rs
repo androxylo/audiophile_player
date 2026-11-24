@@ -22,7 +22,7 @@ use ap_core::config::{ConvolutionConfig, PlayerConfig};
 use ap_core::format::DacWireFormat;
 use ap_dsp::convolution::ConvolutionTail;
 use ap_dsp::pipeline::AudioPipeline;
-use ap_dsp::selector::UpsamplerPolicy;
+use ap_dsp::selector::{UNSUPPORTED_SAMPLE_RATE_PREFIX, UpsamplerPolicy};
 use ap_output_win::hygiene::OptimizationLevel;
 use ap_output_win::sink::OutputError;
 use ap_output_win::wdm_ks::WdmKsSink;
@@ -857,6 +857,15 @@ fn stream_single_track(
     let mut session = match pipeline.start_track(spec, &peak_meta, source.is_streaming()) {
         Ok(s) => s,
         Err(err) => {
+            if err.starts_with(UNSUPPORTED_SAMPLE_RATE_PREFIX) {
+                return (
+                    TrackStreamOutcome::Unsupported(format!(
+                        "Skipped unsupported sample rate on '{}': {err}",
+                        chosen.display()
+                    )),
+                    None,
+                );
+            }
             return (
                 TrackStreamOutcome::Failed(format!(
                     "DSP pipeline error on '{}': {err}",

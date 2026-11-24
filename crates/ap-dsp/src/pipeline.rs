@@ -23,10 +23,16 @@ use crate::convolution::{
 use crate::delay::{ChannelDelayer, ChannelDelayerFactory, NullChannelDelayerFactory};
 use crate::quantize::{StreamingQuantizer, apply_safe_gain_f64};
 use crate::selector::{
-    FilterArchetype, NoiseShaperProfile, SelectedDspPlan, TrackSourceInfo, UpsamplerPicker,
-    UpsamplerPolicy,
+    FilterArchetype, MAX_SUPPORTED_SOURCE_RATE_HZ, MIN_SUPPORTED_SOURCE_RATE_HZ,
+    NoiseShaperProfile, SelectedDspPlan, TrackSourceInfo, UNSUPPORTED_SAMPLE_RATE_PREFIX,
+    UpsamplerPicker, UpsamplerPolicy,
 };
 use crate::upsampler::{Upsampler, build_upsampler};
+
+/// Extra safety margin (dB) required on ReplayGain sample peak for `0 dB` headroom whenever the
+/// steep windowed-sinc upsampler is active, protecting against inter-sample peaks (`~+3 dB` on
+/// `fs/4` signals) plus Gibbs ringing overshoot and `+1 LSB` TPDF dither (`-3.5 dBFS` ceiling).
+pub const UPSAMPLER_ISP_SAFETY_MARGIN_DB: f64 = 0.5;
 
 /// Diagnostic summary of every pipeline stage chosen for a track/stream.
 #[derive(Debug, Clone)]
@@ -63,8 +69,10 @@ impl PipelineReport {
 
     pub fn log_line(&self) -> String {
         format!(
-            "{} | {} | conv={} | delay={}",
+            "{} | effective_shaper={} ({}-bit) | {} | conv={} | delay={}",
             self.dsp_plan.summary(),
+            self.effective_shaper,
+            self.output_bits,
             self.headroom.summary(),
             self.convolver_description,
             self.delayer_name,
@@ -267,6 +275,15 @@ impl AudioPipeline {
         peak_meta: &TrackPeakMetadata,
         is_streaming_source: bool,
     ) -> Result<StreamingPipelineSession, String> {
+        if !(MIN_SUPPORTED_SOURCE_RATE_HZ..=MAX_SUPPORTED_SOURCE_RATE_HZ)
+            .contains(&spec.sample_rate_hz)
+        {
+            return Err(format!(
+                "{UNSUPPORTED_SAMPLE_RATE_PREFIX} {} Hz is outside the supported {}..={} Hz range",
+                spec.sample_rate_hz, MIN_SUPPORTED_SOURCE_RATE_HZ, MAX_SUPPORTED_SOURCE_RATE_HZ
+            ));
+        }
+
         let mut source_info = TrackSourceInfo::from_stream_spec(spec);
         source_info.is_streaming_source = is_streaming_source;
 
@@ -279,10 +296,15 @@ impl AudioPipeline {
             .delayer_factory
             .create_for_rate(dsp_plan.target_rate_hz)?;
 
+        let upsampler_isp_margin_db = if dsp_plan.filter != FilterArchetype::Null {
+            UPSAMPLER_ISP_SAFETY_MARGIN_DB
+        } else {
+            0.0
+        };
         let headroom = select_headroom(
             peak_meta,
             is_streaming_source,
-            convolver.peak_gain_bound_db(),
+            convolver.peak_gain_bound_db() + upsampler_isp_margin_db,
         );
 
         let untouched_native = dsp_plan.filter == FilterArchetype::Null
@@ -291,12 +313,24 @@ impl AudioPipeline {
             && delayer.name() == "null-delay";
 
         let (effective_shaper, output_bits) = if untouched_native {
-            (dsp_plan.shaper, (spec.bits_per_sample as u8).clamp(16, 32))
+            let out_bits = (spec.bits_per_sample as u8).clamp(16, 32);
+            // Truly bit-perfect native pass-through: never add TPDF dither when no DSP modified
+            // the signal and output bit depth can represent every source bit losslessly.
+            let shaper = if !dsp_plan.shaper_overridden
+                && u16::from(out_bits) >= spec.bits_per_sample
+            {
+                NoiseShaperProfile::Bypass
+            } else {
+                dsp_plan.shaper
+            };
+            (shaper, out_bits)
         } else if dsp_plan.shaper == NoiseShaperProfile::Bypass {
             (NoiseShaperProfile::TpdfDither, 24)
         } else {
             (dsp_plan.shaper, 24)
         };
+
+        let quantizer = StreamingQuantizer::new(effective_shaper, output_bits)?;
 
         let report = PipelineReport {
             source_spec: spec,
@@ -309,8 +343,6 @@ impl AudioPipeline {
             delayer_name: delayer.name(),
             effective_shaper,
         };
-
-        let quantizer = StreamingQuantizer::new(effective_shaper, output_bits);
 
         Ok(StreamingPipelineSession {
             report,

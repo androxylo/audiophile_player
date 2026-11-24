@@ -11,11 +11,19 @@ use std::f64::consts::PI;
 
 use ap_core::buffer::StereoF64Buffer;
 
-use crate::selector::{FilterArchetype, SelectedDspPlan, UpsampleRatio};
+use crate::MAX_FILTER_TAPS;
+use crate::selector::{
+    FilterArchetype, MAX_SUPPORTED_SOURCE_RATE_HZ, MAX_UPSAMPLE_RATIO,
+    MIN_SUPPORTED_SOURCE_RATE_HZ, SelectedDspPlan, UNSUPPORTED_SAMPLE_RATE_PREFIX, UpsampleRatio,
+    simple_test_taps_per_phase,
+};
 
 /// Pluggable stateful floating-point upsampler (`StereoF64Buffer -> StereoF64Buffer`).
 pub trait Upsampler: Send {
     fn name(&self) -> &'static str;
+
+    /// Total polyphase FIR kernel taps (`0` for [`NullUpsampler`]).
+    fn total_taps(&self) -> usize;
 
     /// Process one bounded source block, emitting all ready upsampled `f64` samples.
     fn process_block(&mut self, input: StereoF64Buffer) -> Result<StereoF64Buffer, String>;
@@ -26,27 +34,57 @@ pub trait Upsampler: Send {
 
 /// Build the concrete stateful floating-point [`Upsampler`] for a [`SelectedDspPlan`].
 pub fn build_upsampler(plan: &SelectedDspPlan) -> Result<Box<dyn Upsampler>, String> {
+    if !(MIN_SUPPORTED_SOURCE_RATE_HZ..=MAX_SUPPORTED_SOURCE_RATE_HZ)
+        .contains(&plan.source_rate_hz)
+    {
+        return Err(format!(
+            "{UNSUPPORTED_SAMPLE_RATE_PREFIX} {} Hz is outside the supported {}..={} Hz range",
+            plan.source_rate_hz, MIN_SUPPORTED_SOURCE_RATE_HZ, MAX_SUPPORTED_SOURCE_RATE_HZ
+        ));
+    }
+
     match plan.filter {
         FilterArchetype::Null => Ok(Box::new(NullUpsampler::new(plan.target_rate_hz))),
         FilterArchetype::SimpleTest => {
-            let ratio = match plan.ratio {
-                UpsampleRatio::Bypass1x => return Ok(Box::new(NullUpsampler::new(plan.target_rate_hz))),
-                UpsampleRatio::Integer(r) if r >= 2 => r as usize,
+            let ratio_u32 = match plan.ratio {
+                UpsampleRatio::Bypass1x => {
+                    return Ok(Box::new(NullUpsampler::new(plan.target_rate_hz)));
+                }
+                UpsampleRatio::Integer(r) if r >= 2 => r,
                 UpsampleRatio::Integer(_) => {
                     return Ok(Box::new(NullUpsampler::new(plan.target_rate_hz)));
                 }
                 UpsampleRatio::Arbitrary => {
                     return Err(format!(
-                        "simple-test upsampler requires an exact integer ratio to 352.8/384 kHz \
-                         (source rate {} Hz is non-integer)",
+                        "{UNSUPPORTED_SAMPLE_RATE_PREFIX} simple-test upsampler requires an exact \
+                         integer ratio to 352.8/384 kHz (source rate {} Hz is non-integer)",
                         plan.source_rate_hz
                     ));
                 }
             };
+            if ratio_u32 > MAX_UPSAMPLE_RATIO {
+                return Err(format!(
+                    "{UNSUPPORTED_SAMPLE_RATE_PREFIX} integer upsampling ratio {}x exceeds \
+                     hard cap {}x (source rate {} Hz)",
+                    ratio_u32, MAX_UPSAMPLE_RATIO, plan.source_rate_hz
+                ));
+            }
+            let ratio = ratio_u32 as usize;
+            let taps_per_phase = simple_test_taps_per_phase(ratio, plan.tap_budget);
+            let total_taps = ratio.checked_mul(taps_per_phase).ok_or_else(|| {
+                format!(
+                    "upsampler tap count overflow (ratio={ratio}, taps_per_phase={taps_per_phase})"
+                )
+            })?;
+            if total_taps > MAX_FILTER_TAPS {
+                return Err(format!(
+                    "upsampler total taps ({total_taps}) exceeds hard {MAX_FILTER_TAPS}-tap ceiling"
+                ));
+            }
             Ok(Box::new(SimpleWindowedSincUpsampler::new(
                 plan.source_rate_hz,
                 ratio,
-                64,
+                taps_per_phase,
             )))
         }
         other => Err(format!(
@@ -64,11 +102,15 @@ pub fn build_upsampler(plan: &SelectedDspPlan) -> Result<Box<dyn Upsampler>, Str
 #[derive(Debug)]
 pub struct NullUpsampler {
     sample_rate_hz: u32,
+    flushed: bool,
 }
 
 impl NullUpsampler {
     pub fn new(sample_rate_hz: u32) -> Self {
-        Self { sample_rate_hz }
+        Self {
+            sample_rate_hz,
+            flushed: false,
+        }
     }
 }
 
@@ -77,27 +119,42 @@ impl Upsampler for NullUpsampler {
         "null"
     }
 
+    fn total_taps(&self) -> usize {
+        0
+    }
+
     fn process_block(&mut self, input: StereoF64Buffer) -> Result<StereoF64Buffer, String> {
+        if self.flushed {
+            return Err("null upsampler cannot accept blocks after flush()".to_string());
+        }
         if input.left.len() != input.right.len() {
             return Err("stereo f64 buffer L/R length mismatch".to_string());
         }
-        self.sample_rate_hz = input.sample_rate_hz;
+        if input.sample_rate_hz != self.sample_rate_hz {
+            return Err(format!(
+                "null upsampler sample rate mismatch: expected {} Hz, got {} Hz",
+                self.sample_rate_hz, input.sample_rate_hz
+            ));
+        }
         Ok(input)
     }
 
     fn flush(&mut self) -> Result<StereoF64Buffer, String> {
+        self.flushed = true;
         Ok(StereoF64Buffer::empty(self.sample_rate_hz))
     }
 }
 
-/// Initial simple stateful polyphase windowed-sinc `f64` upsampler (Blackman-Harris window).
+/// Initial stateful polyphase Kaiser-windowed sinc `f64` upsampler.
 ///
 /// Retains strictly `taps_per_phase - 1` overlap samples across streaming blocks so arbitrary
 /// chunk sizes produce **bit-for-bit identical** output to whole-track processing:
 /// - Pure IEEE 754 `f64` throughout, zero external crates.
-/// - Linear phase, centered polyphase branches (exact zero group-delay shift).
+/// - Exact Type-I linear phase with centered symmetric polyphase branches (`h[-d] == h[d]`,
+///   exact zero group-delay shift).
 /// - Exact unity DC gain per polyphase branch (`sum(weights) == 1.0`).
-/// - ~92 dB ultrasonic imaging stopband attenuation (4-term Blackman-Harris window).
+/// - Flat passband through `20 kHz` on `44.1 -> 352.8 kHz` (`< 0.01 dB` droop at `256` taps/phase)
+///   with `> 110 dB` ultrasonic imaging stopband attenuation (Kaiser `beta = 12.0`).
 #[derive(Debug)]
 pub struct SimpleWindowedSincUpsampler {
     source_rate_hz: u32,
@@ -115,17 +172,24 @@ impl SimpleWindowedSincUpsampler {
         let m = taps_per_phase.max(8) & !1; // enforce even >= 8
         let half = m / 2;
         let bank = build_polyphase_bank(ratio, m);
-        // Pre-seed history with `half` leading zeros so the first output sample is centered on x[0].
+        // Pre-seed history with `half - 1` leading zeros so tap `j = 0` (`k = half - 1`) aligns
+        // strictly with `x[0]`, and taps `j in -half + 1 ..= half` are centered symmetrically.
+        let lead = half - 1;
         Self {
             source_rate_hz,
             ratio,
             taps_per_phase: m,
             bank,
-            hist_l: vec![0.0_f64; half],
-            hist_r: vec![0.0_f64; half],
+            hist_l: vec![0.0_f64; lead],
+            hist_r: vec![0.0_f64; lead],
             total_in_frames: 0,
             flushed: false,
         }
+    }
+
+    /// Expose polyphase coefficient bank for mathematical symmetry & response inspection.
+    pub fn polyphase_bank(&self) -> &[Vec<f64>] {
+        &self.bank
     }
 
     fn convolve_available(&mut self) -> (Vec<f64>, Vec<f64>) {
@@ -169,9 +233,22 @@ impl Upsampler for SimpleWindowedSincUpsampler {
         "simple-test"
     }
 
+    fn total_taps(&self) -> usize {
+        self.ratio * self.taps_per_phase
+    }
+
     fn process_block(&mut self, input: StereoF64Buffer) -> Result<StereoF64Buffer, String> {
+        if self.flushed {
+            return Err("simple-test upsampler cannot accept blocks after flush()".to_string());
+        }
         if input.left.len() != input.right.len() {
             return Err("stereo f64 buffer L/R length mismatch".to_string());
+        }
+        if input.sample_rate_hz != self.source_rate_hz {
+            return Err(format!(
+                "simple-test upsampler sample rate mismatch: expected {} Hz, got {} Hz",
+                self.source_rate_hz, input.sample_rate_hz
+            ));
         }
         let out_rate = self.source_rate_hz * (self.ratio as u32);
         if input.is_empty() {
@@ -198,9 +275,9 @@ impl Upsampler for SimpleWindowedSincUpsampler {
         }
         self.flushed = true;
 
-        // Append `half - 1` trailing zeros (total padding: `half` leading + `half - 1` trailing
+        // Append `half` trailing zeros (total padding: `half - 1` leading + `half` trailing
         // -> exact `total_in_frames` windows -> exact `total_in_frames * ratio` output samples!).
-        let pad_tail = self.taps_per_phase / 2 - 1;
+        let pad_tail = self.taps_per_phase / 2;
         if pad_tail > 0 {
             self.hist_l.resize(self.hist_l.len() + pad_tail, 0.0_f64);
             self.hist_r.resize(self.hist_r.len() + pad_tail, 0.0_f64);
@@ -217,9 +294,36 @@ impl Upsampler for SimpleWindowedSincUpsampler {
     }
 }
 
+/// Zeroth-order modified Bessel function of the first kind `I_0(x)` computed in pure `f64`
+/// to full machine precision (`~1e-16` relative accuracy).
+fn bessel_i0(x: f64) -> f64 {
+    let half_x = 0.5 * x;
+    let y = half_x * half_x;
+    let mut sum = 1.0_f64;
+    let mut term = 1.0_f64;
+    let mut k = 1.0_f64;
+    while term > sum * 1e-16 {
+        term *= y / (k * k);
+        sum += term;
+        k += 1.0;
+        if k > 200.0 {
+            break;
+        }
+    }
+    sum
+}
+
+/// Build an exact linear-phase Kaiser-windowed sinc polyphase bank (`ratio` phases x `m` taps).
+///
+/// Using tap grid `j = -half + 1 ..= half` with strict window support `|dt| < half`:
+/// - Phase `0` (`frac = 0`) is strictly symmetric around `j = 0` (`j = half` gets weight `0.0`).
+/// - Phases `p` and `ratio - p` satisfy `bank[ratio - p][m - 1 - k] == bank[p][k]` to machine
+///   precision, yielding an exact odd-length Type-I zero-phase prototype filter.
 fn build_polyphase_bank(ratio: usize, m: usize) -> Vec<Vec<f64>> {
     let half = (m / 2) as isize;
-    let cutoff = 0.93_f64;
+    let cutoff = 0.955_f64; // 21.06 kHz @ 44.1 kHz -> flat through 20 kHz, >115 dB by 22.05 kHz
+    let beta = 12.0_f64; // ~118 dB Kaiser stopband attenuation
+    let inv_i0_beta = 1.0 / bessel_i0(beta);
     let radius = (m as f64) * 0.5;
 
     let mut bank = Vec::with_capacity(ratio);
@@ -229,19 +333,18 @@ fn build_polyphase_bank(ratio: usize, m: usize) -> Vec<Vec<f64>> {
         let mut sum = 0.0_f64;
 
         for k in 0..m {
-            let dt = (k as isize - half) as f64 - frac;
+            let j = (k as isize) - half + 1;
+            let dt = (j as f64) - frac;
             let sinc = if dt.abs() < 1e-12 {
                 cutoff
             } else {
                 let arg = PI * cutoff * dt;
                 arg.sin() / (PI * dt)
             };
-            let u = (dt + radius) / (2.0 * radius);
-            let win = if (0.0..=1.0).contains(&u) {
-                0.35875
-                    - 0.48829 * (2.0 * PI * u).cos()
-                    + 0.14128 * (4.0 * PI * u).cos()
-                    - 0.01168 * (6.0 * PI * u).cos()
+            let win = if dt.abs() < radius {
+                let x = dt / radius;
+                let arg = beta * (1.0 - x * x).max(0.0).sqrt();
+                bessel_i0(arg) * inv_i0_beta
             } else {
                 0.0
             };

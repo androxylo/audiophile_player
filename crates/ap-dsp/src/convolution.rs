@@ -601,7 +601,7 @@ impl PreparedStereoIr {
         let raw_max_freq_gain_lin =
             compute_max_freq_gain_linear(&mut planner, &left[..active_taps], &right[..active_taps])?;
         let (norm_scale, original_max_boost_db, normalization_gain_db) =
-            if raw_max_freq_gain_lin > 1.0 {
+            if raw_max_freq_gain_lin > 1.0 + 1e-5 {
                 let boost_db = 20.0 * raw_max_freq_gain_lin.log10();
                 (1.0 / raw_max_freq_gain_lin, boost_db, -boost_db)
             } else {
