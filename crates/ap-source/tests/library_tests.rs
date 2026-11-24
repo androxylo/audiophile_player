@@ -6,8 +6,9 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ap_source::library::{
-    SequentialFlacCursor, default_user_music_dir, discover_flac_files, pick_random_flac,
-    pick_random_flac_walk, pick_random_flac_walk_with_seed, pick_random_flac_with_seed,
+    SequentialFlacCursor, default_user_music_dir, discover_flac_files, natural_str_cmp,
+    pick_random_flac, pick_random_flac_walk, pick_random_flac_walk_with_seed,
+    pick_random_flac_with_seed, read_dir_frame,
 };
 
 fn make_temp_tree(tag: &str) -> PathBuf {
@@ -266,6 +267,264 @@ fn sequential_cursor_starting_after_resumes_deep_in_tree_in_o_depth() {
         yielded.push(rel);
     }
     assert_eq!(yielded, vec!["AlbumA/02.flac", "AlbumB/01.flac"]);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn natural_sorting_orders_case_insensitively_with_numeric_digit_runs() {
+    use std::cmp::Ordering;
+
+    assert_eq!(natural_str_cmp("2.flac", "10.flac"), Ordering::Less);
+    assert_eq!(natural_str_cmp("abba", "Zappa"), Ordering::Less);
+    assert_eq!(natural_str_cmp("track 9", "Track 10"), Ordering::Less);
+
+    let root = make_temp_tree("natural_sort");
+    fs::create_dir_all(root.join("Zappa")).unwrap();
+    fs::create_dir_all(root.join("abba")).unwrap();
+    fs::create_dir_all(root.join("Disc 10")).unwrap();
+    fs::create_dir_all(root.join("Disc 2")).unwrap();
+
+    fs::write(root.join("10.flac"), b"").unwrap();
+    fs::write(root.join("1.flac"), b"").unwrap();
+    fs::write(root.join("2.flac"), b"").unwrap();
+    fs::write(root.join("abba").join("a.flac"), b"").unwrap();
+    fs::write(root.join("Zappa").join("z.flac"), b"").unwrap();
+    fs::write(root.join("Disc 2").join("t.flac"), b"").unwrap();
+    fs::write(root.join("Disc 10").join("t.flac"), b"").unwrap();
+
+    let frame = read_dir_frame(&root).unwrap();
+    let dir_names: Vec<_> = frame
+        .subdirs
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+    let flac_names: Vec<_> = frame
+        .flacs
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(dir_names, vec!["abba", "Disc 2", "Disc 10", "Zappa"]);
+    assert_eq!(flac_names, vec!["1.flac", "2.flac", "10.flac"]);
+
+    // Sequential cursor yields direct files first, then folders, all in natural order.
+    let mut cur = SequentialFlacCursor::new(root.clone()).unwrap();
+    let mut yielded = Vec::new();
+    while let Some(p) = cur.next_track() {
+        yielded.push(p.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/"));
+    }
+    assert_eq!(
+        yielded,
+        vec![
+            "1.flac",
+            "2.flac",
+            "10.flac",
+            "abba/a.flac",
+            "Disc 2/t.flac",
+            "Disc 10/t.flac",
+            "Zappa/z.flac",
+        ]
+    );
+
+    // Folder-only cursor starting after a missing "3.flac" must use natural comparison and yield "10.flac".
+    let mut cur2 =
+        SequentialFlacCursor::new_folder_only(root.clone(), Some(&root.join("3.flac"))).unwrap();
+    let mut after3 = Vec::new();
+    while let Some(p) = cur2.next_track() {
+        after3.push(p.file_name().unwrap().to_string_lossy().to_string());
+    }
+    assert_eq!(after3, vec!["10.flac"]);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn skips_appledouble_dotfiles_recycle_bin_system_volume_and_windows_hidden_entries() {
+    let root = make_temp_tree("skip_hidden");
+    fs::write(root.join("._01.flac"), b"appledouble").unwrap();
+    fs::write(root.join(".hidden.flac"), b"dotfile").unwrap();
+    fs::write(root.join("01.flac"), b"").unwrap();
+    fs::write(root.join("02.flac"), b"").unwrap();
+
+    fs::create_dir_all(root.join(".Trash")).unwrap();
+    fs::write(root.join(".Trash").join("trashed.flac"), b"").unwrap();
+
+    fs::create_dir_all(root.join("$RECYCLE.BIN")).unwrap();
+    fs::write(root.join("$RECYCLE.BIN").join("deleted.flac"), b"").unwrap();
+
+    fs::create_dir_all(root.join("System Volume Information")).unwrap();
+    fs::write(root.join("System Volume Information").join("sys.flac"), b"").unwrap();
+
+    #[cfg(windows)]
+    {
+        let hidden_file = root.join("hidden_attr.flac");
+        let hidden_dir = root.join("HiddenFolder");
+        fs::write(&hidden_file, b"").unwrap();
+        fs::create_dir_all(&hidden_dir).unwrap();
+        fs::write(hidden_dir.join("secret.flac"), b"").unwrap();
+
+        let s1 = std::process::Command::new("attrib")
+            .args(["+H", &hidden_file.to_string_lossy()])
+            .status()
+            .expect("attrib +H file failed");
+        assert!(s1.success());
+        let s2 = std::process::Command::new("attrib")
+            .args(["+H", &hidden_dir.to_string_lossy()])
+            .status()
+            .expect("attrib +H dir failed");
+        assert!(s2.success());
+    }
+
+    let frame = read_dir_frame(&root).unwrap();
+    assert!(frame.subdirs.is_empty(), "expected no subdirs, got {:?}", frame.subdirs);
+    let flac_names: Vec<_> = frame
+        .flacs
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(flac_names, vec!["01.flac", "02.flac"]);
+
+    let discovered: Vec<_> = discover_flac_files(&root)
+        .unwrap()
+        .into_iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(discovered, vec!["01.flac", "02.flac"]);
+
+    let mut cur = SequentialFlacCursor::new(root.clone()).unwrap();
+    let mut seq = Vec::new();
+    while let Some(p) = cur.next_track() {
+        seq.push(p.file_name().unwrap().to_string_lossy().to_string());
+    }
+    assert_eq!(seq, vec!["01.flac", "02.flac"]);
+
+    for seed in 0..30_u64 {
+        let picked = pick_random_flac_walk_with_seed(&root, seed).unwrap();
+        let name = picked.file_name().unwrap().to_string_lossy().to_string();
+        assert!(name == "01.flac" || name == "02.flac", "unexpected hidden pick: {name}");
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[cfg(windows)]
+#[test]
+fn junction_cycles_and_duplicate_junctions_never_loop_or_duplicate_tracks() {
+    let root = make_temp_tree("junc_cycles");
+    let album = root.join("Album");
+    let shared_target = make_temp_tree("junc_shared_target");
+    fs::create_dir_all(&album).unwrap();
+    fs::write(album.join("only_once.flac"), b"").unwrap();
+    fs::write(shared_target.join("shared_once.flac"), b"").unwrap();
+
+    let self_loop = album.join("SelfLoop");
+    let root_loop = album.join("RootLoop");
+    let dup_a = root.join("DupA");
+    let dup_b = root.join("DupB");
+
+    for (link, target) in [
+        (&self_loop, &album),
+        (&root_loop, &root),
+        (&dup_a, &shared_target),
+        (&dup_b, &shared_target),
+    ] {
+        let st = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J", &link.to_string_lossy(), &target.to_string_lossy()])
+            .status()
+            .expect("mklink /J failed");
+        assert!(st.success(), "mklink failed for {}", link.display());
+    }
+
+    // 1. discover_flac_files terminates quickly with zero duplicates.
+    let found = discover_flac_files(&root).unwrap();
+    assert_eq!(found.len(), 2, "expected 2 unique tracks, got {found:?}");
+
+    // 2. SequentialFlacCursor terminates cleanly after 2 tracks (never replays 32x or 2^32x).
+    let mut cur = SequentialFlacCursor::new(root.clone()).unwrap();
+    let mut seq = Vec::new();
+    while let Some(p) = cur.next_track() {
+        seq.push(p);
+        assert!(seq.len() <= 10, "sequential cursor looped infinitely: {seq:?}");
+    }
+    assert_eq!(seq.len(), 2, "expected 2 sequential tracks, got {seq:?}");
+
+    // 3. Random walker terminates promptly across many seeds.
+    for seed in 0..30_u64 {
+        let picked = pick_random_flac_walk_with_seed(&root, seed).unwrap();
+        assert!(
+            picked.ends_with("only_once.flac") || picked.ends_with("shared_once.flac"),
+            "unexpected pick: {}",
+            picked.display()
+        );
+    }
+
+    // 4. Empty directory with TWO self-loops must NOT blow up exponentially (2^32).
+    let empty_cycle = make_temp_tree("junc_empty_cycle");
+    let loop1 = empty_cycle.join("Loop1");
+    let loop2 = empty_cycle.join("Loop2");
+    for link in [&loop1, &loop2] {
+        let st = std::process::Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &link.to_string_lossy(),
+                &empty_cycle.to_string_lossy(),
+            ])
+            .status()
+            .expect("mklink /J failed");
+        assert!(st.success());
+    }
+    assert!(pick_random_flac_walk_with_seed(&empty_cycle, 1).is_err());
+
+    let _ = fs::remove_dir(&self_loop);
+    let _ = fs::remove_dir(&root_loop);
+    let _ = fs::remove_dir(&dup_a);
+    let _ = fs::remove_dir(&dup_b);
+    let _ = fs::remove_dir(&loop1);
+    let _ = fs::remove_dir(&loop2);
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&shared_target);
+    let _ = fs::remove_dir_all(&empty_cycle);
+}
+
+#[test]
+fn walk_picker_weights_large_folders_and_here_slot_fairly() {
+    let root = make_temp_tree("walk_weighted");
+    let big = root.join("BigCollection");
+    let single = root.join("SingleFolder");
+    fs::create_dir_all(&big).unwrap();
+    fs::create_dir_all(&single).unwrap();
+
+    fs::write(root.join("loose.flac"), b"").unwrap();
+    fs::write(single.join("lone.flac"), b"").unwrap();
+    for i in 1..=20 {
+        fs::write(big.join(format!("track_{i:02}.flac")), b"").unwrap();
+    }
+
+    let mut big_hits = 0usize;
+    let mut loose_hits = 0usize;
+    let mut single_hits = 0usize;
+    for seed in 0..200_u64 {
+        let picked = pick_random_flac_walk_with_seed(&root, seed).unwrap();
+        if picked.starts_with(&big) {
+            big_hits += 1;
+        } else if picked.starts_with(&single) {
+            single_hits += 1;
+        } else {
+            loose_hits += 1;
+        }
+    }
+
+    // BigCollection has weight 20 vs SingleFolder=1 and Here=1 (~90.9% expected).
+    assert!(
+        big_hits >= 140,
+        "expected BigCollection to dominate weighted walk (got big={big_hits}, single={single_hits}, loose={loose_hits})"
+    );
+    assert!(
+        loose_hits > 0 && single_hits > 0,
+        "expected small branches to remain reachable (big={big_hits}, single={single_hits}, loose={loose_hits})"
+    );
 
     let _ = fs::remove_dir_all(&root);
 }

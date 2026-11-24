@@ -573,3 +573,50 @@ fn round_trips_unpaired_utf16_surrogate_paths_losslessly_on_windows() {
     server.shutdown();
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn browser_listing_uses_natural_order_and_skips_hidden_and_appledouble_entries() {
+    let root = make_temp_music_dir("browser_natural_hidden");
+    fs::create_dir_all(root.join("Zappa")).unwrap();
+    fs::create_dir_all(root.join("abba")).unwrap();
+    fs::create_dir_all(root.join("Disc 10")).unwrap();
+    fs::create_dir_all(root.join("Disc 2")).unwrap();
+    fs::create_dir_all(root.join(".Trash")).unwrap();
+    fs::create_dir_all(root.join("$RECYCLE.BIN")).unwrap();
+    fs::create_dir_all(root.join("System Volume Information")).unwrap();
+
+    fs::write(root.join("10.flac"), b"").unwrap();
+    fs::write(root.join("1.flac"), b"").unwrap();
+    fs::write(root.join("2.flac"), b"").unwrap();
+    fs::write(root.join("._01.flac"), b"").unwrap();
+    fs::write(root.join(".hidden.flac"), b"").unwrap();
+
+    #[cfg(windows)]
+    {
+        let hidden = root.join("win_hidden.flac");
+        fs::write(&hidden, b"").unwrap();
+        let st = std::process::Command::new("attrib")
+            .args(["+H", &hidden.to_string_lossy()])
+            .status()
+            .expect("attrib +H failed");
+        assert!(st.success());
+    }
+
+    let listing = ap_control::browser::list_folder_entries_in_root(&root, &root);
+    assert!(listing.error.is_none());
+    let dir_names: Vec<_> = listing
+        .subdirs
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+    let flac_names: Vec<_> = listing
+        .flac_files
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+
+    assert_eq!(dir_names, vec!["abba", "Disc 2", "Disc 10", "Zappa"]);
+    assert_eq!(flac_names, vec!["1.flac", "2.flac", "10.flac"]);
+
+    let _ = fs::remove_dir_all(&root);
+}

@@ -327,9 +327,7 @@ fn check_reparse_target_is_local(target: &Path) -> Result<(), String> {
 
 /// Check case-insensitively whether `path` has a `.flac` extension.
 pub fn is_flac_extension(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("flac"))
+    ap_source::library::is_flac_path(path)
 }
 
 /// Validate a file path before submitting `PlayFile` or calling `FlacBlockReader::open`.

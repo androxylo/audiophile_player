@@ -7,4 +7,4 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# Minimal std::net or lightweight localhost HTTP server finalized in INV-08.
+ap-source.workspace = true

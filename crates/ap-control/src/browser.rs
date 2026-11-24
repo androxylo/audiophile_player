@@ -2,10 +2,11 @@
 //! encoding helpers.
 
 use std::ffi::OsString;
-use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::security::{is_flac_extension, normalize_allowed_root, normalized_paths_equal};
+use ap_source::library::read_dir_frame;
+
+use crate::security::{normalize_allowed_root, normalized_paths_equal};
 
 /// Prefix for lossless UTF-16 code-unit hex encoding of Windows paths containing unpaired
 /// surrogates (or paths colliding with this prefix).
@@ -45,40 +46,19 @@ fn list_folder_entries_inner(dir: &Path, allowed_root: Option<&Path>) -> FolderL
     } else {
         dir.parent().map(Path::to_path_buf)
     };
-    let mut subdirs = Vec::new();
-    let mut flac_files = Vec::new();
-
-    match fs::read_dir(dir) {
-        Ok(entries) => {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                // Use fs::metadata(&p) rather than entry.file_type() so Windows NTFS volume
-                // mount points, directory junctions, and symlinks (e.g. mounted music drives)
-                // are properly recognized as directories/files.
-                let Ok(meta) = fs::metadata(&p) else {
-                    continue;
-                };
-                if meta.is_dir() {
-                    subdirs.push(p);
-                } else if meta.is_file() && is_flac_extension(&p) {
-                    flac_files.push(p);
-                }
-            }
-            subdirs.sort();
-            flac_files.sort();
-            FolderListing {
-                current_dir: dir.to_path_buf(),
-                parent_dir,
-                subdirs,
-                flac_files,
-                error: None,
-            }
-        }
+    match read_dir_frame(dir) {
+        Ok(frame) => FolderListing {
+            current_dir: dir.to_path_buf(),
+            parent_dir,
+            subdirs: frame.subdirs,
+            flac_files: frame.flacs,
+            error: None,
+        },
         Err(err) => FolderListing {
             current_dir: dir.to_path_buf(),
             parent_dir,
-            subdirs,
-            flac_files,
+            subdirs: Vec::new(),
+            flac_files: Vec::new(),
             error: Some(format!("Cannot read folder '{}': {err}", dir.display())),
         },
     }

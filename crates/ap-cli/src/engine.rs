@@ -25,7 +25,9 @@ use ap_dsp::selector::UpsamplerPolicy;
 use ap_output_win::hygiene::OptimizationLevel;
 use ap_output_win::sink::OutputError;
 use ap_output_win::wdm_ks::WdmKsSink;
-use ap_source::flac::{AudioBlockSource, FlacBlockReader};
+use ap_source::flac::{
+    AudioBlockSource, FlacBlockReader, UNSUPPORTED_CHANNEL_LAYOUT_PREFIX,
+};
 use ap_source::library::{SequentialFlacCursor, default_user_music_dir, pick_random_flac_walk};
 
 use crate::prefetch::{
@@ -581,6 +583,8 @@ enum TrackStreamOutcome {
     Played,
     /// Epoch changed or buffer closed mid-track — caller should simply re-check control state.
     Aborted,
+    /// Valid FLAC whose channel layout is unsupported (e.g. 5.1 surround); distinct from corruption.
+    Unsupported(String),
     /// Track failed to open, failed DSP setup, panicked, or yielded 0 PCM frames.
     Failed(String),
 }
@@ -594,11 +598,14 @@ fn producer_loop(
     buf: Arc<BoundedBlockStreamBuffer>,
     shared: Arc<SharedControl>,
 ) {
+    const MAX_CONSECUTIVE_UNSUPPORTED: u32 = 50;
+
     let mut seq_cursor: Option<(u64, SequentialFlacCursor)> = None;
     let mut single_consumed_epoch: Option<u64> = None;
     let mut last_random: Option<PathBuf> = None;
     let mut last_seen_epoch: Option<u64> = None;
     let mut consecutive_errors: u32 = 0;
+    let mut consecutive_unsupported: u32 = 0;
 
     while let Some((epoch, directive)) = ctrl.wait_active() {
         // Guard against the brief window where `buf.reset_and_flush()` bumped the buffer epoch
@@ -612,6 +619,7 @@ fn producer_loop(
         }
         if last_seen_epoch != Some(epoch) {
             consecutive_errors = 0;
+            consecutive_unsupported = 0;
             last_seen_epoch = Some(epoch);
         }
 
@@ -716,8 +724,29 @@ fn producer_loop(
         match outcome {
             TrackStreamOutcome::Played => {
                 consecutive_errors = 0;
+                consecutive_unsupported = 0;
             }
             TrackStreamOutcome::Aborted => {}
+            TrackStreamOutcome::Unsupported(msg) => {
+                eprintln!("  [skip] {msg}");
+                shared.record_action(msg.clone());
+                if is_single_file {
+                    let _ = buf.push_for_epoch(epoch, StreamEvent::FatalError(msg));
+                    ctrl.pause_if_epoch(epoch);
+                    continue;
+                }
+                consecutive_unsupported += 1;
+                if consecutive_unsupported >= MAX_CONSECUTIVE_UNSUPPORTED {
+                    let _ = buf.push_for_epoch(
+                        epoch,
+                        StreamEvent::FatalError(format!(
+                            "Paused after {MAX_CONSECUTIVE_UNSUPPORTED} consecutive unsupported FLACs — DAC released"
+                        )),
+                    );
+                    ctrl.pause_if_epoch(epoch);
+                    consecutive_unsupported = 0;
+                }
+            }
             TrackStreamOutcome::Failed(msg) => {
                 eprintln!("  [skip] {msg}");
                 shared.record_action(msg.clone());
@@ -767,6 +796,12 @@ fn stream_single_track(
     let mut source = match FlacBlockReader::open(chosen) {
         Ok(s) => s,
         Err(err) => {
+            if err.starts_with(UNSUPPORTED_CHANNEL_LAYOUT_PREFIX) {
+                return TrackStreamOutcome::Unsupported(format!(
+                    "Skipped unsupported FLAC '{}': {err}",
+                    chosen.display()
+                ));
+            }
             return TrackStreamOutcome::Failed(format!(
                 "Skipped unreadable FLAC '{}': {err}",
                 chosen.display()

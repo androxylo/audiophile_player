@@ -16,6 +16,9 @@ dependencies = [
 [[package]]
 name = "ap-control"
 version = "0.1.0"
+dependencies = [
+ "ap-source",
+]
 
 [[package]]
 name = "ap-core"

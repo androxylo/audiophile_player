@@ -27,10 +27,88 @@ pub trait AudioBlockSource: Send {
     fn read_next_block(&mut self, max_frames: usize) -> Result<Option<StereoF64Buffer>, String>;
 }
 
+/// Upper bound on upfront `Vec::with_capacity` frame pre-allocation from untrusted
+/// `STREAMINFO.total_samples` metadata (`1 << 24` = 16,777,216 frames). Legitimate longer
+/// tracks grow incrementally while corrupt headers claiming `2^36 - 1` samples cannot trigger
+/// an OOM abort.
+pub const MAX_PREALLOC_FRAMES: usize = 1 << 24;
+
+/// Distinct error prefix returned for valid FLAC files whose channel layout is unsupported
+/// (e.g. 3+ channel surround), allowing callers to distinguish unsupported layouts from
+/// corrupted files.
+pub const UNSUPPORTED_CHANNEL_LAYOUT_PREFIX: &str = "unsupported channel layout:";
+
+/// Clamp an untrusted `STREAMINFO.total_samples` hint to [`MAX_PREALLOC_FRAMES`].
+pub fn capped_prealloc_frames(total_frames: Option<u64>) -> usize {
+    total_frames
+        .map(|n| n.min(MAX_PREALLOC_FRAMES as u64) as usize)
+        .unwrap_or(0)
+}
+
+struct ValidatedFlac {
+    reader: FlacSampleReader<BufReader<File>>,
+    source_channels: u8,
+    spec: StreamSpec,
+    peak_meta: TrackPeakMetadata,
+    total_frames: Option<u64>,
+    shift: u32,
+}
+
+fn open_validated(path: &Path) -> Result<ValidatedFlac, String> {
+    let file = File::open(path)
+        .map_err(|e| format!("failed to open FLAC '{}': {e}", path.display()))?;
+    let reader = FlacSampleReader::new(BufReader::new(file))
+        .map_err(|e| format!("failed to parse FLAC '{}': {e}", path.display()))?;
+
+    let source_channels = reader.channel_count();
+    let sample_rate_hz = reader.sample_rate();
+    let bits_per_sample = reader.bits_per_sample();
+
+    match source_channels {
+        1 | 2 => {}
+        _ => {
+            return Err(format!(
+                "{UNSUPPORTED_CHANNEL_LAYOUT_PREFIX} {source_channels} channels in '{}' (only mono and stereo FLAC are supported)",
+                path.display()
+            ));
+        }
+    }
+    if bits_per_sample == 0 || bits_per_sample > 32 {
+        return Err(format!(
+            "unsupported FLAC bit depth {bits_per_sample} in '{}'",
+            path.display()
+        ));
+    }
+
+    // Mono sources are duplicated into dual-mono stereo (L == R) so downstream stereo DSP
+    // and DAC stages always receive 2-channel frames.
+    let spec = StreamSpec {
+        sample_rate_hz,
+        bits_per_sample: bits_per_sample as u16,
+        channels: 2,
+    };
+    let peak_meta = parse_peak_metadata(reader.metadata().get::<VorbisComment>());
+    let total_frames = reader.total_samples();
+    let shift = 32 - bits_per_sample;
+
+    Ok(ValidatedFlac {
+        reader,
+        source_channels,
+        spec,
+        peak_meta,
+        total_frames,
+        shift,
+    })
+}
+
 /// Streaming RFC 9639 FLAC reader yielding bounded `StereoF64Buffer` chunks without
 /// ever loading an entire multi-gigabyte file into RAM.
+///
+/// Supports both mono (`1` channel, duplicated identically into stereo L/R) and stereo
+/// (`2` channels) FLAC files at 1..=32 bits per sample.
 pub struct FlacBlockReader {
     reader: FlacSampleReader<BufReader<File>>,
+    source_channels: usize,
     spec: StreamSpec,
     peak_meta: TrackPeakMetadata,
     total_frames: Option<u64>,
@@ -41,46 +119,22 @@ pub struct FlacBlockReader {
 
 impl FlacBlockReader {
     pub fn open(path: &Path) -> Result<Self, String> {
-        let file = File::open(path)
-            .map_err(|e| format!("failed to open FLAC '{}': {e}", path.display()))?;
-        let reader = FlacSampleReader::new(BufReader::new(file))
-            .map_err(|e| format!("failed to parse FLAC '{}': {e}", path.display()))?;
-
-        let channels = reader.channel_count();
-        let sample_rate_hz = reader.sample_rate();
-        let bits_per_sample = reader.bits_per_sample();
-
-        if channels != 2 {
-            return Err(format!(
-                "only stereo (2-channel) FLAC is supported, got {channels} channels in '{}'",
-                path.display()
-            ));
-        }
-        if bits_per_sample == 0 || bits_per_sample > 32 {
-            return Err(format!(
-                "unsupported FLAC bit depth {bits_per_sample} in '{}'",
-                path.display()
-            ));
-        }
-
-        let spec = StreamSpec {
-            sample_rate_hz,
-            bits_per_sample: bits_per_sample as u16,
-            channels: u16::from(channels),
-        };
-        let peak_meta = parse_peak_metadata(reader.metadata().get::<VorbisComment>());
-        let total_frames = reader.total_samples();
-        let shift = 32 - bits_per_sample;
-
+        let validated = open_validated(path)?;
         Ok(Self {
-            reader,
-            spec,
-            peak_meta,
-            total_frames,
-            shift,
+            reader: validated.reader,
+            source_channels: usize::from(validated.source_channels),
+            spec: validated.spec,
+            peak_meta: validated.peak_meta,
+            total_frames: validated.total_frames,
+            shift: validated.shift,
             scratch: Vec::new(),
             eof: false,
         })
+    }
+
+    /// Original channel count stored in the FLAC `STREAMINFO` header (`1` for mono, `2` for stereo).
+    pub fn source_channels(&self) -> u8 {
+        self.source_channels as u8
     }
 }
 
@@ -106,7 +160,8 @@ impl AudioBlockSource for FlacBlockReader {
             return Ok(None);
         }
 
-        let target_samples = max_frames.saturating_mul(2);
+        let ch = self.source_channels;
+        let target_samples = max_frames.saturating_mul(ch);
         if self.scratch.len() < target_samples {
             self.scratch.resize(target_samples, 0);
         }
@@ -124,7 +179,7 @@ impl AudioBlockSource for FlacBlockReader {
             filled += n;
         }
 
-        let frames = filled / 2;
+        let frames = filled / ch;
         if frames == 0 {
             return Ok(None);
         }
@@ -135,9 +190,17 @@ impl AudioBlockSource for FlacBlockReader {
         let mut right = Vec::with_capacity(frames);
         let shift = self.shift;
 
-        for pair in self.scratch[..frames * 2].chunks_exact(2) {
-            left.push((pair[0].wrapping_shl(shift) as f64) * inv_scale);
-            right.push((pair[1].wrapping_shl(shift) as f64) * inv_scale);
+        if ch == 1 {
+            for &sample in &self.scratch[..frames] {
+                let v = (sample.wrapping_shl(shift) as f64) * inv_scale;
+                left.push(v);
+                right.push(v);
+            }
+        } else {
+            for pair in self.scratch[..frames * 2].chunks_exact(2) {
+                left.push((pair[0].wrapping_shl(shift) as f64) * inv_scale);
+                right.push((pair[1].wrapping_shl(shift) as f64) * inv_scale);
+            }
         }
 
         Ok(Some(StereoF64Buffer {
@@ -204,65 +267,48 @@ fn parse_peak_metadata(vc: Option<&VorbisComment>) -> TrackPeakMetadata {
     }
 }
 
-/// Decode a local stereo FLAC file completely into RAM as bit-exact MSB-aligned `i32` frames.
+/// Decode a local mono or stereo FLAC file completely into RAM as bit-exact MSB-aligned stereo
+/// `i32` frames (mono sources are duplicated identically to L and R).
 pub fn decode_flac_full_memory_int32(path: &Path) -> Result<DecodedFlacInt32, String> {
-    let file = File::open(path)
-        .map_err(|e| format!("failed to open FLAC '{}': {e}", path.display()))?;
-    let mut reader = FlacSampleReader::new(BufReader::new(file))
-        .map_err(|e| format!("failed to parse FLAC '{}': {e}", path.display()))?;
-
-    let channels = reader.channel_count();
-    let sample_rate_hz = reader.sample_rate();
-    let bits_per_sample = reader.bits_per_sample();
-
-    if channels != 2 {
-        return Err(format!(
-            "only stereo (2-channel) FLAC is supported, got {channels} channels in '{}'",
-            path.display()
-        ));
-    }
-    if bits_per_sample == 0 || bits_per_sample > 32 {
-        return Err(format!(
-            "unsupported FLAC bit depth {bits_per_sample} in '{}'",
-            path.display()
-        ));
-    }
-
-    let spec = StreamSpec {
-        sample_rate_hz,
-        bits_per_sample: bits_per_sample as u16,
-        channels: u16::from(channels),
-    };
-    let peak_meta = parse_peak_metadata(reader.metadata().get::<VorbisComment>());
-    let shift = 32 - bits_per_sample;
-
-    let total_frames = reader.total_samples().unwrap_or(0) as usize;
-    let mut raw_interleaved = Vec::with_capacity(total_frames.saturating_mul(2));
-    reader
+    let mut validated = open_validated(path)?;
+    let ch = usize::from(validated.source_channels);
+    let prealloc_frames = capped_prealloc_frames(validated.total_frames);
+    let mut raw_interleaved = Vec::with_capacity(prealloc_frames.saturating_mul(ch));
+    validated
+        .reader
         .read_to_end(&mut raw_interleaved)
         .map_err(|e| format!("FLAC decode error in '{}': {e}", path.display()))?;
 
-    let mut frames = Vec::with_capacity(raw_interleaved.len() / 2);
-    for pair in raw_interleaved.chunks_exact(2) {
-        frames.push([pair[0].wrapping_shl(shift), pair[1].wrapping_shl(shift)]);
+    let shift = validated.shift;
+    let mut frames = Vec::with_capacity(raw_interleaved.len() / ch);
+    if ch == 1 {
+        for &s in &raw_interleaved {
+            let shifted = s.wrapping_shl(shift);
+            frames.push([shifted, shifted]);
+        }
+    } else {
+        for pair in raw_interleaved.chunks_exact(2) {
+            frames.push([pair[0].wrapping_shl(shift), pair[1].wrapping_shl(shift)]);
+        }
     }
 
     Ok(DecodedFlacInt32 {
-        spec,
-        peak_meta,
+        spec: validated.spec,
+        peak_meta: validated.peak_meta,
         pcm: InterleavedInt32Buffer {
-            sample_rate_hz,
+            sample_rate_hz: validated.spec.sample_rate_hz,
             frames,
         },
     })
 }
 
-/// Decode a local stereo FLAC file completely into RAM as pure IEEE 754 `f64` planar buffers.
+/// Decode a local mono or stereo FLAC file completely into RAM as pure IEEE 754 `f64` planar
+/// stereo buffers (mono sources are duplicated identically to L and R).
 pub fn decode_flac_full_memory(path: &Path) -> Result<DecodedFlacTrack, String> {
     let mut src = FlacBlockReader::open(path)?;
     let spec = src.spec();
     let peak_meta = src.peak_meta();
-    let cap = src.total_frames().unwrap_or(0) as usize;
+    let cap = capped_prealloc_frames(src.total_frames());
     let mut left = Vec::with_capacity(cap);
     let mut right = Vec::with_capacity(cap);
 
