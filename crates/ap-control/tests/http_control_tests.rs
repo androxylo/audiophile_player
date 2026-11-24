@@ -821,3 +821,63 @@ fn reparse_tag_detector_identifies_ntfs_junctions_and_rejects_cyclic_link_chains
     let _ = fs::remove_dir_all(&target);
     let _ = fs::remove_dir_all(&cyc_dir);
 }
+
+#[test]
+fn pause_and_next_never_touch_filesystem_and_fs_ops_enforce_bounded_timeout() {
+    use ap_control::server::run_fs_op_bounded;
+    use std::time::{Duration, Instant};
+
+    // 1. Review #3 Finding #4: even with a blackhole UNC music root (`\\192.0.2.1\Music`, RFC 5737
+    // TEST-NET-1 where any `fs::symlink_metadata` would hang for tens of seconds), POST /action/pause
+    // and POST /action/next MUST submit commands and return 303 immediately (< 500 ms)!
+    let blackhole_root = PathBuf::from(r"\\192.0.2.1\Music");
+    let shared = SharedControl::new(blackhole_root, "Test DAC");
+    let mut server = ControlServer::start(Arc::clone(&shared), None).unwrap();
+    let port = server.addr().port();
+
+    for (endpoint, expected_cmd) in [
+        ("/action/pause", ControlCommand::Pause),
+        ("/action/next", ControlCommand::Next),
+    ] {
+        let body = format!(
+            "dir={}",
+            ap_control::browser::url_encode(r"\\192.0.2.1\Music\StalledArtist\Album")
+        );
+        let t0 = Instant::now();
+        let resp = http_request(
+            server.addr(),
+            &format!(
+                "POST {endpoint} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://127.0.0.1:{port}\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            ),
+        );
+        let elapsed = t0.elapsed();
+        assert!(
+            resp.starts_with("HTTP/1.1 303 See Other"),
+            "expected 303 for {endpoint}, got {resp:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "{endpoint} must NOT block on filesystem I/O (took {elapsed:?})"
+        );
+        assert_eq!(shared.take_pending_command(), Some(expected_cmd));
+    }
+
+    server.shutdown();
+
+    // 2. Bounded FS helper returns Err(()) promptly when a storage call stalls past its deadline.
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let t1 = Instant::now();
+    let timed_out = run_fs_op_bounded(Duration::from_millis(40), move || {
+        let _ = rx.recv_timeout(Duration::from_secs(5));
+        42_u32
+    });
+    let elapsed_fs = t1.elapsed();
+    let _ = tx.send(());
+    assert!(timed_out.is_err(), "stalled FS op must time out cleanly");
+    assert!(
+        elapsed_fs < Duration::from_millis(500),
+        "bounded FS op took too long to time out: {elapsed_fs:?}"
+    );
+}

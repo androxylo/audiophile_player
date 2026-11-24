@@ -22,6 +22,7 @@
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
@@ -33,8 +34,9 @@ use crate::browser::{
 };
 use crate::html::{render_control_page, render_status_json};
 use crate::security::{
-    is_allowed_fetch_dest, is_allowed_fetch_site, is_valid_localhost_host,
-    is_valid_localhost_origin, validate_path_within_root, validate_playable_flac_path,
+    extract_unc_share, is_allowed_fetch_dest, is_allowed_fetch_site, is_valid_localhost_host,
+    is_valid_localhost_origin, lexically_within_root, normalize_allowed_root,
+    validate_path_syntax_for_root, validate_path_within_root, validate_playable_flac_path,
 };
 use crate::state::{ControlCommand, SharedControl};
 
@@ -48,6 +50,10 @@ pub const MAX_HEADER_BYTES: usize = 8 * 1024;
 pub const MAX_BODY_BYTES: usize = 24 * 1024;
 /// Overall wall-clock deadline for reading a single HTTP request (prevents trickle slowloris).
 pub const REQUEST_READ_DEADLINE: Duration = Duration::from_secs(5);
+/// Maximum time a worker will wait on a blocking filesystem browse/validation operation
+/// (strictly below `CONNECTION_TOTAL_DEADLINE` so a stalled NAS returns `504 Gateway Timeout`
+/// cleanly instead of pinning worker slots or dropping an empty reply).
+pub const FS_OP_DEADLINE: Duration = Duration::from_secs(4);
 /// Overall wall-clock deadline for an entire HTTP connection (read + browse + chunked write)
 /// so slow-reading clients cannot pin worker slots indefinitely.
 pub const CONNECTION_TOTAL_DEADLINE: Duration = Duration::from_secs(10);
@@ -55,6 +61,44 @@ pub const CONNECTION_TOTAL_DEADLINE: Duration = Duration::from_secs(10);
 const RESPONSE_WRITE_CHUNK_BYTES: usize = 16 * 1024;
 /// Maximum concurrent connection worker threads.
 pub const MAX_CONCURRENT_WORKERS: usize = 16;
+
+static ACTIVE_FS_HELPERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Run a potentially blocking filesystem validation or directory-listing closure with a strict
+/// wall-clock timeout and a bounded concurrency cap so a stalled NAS/USB drive can never pin
+/// HTTP worker slots or prevent `POST /action/pause` from releasing the DAC.
+pub fn run_fs_op_bounded<T, F>(timeout: Duration, op: F) -> Result<T, ()>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let prev = ACTIVE_FS_HELPERS.fetch_add(1, Ordering::AcqRel);
+    if prev >= MAX_CONCURRENT_WORKERS {
+        ACTIVE_FS_HELPERS.fetch_sub(1, Ordering::AcqRel);
+        return Err(());
+    }
+
+    struct HelperGuard;
+    impl Drop for HelperGuard {
+        fn drop(&mut self) {
+            ACTIVE_FS_HELPERS.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    let (tx, rx) = mpsc::sync_channel(1);
+    let spawned = thread::Builder::new()
+        .name("ap-http-fs".to_string())
+        .spawn(move || {
+            let _guard = HelperGuard;
+            let _ = tx.send(op());
+        });
+    if spawned.is_err() {
+        ACTIVE_FS_HELPERS.fetch_sub(1, Ordering::AcqRel);
+        return Err(());
+    }
+
+    rx.recv_timeout(timeout).map_err(|_| ())
+}
 
 /// Path to the runtime URL discovery file (`%LOCALAPPDATA%\audiophile-player\server.url` on
 /// Windows) read by launcher scripts so they find the active port even beyond 8105 without
@@ -461,26 +505,45 @@ fn handle_connection(
             }
 
             let snap = shared.snapshot();
-            let browse_dir = match raw_dir_param {
-                Some(raw) => match decode_and_validate_dir(&raw, &allowed_root) {
-                    Ok(valid) => valid,
-                    Err(reason) => {
-                        write_response(
-                            stream,
-                            "403 Forbidden",
-                            "text/plain; charset=utf-8",
-                            format!("Forbidden path: {reason}").as_bytes(),
-                            None,
-                            conn_deadline,
-                            stop,
-                        );
-                        return;
-                    }
-                },
-                None => snap.active_folder.clone(),
+            let root_for_fs = allowed_root.clone();
+            let fallback_dir = snap.active_folder.clone();
+            let fs_res = run_fs_op_bounded(FS_OP_DEADLINE, move || {
+                let browse_dir = match raw_dir_param {
+                    Some(raw) => match decode_and_validate_dir(&raw, &root_for_fs) {
+                        Ok(valid) => valid,
+                        Err(reason) => return Err(reason),
+                    },
+                    None => fallback_dir,
+                };
+                Ok(list_folder_entries_in_root(&browse_dir, &root_for_fs))
+            });
+            let listing = match fs_res {
+                Ok(Ok(l)) => l,
+                Ok(Err(reason)) => {
+                    write_response(
+                        stream,
+                        "403 Forbidden",
+                        "text/plain; charset=utf-8",
+                        format!("Forbidden path: {reason}").as_bytes(),
+                        None,
+                        conn_deadline,
+                        stop,
+                    );
+                    return;
+                }
+                Err(()) => {
+                    write_response(
+                        stream,
+                        "504 Gateway Timeout",
+                        "text/plain; charset=utf-8",
+                        b"Storage timed out while reading folder; playback controls (Pause / Next) remain available.",
+                        None,
+                        conn_deadline,
+                        stop,
+                    );
+                    return;
+                }
             };
-
-            let listing = list_folder_entries_in_root(&browse_dir, &allowed_root);
             let html = render_control_page(&snap, &listing);
             write_response(
                 stream,
@@ -520,14 +583,26 @@ fn handle_connection(
             );
         }
         ("POST", "/action/play-random") => {
-            let dir = match extract_validated_dir(&req.body, shared, &allowed_root) {
-                Ok(d) => d,
-                Err(reason) => {
+            let dir = match extract_validated_dir_bounded(&req.body, shared, &allowed_root) {
+                Ok(Ok(d)) => d,
+                Ok(Err(reason)) => {
                     write_response(
                         stream,
                         "403 Forbidden",
                         "text/plain; charset=utf-8",
                         format!("Forbidden folder: {reason}").as_bytes(),
+                        None,
+                        conn_deadline,
+                        stop,
+                    );
+                    return;
+                }
+                Err(()) => {
+                    write_response(
+                        stream,
+                        "504 Gateway Timeout",
+                        "text/plain; charset=utf-8",
+                        b"Storage timed out validating folder path.",
                         None,
                         conn_deadline,
                         stop,
@@ -539,9 +614,9 @@ fn handle_connection(
             redirect_to_dir(stream, &dir, conn_deadline, stop);
         }
         ("POST", "/action/play-sequential") => {
-            let dir = match extract_validated_dir(&req.body, shared, &allowed_root) {
-                Ok(d) => d,
-                Err(reason) => {
+            let dir = match extract_validated_dir_bounded(&req.body, shared, &allowed_root) {
+                Ok(Ok(d)) => d,
+                Ok(Err(reason)) => {
                     write_response(
                         stream,
                         "403 Forbidden",
@@ -553,19 +628,43 @@ fn handle_connection(
                     );
                     return;
                 }
+                Err(()) => {
+                    write_response(
+                        stream,
+                        "504 Gateway Timeout",
+                        "text/plain; charset=utf-8",
+                        b"Storage timed out validating folder path.",
+                        None,
+                        conn_deadline,
+                        stop,
+                    );
+                    return;
+                }
             };
             shared.submit_command(ControlCommand::PlaySequential(dir.clone()));
             redirect_to_dir(stream, &dir, conn_deadline, stop);
         }
         ("POST", "/action/play-file") => {
-            let dir = match extract_validated_dir(&req.body, shared, &allowed_root) {
-                Ok(d) => d,
-                Err(reason) => {
+            let dir = match extract_validated_dir_bounded(&req.body, shared, &allowed_root) {
+                Ok(Ok(d)) => d,
+                Ok(Err(reason)) => {
                     write_response(
                         stream,
                         "403 Forbidden",
                         "text/plain; charset=utf-8",
                         format!("Forbidden folder: {reason}").as_bytes(),
+                        None,
+                        conn_deadline,
+                        stop,
+                    );
+                    return;
+                }
+                Err(()) => {
+                    write_response(
+                        stream,
+                        "504 Gateway Timeout",
+                        "text/plain; charset=utf-8",
+                        b"Storage timed out validating folder path.",
                         None,
                         conn_deadline,
                         stop,
@@ -602,9 +701,12 @@ fn handle_connection(
                     return;
                 }
             };
-            let valid_file = match validate_playable_flac_path(&decoded, Some(&allowed_root)) {
-                Ok(p) => p,
-                Err(reason) => {
+            let root_for_fs = allowed_root.clone();
+            let valid_file = match run_fs_op_bounded(FS_OP_DEADLINE, move || {
+                validate_playable_flac_path(&decoded, Some(&root_for_fs))
+            }) {
+                Ok(Ok(p)) => p,
+                Ok(Err(reason)) => {
                     write_response(
                         stream,
                         "403 Forbidden",
@@ -616,24 +718,34 @@ fn handle_connection(
                     );
                     return;
                 }
+                Err(()) => {
+                    write_response(
+                        stream,
+                        "504 Gateway Timeout",
+                        "text/plain; charset=utf-8",
+                        b"Storage timed out validating file path.",
+                        None,
+                        conn_deadline,
+                        stop,
+                    );
+                    return;
+                }
             };
             shared.submit_command(ControlCommand::PlayFile(valid_file));
             redirect_to_dir(stream, &dir, conn_deadline, stop);
         }
         ("POST", "/action/next") => {
-            // Next does not act on a user-supplied filesystem path; fall back cleanly to
-            // active_folder if the hidden redirect `dir` token is missing or stale.
-            let dir = extract_validated_dir(&req.body, shared, &allowed_root)
-                .unwrap_or_else(|_| shared.snapshot().active_folder);
+            // Review #3 Finding #4: submit Next IMMEDIATELY with ZERO blocking filesystem I/O
+            // so a stalled NAS/USB drive can never delay or drop track skipping.
             shared.submit_command(ControlCommand::Next);
+            let dir = extract_syntax_only_dir(&req.body, shared, &allowed_root);
             redirect_to_dir(stream, &dir, conn_deadline, stop);
         }
         ("POST", "/action/pause") => {
-            // Pause MUST always succeed to release the exclusive DAC pin, even if the hidden
-            // redirect `dir` token is missing or stale.
-            let dir = extract_validated_dir(&req.body, shared, &allowed_root)
-                .unwrap_or_else(|_| shared.snapshot().active_folder);
+            // Review #3 Finding #4: submit Pause IMMEDIATELY with ZERO blocking filesystem I/O
+            // so releasing the exclusive DAC pin (for Audirvana / etc.) never blocks on a stalled NAS.
             shared.submit_command(ControlCommand::Pause);
+            let dir = extract_syntax_only_dir(&req.body, shared, &allowed_root);
             redirect_to_dir(stream, &dir, conn_deadline, stop);
         }
         _ => {
@@ -655,14 +767,39 @@ fn decode_and_validate_dir(raw: &str, allowed_root: &Path) -> Result<PathBuf, St
     validate_path_within_root(&decoded, allowed_root)
 }
 
-fn extract_validated_dir(
+fn extract_validated_dir_bounded(
     body: &str,
     shared: &SharedControl,
     allowed_root: &Path,
-) -> Result<PathBuf, String> {
+) -> Result<Result<PathBuf, String>, ()> {
     match parse_form_param(body, "dir").filter(|s| !s.trim().is_empty()) {
-        Some(raw) => decode_and_validate_dir(&raw, allowed_root),
-        None => Ok(shared.snapshot().active_folder),
+        Some(raw) => {
+            let root = allowed_root.to_path_buf();
+            run_fs_op_bounded(FS_OP_DEADLINE, move || decode_and_validate_dir(&raw, &root))
+        }
+        None => Ok(Ok(shared.snapshot().active_folder)),
+    }
+}
+
+/// Pure-memory redirect folder extraction performing **zero** filesystem syscalls.
+/// Used by `POST /action/pause` and `POST /action/next` after command submission so a stalled NAS
+/// never blocks the redirect response. Any invalid/out-of-root `dir` falls back cleanly to
+/// `active_folder`, and the subsequent `GET /?dir=...` still performs full filesystem validation.
+fn extract_syntax_only_dir(body: &str, shared: &SharedControl, allowed_root: &Path) -> PathBuf {
+    let Some(raw) = parse_form_param(body, "dir").filter(|s| !s.trim().is_empty()) else {
+        return shared.snapshot().active_folder;
+    };
+    let Ok(decoded) = decode_path_token(&raw) else {
+        return shared.snapshot().active_folder;
+    };
+    let norm_root = normalize_allowed_root(allowed_root);
+    let allowed_unc = extract_unc_share(&norm_root);
+    let share_ref = allowed_unc
+        .as_ref()
+        .map(|(s, sh)| (s.as_str(), sh.as_str()));
+    match validate_path_syntax_for_root(&decoded, share_ref) {
+        Ok(norm) if lexically_within_root(&norm, &norm_root) => norm,
+        _ => shared.snapshot().active_folder,
     }
 }
 
