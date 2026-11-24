@@ -100,16 +100,17 @@ fn wavert_frame_pump_writes_exact_int32_bytes_and_zero_pads_tail() {
 
 #[test]
 fn wavert_frame_pump_encodes_int24_packed_and_int16_from_msb_aligned_int32() {
-    // MSB-aligned int32: top 24 bits = 0x123456, top 16 bits = 0x1234
-    let frames = vec![[0x1234_5600_i32, -0x0001_0000_i32]];
-
-    let mut p24 = WaveRtFramePump::new(&frames, DacWireFormat::Int24Packed);
+    // Exact MSB-aligned 24-bit int32 (low byte == 0) passes bit-identically to Int24Packed.
+    let frames24 = vec![[0x1234_5600_i32, -0x0001_0000_i32]];
+    let mut p24 = WaveRtFramePump::new(&frames24, DacWireFormat::Int24Packed);
     let mut out24 = vec![0u8; 6];
     assert_eq!(p24.fill_slice(&mut out24), 1);
     // 0x123456 in little-endian 3 bytes: [0x56, 0x34, 0x12]
     assert_eq!(&out24[0..3], &[0x56, 0x34, 0x12]);
 
-    let mut p16 = WaveRtFramePump::new(&frames, DacWireFormat::Int16);
+    // Exact MSB-aligned 16-bit int32 (low 16 bits == 0) passes bit-identically to Int16.
+    let frames16 = vec![[0x1234_0000_i32, -0x0001_0000_i32]];
+    let mut p16 = WaveRtFramePump::new(&frames16, DacWireFormat::Int16);
     let mut out16 = vec![0u8; 4];
     assert_eq!(p16.fill_slice(&mut out16), 1);
     assert_eq!(&out16[0..2], &0x1234_i16.to_le_bytes());
@@ -239,24 +240,60 @@ fn ks_pin_connect_blob_padding_is_zeroed_and_channel_mask_handles_high_channels(
 }
 
 #[test]
-fn wavert_frame_pump_rounds_reduced_depths_and_zeros_int24_in_32_low_byte() {
+fn wavert_frame_pump_dithers_reduced_depths_and_zeros_int24_in_32_low_byte() {
     assert_eq!(DacWireFormat::Int32.bytes_per_frame(), 8);
     assert_eq!(DacWireFormat::Int24In32.bytes_per_frame(), 8);
     assert_eq!(DacWireFormat::Int24Packed.bytes_per_frame(), 6);
     assert_eq!(DacWireFormat::Int16.bytes_per_frame(), 4);
 
-    // Non-zero low bytes that round up cleanly without truncation bias.
-    let frames = vec![[0x1234_56C0_i32, 0x7FFF_FFFF_i32]];
+    // 1. Already-quantized 24-bit and 16-bit buffers must pass through BIT-IDENTICALLY (no double-dither).
+    let exact24 = vec![[0x1234_5600_i32, -0x0045_6700_i32]; 16];
+    let mut p_exact24 = WaveRtFramePump::new(&exact24, DacWireFormat::Int24In32);
+    let mut out_exact24 = vec![0xAA_u8; 16 * 8];
+    assert_eq!(p_exact24.fill_slice(&mut out_exact24), 16);
+    for i in 0..16 {
+        assert_eq!(
+            i32::from_le_bytes(out_exact24[i * 8..i * 8 + 4].try_into().unwrap()),
+            0x1234_5600
+        );
+        assert_eq!(
+            i32::from_le_bytes(out_exact24[i * 8 + 4..i * 8 + 8].try_into().unwrap()),
+            -0x0045_6700
+        );
+    }
 
-    let mut p24_32 = WaveRtFramePump::new(&frames, DacWireFormat::Int24In32);
-    let mut out24_32 = vec![0xAA_u8; 8];
-    assert_eq!(p24_32.fill_slice(&mut out24_32), 1);
-    let l = i32::from_le_bytes(out24_32[0..4].try_into().unwrap());
-    let r = i32::from_le_bytes(out24_32[4..8].try_into().unwrap());
-    assert_eq!(l & 0xFF, 0, "Int24In32 low byte must be zeroed");
-    assert_eq!(r & 0xFF, 0, "Int24In32 low byte must be zeroed");
-    assert_eq!(l, 0x1234_5700);
-    assert_eq!(r, 0x7FFF_FF00);
+    // 2. Sub-LSB 32-bit input into Int24In32: unbiased TPDF dither (mean ≈ 0x123456.75), low byte always 0, clean saturation.
+    let n = 8192_usize;
+    let frames24 = vec![[0x1234_56C0_i32, 0x7FFF_FFFF_i32]; n];
+    let mut p24_32 = WaveRtFramePump::new(&frames24, DacWireFormat::Int24In32);
+    let mut out24_32 = vec![0xAA_u8; n * 8];
+    assert_eq!(p24_32.fill_slice(&mut out24_32), n);
+    let mut sum_l = 0.0_f64;
+    let mut distinct_l = std::collections::HashSet::new();
+    for i in 0..n {
+        let l = i32::from_le_bytes(out24_32[i * 8..i * 8 + 4].try_into().unwrap());
+        let r = i32::from_le_bytes(out24_32[i * 8 + 4..i * 8 + 8].try_into().unwrap());
+        assert_eq!(l & 0xFF, 0, "Int24In32 low byte must be zeroed");
+        assert_eq!(r & 0xFF, 0, "Int24In32 low byte must be zeroed");
+        let l_q = l >> 8;
+        assert!(
+            (l_q - 0x123456).abs() <= 2,
+            "TPDF dither must stay within ±2 LSB of input, got {l_q:#x}"
+        );
+        // Full-scale positive never wraps negative.
+        assert!(r >= 0x7FFF_FD00 && r <= 0x7FFF_FF00);
+        distinct_l.insert(l_q);
+        sum_l += (l_q - 0x123456) as f64;
+    }
+    let mean_frac_l = sum_l / (n as f64);
+    assert!(
+        (mean_frac_l - 0.75).abs() < 0.05,
+        "TPDF 24-bit mean fractional LSB should be ~0.75, got {mean_frac_l:.4}"
+    );
+    assert!(
+        distinct_l.len() >= 2,
+        "TPDF dither must actively dither sub-LSB input across adjacent codes"
+    );
 
     // Fade-out on Int24In32 must also keep low byte zero on every frame.
     let fade_frames = vec![[0x4000_0000_i32, -0x4000_0000_i32]; 16];
@@ -268,13 +305,24 @@ fn wavert_frame_pump_rounds_reduced_depths_and_zeros_int24_in_32_low_byte() {
         assert_eq!(out_f[i * 8 + 4], 0, "Int24In32 faded R low byte must be 0");
     }
 
-    // Int16 rounding: 0x1234_C000 rounds up to 0x1235 instead of truncating to 0x1234.
-    let frames16 = vec![[0x1234_C000_i32, i32::MAX]];
+    // 3. Int16 TPDF requantization: mean of 0x1234_C000 is 0x1234.75, full-scale saturates cleanly.
+    let frames16 = vec![[0x1234_C000_i32, i32::MAX]; n];
     let mut p16 = WaveRtFramePump::new(&frames16, DacWireFormat::Int16);
-    let mut out16 = vec![0u8; 4];
-    assert_eq!(p16.fill_slice(&mut out16), 1);
-    assert_eq!(i16::from_le_bytes(out16[0..2].try_into().unwrap()), 0x1235);
-    assert_eq!(i16::from_le_bytes(out16[2..4].try_into().unwrap()), i16::MAX);
+    let mut out16 = vec![0u8; n * 4];
+    assert_eq!(p16.fill_slice(&mut out16), n);
+    let mut sum16 = 0.0_f64;
+    for i in 0..n {
+        let l16 = i16::from_le_bytes(out16[i * 4..i * 4 + 2].try_into().unwrap());
+        let r16 = i16::from_le_bytes(out16[i * 4 + 2..i * 4 + 4].try_into().unwrap());
+        assert!((i32::from(l16) - 0x1234).abs() <= 2);
+        assert!(r16 >= i16::MAX - 2);
+        sum16 += (i32::from(l16) - 0x1234) as f64;
+    }
+    let mean_frac_16 = sum16 / (n as f64);
+    assert!(
+        (mean_frac_16 - 0.75).abs() < 0.05,
+        "TPDF 16-bit mean fractional LSB should be ~0.75, got {mean_frac_16:.4}"
+    );
 }
 
 #[test]
@@ -512,6 +560,115 @@ fn wavert_loop_controller_recovers_from_nonblocking_underrun_without_truncating_
     assert_eq!(ctrl.frames_played(), 12, "all 8 + 4 audio frames must play cleanly");
 }
 
+#[test]
+fn wavert_loop_controller_handles_lagging_play_offset_and_boundary_jitter_without_false_coalescing()
+{
+    let layout = WaveRtRingLayout::new(64, 8).unwrap(); // 4 frames per half (half_len = 32)
+    let frames = vec![[42_i32, -42_i32]; 64];
+
+    // 1. Constant PlayOffset lag (10 bytes behind each 32-byte boundary, like usbaudio2.sys).
+    let mut pump = WaveRtFramePump::new(&frames, DacWireFormat::Int32);
+    let mut ring = vec![0u8; 64];
+    let mut ctrl = WaveRtLoopController::new(layout);
+    ctrl.prefill(&mut ring, &mut pump).unwrap();
+
+    let (h1, _) = ctrl
+        .on_notification(&mut ring, &mut pump, false, Some(22)) // 32 - 10
+        .unwrap();
+    let (h2, _) = ctrl
+        .on_notification(&mut ring, &mut pump, false, Some(54)) // 64 - 10
+        .unwrap();
+    let (h3, _) = ctrl
+        .on_notification(&mut ring, &mut pump, false, Some(86)) // 96 - 10
+        .unwrap();
+    let (h4, _) = ctrl
+        .on_notification(&mut ring, &mut pump, false, Some(118)) // 128 - 10
+        .unwrap();
+    assert_eq!(
+        [h1, h2, h3, h4],
+        [0, 1, 0, 1],
+        "lagging PlayOffset must not flip into the active DMA half"
+    );
+    assert_eq!(
+        ctrl.frames_played(),
+        16,
+        "4 normal halves = 16 frames (no false coalescing credit)"
+    );
+
+    // Now simulate a REAL coalesced wake (1 notification missed) WHILE still lagging by 10 bytes:
+    // next normal wake would be 150 (160 - 10); missed one -> arrives at 182 (192 - 10), delta = 64.
+    let (h5, _) = ctrl
+        .on_notification(&mut ring, &mut pump, false, Some(182))
+        .unwrap();
+    assert_eq!(
+        h5, 1,
+        "real coalesced wake with constant lag must resync to half 1"
+    );
+    assert_eq!(
+        ctrl.frames_played(),
+        24,
+        "coalesced wake must credit both halves (16 + 8)"
+    );
+
+    // 2. Coarse boundary jitter (position 1 byte short of boundary on wake 2).
+    let mut pump2 = WaveRtFramePump::new(&frames, DacWireFormat::Int32);
+    let mut ctrl2 = WaveRtLoopController::new(layout);
+    ctrl2.prefill(&mut ring, &mut pump2).unwrap();
+    let (j1, _) = ctrl2
+        .on_notification(&mut ring, &mut pump2, false, Some(32))
+        .unwrap();
+    let (j2, _) = ctrl2
+        .on_notification(&mut ring, &mut pump2, false, Some(63)) // 1 byte short of 64!
+        .unwrap();
+    let (j3, _) = ctrl2
+        .on_notification(&mut ring, &mut pump2, false, Some(95))
+        .unwrap();
+    assert_eq!([j1, j2, j3], [0, 1, 0]);
+    assert_eq!(ctrl2.frames_played(), 12);
+
+    // 3. Modulo-buf_len wrapping POSITIONREGISTER (normal wrap + full-ring coalesced wrap).
+    let mut pump3 = WaveRtFramePump::new(&frames, DacWireFormat::Int32);
+    let mut ctrl3 = WaveRtLoopController::new(layout);
+    ctrl3.prefill(&mut ring, &mut pump3).unwrap();
+    let (r1, _) = ctrl3
+        .on_notification(&mut ring, &mut pump3, false, Some(36))
+        .unwrap();
+    let (r2, _) = ctrl3
+        .on_notification(&mut ring, &mut pump3, false, Some(4)) // wrapped normally
+        .unwrap();
+    assert_eq!([r1, r2], [0, 1]);
+    assert_eq!(ctrl3.frames_played(), 8);
+    // Coalesced full ring on wrapping register: DMA wrapped all the way back to pos=6 (in half 0).
+    let (r3, _) = ctrl3
+        .on_notification(&mut ring, &mut pump3, false, Some(6))
+        .unwrap();
+    assert_eq!(r3, 1, "wrapping register full-ring coalesce must resync to safe half 1");
+    assert_eq!(ctrl3.frames_played(), 16);
+}
+
+#[cfg(windows)]
+#[test]
+fn memory_lock_guard_refcounts_shared_pages_across_overlapping_guards() {
+    let buf = vec![[0_i32, 0_i32]; 2048];
+    let g1 = MemoryLockGuard::lock_slice(&buf[0..1024]);
+    let g2 = MemoryLockGuard::lock_slice(&buf[512..1536]);
+    assert!(g1.is_locked());
+    assert!(g2.is_locked());
+    let locked_both = MemoryLockGuard::active_locked_page_count();
+    assert!(locked_both > 0);
+    drop(g1);
+    assert!(
+        MemoryLockGuard::active_locked_page_count() > 0,
+        "dropping first overlapping guard must keep second guard's pages locked"
+    );
+    drop(g2);
+    assert_eq!(
+        MemoryLockGuard::active_locked_page_count(),
+        0,
+        "dropping last guard must release all refcounted pages"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 2. Live Windows Kernel Streaming (WDM-KS) Hardware Tests (Schiit Gungnir 2)
 // ---------------------------------------------------------------------------
@@ -540,6 +697,29 @@ fn live_wdm_ks_probes_notification_get_and_hardware_position_on_gungnir2() {
         probe.sample_play_offsets.len(),
         4,
         "expected 4 live hardware play-offset samples"
+    );
+
+    // Feed the real hardware positions into WaveRtLoopController and verify zero false
+    // coalescing: halves must strictly alternate [0, 1, 0, 1] and step by ~1 half per wake.
+    let layout = WaveRtRingLayout::new(probe.buffer_bytes, 8).unwrap();
+    let silent = vec![[0_i32, 0_i32]; (probe.buffer_bytes / 8) * 4];
+    let mut pump = WaveRtFramePump::new(&silent, DacWireFormat::Int32);
+    let mut ring = vec![0u8; probe.buffer_bytes];
+    let mut ctrl = WaveRtLoopController::new(layout);
+    ctrl.prefill(&mut ring, &mut pump).unwrap();
+
+    let mut chosen_halves = Vec::new();
+    for &(pos, _) in &probe.sample_play_offsets {
+        let (h, _) = ctrl
+            .on_notification(&mut ring, &mut pump, false, Some(pos))
+            .unwrap();
+        chosen_halves.push(h);
+    }
+    assert_eq!(
+        chosen_halves,
+        vec![0, 1, 0, 1],
+        "live Gungnir 2 notifications must alternate cleanly without false coalescing: offsets={:?}",
+        probe.sample_play_offsets
     );
 }
 

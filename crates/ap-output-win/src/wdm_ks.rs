@@ -86,10 +86,24 @@ pub struct KsRenderDevice {
 /// Exact Win32 `KSPIN_CONNECT` immediately followed by `KSDATAFORMAT_WAVEFORMATEXTENSIBLE`.
 #[cfg(windows)]
 #[repr(C)]
-pub struct KsPinConnectBlob {
+struct KsPinConnectLayout {
     connect: KSPIN_CONNECT,
     data_format: KSDATAFORMAT,
     wave_format: WAVEFORMATEXTENSIBLE,
+}
+
+#[cfg(windows)]
+const KS_PIN_CONNECT_BLOB_SIZE: usize = core::mem::size_of::<KsPinConnectLayout>();
+
+/// Aligned, fully initialized byte representation of `KSPIN_CONNECT` + `KSDATAFORMAT_WAVEFORMATEXTENSIBLE`.
+///
+/// Storing the ABI blob as an aligned byte array guarantees every padding byte (such as
+/// bytes 52..56 after `KSPIN_CONNECT.PinId` on x64) stays initialized across typed moves,
+/// making [`KsPinConnectBlob::as_bytes`] 100% sound without `unsafe`.
+#[cfg(windows)]
+#[repr(C, align(8))]
+pub struct KsPinConnectBlob {
+    bytes: [u8; KS_PIN_CONNECT_BLOB_SIZE],
 }
 
 #[cfg(windows)]
@@ -102,6 +116,9 @@ impl KsPinConnectBlob {
         wire_format: DacWireFormat,
         looped_wavert: bool,
     ) -> Self {
+        const _: () = assert!(
+            core::mem::align_of::<KsPinConnectBlob>() >= core::mem::align_of::<KsPinConnectLayout>()
+        );
         let (bits_per_sample, valid_bits) = match wire_format {
             DacWireFormat::Int32 => (32_u16, 32_u16),
             DacWireFormat::Int24In32 => (32_u16, 24_u16),
@@ -131,11 +148,12 @@ impl KsPinConnectBlob {
                 .unwrap_or(u32::MAX)
         };
 
-        // Zero-initialize the entire blob first and write individual fields in place so every
-        // padding byte (such as bytes 52..56 after `KSPIN_CONNECT.PinId` on x64) is guaranteed
-        // initialized to 0, keeping `as_bytes()` completely sound.
-        let mut uninit = core::mem::MaybeUninit::<Self>::zeroed();
-        let ptr = uninit.as_mut_ptr();
+        // Start with all bytes explicitly zeroed in the byte array; write only initialized
+        // fields so implicit struct padding bytes remain initialized 0u8 even after moves.
+        let mut blob = Self {
+            bytes: [0u8; KS_PIN_CONNECT_BLOB_SIZE],
+        };
+        let ptr = blob.bytes.as_mut_ptr().cast::<KsPinConnectLayout>();
         unsafe {
             core::ptr::addr_of_mut!((*ptr).connect.Interface).write(ks_identifier(
                 KSINTERFACESETID_Standard,
@@ -182,51 +200,145 @@ impl KsPinConnectBlob {
                 dwChannelMask: channel_mask,
                 SubFormat: KSDATAFORMAT_SUBTYPE_PCM,
             });
-
-            uninit.assume_init()
         }
+        blob
+    }
+
+    #[inline]
+    fn layout(&self) -> &KsPinConnectLayout {
+        unsafe { &*self.bytes.as_ptr().cast::<KsPinConnectLayout>() }
     }
 
     pub fn as_bytes(&self) -> &[u8] {
-        unsafe {
-            core::slice::from_raw_parts(
-                (self as *const Self).cast::<u8>(),
-                core::mem::size_of::<Self>(),
-            )
-        }
+        &self.bytes
     }
 
     pub fn as_connect_ptr(&self) -> *const KSPIN_CONNECT {
-        &self.connect
+        self.bytes.as_ptr().cast::<KSPIN_CONNECT>()
     }
 
     pub fn format_size(&self) -> u32 {
-        unsafe { self.data_format.Anonymous.FormatSize }
+        unsafe { self.layout().data_format.Anonymous.FormatSize }
     }
 
     pub fn block_align(&self) -> u16 {
-        let f = self.wave_format.Format;
+        let f = self.layout().wave_format.Format;
         f.nBlockAlign
     }
 
     pub fn bits_per_sample(&self) -> u16 {
-        let f = self.wave_format.Format;
+        let f = self.layout().wave_format.Format;
         f.wBitsPerSample
     }
 
     pub fn valid_bits_per_sample(&self) -> u16 {
-        unsafe { self.wave_format.Samples.wValidBitsPerSample }
+        unsafe { self.layout().wave_format.Samples.wValidBitsPerSample }
     }
 
     pub fn avg_bytes_per_sec(&self) -> u32 {
-        let f = self.wave_format.Format;
+        let f = self.layout().wave_format.Format;
         f.nAvgBytesPerSec
     }
 
     pub fn channel_mask(&self) -> u32 {
-        let mask = self.wave_format.dwChannelMask;
+        let mask = self.layout().wave_format.dwChannelMask;
         mask
     }
+}
+
+/// Stereo-decorrelated TPDF dither state for reduced-depth wire requantization (`Int24*`, `Int16`).
+///
+/// Stays completely inactive (`active == false`) as long as all incoming MSB-aligned `i32`
+/// samples already have zero discarded lower bits (preserving bit-perfect pass-through for
+/// already-quantized 24-bit or 16-bit DSP streams without double-dithering). Latches active
+/// as soon as any sample carries non-zero sub-LSB precision, applying continuous unbiased
+/// 1-LSB TPDF dither before rounding and clamping.
+#[derive(Debug, Clone)]
+struct WireDitherState {
+    prng_l: u64,
+    prng_r: u64,
+    active: bool,
+}
+
+impl Default for WireDitherState {
+    fn default() -> Self {
+        Self {
+            prng_l: 0x9E37_79B9_7F4A_7C15,
+            prng_r: 0xD1B5_4A32_D192_ED03,
+            active: false,
+        }
+    }
+}
+
+impl WireDitherState {
+    #[inline]
+    fn next_u32(state: &mut u64) -> u32 {
+        // Fast SplitMix64 step (zero heap allocation, full 64-bit period, statistically clean).
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        ((z ^ (z >> 31)) >> 32) as u32
+    }
+
+    /// Generate a 1-LSB TPDF sample in `[-1.0, +1.0]` (in units of target LSB) for channel `ch`.
+    #[inline]
+    fn next_tpdf_lsb(&mut self, ch: usize) -> f64 {
+        const INV_2_32: f64 = 1.0 / 4_294_967_296.0;
+        let st = if ch == 0 {
+            &mut self.prng_l
+        } else {
+            &mut self.prng_r
+        };
+        let u1 = (Self::next_u32(st) as f64) * INV_2_32;
+        let u2 = (Self::next_u32(st) as f64) * INV_2_32;
+        u1 - u2
+    }
+
+    #[inline]
+    fn quantize_to_top_24(&mut self, sample: i32, ch: usize) -> i32 {
+        if !self.active {
+            if (sample & 0xFF) == 0 {
+                return sample;
+            }
+            self.active = true;
+        }
+        let dither = self.next_tpdf_lsb(ch);
+        let scaled = (sample as f64) / 256.0 + dither;
+        let q = scaled.round() as i64;
+        (q.clamp(-0x80_0000, 0x7F_FFFF) as i32) << 8
+    }
+
+    #[inline]
+    fn quantize_to_top_16(&mut self, sample: i32, ch: usize) -> i16 {
+        if !self.active {
+            if (sample & 0xFFFF) == 0 {
+                return (sample >> 16) as i16;
+            }
+            self.active = true;
+        }
+        let dither = self.next_tpdf_lsb(ch);
+        let scaled = (sample as f64) / 65536.0 + dither;
+        let q = scaled.round() as i64;
+        q.clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16
+    }
+}
+
+/// Shared frame encoder used by both `WaveRtFramePump` and `StreamingWaveRtPump`.
+#[inline]
+fn encode_frames_into(
+    dst: &mut [u8],
+    frames: &[[i32; 2]],
+    wire_format: DacWireFormat,
+    dither: &mut WireDitherState,
+) -> usize {
+    let bpf = wire_format.bytes_per_frame();
+    let mut offset = 0;
+    for &[l, r] in frames {
+        encode_frame(&mut dst[offset..offset + bpf], l, r, wire_format, dither);
+        offset += bpf;
+    }
+    offset
 }
 
 /// Pure, hardware-independent WaveRT cyclic ring-buffer frame encoder & pump.
@@ -238,6 +350,7 @@ pub struct WaveRtFramePump<'a> {
     frames: &'a [[i32; 2]],
     cursor: usize,
     wire_format: DacWireFormat,
+    dither: WireDitherState,
 }
 
 impl<'a> WaveRtFramePump<'a> {
@@ -246,6 +359,7 @@ impl<'a> WaveRtFramePump<'a> {
             frames,
             cursor: 0,
             wire_format,
+            dither: WireDitherState::default(),
         }
     }
 
@@ -269,11 +383,12 @@ impl<'a> WaveRtFramePump<'a> {
         let remaining = self.frames.len().saturating_sub(self.cursor);
         let to_write = max_frames.min(remaining);
 
-        let mut offset = 0;
-        for &[l, r] in &self.frames[self.cursor..self.cursor + to_write] {
-            encode_frame(&mut dst[offset..offset + bpf], l, r, self.wire_format);
-            offset += bpf;
-        }
+        let offset = encode_frames_into(
+            dst,
+            &self.frames[self.cursor..self.cursor + to_write],
+            self.wire_format,
+            &mut self.dither,
+        );
         self.cursor += to_write;
 
         if offset < dst.len() {
@@ -284,9 +399,7 @@ impl<'a> WaveRtFramePump<'a> {
 
     /// Fill `dst` with a smooth linear fade-out to silence so mid-track stops are click-free.
     pub fn fill_fade_out_slice(&mut self, dst: &mut [u8]) -> usize {
-        let written = self.fill_slice(dst);
-        apply_linear_fade_out_bytes(dst, written, self.wire_format);
-        written
+        WaveRtPumpSource::fill_fade_out_slice(self, dst)
     }
 }
 
@@ -312,19 +425,30 @@ impl From<Option<InterleavedInt32Buffer>> for StreamBlock {
 
 /// Internal chunk source abstraction shared by `play_full_memory` and `play_block_stream`.
 pub trait WaveRtPumpSource {
-    fn bytes_per_frame(&self) -> usize;
+    fn wire_format(&self) -> DacWireFormat;
+
+    fn bytes_per_frame(&self) -> usize {
+        self.wire_format().bytes_per_frame()
+    }
+
     fn frames_written(&self) -> usize;
     fn is_eof(&self) -> bool;
     fn fill_slice(&mut self, dst: &mut [u8]) -> usize;
-    fn fill_fade_out_slice(&mut self, dst: &mut [u8]) -> usize;
+
+    fn fill_fade_out_slice(&mut self, dst: &mut [u8]) -> usize {
+        let written = self.fill_slice(dst);
+        apply_linear_fade_out_bytes(dst, written, self.wire_format());
+        written
+    }
+
     fn take_error(&mut self) -> Option<OutputError> {
         None
     }
 }
 
 impl WaveRtPumpSource for WaveRtFramePump<'_> {
-    fn bytes_per_frame(&self) -> usize {
-        WaveRtFramePump::bytes_per_frame(self)
+    fn wire_format(&self) -> DacWireFormat {
+        self.wire_format
     }
 
     fn frames_written(&self) -> usize {
@@ -337,10 +461,6 @@ impl WaveRtPumpSource for WaveRtFramePump<'_> {
 
     fn fill_slice(&mut self, dst: &mut [u8]) -> usize {
         WaveRtFramePump::fill_slice(self, dst)
-    }
-
-    fn fill_fade_out_slice(&mut self, dst: &mut [u8]) -> usize {
-        WaveRtFramePump::fill_fade_out_slice(self, dst)
     }
 }
 
@@ -357,6 +477,7 @@ where
     cursor: usize,
     expected_sample_rate_hz: u32,
     wire_format: DacWireFormat,
+    dither: WireDitherState,
     total_frames_written: usize,
     eof: bool,
     pending_error: Option<OutputError>,
@@ -375,6 +496,7 @@ where
             cursor: 0,
             expected_sample_rate_hz,
             wire_format,
+            dither: WireDitherState::default(),
             total_frames_written: 0,
             eof: false,
             pending_error: None,
@@ -430,8 +552,8 @@ where
     F: FnMut() -> B,
     B: Into<StreamBlock>,
 {
-    fn bytes_per_frame(&self) -> usize {
-        self.wire_format.bytes_per_frame()
+    fn wire_format(&self) -> DacWireFormat {
+        self.wire_format
     }
 
     fn frames_written(&self) -> usize {
@@ -455,11 +577,13 @@ where
             let remaining = buf.frames.len() - self.cursor;
             let to_copy = (max_frames - written_total).min(remaining);
 
-            let mut offset = written_total * bpf;
-            for &[l, r] in &buf.frames[self.cursor..self.cursor + to_copy] {
-                encode_frame(&mut dst[offset..offset + bpf], l, r, self.wire_format);
-                offset += bpf;
-            }
+            let dst_off = written_total * bpf;
+            encode_frames_into(
+                &mut dst[dst_off..dst_off + to_copy * bpf],
+                &buf.frames[self.cursor..self.cursor + to_copy],
+                self.wire_format,
+                &mut self.dither,
+            );
             self.cursor += to_copy;
             written_total += to_copy;
             self.total_frames_written += to_copy;
@@ -470,12 +594,6 @@ where
             dst[used_bytes..].fill(0);
         }
         written_total
-    }
-
-    fn fill_fade_out_slice(&mut self, dst: &mut [u8]) -> usize {
-        let written = self.fill_slice(dst);
-        apply_linear_fade_out_bytes(dst, written, self.wire_format);
-        written
     }
 
     fn take_error(&mut self) -> Option<OutputError> {
@@ -553,6 +671,23 @@ impl WaveRtRingLayout {
             0 // DMA is reading half 1 -> safely write half 0
         }
     }
+    /// Returns true if `play_offset_bytes` lies strictly inside the "override zone" of
+    /// `toggle_half` (i.e. inside `toggle_half` and at least `guard` bytes before the boundary
+    /// into `toggle_half ^ 1`), meaning DMA is genuinely active inside `toggle_half` rather
+    /// than merely lagging slightly behind the expected half boundary.
+    pub fn is_clearly_inside_half(&self, half_idx: usize, play_offset_bytes: u64) -> bool {
+        let pos = (play_offset_bytes % (self.buf_len as u64)) as usize;
+        if half_idx == 0 {
+            let guard = (self.half_len / 4).max(self.bpf);
+            let limit = self.half_len.saturating_sub(guard);
+            pos < limit
+        } else {
+            let half1_len = self.buf_len - self.half_len;
+            let guard = (half1_len / 4).max(self.bpf);
+            let limit = self.buf_len.saturating_sub(guard);
+            pos >= self.half_len && pos < limit
+        }
+    }
 }
 
 /// Outcome of processing one WaveRT hardware notification event.
@@ -565,14 +700,17 @@ pub enum WaveRtStepOutcome {
 /// Pure, hardware-independent WaveRT cyclic half-buffer state machine.
 ///
 /// Manages:
-/// - Hardware-position-driven safe half selection (resynchronizes after any coalesced event).
+/// - Toggle-primary half scheduling with unwrapped-position coalescing detection and a 1/4-half
+///   boundary guard band, immune to `usbaudio2.sys` `PlayOffset` lag and coarse position jitter
+///   while still resynchronizing accurately after genuine coalesced notifications.
 /// - Stop fade-out that waits for the fade half to finish playing (`trailing_silent_halves >= 2`).
 /// - Non-blocking underrun handling (emits digital silence without ending playback).
 /// - Accurate `frames_played` counting only real audio frames whose half completed DMA playback.
 pub struct WaveRtLoopController {
     layout: WaveRtRingLayout,
-    next_fallback_half: usize,
+    next_expected_half: usize,
     last_written_half: Option<usize>,
+    last_position_bytes: Option<u64>,
     half_audio_frames: [usize; 2],
     completed_audio_frames: usize,
     trailing_silent_halves: usize,
@@ -583,8 +721,9 @@ impl WaveRtLoopController {
     pub fn new(layout: WaveRtRingLayout) -> Self {
         Self {
             layout,
-            next_fallback_half: 0,
+            next_expected_half: 0,
             last_written_half: None,
+            last_position_bytes: None,
             half_audio_frames: [0, 0],
             completed_audio_frames: 0,
             trailing_silent_halves: 0,
@@ -619,7 +758,81 @@ impl WaveRtLoopController {
         }
         self.half_audio_frames = [w0, w1];
         self.last_written_half = Some(1);
+        self.last_position_bytes = None;
         Ok(())
+    }
+
+    /// Decide which half to write and whether at least one notification was coalesced.
+    ///
+    /// Uses the toggle (`next_expected_half`) as the primary schedule so constant `PlayOffset`
+    /// latency or boundary jitter never overwrites the active DMA half or falsely credits frames.
+    /// Overrides the toggle and reports coalescing only when the unwrapped hardware position
+    /// advances by `>= 1.5` halves (or a wrapping hardware register completes a full ring inside
+    /// the override guard band).
+    fn select_write_half(&mut self, play_offset_bytes: Option<u64>) -> (usize, bool) {
+        let toggle_half = self.next_expected_half;
+        let Some(pos) = play_offset_bytes else {
+            return (toggle_half, false);
+        };
+
+        let half_u64 = self.layout.half_len() as u64;
+        let buf_u64 = self.layout.buf_len() as u64;
+        let coalesce_threshold = half_u64.saturating_add(half_u64 / 2);
+        let min_normal_step = half_u64 / 2;
+
+        let result = match self.last_position_bytes {
+            None => {
+                // First notification after KSSTATE_RUN (DMA started at byte 0).
+                // Any position < 1.5 halves (including lagging PlayOffset < half_len) is a normal
+                // first half completion; only >= 1.5 halves indicates an already-coalesced wake.
+                if pos >= coalesce_threshold {
+                    let halves_elapsed = ((pos.saturating_add(half_u64 / 2)) / half_u64).max(2);
+                    let write_half = toggle_half ^ (((halves_elapsed - 1) as usize) & 1);
+                    (write_half, true)
+                } else {
+                    (toggle_half, false)
+                }
+            }
+            Some(prev) => {
+                if pos >= prev {
+                    let delta = pos - prev;
+                    if delta >= coalesce_threshold {
+                        // Monotonic cumulative position jumped >= 1.5 halves: genuine coalescing.
+                        // Computing elapsed halves from the delta cancels any constant PlayOffset lag.
+                        let halves_elapsed =
+                            ((delta.saturating_add(half_u64 / 2)) / half_u64).max(2);
+                        let write_half = toggle_half ^ (((halves_elapsed - 1) as usize) & 1);
+                        (write_half, true)
+                    } else if prev < buf_u64
+                        && pos < buf_u64
+                        && delta < min_normal_step
+                        && self.layout.is_clearly_inside_half(toggle_half, pos)
+                    {
+                        // Modulo-buf_len hardware POSITIONREGISTER wrapped a full ring period
+                        // back into the active half we would otherwise write.
+                        (self.layout.safe_write_half_for_play_byte(pos), true)
+                    } else {
+                        (toggle_half, false)
+                    }
+                } else if prev < buf_u64 && pos < buf_u64 {
+                    // Modulo-buf_len hardware POSITIONREGISTER wrapped around buf_len.
+                    let ring_delta = (buf_u64 - prev).saturating_add(pos);
+                    if ring_delta >= coalesce_threshold
+                        && self.layout.is_clearly_inside_half(toggle_half, pos)
+                    {
+                        (self.layout.safe_write_half_for_play_byte(pos), true)
+                    } else {
+                        (toggle_half, false)
+                    }
+                } else {
+                    // 32-bit counter wrap or non-monotonic driver quirk: trust toggle.
+                    (toggle_half, false)
+                }
+            }
+        };
+
+        self.last_position_bytes = Some(pos);
+        result
     }
 
     /// Process one WaveRT half-buffer completion notification.
@@ -632,14 +845,11 @@ impl WaveRtLoopController {
         stop_requested: bool,
         play_offset_bytes: Option<u64>,
     ) -> Result<(usize, WaveRtStepOutcome), OutputError> {
-        let write_half = match play_offset_bytes {
-            Some(pos) => self.layout.safe_write_half_for_play_byte(pos),
-            None => self.next_fallback_half,
-        };
-        self.next_fallback_half = write_half ^ 1;
+        let (write_half, coalesced) = self.select_write_half(play_offset_bytes);
+        self.next_expected_half = write_half ^ 1;
 
-        if self.last_written_half == Some(write_half) {
-            // Coalesced notification (a full ring period elapsed): both halves completed DMA.
+        if coalesced {
+            // Coalesced notification (>= 1.5 halves elapsed): both halves completed DMA.
             self.completed_audio_frames += self.half_audio_frames[0] + self.half_audio_frames[1];
             self.half_audio_frames = [0, 0];
         } else {
@@ -711,6 +921,7 @@ fn round_i32_to_top_24(sample: i32) -> i32 {
 
 /// Round an MSB-aligned signed 32-bit PCM sample to signed 16-bit (unbiased round-to-nearest-even)
 /// with clean saturation. Already-quantized 16-bit samples (low 16 bits == 0) pass through bit-identically.
+#[cfg(test)]
 #[inline]
 fn round_i32_to_top_16(sample: i32) -> i16 {
     let mut q = i64::from(sample) >> 16;
@@ -722,27 +933,33 @@ fn round_i32_to_top_16(sample: i32) -> i16 {
 }
 
 #[inline]
-fn encode_frame(dst: &mut [u8], l: i32, r: i32, wire_format: DacWireFormat) {
+fn encode_frame(
+    dst: &mut [u8],
+    l: i32,
+    r: i32,
+    wire_format: DacWireFormat,
+    dither: &mut WireDitherState,
+) {
     match wire_format {
         DacWireFormat::Int32 => {
             dst[0..4].copy_from_slice(&l.to_le_bytes());
             dst[4..8].copy_from_slice(&r.to_le_bytes());
         }
         DacWireFormat::Int24In32 => {
-            let l24 = round_i32_to_top_24(l);
-            let r24 = round_i32_to_top_24(r);
+            let l24 = dither.quantize_to_top_24(l, 0);
+            let r24 = dither.quantize_to_top_24(r, 1);
             dst[0..4].copy_from_slice(&l24.to_le_bytes());
             dst[4..8].copy_from_slice(&r24.to_le_bytes());
         }
         DacWireFormat::Int24Packed => {
-            let lb = round_i32_to_top_24(l).to_le_bytes();
-            let rb = round_i32_to_top_24(r).to_le_bytes();
+            let lb = dither.quantize_to_top_24(l, 0).to_le_bytes();
+            let rb = dither.quantize_to_top_24(r, 1).to_le_bytes();
             dst[0..3].copy_from_slice(&lb[1..4]);
             dst[3..6].copy_from_slice(&rb[1..4]);
         }
         DacWireFormat::Int16 => {
-            let l16 = round_i32_to_top_16(l);
-            let r16 = round_i32_to_top_16(r);
+            let l16 = dither.quantize_to_top_16(l, 0);
+            let r16 = dither.quantize_to_top_16(r, 1);
             dst[0..2].copy_from_slice(&l16.to_le_bytes());
             dst[2..4].copy_from_slice(&r16.to_le_bytes());
         }
@@ -953,6 +1170,11 @@ impl WdmKsSink {
         Arc::clone(&self.stop_flag)
     }
 
+    /// Re-arm the sink after a previous `stop()` so subsequent playback calls proceed.
+    pub fn arm(&mut self) {
+        self.stop_flag.store(false, Ordering::SeqCst);
+    }
+
     pub fn device(&self) -> &KsRenderDevice {
         &self.device
     }
@@ -1043,9 +1265,10 @@ impl WdmKsSink {
         };
 
         let position_register_supported = query_position_register(pin.raw()).is_some();
-        let audio_position_supported = query_audio_position_bytes(pin.raw()).is_some();
+        let audio_position_supported = query_audio_position(pin.raw()).is_some();
 
-        // Stream 4 silent notifications to observe live PlayOffset % buf_len behavior.
+        // Stream 4 silent notifications to observe live PlayOffset/WriteOffset % buf_len behavior.
+        // `allocate_wavert_buffer_with_notification` already guarantees `BufferAddress` is non-null.
         let cyclic_slice = unsafe {
             core::slice::from_raw_parts_mut(rt_buf.BufferAddress.cast::<u8>(), layout.buf_len())
         };
@@ -1063,13 +1286,17 @@ impl WdmKsSink {
         state_guard.set_state(KSSTATE_RUN)?;
 
         let mut sample_play_offsets = Vec::with_capacity(4);
+        let mut sample_write_offsets = Vec::with_capacity(4);
         for _ in 0..4 {
             let wait_res = unsafe { WaitForSingleObject(ev_run.raw(), 1500) };
             if wait_res != WAIT_OBJECT_0 {
                 break;
             }
-            if let Some(pos) = pos_reader.read_play_offset_bytes() {
+            if let Some(pos) = pos_reader.read_position_bytes() {
                 sample_play_offsets.push((pos, layout.safe_write_half_for_play_byte(pos)));
+            }
+            if let Some(ap) = query_audio_position(pin.raw()) {
+                sample_write_offsets.push((ap.PlayOffset, ap.WriteOffset));
             }
         }
 
@@ -1086,6 +1313,7 @@ impl WdmKsSink {
             position_register_supported,
             audio_position_supported,
             sample_play_offsets,
+            sample_write_offsets,
         })
     }
 
@@ -1124,19 +1352,10 @@ impl WdmKsSink {
         )?;
 
         // 3. Allocate WaveRT cyclic buffer (~100 ms total = two ~50 ms notification halves).
+        // `allocate_wavert_buffer_with_notification` verifies `BufferAddress` is non-null.
         let bpf = pump.bytes_per_frame() as u32;
         let requested_bytes = ((sample_rate_hz / 10).max(256)) * bpf;
         let rt_buf = allocate_wavert_buffer_with_notification(pin.raw(), requested_bytes, 2)?;
-        if rt_buf.BufferAddress.is_null() {
-            return Err(OutputError::Win32 {
-                operation: "KSPROPERTY_RTAUDIO_BUFFER_WITH_NOTIFICATION",
-                code: 0,
-                detail: format!(
-                    "driver returned null WaveRT buffer (size={})",
-                    rt_buf.ActualBufferSize
-                ),
-            });
-        }
         let layout = WaveRtRingLayout::new(rt_buf.ActualBufferSize as usize, bpf as usize)?;
         let call_barrier = rt_buf.CallMemoryBarrier != 0;
 
@@ -1181,7 +1400,7 @@ impl WdmKsSink {
             notifications += 1;
 
             let stop_requested = self.stop_flag.load(Ordering::SeqCst);
-            let play_offset = pos_reader.read_play_offset_bytes();
+            let play_offset = pos_reader.read_position_bytes();
 
             match controller.on_notification(cyclic_slice, pump, stop_requested, play_offset) {
                 Ok((_, outcome)) => {
@@ -1251,6 +1470,10 @@ impl ZeroMixerAudioSink for WdmKsSink {
     fn stop(&mut self) -> Result<(), OutputError> {
         self.stop_flag.store(true, Ordering::SeqCst);
         Ok(())
+    }
+
+    fn arm(&mut self) {
+        WdmKsSink::arm(self);
     }
 }
 
@@ -1403,6 +1626,8 @@ pub struct WaveRtHardwareProbe {
     pub position_register_supported: bool,
     pub audio_position_supported: bool,
     pub sample_play_offsets: Vec<(u64, usize)>,
+    /// Raw `(PlayOffset, WriteOffset)` pairs from `KSPROPERTY_AUDIO_POSITION` on each wake.
+    pub sample_write_offsets: Vec<(u64, u64)>,
 }
 
 #[cfg(windows)]
@@ -1504,7 +1729,7 @@ fn query_position_register(pin: HANDLE) -> Option<(*const core::ffi::c_void, u32
 }
 
 #[cfg(windows)]
-fn query_audio_position_bytes(pin: HANDLE) -> Option<u64> {
+fn query_audio_position(pin: HANDLE) -> Option<KSAUDIO_POSITION> {
     let prop = ks_identifier(
         KSPROPSETID_Audio,
         KSPROPERTY_AUDIO_POSITION as u32,
@@ -1518,10 +1743,10 @@ fn query_audio_position_bytes(pin: HANDLE) -> Option<u64> {
         core::mem::size_of::<KSAUDIO_POSITION>() as u32,
         "KSPROPERTY_AUDIO_POSITION",
     );
-    ok.ok().map(|_| pos.PlayOffset)
+    ok.ok().map(|_| pos)
 }
 
-/// Hardware play-cursor reader for a live WaveRT KS pin (must not outlive `pin`).
+/// Hardware DMA/play-cursor reader for a live WaveRT KS pin (must not outlive `pin`).
 #[cfg(windows)]
 enum WaveRtPositionReader {
     Register {
@@ -1540,13 +1765,13 @@ impl WaveRtPositionReader {
         if let Some((ptr, width_bits)) = query_position_register(pin) {
             return Self::Register { ptr, width_bits };
         }
-        if query_audio_position_bytes(pin).is_some() {
+        if query_audio_position(pin).is_some() {
             return Self::AudioPositionIoctl { pin };
         }
         Self::Unavailable
     }
 
-    fn read_play_offset_bytes(&self) -> Option<u64> {
+    fn read_position_bytes(&self) -> Option<u64> {
         match *self {
             Self::Register { ptr, width_bits } => unsafe {
                 match width_bits {
@@ -1555,7 +1780,16 @@ impl WaveRtPositionReader {
                     _ => None,
                 }
             },
-            Self::AudioPositionIoctl { pin } => query_audio_position_bytes(pin),
+            Self::AudioPositionIoctl { pin } => query_audio_position(pin).map(|pos| {
+                // Prefer WriteOffset (the driver's DMA/read cursor that drives WaveRT
+                // half-buffer notifications) over PlayOffset (which lags by USB/DAC latency)
+                // whenever WriteOffset is populated; fall back to PlayOffset if zero.
+                if pos.WriteOffset > 0 {
+                    pos.WriteOffset
+                } else {
+                    pos.PlayOffset
+                }
+            }),
             Self::Unavailable => None,
         }
     }
@@ -1797,6 +2031,16 @@ fn allocate_wavert_buffer_with_notification(
         core::mem::size_of::<KSRTAUDIO_BUFFER>() as u32,
         "KSPROPERTY_RTAUDIO_BUFFER_WITH_NOTIFICATION",
     )?;
+    if out.BufferAddress.is_null() {
+        return Err(OutputError::Win32 {
+            operation: "KSPROPERTY_RTAUDIO_BUFFER_WITH_NOTIFICATION",
+            code: 0,
+            detail: format!(
+                "driver returned null WaveRT buffer (size={})",
+                out.ActualBufferSize
+            ),
+        });
+    }
     Ok(out)
 }
 

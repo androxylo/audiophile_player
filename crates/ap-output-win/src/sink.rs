@@ -95,5 +95,12 @@ pub trait ZeroMixerAudioSink {
     ) -> Result<PlaybackStats, OutputError>;
 
     /// Stop playback immediately and release the exclusive hardware pin/endpoint cleanly.
+    ///
+    /// Note: `stop()` latches the sink's stop state so any concurrent or pending play call
+    /// observes the interruption. Call [`ZeroMixerAudioSink::arm`] before starting a new track
+    /// after stopping.
     fn stop(&mut self) -> Result<(), OutputError>;
+
+    /// Clear any latched stop state so subsequent playback calls proceed normally.
+    fn arm(&mut self);
 }
