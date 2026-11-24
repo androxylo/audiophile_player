@@ -14,9 +14,13 @@
 //!
 //! At IR load time, peak frequency magnitude `max |H(f)|` is measured with a `>= 2x` zero-padded
 //! real FFT across both channels. Any IR with `max |H(f)| > 1.0` (`> 0 dB`) is **auto-normalized
-//! down to `0 dB`** (applying the same scale factor to both channels to preserve L/R balance) and
-//! logged once on first load. The post-normalization time-domain L1 norm (`sum |h[n]|`) is also
-//! computed as a conservative peak bound for `0 dB` headroom gating in `ap_core::headroom`.
+//! down to `0 dB` steady-state** (applying the same scale factor to both channels to preserve L/R
+//! balance) and logged once on first load. Steady-state `<= 0 dB` IRs are never attenuated by
+//! their time-domain L1 norm so the strict `-3 dB` / `0 dB` headroom policy (`REQUIREMENTS.md`
+//! §5.2) is preserved with zero variable gain attenuation. The post-normalization time-domain L1
+//! norm (`sum |h[n]|`) is computed as a conservative peak bound for `0 dB` headroom gating in
+//! `ap_core::headroom`; in `-3 dB` mode, fixed `-3 dB` headroom protects real-world transients
+//! and the final quantizer saturates cleanly without wraparound on adversarial worst-case impulses.
 //!
 //! ## Configuration & Folder Discovery
 //! Convolution is **disabled by default** ([`ConvolutionConfig::disabled()`]) until explicitly
@@ -43,12 +47,12 @@ use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 const MIN_PARTITION_BLOCK: usize = 1_024;
 const MAX_PARTITION_BLOCK: usize = 65_536;
 
-/// Maximum supported impulse-response length (`2^23 = 8,388,608` taps per channel, ~21.8 s at
-/// 384 kHz — 2x standard 4M-tap REW exports). Prevents stray multi-GB WAV files in a watched
-/// convolution directory from exhausting RAM or aborting on FFT/spectrum allocation.
-pub const MAX_IR_TAPS: usize = 1 << 23;
+/// Maximum supported impulse-response length (`2^22 = 4,194,304` taps per channel, matching
+/// `REQUIREMENTS.md` §5.3's 4M-tap REW export cap). Prevents oversized or stray WAV files in a
+/// watched convolution directory from exhausting RAM or aborting on FFT/spectrum allocation.
+pub const MAX_IR_TAPS: usize = 1 << 22;
 
-/// Hard cap on WAV `data` payload bytes (`MAX_IR_TAPS` stereo `f64` frames = 128 MiB).
+/// Hard cap on WAV `data` payload bytes (`MAX_IR_TAPS` stereo `f64` frames = 64 MiB).
 pub const MAX_IR_DATA_BYTES: u64 = (MAX_IR_TAPS as u64) * 16;
 
 /// Flush-tail threshold (`-200 dB`, 56 dB below 24-bit PCM) applied only when an IR exceeds
@@ -490,26 +494,44 @@ pub struct DiscoveredRewFilter {
     pub header: WavHeaderInfo,
 }
 
+/// Diagnostic record for a `.wav` file skipped during directory discovery due to a probe error
+/// (e.g. truncated/incomplete REW export or tap count exceeding [`MAX_IR_TAPS`]).
+#[derive(Debug, Clone)]
+pub struct SkippedRewWav {
+    pub path: PathBuf,
+    pub modified: Option<SystemTime>,
+    pub reason: String,
+}
+
+fn is_newer_candidate(
+    cand_mod: Option<SystemTime>,
+    cand_path: &Path,
+    prev_mod: Option<SystemTime>,
+    prev_path: &Path,
+) -> bool {
+    match (cand_mod, prev_mod) {
+        (Some(a), Some(b)) if a != b => a > b,
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        _ => cand_path.file_name() > prev_path.file_name(),
+    }
+}
+
 /// Auto-discover the **most recent 2-channel `.wav` by filesystem modification time (`mtime`)**
-/// in `dir` matching `target_rate_hz`.
-///
-/// Mono `.L`/`.R` helper files, truncated/unreadable WAVs, and mismatched sample rates are
-/// ignored. EqualizerAPO `config.txt` directives are **not** parsed; if multiple rate-matched
-/// stereo WAVs exist in `dir`, ties break by `mtime` (then filename), or you can pin an exact
-/// filter via `file_352800` / `file_384000` in `config.toml`. Returns `Ok(None)` if `dir` does
-/// not exist or contains no matching stereo WAV for `target_rate_hz`.
-pub fn discover_latest_rew_wav(
+/// in `dir` matching `target_rate_hz`, along with any `.wav` files whose header probe failed.
+pub fn discover_latest_rew_wav_with_diagnostics(
     dir: &Path,
     target_rate_hz: u32,
-) -> Result<Option<DiscoveredRewFilter>, String> {
+) -> Result<(Option<DiscoveredRewFilter>, Vec<SkippedRewWav>), String> {
     if !dir.exists() {
-        return Ok(None);
+        return Ok((None, Vec::new()));
     }
 
     let entries = fs::read_dir(dir)
         .map_err(|e| format!("failed to scan REW filter directory '{}': {e}", dir.display()))?;
 
     let mut best: Option<DiscoveredRewFilter> = None;
+    let mut skipped: Vec<SkippedRewWav> = Vec::new();
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -529,8 +551,17 @@ pub fn discover_latest_rew_wav(
             continue;
         }
 
-        let Ok(header) = probe_wav_header(&path) else {
-            continue;
+        let modified = meta.modified().ok();
+        let header = match probe_wav_header(&path) {
+            Ok(h) => h,
+            Err(reason) => {
+                skipped.push(SkippedRewWav {
+                    path,
+                    modified,
+                    reason,
+                });
+                continue;
+            }
         };
         if header.channels != 2 || header.sample_rate_hz != target_rate_hz || header.num_frames == 0
         {
@@ -539,19 +570,16 @@ pub fn discover_latest_rew_wav(
 
         let candidate = DiscoveredRewFilter {
             path,
-            modified: meta.modified().ok(),
+            modified,
             file_len: meta.len(),
             header,
         };
 
         let is_newer = match &best {
             None => true,
-            Some(prev) => match (candidate.modified, prev.modified) {
-                (Some(a), Some(b)) if a != b => a > b,
-                (Some(_), None) => true,
-                (None, Some(_)) => false,
-                _ => candidate.path.file_name() > prev.path.file_name(),
-            },
+            Some(prev) => {
+                is_newer_candidate(candidate.modified, &candidate.path, prev.modified, &prev.path)
+            }
         };
 
         if is_newer {
@@ -559,6 +587,22 @@ pub fn discover_latest_rew_wav(
         }
     }
 
+    Ok((best, skipped))
+}
+
+/// Auto-discover the **most recent 2-channel `.wav` by filesystem modification time (`mtime`)**
+/// in `dir` matching `target_rate_hz`.
+///
+/// Mono `.L`/`.R` helper files, truncated/unreadable WAVs, and mismatched sample rates are
+/// ignored. EqualizerAPO `config.txt` directives are **not** parsed; if multiple rate-matched
+/// stereo WAVs exist in `dir`, ties break by `mtime` (then filename), or you can pin an exact
+/// filter via `file_352800` / `file_384000` in `config.toml`. Returns `Ok(None)` if `dir` does
+/// not exist or contains no matching stereo WAV for `target_rate_hz`.
+pub fn discover_latest_rew_wav(
+    dir: &Path,
+    target_rate_hz: u32,
+) -> Result<Option<DiscoveredRewFilter>, String> {
+    let (best, _skipped) = discover_latest_rew_wav_with_diagnostics(dir, target_rate_hz)?;
     Ok(best)
 }
 
@@ -657,36 +701,35 @@ impl PreparedStereoIr {
         let r2c = planner.plan_fft_forward(fft_len);
         let c2r = planner.plan_fft_inverse(fft_len);
 
-        // Measure BOTH peak frequency-domain magnitude (via >= 2x zero-padded full-band f64 RFFT)
-        // AND raw time-domain L1 norm (`sum |h[n]|`). Auto-normalize equally on L & R (preserving
-        // exact L/R balance) by `max(max|H|, L1 / 10^(+3/20))` so:
-        // 1. Steady-state frequency gain never exceeds `0 dB` (`max|H_norm| <= 1.0`).
-        // 2. Post-normalization `L1 <= 10^(+3/20)` (`+3.00 dB`), guaranteeing that even in `-3 dB`
-        //    mode (untagged tracks, hot tracks, live streams), an all-pass or excess-phase REW IR
-        //    can NEVER push a full-scale transient over `0 dBFS` into the quantizer clamp.
+        // Measure peak frequency-domain magnitude via >= 2x zero-padded full-band f64 RFFT.
+        // Auto-normalize equally on L & R (preserving exact L/R balance) ONLY when steady-state
+        // `max |H(f)| > 1.0` (`> 0 dB`) so:
+        // 1. Steady-state frequency response never boosts above `0 dB` (`max |H_norm| <= 1.0`).
+        // 2. IRs with `max |H(f)| <= 0 dB` are NEVER attenuated by variable L1-based gain,
+        //    strictly preserving the hardcoded `-3 dB` / `0 dB` headroom policy (`REQUIREMENTS.md` §5.2).
+        // 3. Post-normalization `L1 = max(sum|h_L|, sum|h_R|)` is computed and used to gate `0 dB`
+        //    headroom eligibility strictly (`peak + L1 + ISP <= -3 dB`), while `-3 dB` mode applies
+        //    fixed `-3 dB` safety headroom and the single final quantizer saturates cleanly.
         let raw_max_freq_gain_lin =
             compute_max_freq_gain_linear(&mut planner, &left[..active_taps], &right[..active_taps])?;
         let raw_l1_left: f64 = left[..active_taps].iter().map(|v| v.abs()).sum();
         let raw_l1_right: f64 = right[..active_taps].iter().map(|v| v.abs()).sum();
         let raw_l1_norm = raw_l1_left.max(raw_l1_right);
-        let minus_3db_l1_ceiling = 1.0 / ap_core::headroom::MINUS_3_DB_LINEAR_THRESHOLD; // ~1.412538 (+3.00 dB)
-        let l1_required_denom = raw_l1_norm / minus_3db_l1_ceiling;
-        let required_denom = raw_max_freq_gain_lin.max(l1_required_denom);
 
         let original_max_boost_db = if raw_max_freq_gain_lin > 1.0 + 1e-5 {
             20.0 * raw_max_freq_gain_lin.log10()
         } else {
             0.0
         };
-        let (norm_scale, normalization_gain_db) = if required_denom > 1.0 + 1e-5 {
-            let atten_db = -20.0 * required_denom.log10();
-            (1.0 / required_denom, atten_db)
+        let (norm_scale, normalization_gain_db) = if raw_max_freq_gain_lin > 1.0 + 1e-5 {
+            let atten_db = -20.0 * raw_max_freq_gain_lin.log10();
+            (1.0 / raw_max_freq_gain_lin, atten_db)
         } else {
             (1.0, 0.0)
         };
         let max_boost_db = 0.0;
 
-        // Post-normalization conservative time-domain worst-case peak bound (`<= +3.00 dB`).
+        // Post-normalization conservative time-domain worst-case peak bound (used to gate 0 dB mode).
         let l1_norm = raw_l1_norm * norm_scale;
         let l1_norm_db = if l1_norm > 1.0 {
             20.0 * l1_norm.log10()
@@ -1346,7 +1389,7 @@ impl RewConvolverFactory {
 
         if prepared.normalization_gain_db < 0.0 {
             let notice = format!(
-                "  [rew] Auto-normalized '{}' by {:.2} dB (raw peak freq +{:.2} dB, post-norm L1 bound +{:.2} dB <= +3.00 dB) preserving L/R balance.",
+                "  [rew] Auto-normalized '{}' by {:.2} dB (raw peak freq +{:.2} dB -> 0.00 dB, post-norm L1 bound +{:.2} dB) preserving L/R balance.",
                 prepared.label,
                 prepared.normalization_gain_db,
                 prepared.original_max_boost_db,
@@ -1354,6 +1397,16 @@ impl RewConvolverFactory {
             );
             self.emit_notice_once(
                 format!("norm:{}:{:?}:{}", path.display(), modified, file_len),
+                notice,
+            );
+        } else if prepared.l1_norm_db > 3.0 {
+            let notice = format!(
+                "  [rew] Note: '{}' has steady-state peak <= 0 dB with L1 transient bound +{:.2} dB (0 dB headroom gating accounts for full L1; -3 dB mode keeps fixed -3 dB headroom without extra attenuation).",
+                prepared.label,
+                prepared.l1_norm_db,
+            );
+            self.emit_notice_once(
+                format!("l1-note:{}:{:?}:{}", path.display(), modified, file_len),
                 notice,
             );
         }
@@ -1420,7 +1473,33 @@ impl StereoConvolverFactory for RewConvolverFactory {
                     sample_rate_hz: target_rate_hz,
                 }));
             }
-            return match discover_latest_rew_wav(dir, target_rate_hz)? {
+            let (best, skipped) = discover_latest_rew_wav_with_diagnostics(dir, target_rate_hz)?;
+            for sk in &skipped {
+                let is_relevant = match &best {
+                    None => true,
+                    Some(chosen) => is_newer_candidate(
+                        sk.modified,
+                        &sk.path,
+                        chosen.modified,
+                        &chosen.path,
+                    ),
+                };
+                if is_relevant {
+                    let fname = sk
+                        .path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("<wav>");
+                    self.emit_notice_once(
+                        format!("skipped-wav:{}:{:?}", sk.path.display(), sk.modified),
+                        format!(
+                            "  [rew] WARNING: skipped newer/unreadable WAV '{}' during {} Hz discovery ({})",
+                            fname, target_rate_hz, sk.reason
+                        ),
+                    );
+                }
+            }
+            return match best {
                 Some(found) => {
                     let ir = self.load_or_get_cached(
                         target_rate_hz,

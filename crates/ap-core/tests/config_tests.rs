@@ -189,3 +189,29 @@ fn validate_paths_rejects_missing_dir_or_file_when_enabled_and_allows_when_disab
 
     let _ = fs::remove_dir_all(&tmp);
 }
+
+#[test]
+fn example_toml_auto_enables_convolution_when_only_dir_is_uncommented() {
+    // Review #3 Finding #15: example template must not ship uncommented `enabled = false`
+    // that silently disables convolution when the user uncomments `dir = ...`.
+    let template = include_str!("../../../audiophile-player.example.toml");
+    let unmodified = PlayerConfig::from_toml_str(template).unwrap();
+    assert!(
+        !unmodified.convolution.enabled,
+        "unmodified template without uncommented sources should default to disabled"
+    );
+
+    let with_dir = template.replace(
+        "# dir = 'C:\\Program Files\\EqualizerAPO\\config'",
+        "dir = 'C:\\Program Files\\EqualizerAPO\\config'",
+    );
+    assert_ne!(
+        with_dir, template,
+        "template must contain the Option A dir example line"
+    );
+    let enabled_cfg = PlayerConfig::from_toml_str(&with_dir).unwrap();
+    assert!(
+        enabled_cfg.convolution.enabled,
+        "uncommenting only `dir` in example template must auto-enable convolution"
+    );
+}

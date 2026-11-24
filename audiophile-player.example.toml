@@ -9,8 +9,9 @@
 # REW stereo convolution needs to be configured here.
 
 [convolution]
-# Master switch. Set to false to temporarily bypass convolution without deleting paths.
-enabled = false
+# Master switch. Omit this line to auto-enable whenever `dir`, `file`, or `file_*` is set.
+# Set `enabled = false` explicitly to temporarily bypass convolution without deleting paths.
+# enabled = true
 
 # Option A: Folder containing rate-matched 2-channel REW WAV filters.
 # Auto-picks the most recent 2-channel .wav by modification date matching the active

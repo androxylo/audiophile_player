@@ -102,6 +102,12 @@ impl ConvolutionConfig {
     pub fn validate_paths(&self) -> Result<(), String> {
         self.validate()?;
         if !self.enabled {
+            if self.has_any_source() {
+                eprintln!(
+                    "Notice: [convolution] has enabled = false while filter sources are configured; \
+                     REW convolution is bypassed. Remove `enabled = false` or set `enabled = true` to enable."
+                );
+            }
             return Ok(());
         }
         if let Some(ref dir) = self.dir {

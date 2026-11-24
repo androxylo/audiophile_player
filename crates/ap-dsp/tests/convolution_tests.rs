@@ -1187,7 +1187,7 @@ fn gapless_tail_is_preserved_at_end_of_queue_and_across_rate_change() {
 }
 
 #[test]
-fn all_pass_ir_with_l1_above_3db_auto_normalizes_and_never_clips_in_minus_3db_mode() {
+fn all_pass_ir_preserves_strict_headroom_policy_and_gates_zero_db_by_l1() {
     let tmp = std::env::temp_dir().join(format!(
         "ap_dsp_allpass_l1_test_{}",
         std::process::id()
@@ -1197,7 +1197,7 @@ fn all_pass_ir_with_l1_above_3db_auto_normalizes_and_never_clips_in_minus_3db_mo
 
     // Truncated first-order all-pass IR with a = 0.5:
     //   h[0] = -0.5, h[n] = 0.75 * 0.5^(n-1) for n >= 1.
-    // Exact |H(e^{jw})| = 1.0 (0 dB), but L1 = sum|h| = 2.0 (+6.02 dB).
+    // Exact |H(e^{jw})| = 1.0 (0 dB), and L1 = sum|h| = 2.0 (+6.02 dB).
     let n_taps = 64_usize;
     let mut h = vec![0.0_f64; n_taps];
     h[0] = -0.5;
@@ -1212,20 +1212,27 @@ fn all_pass_ir_with_l1_above_3db_auto_normalizes_and_never_clips_in_minus_3db_mo
     let ap_path = tmp.join("allpass_384k.wav");
     write_wav_f32(&ap_path, 384_000, 2, &wav_samples, false);
 
+    // Review #3 Finding #2: steady-state <= 0 dB IR MUST NOT be attenuated by variable L1 gain
+    // (preserving strict -3 dB / 0 dB headroom policy), while L1 (~+6.02 dB) is preserved to gate
+    // 0 dB mode and logged once as an informational notice.
     let factory = RewConvolverFactory::new(ConvolutionConfig::explicit_file(ap_path.clone()));
     let conv = factory.create_for_rate(384_000).unwrap();
     assert!(
-        conv.peak_gain_bound_db() <= 3.001,
-        "post-normalization L1 bound must be <= +3.00 dB, got {:.3} dB",
+        (conv.peak_gain_bound_db() - 6.0206).abs() < 0.05,
+        "expected unattenuated L1 bound ~+6.02 dB, got {:.3} dB",
         conv.peak_gain_bound_db()
     );
     assert!(
-        conv.description().contains("norm -"),
-        "all-pass IR with L1=+6 dB must auto-normalize: {}",
+        !conv.description().contains("norm -"),
+        "0 dB-peak all-pass IR must NOT receive variable L1 attenuation: {}",
         conv.description()
     );
+    assert!(
+        factory.warnings().iter().any(|w| w.contains("L1 transient bound")),
+        "expected informational L1 notice in factory.warnings(): {:?}",
+        factory.warnings()
+    );
 
-    // Feed worst-case full-scale adversarial transient x[n0 - k] = sign(h[k]) in untagged -3 dB mode.
     let pipeline = AudioPipeline::with_rew_config(
         UpsamplerPolicy {
             filter_override: Some(FilterArchetype::Null),
@@ -1239,12 +1246,60 @@ fn all_pass_ir_with_l1_above_3db_auto_normalizes_and_never_clips_in_minus_3db_mo
         bits_per_sample: 24,
         channels: 2,
     };
+
+    // 1. Quiet track (-10 dBTP <= -3.0 - 6.02 = -9.02 dBFS) runs in 0 dB mode with ZERO extra attenuation!
+    let quiet_meta = TrackPeakMetadata {
+        true_peak_linear: Some(10.0_f64.powf(-10.0 / 20.0)), // ~0.3162
+        ..TrackPeakMetadata::default()
+    };
+    let dc_amp = 0.25_f64;
+    let processed_quiet = pipeline
+        .process(
+            StereoF64Buffer {
+                sample_rate_hz: 384_000,
+                left: vec![dc_amp; 512],
+                right: vec![dc_amp; 512],
+            },
+            spec,
+            &quiet_meta,
+            false,
+        )
+        .unwrap();
+    assert_eq!(processed_quiet.report.headroom.mode, HeadroomMode::ZeroDb);
+    // Steady-state DC gain of all-pass h[0]=-0.5, sum_{k>=1} h[k]=1.5 is +1.0 (exact unity, NOT -3.02 dB!).
+    let steady_l = (processed_quiet.pcm.frames[256][0] as f64) / 2_147_483_648.0;
+    assert!(
+        (steady_l - dc_amp).abs() < 1e-4,
+        "0 dB mode with 0 dB-peak all-pass IR must preserve unity steady-state gain (~{dc_amp}), got {steady_l:.5}"
+    );
+
+    // 2. Track at -5 dBTP (> -9.02 dBFS) is gated to -3 dB by the L1 bound.
+    let mid_meta = TrackPeakMetadata {
+        true_peak_linear: Some(10.0_f64.powf(-5.0 / 20.0)),
+        ..TrackPeakMetadata::default()
+    };
+    let processed_mid = pipeline
+        .process(
+            StereoF64Buffer {
+                sample_rate_hz: 384_000,
+                left: vec![0.1; 128],
+                right: vec![0.1; 128],
+            },
+            spec,
+            &mid_meta,
+            false,
+        )
+        .unwrap();
+    assert_eq!(processed_mid.report.headroom.mode, HeadroomMode::Minus3Db);
+
+    // 3. Adversarial full-scale sign-aligned transient in untagged -3 dB mode saturates cleanly
+    // at positive full-scale without integer wraparound.
     let n0 = 256_usize;
     let mut sig = vec![0.0_f64; 512];
     for k in 0..n_taps {
         sig[n0 - k] = if h[k] >= 0.0 { 0.999 } else { -0.999 };
     }
-    let processed = pipeline
+    let processed_adv = pipeline
         .process(
             StereoF64Buffer {
                 sample_rate_hz: 384_000,
@@ -1252,23 +1307,73 @@ fn all_pass_ir_with_l1_above_3db_auto_normalizes_and_never_clips_in_minus_3db_mo
                 right: sig,
             },
             spec,
-            &TrackPeakMetadata::default(), // untagged -> -3 dB mode
+            &TrackPeakMetadata::default(),
             false,
         )
         .unwrap();
-    assert_eq!(processed.report.headroom.mode, HeadroomMode::Minus3Db);
-
-    // At n0, output must stay below 24-bit full-scale clamp (0x7FFF_FF00) with zero clipping!
-    let peak_sample_l = processed.pcm.frames[n0][0];
+    assert_eq!(processed_adv.report.headroom.mode, HeadroomMode::Minus3Db);
     let max_24 = 0x7F_FFFF_i32 << 8;
-    assert!(
-        peak_sample_l > 0 && peak_sample_l < max_24,
-        "all-pass transient in -3 dB mode must NOT clip full scale: got {peak_sample_l:#x}, max={max_24:#x}"
+    assert_eq!(
+        processed_adv.pcm.frames[n0][0], max_24,
+        "adversarial over-scale transient must saturate cleanly at positive 24-bit max without wrapping"
     );
-    let peak_norm = (peak_sample_l as f64) / 2_147_483_648.0;
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn discover_latest_rew_wav_warns_when_newer_wav_fails_probe_and_enforces_4m_cap() {
+    // Review #3 Finding #13: MAX_IR_TAPS matches REQUIREMENTS.md §5.3 (2^22 = 4,194,304).
+    assert_eq!(ap_dsp::convolution::MAX_IR_TAPS, 1 << 22);
+    assert_eq!(ap_dsp::convolution::MAX_IR_DATA_BYTES, (1u64 << 22) * 16);
+
+    // Review #3 Finding #14: if a newer .wav fails header probing (e.g. over-cap or truncated),
+    // RewConvolverFactory must warn naming the skipped file instead of silently using an older filter.
+    let tmp = std::env::temp_dir().join(format!(
+        "ap_dsp_discover_warn_test_{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(&tmp).unwrap();
+
+    let older_ok = tmp.join("a_older_384k.wav");
+    write_wav_f32(&older_ok, 384_000, 2, &[1.0, 1.0, 0.0, 0.0], false);
+
+    // Ensure distinct newer mtime (or tie-breaking filename 'z_newer_overcap.wav').
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    let newer_bad = tmp.join("z_newer_overcap.wav");
+    {
+        // Valid RIFF/fmt header claiming (MAX_IR_TAPS + 1) stereo f32 frames -> exceeds 4M cap.
+        let mut f = File::create(&newer_bad).unwrap();
+        let data_bytes: u32 = ((ap_dsp::convolution::MAX_IR_TAPS + 1) * 8) as u32;
+        f.write_all(b"RIFF").unwrap();
+        f.write_all(&(36u32.saturating_add(data_bytes)).to_le_bytes()).unwrap();
+        f.write_all(b"WAVE").unwrap();
+        f.write_all(b"fmt ").unwrap();
+        f.write_all(&16u32.to_le_bytes()).unwrap();
+        f.write_all(&3u16.to_le_bytes()).unwrap(); // IEEE float
+        f.write_all(&2u16.to_le_bytes()).unwrap(); // stereo
+        f.write_all(&384_000u32.to_le_bytes()).unwrap();
+        f.write_all(&(384_000u32 * 8).to_le_bytes()).unwrap();
+        f.write_all(&8u16.to_le_bytes()).unwrap();
+        f.write_all(&32u16.to_le_bytes()).unwrap();
+        f.write_all(b"data").unwrap();
+        f.write_all(&data_bytes.to_le_bytes()).unwrap();
+    }
+
+    let factory = RewConvolverFactory::new(ConvolutionConfig::auto_dir(tmp.clone()));
+    let conv = factory.create_for_rate(384_000).unwrap();
     assert!(
-        (peak_norm - 0.999).abs() < 0.005,
-        "expected tight near-0 dBFS unclipped peak (~0.999), got {peak_norm:.5}"
+        conv.description().contains("a_older_384k.wav"),
+        "expected fallback to older valid filter, got {}",
+        conv.description()
+    );
+    let warnings = factory.warnings();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("z_newer_overcap.wav") && w.contains("skipped")),
+        "expected warning naming skipped newer WAV 'z_newer_overcap.wav', got: {warnings:?}"
     );
 
     let _ = fs::remove_dir_all(&tmp);
