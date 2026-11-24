@@ -1126,7 +1126,13 @@ impl WaveRtLoopController {
                         && raw_delta < half / 2
                         && self.wrap_mode != PositionWrapMode::Monotonic
                         && match clock_allows_full_ring_wrap {
-                            Some(true) => is_modular || self.lag_bytes == 0,
+                            Some(true) => {
+                                (is_modular || self.lag_bytes == 0)
+                                    && self.layout.is_clearly_inside_half(
+                                        self.next_expected_half,
+                                        pos.saturating_add(self.lag_bytes),
+                                    )
+                            }
                             Some(false) => false,
                             None => {
                                 is_modular
