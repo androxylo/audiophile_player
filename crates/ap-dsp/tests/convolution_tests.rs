@@ -1187,6 +1187,94 @@ fn gapless_tail_is_preserved_at_end_of_queue_and_across_rate_change() {
 }
 
 #[test]
+fn all_pass_ir_with_l1_above_3db_auto_normalizes_and_never_clips_in_minus_3db_mode() {
+    let tmp = std::env::temp_dir().join(format!(
+        "ap_dsp_allpass_l1_test_{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(&tmp).unwrap();
+
+    // Truncated first-order all-pass IR with a = 0.5:
+    //   h[0] = -0.5, h[n] = 0.75 * 0.5^(n-1) for n >= 1.
+    // Exact |H(e^{jw})| = 1.0 (0 dB), but L1 = sum|h| = 2.0 (+6.02 dB).
+    let n_taps = 64_usize;
+    let mut h = vec![0.0_f64; n_taps];
+    h[0] = -0.5;
+    for k in 1..n_taps {
+        h[k] = 0.75 * 0.5_f64.powi((k - 1) as i32);
+    }
+    let mut wav_samples = Vec::with_capacity(n_taps * 2);
+    for &v in &h {
+        wav_samples.push(v as f32);
+        wav_samples.push(v as f32);
+    }
+    let ap_path = tmp.join("allpass_384k.wav");
+    write_wav_f32(&ap_path, 384_000, 2, &wav_samples, false);
+
+    let factory = RewConvolverFactory::new(ConvolutionConfig::explicit_file(ap_path.clone()));
+    let conv = factory.create_for_rate(384_000).unwrap();
+    assert!(
+        conv.peak_gain_bound_db() <= 3.001,
+        "post-normalization L1 bound must be <= +3.00 dB, got {:.3} dB",
+        conv.peak_gain_bound_db()
+    );
+    assert!(
+        conv.description().contains("norm -"),
+        "all-pass IR with L1=+6 dB must auto-normalize: {}",
+        conv.description()
+    );
+
+    // Feed worst-case full-scale adversarial transient x[n0 - k] = sign(h[k]) in untagged -3 dB mode.
+    let pipeline = AudioPipeline::with_rew_config(
+        UpsamplerPolicy {
+            filter_override: Some(FilterArchetype::Null),
+            ..UpsamplerPolicy::default()
+        },
+        ConvolutionConfig::explicit_file(ap_path),
+    )
+    .unwrap();
+    let spec = StreamSpec {
+        sample_rate_hz: 384_000,
+        bits_per_sample: 24,
+        channels: 2,
+    };
+    let n0 = 256_usize;
+    let mut sig = vec![0.0_f64; 512];
+    for k in 0..n_taps {
+        sig[n0 - k] = if h[k] >= 0.0 { 0.999 } else { -0.999 };
+    }
+    let processed = pipeline
+        .process(
+            StereoF64Buffer {
+                sample_rate_hz: 384_000,
+                left: sig.clone(),
+                right: sig,
+            },
+            spec,
+            &TrackPeakMetadata::default(), // untagged -> -3 dB mode
+            false,
+        )
+        .unwrap();
+    assert_eq!(processed.report.headroom.mode, HeadroomMode::Minus3Db);
+
+    // At n0, output must stay below 24-bit full-scale clamp (0x7FFF_FF00) with zero clipping!
+    let peak_sample_l = processed.pcm.frames[n0][0];
+    let max_24 = 0x7F_FFFF_i32 << 8;
+    assert!(
+        peak_sample_l > 0 && peak_sample_l < max_24,
+        "all-pass transient in -3 dB mode must NOT clip full scale: got {peak_sample_l:#x}, max={max_24:#x}"
+    );
+    let peak_norm = (peak_sample_l as f64) / 2_147_483_648.0;
+    assert!(
+        (peak_norm - 0.999).abs() < 0.005,
+        "expected tight near-0 dBFS unclipped peak (~0.999), got {peak_norm:.5}"
+    );
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
 #[ignore = "requires local C:\\Program Files\\EqualizerAPO\\config REW WAVs"]
 fn real_equalizer_apo_rew_filters_load_and_stream_4m_taps_if_present() {
     let dir = Path::new(r"C:\Program Files\EqualizerAPO\config");

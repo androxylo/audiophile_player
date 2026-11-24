@@ -66,12 +66,28 @@ pub struct TrackPeakMetadata {
     pub replaygain_track_peak: Option<f64>,
     pub replaygain_album_gain_db: Option<f64>,
     pub replaygain_album_peak: Option<f64>,
+    /// Measured True Peak amplitude (linear relative to full scale `1.0`), parsed from
+    /// `TRUE_PEAK`, `REPLAYGAIN_TRACK_TRUE_PEAK`, or `R128_TRACK_TRUE_PEAK`.
+    /// When present, inter-sample peaks (ISPs) are already measured directly.
+    pub true_peak_linear: Option<f64>,
 }
 
 impl TrackPeakMetadata {
+    /// True when a finite positive True Peak tag is present (ISPs already accounted for).
+    pub fn has_verified_true_peak(&self) -> bool {
+        self.true_peak_linear
+            .is_some_and(|p| p.is_finite() && p > 0.0)
+    }
+
     /// Return the best verified peak amplitude (linear relative to full scale `1.0`),
-    /// prioritizing track peak over album peak and rejecting invalid/non-positive values.
+    /// prioritizing measured True Peak over ReplayGain track peak and album peak, and
+    /// rejecting invalid/non-positive values.
     pub fn effective_peak_linear(&self) -> Option<(f64, &'static str)> {
+        if let Some(p) = self.true_peak_linear {
+            if p.is_finite() && p > 0.0 {
+                return Some((p, "TRUE_PEAK"));
+            }
+        }
         if let Some(p) = self.replaygain_track_peak {
             if p.is_finite() && p > 0.0 {
                 return Some((p, "REPLAYGAIN_TRACK_PEAK"));

@@ -49,6 +49,13 @@ impl GaplessCarryover {
     pub fn is_empty(&self) -> bool {
         self.upsampler.is_none() && self.convolver.is_none()
     }
+
+    /// Maximum absolute amplitude (`0.0` if absent) of any carried REW convolution tail.
+    pub fn convolver_tail_peak_linear(&self) -> f64 {
+        self.convolver
+            .as_ref()
+            .map_or(0.0, ConvolutionTail::peak_linear)
+    }
 }
 
 /// Extra safety margin (dB) required on ReplayGain sample peak for `0 dB` headroom whenever the
@@ -337,6 +344,20 @@ impl AudioPipeline {
         peak_meta: &TrackPeakMetadata,
         is_streaming_source: bool,
     ) -> Result<StreamingPipelineSession, String> {
+        self.start_track_with_tail_hint(spec, peak_meta, is_streaming_source, None)
+    }
+
+    /// Open a fresh stateful [`StreamingPipelineSession`], accounting for an optional incoming
+    /// gapless REW convolution tail `(tail_rate_hz, tail_peak_linear)` so Track B's `0 dB`
+    /// headroom decision cannot clip when Track A's decaying tail overlap-adds onto Track B's
+    /// opening samples.
+    pub fn start_track_with_tail_hint(
+        &self,
+        spec: StreamSpec,
+        peak_meta: &TrackPeakMetadata,
+        is_streaming_source: bool,
+        incoming_tail_hint: Option<(u32, f64)>,
+    ) -> Result<StreamingPipelineSession, String> {
         if !(MIN_SUPPORTED_SOURCE_RATE_HZ..=MAX_SUPPORTED_SOURCE_RATE_HZ)
             .contains(&spec.sample_rate_hz)
         {
@@ -358,16 +379,52 @@ impl AudioPipeline {
             .delayer_factory
             .create_for_rate(dsp_plan.target_rate_hz)?;
 
-        let upsampler_isp_margin_db = if dsp_plan.filter != FilterArchetype::Null {
-            UPSAMPLER_ISP_SAFETY_MARGIN_DB
-        } else {
-            0.0
-        };
-        let headroom = select_headroom(
+        // When a verified True Peak tag is present, inter-sample peaks are already measured
+        // directly; otherwise add the conservative sample-peak ISP safety margin whenever a
+        // non-null upsampler reconstructs inter-sample peaks.
+        let upsampler_isp_margin_db =
+            if dsp_plan.filter != FilterArchetype::Null && !peak_meta.has_verified_true_peak() {
+                UPSAMPLER_ISP_SAFETY_MARGIN_DB
+            } else {
+                0.0
+            };
+        let mut headroom = select_headroom(
             peak_meta,
             is_streaming_source,
             convolver.peak_gain_bound_db() + upsampler_isp_margin_db,
         );
+
+        // If an equal-rate decaying REW tail from the previous track will overlap-add onto this
+        // track's opening, ensure `next_track_peak * conv_and_isp_bound + tail_peak <= 1.0`; if
+        // `0 dB` would risk exceeding full scale, safely fall back to hardcoded `-3 dB`.
+        if headroom.mode == HeadroomMode::ZeroDb {
+            if let Some((tail_rate_hz, tail_peak_lin)) = incoming_tail_hint {
+                if tail_rate_hz == dsp_plan.target_rate_hz
+                    && tail_peak_lin.is_finite()
+                    && tail_peak_lin > 1e-6
+                {
+                    let track_peak_lin = peak_meta
+                        .effective_peak_linear()
+                        .map_or(1.0, |(p, _)| p);
+                    let bound_lin = 10.0_f64.powf(
+                        (convolver.peak_gain_bound_db() + upsampler_isp_margin_db) / 20.0,
+                    );
+                    let combined_peak = track_peak_lin * bound_lin + tail_peak_lin;
+                    if combined_peak > 1.0 {
+                        headroom = HeadroomDecision {
+                            mode: HeadroomMode::Minus3Db,
+                            peak_dbfs: headroom.peak_dbfs,
+                            reason: format!(
+                                "incoming gapless REW tail ({:.3}) + track peak bound ({:.3}) = {:.3} > 1.0 -> -3 dB",
+                                tail_peak_lin,
+                                track_peak_lin * bound_lin,
+                                combined_peak
+                            ),
+                        };
+                    }
+                }
+            }
+        }
 
         let untouched_native = dsp_plan.filter == FilterArchetype::Null
             && headroom.mode == HeadroomMode::ZeroDb

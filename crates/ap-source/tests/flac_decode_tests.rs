@@ -262,3 +262,30 @@ fn caps_untrusted_streaminfo_total_samples_preallocation() {
 
     let _ = fs::remove_file(&path);
 }
+
+#[test]
+fn parses_true_peak_tags_in_linear_and_dbtp_forms_separately_from_sample_peak() {
+    let fields_db = vec![
+        "REPLAYGAIN_TRACK_PEAK=0.70".to_string(),
+        "TRUE_PEAK=-3.5 dBTP".to_string(),
+    ];
+    let m1 = parse_peak_metadata_fields(&fields_db);
+    assert_eq!(m1.replaygain_track_peak, Some(0.70));
+    assert!(m1.has_verified_true_peak());
+    let expected_tp = 10.0_f64.powf(-3.5 / 20.0);
+    assert!((m1.true_peak_linear.unwrap() - expected_tp).abs() < 1e-12);
+    let (eff, tag) = m1.effective_peak_linear().unwrap();
+    assert_eq!(tag, "TRUE_PEAK");
+    assert!((eff - expected_tp).abs() < 1e-12);
+
+    // Linear true peak (> 0.0) without dB suffix is stored as linear amplitude directly.
+    let fields_lin = vec!["REPLAYGAIN_TRACK_TRUE_PEAK=0.625".to_string()];
+    let m2 = parse_peak_metadata_fields(&fields_lin);
+    assert_eq!(m2.true_peak_linear, Some(0.625));
+    assert!(m2.has_verified_true_peak());
+
+    // Bare negative R128_TRACK_TRUE_PEAK converts dBTP -> linear.
+    let fields_r128 = vec!["R128_TRACK_TRUE_PEAK=-6.0".to_string()];
+    let m3 = parse_peak_metadata_fields(&fields_r128);
+    assert!((m3.true_peak_linear.unwrap() - 10.0_f64.powf(-6.0 / 20.0)).abs() < 1e-12);
+}

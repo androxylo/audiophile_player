@@ -965,7 +965,16 @@ fn stream_single_track(
         .total_frames()
         .map(|f| f as f64 / spec.sample_rate_hz as f64);
 
-    let mut session = match pipeline.start_track(spec, &peak_meta, source.is_streaming()) {
+    let incoming_tail_hint = incoming_carryover.as_ref().and_then(|c| {
+        let p = c.convolver_tail_peak_linear();
+        (p > 0.0).then_some((c.output_rate_hz, p))
+    });
+    let mut session = match pipeline.start_track_with_tail_hint(
+        spec,
+        &peak_meta,
+        source.is_streaming(),
+        incoming_tail_hint,
+    ) {
         Ok(s) => s,
         Err(err) => {
             if !flush_prev_on_incompatible(buf, &mut incoming_carryover, &mut had_pending_prev_end) {

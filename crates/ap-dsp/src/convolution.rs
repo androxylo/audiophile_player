@@ -73,6 +73,25 @@ pub struct ConvolutionTail {
     pub right: Vec<f64>,
 }
 
+impl ConvolutionTail {
+    /// Maximum absolute sample amplitude across both channels (`0.0` if empty).
+    pub fn peak_linear(&self) -> f64 {
+        let max_l = self
+            .left
+            .iter()
+            .copied()
+            .map(f64::abs)
+            .fold(0.0_f64, f64::max);
+        let max_r = self
+            .right
+            .iter()
+            .copied()
+            .map(f64::abs)
+            .fold(0.0_f64, f64::max);
+        max_l.max(max_r)
+    }
+}
+
 /// Pluggable stateful stereo convolution stage operating strictly in IEEE 754 `f64`.
 pub trait StereoConvolver: Send {
     fn name(&self) -> &'static str;
@@ -638,24 +657,37 @@ impl PreparedStereoIr {
         let r2c = planner.plan_fft_forward(fft_len);
         let c2r = planner.plan_fft_inverse(fft_len);
 
-        // Measure peak frequency-domain magnitude via >= 2x zero-padded full-band f64 RFFT.
-        // Auto-normalize any > 0 dB IR down to 0 dB equally on L & R (preserving L/R balance).
+        // Measure BOTH peak frequency-domain magnitude (via >= 2x zero-padded full-band f64 RFFT)
+        // AND raw time-domain L1 norm (`sum |h[n]|`). Auto-normalize equally on L & R (preserving
+        // exact L/R balance) by `max(max|H|, L1 / 10^(+3/20))` so:
+        // 1. Steady-state frequency gain never exceeds `0 dB` (`max|H_norm| <= 1.0`).
+        // 2. Post-normalization `L1 <= 10^(+3/20)` (`+3.00 dB`), guaranteeing that even in `-3 dB`
+        //    mode (untagged tracks, hot tracks, live streams), an all-pass or excess-phase REW IR
+        //    can NEVER push a full-scale transient over `0 dBFS` into the quantizer clamp.
         let raw_max_freq_gain_lin =
             compute_max_freq_gain_linear(&mut planner, &left[..active_taps], &right[..active_taps])?;
-        let (norm_scale, original_max_boost_db, normalization_gain_db) =
-            if raw_max_freq_gain_lin > 1.0 + 1e-5 {
-                let boost_db = 20.0 * raw_max_freq_gain_lin.log10();
-                (1.0 / raw_max_freq_gain_lin, boost_db, -boost_db)
-            } else {
-                (1.0, 0.0, 0.0)
-            };
+        let raw_l1_left: f64 = left[..active_taps].iter().map(|v| v.abs()).sum();
+        let raw_l1_right: f64 = right[..active_taps].iter().map(|v| v.abs()).sum();
+        let raw_l1_norm = raw_l1_left.max(raw_l1_right);
+        let minus_3db_l1_ceiling = 1.0 / ap_core::headroom::MINUS_3_DB_LINEAR_THRESHOLD; // ~1.412538 (+3.00 dB)
+        let l1_required_denom = raw_l1_norm / minus_3db_l1_ceiling;
+        let required_denom = raw_max_freq_gain_lin.max(l1_required_denom);
+
+        let original_max_boost_db = if raw_max_freq_gain_lin > 1.0 + 1e-5 {
+            20.0 * raw_max_freq_gain_lin.log10()
+        } else {
+            0.0
+        };
+        let (norm_scale, normalization_gain_db) = if required_denom > 1.0 + 1e-5 {
+            let atten_db = -20.0 * required_denom.log10();
+            (1.0 / required_denom, atten_db)
+        } else {
+            (1.0, 0.0)
+        };
         let max_boost_db = 0.0;
 
-        // Compute conservative time-domain worst-case peak bound (L1 norm sum|h| per channel)
-        // on the normalized IR.
-        let l1_left: f64 = left[..active_taps].iter().map(|v| (v * norm_scale).abs()).sum();
-        let l1_right: f64 = right[..active_taps].iter().map(|v| (v * norm_scale).abs()).sum();
-        let l1_norm = l1_left.max(l1_right);
+        // Post-normalization conservative time-domain worst-case peak bound (`<= +3.00 dB`).
+        let l1_norm = raw_l1_norm * norm_scale;
         let l1_norm_db = if l1_norm > 1.0 {
             20.0 * l1_norm.log10()
         } else {
@@ -1314,7 +1346,7 @@ impl RewConvolverFactory {
 
         if prepared.normalization_gain_db < 0.0 {
             let notice = format!(
-                "  [rew] Auto-normalized '{}' by {:.2} dB (peak frequency gain +{:.2} dB -> 0.00 dB, L1 bound {:.2} dB) preserving L/R balance.",
+                "  [rew] Auto-normalized '{}' by {:.2} dB (raw peak freq +{:.2} dB, post-norm L1 bound +{:.2} dB <= +3.00 dB) preserving L/R balance.",
                 prepared.label,
                 prepared.normalization_gain_db,
                 prepared.original_max_boost_db,

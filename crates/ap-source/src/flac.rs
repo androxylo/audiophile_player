@@ -227,9 +227,31 @@ pub struct DecodedFlacInt32 {
     pub pcm: InterleavedInt32Buffer,
 }
 
+/// Parse a True Peak Vorbis comment value, accepting either linear amplitude (`> 0.0`, e.g.
+/// `0.7079`) or dBTP (`<= 0.0` or suffixed with `dB` / `dBTP`, e.g. `-3.0 dBTP`).
+fn parse_true_peak_linear(raw: &str) -> Option<f64> {
+    let trimmed = raw.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let is_db = lower.contains("db");
+    let num_token = trimmed
+        .split(|c: char| c.is_whitespace() || c.is_ascii_alphabetic())
+        .find(|s| !s.is_empty())?;
+    let val = num_token.parse::<f64>().ok()?;
+    if !val.is_finite() {
+        return None;
+    }
+    if is_db || val <= 0.0 {
+        // dBTP (e.g. -3.0 dBTP, +0.5 dBTP, or bare -4.2) -> linear amplitude
+        Some(10.0_f64.powf(val / 20.0))
+    } else {
+        Some(val)
+    }
+}
+
 /// Parse ReplayGain / peak Vorbis comment tags from a `VorbisComment` metadata block.
 pub fn parse_peak_metadata_fields(fields: &[String]) -> TrackPeakMetadata {
     let mut meta = TrackPeakMetadata::default();
+    let mut album_true_peak: Option<f64> = None;
     for field in fields {
         let Some((k, v)) = field.split_once('=') else {
             continue;
@@ -241,12 +263,18 @@ pub fn parse_peak_metadata_fields(fields: &[String]) -> TrackPeakMetadata {
             .and_then(|s| s.parse::<f64>().ok());
         match key.as_str() {
             "REPLAYGAIN_TRACK_GAIN" => meta.replaygain_track_gain_db = val_num,
-            "REPLAYGAIN_TRACK_PEAK" | "TRUE_PEAK" | "REPLAYGAIN_TRACK_TRUE_PEAK" => {
-                meta.replaygain_track_peak = val_num;
+            "REPLAYGAIN_TRACK_PEAK" => meta.replaygain_track_peak = val_num,
+            "TRUE_PEAK" | "REPLAYGAIN_TRACK_TRUE_PEAK" | "R128_TRACK_TRUE_PEAK" => {
+                if let Some(lin) = parse_true_peak_linear(v) {
+                    meta.true_peak_linear = Some(lin);
+                }
             }
             "REPLAYGAIN_ALBUM_GAIN" => meta.replaygain_album_gain_db = val_num,
-            "REPLAYGAIN_ALBUM_PEAK" | "REPLAYGAIN_ALBUM_TRUE_PEAK" => {
-                meta.replaygain_album_peak = val_num;
+            "REPLAYGAIN_ALBUM_PEAK" => meta.replaygain_album_peak = val_num,
+            "REPLAYGAIN_ALBUM_TRUE_PEAK" | "R128_ALBUM_TRUE_PEAK" => {
+                if let Some(lin) = parse_true_peak_linear(v) {
+                    album_true_peak = Some(lin);
+                }
             }
             "R128_TRACK_GAIN" => {
                 meta.replaygain_track_gain_db = val_num.map(|q| q / 256.0);
@@ -256,6 +284,9 @@ pub fn parse_peak_metadata_fields(fields: &[String]) -> TrackPeakMetadata {
             }
             _ => {}
         }
+    }
+    if meta.true_peak_linear.is_none() {
+        meta.true_peak_linear = album_true_peak;
     }
     meta
 }

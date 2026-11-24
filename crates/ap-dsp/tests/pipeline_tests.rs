@@ -202,6 +202,48 @@ fn pipeline_adds_upsampler_isp_safety_margin_on_0_db_headroom_selection() {
         .start_track(native_spec, &at_minus_3, false)
         .unwrap();
     assert_eq!(s_native.report().headroom.mode, HeadroomMode::ZeroDb);
+
+    // - Verified TRUE_PEAK at -3.00 dBTP already includes ISPs, so 44.1 -> 352.8 kHz qualifies for 0 dB.
+    let at_minus_3_tp = TrackPeakMetadata {
+        true_peak_linear: Some(10.0_f64.powf(-3.0 / 20.0)),
+        ..TrackPeakMetadata::default()
+    };
+    let s_cd_tp = pipeline.start_track(cd_spec, &at_minus_3_tp, false).unwrap();
+    assert_eq!(s_cd_tp.report().headroom.mode, HeadroomMode::ZeroDb);
+}
+
+#[test]
+fn incoming_gapless_rew_tail_forces_minus_3db_when_sum_would_exceed_full_scale() {
+    let pipeline = AudioPipeline::new(UpsamplerPolicy::default()).unwrap();
+    let native_spec = StreamSpec {
+        sample_rate_hz: 384_000,
+        bits_per_sample: 24,
+        channels: 2,
+    };
+    // Track B has peak = -3.0 dBFS (~0.7079): qualifies for 0 dB on its own.
+    let quiet_b = TrackPeakMetadata {
+        replaygain_track_peak: Some(10.0_f64.powf(-3.0 / 20.0)),
+        ..TrackPeakMetadata::default()
+    };
+
+    // Small incoming tail (0.10): 0.7079 + 0.10 = 0.8079 <= 1.0 -> stays 0 dB.
+    let s_small = pipeline
+        .start_track_with_tail_hint(native_spec, &quiet_b, false, Some((384_000, 0.10)))
+        .unwrap();
+    assert_eq!(s_small.report().headroom.mode, HeadroomMode::ZeroDb);
+
+    // Loud incoming tail (0.40): 0.7079 + 0.40 = 1.1079 > 1.0 -> safely forces -3 dB!
+    let s_hot = pipeline
+        .start_track_with_tail_hint(native_spec, &quiet_b, false, Some((384_000, 0.40)))
+        .unwrap();
+    assert_eq!(s_hot.report().headroom.mode, HeadroomMode::Minus3Db);
+    assert!(s_hot.report().headroom.reason.contains("incoming gapless REW tail"));
+
+    // Different-rate incoming tail (352.8 kHz) won't be attached to 384 kHz Track B -> stays 0 dB.
+    let s_other_rate = pipeline
+        .start_track_with_tail_hint(native_spec, &quiet_b, false, Some((352_800, 0.40)))
+        .unwrap();
+    assert_eq!(s_other_rate.report().headroom.mode, HeadroomMode::ZeroDb);
 }
 
 #[test]

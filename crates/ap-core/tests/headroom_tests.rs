@@ -27,6 +27,7 @@ fn unknown_or_invalid_peak_always_defaults_to_minus_3_db() {
         replaygain_track_peak: None,
         replaygain_album_gain_db: Some(5.0),
         replaygain_album_peak: None,
+        true_peak_linear: None,
     };
     assert_eq!(
         select_headroom(&gain_only, false, 0.0).mode,
