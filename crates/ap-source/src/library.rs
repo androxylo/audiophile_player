@@ -87,6 +87,7 @@ fn is_excluded_entry_name(name: &str) -> bool {
         ".recycle",
         ".recycle.bin",
         "#recycle",
+        "#snapshot",
         "$recycle.bin",
         ".stversions",
         ".stfolder",
@@ -94,11 +95,53 @@ fn is_excluded_entry_name(name: &str) -> bool {
         ".snapshots",
         ".zfs",
         "@eadir",
+        "@recycle",
+        "@recently-snapshot",
         "system volume information",
         "thumbs.db",
         "desktop.ini",
     ];
     EXCLUDED.iter().any(|&ex| lower == ex)
+}
+
+/// Returns `true` when `dir` resides on a remote network filesystem — either a UNC/SMB share
+/// (`\\server\share\...`) or a Windows mapped network drive (`GetDriveTypeW == DRIVE_REMOTE`,
+/// cached per drive letter so hot directory walks do zero extra syscalls) (Review #5 #23).
+pub fn is_remote_network_dir(dir: &Path) -> bool {
+    if extract_unc_share(dir).is_some() {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        if let Some(Component::Prefix(p)) = dir.components().next() {
+            let drive_byte = match p.kind() {
+                Prefix::Disk(d) | Prefix::VerbatimDisk(d) => Some(d.to_ascii_uppercase()),
+                _ => None,
+            };
+            if let Some(d) = drive_byte {
+                static DRIVE_REMOTE_CACHE: OnceLock<Mutex<HashMap<u8, bool>>> = OnceLock::new();
+                let cache = DRIVE_REMOTE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+                if let Ok(guard) = cache.lock() {
+                    if let Some(&is_remote) = guard.get(&d) {
+                        return is_remote;
+                    }
+                }
+                const DRIVE_REMOTE: u32 = 4;
+                unsafe extern "system" {
+                    fn GetDriveTypeW(lp_root_path_name: *const u16) -> u32;
+                }
+                let root_wide: [u16; 4] = [u16::from(d), u16::from(b':'), u16::from(b'\\'), 0];
+                let is_remote = unsafe { GetDriveTypeW(root_wide.as_ptr()) } == DRIVE_REMOTE;
+                if let Ok(mut guard) = cache.lock() {
+                    guard.insert(d, is_remote);
+                }
+                return is_remote;
+            }
+        }
+    }
+
+    false
 }
 
 /// Returns `true` if a `DirEntry` should be skipped due to name or Windows `HIDDEN`/`SYSTEM`
@@ -385,56 +428,87 @@ pub fn is_symlink_or_mount_point(meta: &fs::Metadata) -> bool {
     meta.file_type().is_symlink()
 }
 
+/// Lexically collapse `.` and `..` components matching Windows Win32 / I/O-manager path
+/// resolution semantics (Review #5 Finding #10).
+///
+/// On Windows, `C:\A\missing\..\evil` and `C:\A\J\..\evil` (even when `J` is a junction) resolve
+/// lexically to `C:\A\evil` BEFORE reparse-point traversal, so the security walker must normalize
+/// `.` / `..` lexically before inspecting components.
+fn lexical_clean_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    let mut has_root_or_prefix = false;
+    let mut normal_depth = 0usize;
+
+    for comp in path.components() {
+        match comp {
+            Component::Prefix(_) | Component::RootDir => {
+                out.push(comp.as_os_str());
+                has_root_or_prefix = true;
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if normal_depth > 0 {
+                    out.pop();
+                    normal_depth -= 1;
+                } else if !has_root_or_prefix {
+                    out.push(comp.as_os_str());
+                }
+            }
+            Component::Normal(seg) => {
+                out.push(seg);
+                normal_depth += 1;
+            }
+        }
+    }
+
+    out
+}
+
 /// Walk `resolved_path` component by component from its safe root prefix using `symlink_metadata`,
-/// recursively inspecting and resolving EVERY intermediate AND final symlink/junction hop BEFORE
-/// applying any subsequent `..` or crossing an unchecked reparse point (Review #4 Finding #4).
+/// first collapsing `.` / `..` lexically (matching Windows I/O-manager semantics) and recursively
+/// inspecting EVERY intermediate AND final symlink/junction hop (Review #4 #4 + Review #5 #10).
+///
+/// A `NotFound` component is treated as safe ONLY when no components remain after it.
 fn verify_resolved_path_components(
     resolved_path: &Path,
     allowed_unc_share: Option<(&str, &str)>,
     remaining_hops: usize,
 ) -> Result<(), String> {
+    let cleaned = lexical_clean_path(resolved_path);
     let mut cur = PathBuf::new();
-    let mut comps = resolved_path.components().peekable();
-    let mut prefix_len = 0usize;
+    let mut comps = cleaned.components().peekable();
 
     // Assemble safe prefix/root first without statting `C:\` or `\\NAS\Share\` as a link.
     while let Some(c) = comps.peek() {
         match c {
             Component::Prefix(_) | Component::RootDir => {
                 cur.push(c.as_os_str());
-                prefix_len += 1;
                 comps.next();
             }
             _ => break,
         }
     }
 
-    let mut normal_depth = 0usize;
     while let Some(comp) = comps.next() {
         match comp {
             Component::CurDir => continue,
-            Component::ParentDir => {
-                if normal_depth > 0 {
-                    cur.pop();
-                    normal_depth -= 1;
-                } else if prefix_len == 0 {
-                    cur.push(comp.as_os_str());
-                }
-                continue;
-            }
-            Component::Normal(seg) => {
-                cur.push(seg);
-                normal_depth += 1;
-            }
-            Component::Prefix(_) | Component::RootDir => {
+            Component::ParentDir | Component::Normal(_) | Component::Prefix(_) | Component::RootDir => {
                 cur.push(comp.as_os_str());
-                continue;
             }
         }
 
-        let Ok(meta) = fs::symlink_metadata(&cur) else {
-            // Non-existent suffix is syntactically safe; downstream open will fail cleanly.
-            return Ok(());
+        let meta = match fs::symlink_metadata(&cur) {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::NotFound && comps.peek().is_none() => {
+                // Non-existent FINAL component is syntactically safe; downstream open fails cleanly.
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(format!(
+                    "cannot verify path component '{}': {e}",
+                    cur.display()
+                ));
+            }
         };
         if is_symlink_or_mount_point(&meta) {
             if remaining_hops == 0 {
@@ -459,7 +533,7 @@ fn verify_resolved_path_components(
                     .unwrap_or(target)
             };
             // Append any remaining suffix components after this intermediate reparse point and
-            // continue walking component-by-component from the resolved target.
+            // continue walking component-by-component from the lexically cleaned target.
             for rest in comps {
                 next.push(rest.as_os_str());
             }
@@ -468,6 +542,15 @@ fn verify_resolved_path_components(
     }
 
     Ok(())
+}
+
+/// Inspect a candidate path (applying Windows lexical `.`/`..` normalization and checking every
+/// intermediate and final reparse point against `allowed_unc_share`).
+pub fn verify_resolved_path_is_allowed(
+    path: &Path,
+    allowed_unc_share: Option<(&str, &str)>,
+) -> Result<(), String> {
+    verify_resolved_path_components(path, allowed_unc_share, MAX_SYMLINK_HOPS)
 }
 
 /// Walk a symlink/junction chain starting at `start_link` up to [`MAX_SYMLINK_HOPS`] hops
@@ -512,7 +595,7 @@ pub fn verify_symlink_chain_is_allowed(
 pub fn read_dir_frame(dir: &Path) -> io::Result<DirEntries> {
     let entries = fs::read_dir(dir)?;
     let allowed_unc = extract_unc_share(dir);
-    let is_unc_dir = allowed_unc.is_some();
+    let is_remote_dir = is_remote_network_dir(dir);
     let share_ref = allowed_unc
         .as_ref()
         .map(|(s, sh)| (s.as_str(), sh.as_str()));
@@ -520,7 +603,7 @@ pub fn read_dir_frame(dir: &Path) -> io::Result<DirEntries> {
     let mut flacs = Vec::new();
 
     for entry in entries.flatten() {
-        if should_skip_dir_entry(&entry, is_unc_dir) {
+        if should_skip_dir_entry(&entry, is_remote_dir) {
             continue;
         }
         let Ok(ft) = entry.file_type() else {

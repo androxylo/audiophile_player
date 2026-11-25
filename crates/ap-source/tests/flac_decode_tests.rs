@@ -436,3 +436,38 @@ fn rejects_zero_hz_streaminfo_flac_cleanly() {
 
     let _ = fs::remove_file(&path);
 }
+
+#[test]
+fn review5_bare_positive_replaygain_true_peak_does_not_overwrite_unambiguous_true_peak() {
+    // Review #5 Finding #24: An earlier valid unambiguous `TRUE_PEAK` or `R128_TRACK_TRUE_PEAK`
+    // MUST NOT be erased by a later bare-positive `REPLAYGAIN_TRACK_TRUE_PEAK` candidate that
+    // fails the companion sample-peak cross-check!
+    let fields = vec![
+        "TRUE_PEAK=-4.0 dB".to_string(),
+        "REPLAYGAIN_TRACK_TRUE_PEAK=0.5".to_string(),
+    ];
+    let meta = parse_peak_metadata_fields(&fields);
+    let expected_lin = 10.0_f64.powf(-4.0 / 20.0);
+    let got = meta
+        .true_peak_linear
+        .expect("unambiguous TRUE_PEAK must be preserved");
+    assert!(
+        (got - expected_lin).abs() < 1e-6,
+        "expected {expected_lin:.6}, got {got:.6}"
+    );
+
+    // Same for R128_ALBUM_TRUE_PEAK followed by bare-positive REPLAYGAIN_ALBUM_TRUE_PEAK.
+    let album_fields = vec![
+        "R128_ALBUM_TRUE_PEAK=-5.0 dBTP".to_string(),
+        "REPLAYGAIN_ALBUM_TRUE_PEAK=0.8".to_string(),
+    ];
+    let album_meta = parse_peak_metadata_fields(&album_fields);
+    let expected_album = 10.0_f64.powf(-5.0 / 20.0);
+    let got_album = album_meta
+        .true_peak_linear
+        .expect("unambiguous R128_ALBUM_TRUE_PEAK must be preserved");
+    assert!(
+        (got_album - expected_album).abs() < 1e-6,
+        "expected {expected_album:.6}, got {got_album:.6}"
+    );
+}

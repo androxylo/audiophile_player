@@ -78,9 +78,7 @@ fn fs_helper_pool() -> &'static Mutex<FsHelperPoolState> {
     POOL.get_or_init(|| Mutex::new(FsHelperPoolState::default()))
 }
 
-/// Derive a stable volume/share concurrency bucket key for `path` (e.g. `unc:\\nas\music` or
-/// `drive:c`) so stalled I/O on one share or drive is isolated from every other volume.
-pub fn fs_volume_key(path: &Path) -> String {
+fn lexical_volume_key(path: &Path) -> String {
     if let Some((srv, share)) = extract_unc_share(path) {
         return format!("unc:\\\\{srv}\\{share}");
     }
@@ -96,6 +94,62 @@ pub fn fs_volume_key(path: &Path) -> String {
         }
     }
     "local".to_string()
+}
+
+/// Derive a stable volume/share concurrency bucket key for `path` (e.g. `unc:\\nas\music` or
+/// `drive:c`) so stalled I/O on one share or drive is isolated from every other volume.
+///
+/// Review #5 Finding #31: For local fixed/removable drive paths, inspects local NTFS reparse
+/// tags (`symlink_metadata` + `read_link`, never contacting any remote target) up to 4 hops so a
+/// junction or symlink pointing to another volume (e.g. `C:\Music\NAS -> Z:\Music` or
+/// `C:\Music\Usb -> D:\Archive`) is billed to the **target** volume's bucket instead of starving
+/// local `C:\` folders.
+pub fn fs_volume_key(path: &Path) -> String {
+    fs_volume_key_with(path, &|p| {
+        let meta = std::fs::symlink_metadata(p).ok()?;
+        if meta.file_type().is_symlink() {
+            std::fs::read_link(p).ok()
+        } else {
+            None
+        }
+    })
+}
+
+fn fs_volume_key_with(path: &Path, read_reparse_target: &dyn Fn(&Path) -> Option<PathBuf>) -> String {
+    fn resolve_key(
+        path: &Path,
+        remaining_hops: usize,
+        read_reparse_target: &dyn Fn(&Path) -> Option<PathBuf>,
+    ) -> String {
+        if extract_unc_share(path).is_some() || ap_source::library::is_remote_network_dir(path) {
+            return lexical_volume_key(path);
+        }
+        if remaining_hops == 0 {
+            return lexical_volume_key(path);
+        }
+        let mut cur = PathBuf::new();
+        let mut comps = path.components();
+        while let Some(comp) = comps.next() {
+            cur.push(comp.as_os_str());
+            if matches!(comp, Component::Prefix(_) | Component::RootDir) {
+                continue;
+            }
+            if let Some(target) = read_reparse_target(&cur) {
+                let mut next = if target.is_absolute() {
+                    target
+                } else {
+                    cur.parent().map(|p| p.join(&target)).unwrap_or(target)
+                };
+                for rest in comps {
+                    next.push(rest.as_os_str());
+                }
+                return resolve_key(&next, remaining_hops - 1, read_reparse_target);
+            }
+        }
+        lexical_volume_key(path)
+    }
+
+    resolve_key(path, 4, read_reparse_target)
 }
 
 /// Run a potentially blocking filesystem validation or directory-listing closure with a strict
@@ -699,12 +753,12 @@ fn handle_connection(
                     return;
                 }
                 Err(()) => {
-                    write_response(
+                    write_storage_timeout_control_page(
                         stream,
-                        "504 Gateway Timeout",
-                        "text/plain; charset=utf-8",
-                        b"Storage timed out validating folder path.",
-                        None,
+                        shared,
+                        &allowed_root,
+                        &req.body,
+                        "Storage timed out or is busy validating folder path. Playback controls (Pause / Next / Play) and other folders remain available.",
                         conn_deadline,
                         stop,
                     );
@@ -730,12 +784,12 @@ fn handle_connection(
                     return;
                 }
                 Err(()) => {
-                    write_response(
+                    write_storage_timeout_control_page(
                         stream,
-                        "504 Gateway Timeout",
-                        "text/plain; charset=utf-8",
-                        b"Storage timed out validating folder path.",
-                        None,
+                        shared,
+                        &allowed_root,
+                        &req.body,
+                        "Storage timed out or is busy validating folder path. Playback controls (Pause / Next / Play) and other folders remain available.",
                         conn_deadline,
                         stop,
                     );
@@ -761,12 +815,12 @@ fn handle_connection(
                     return;
                 }
                 Err(()) => {
-                    write_response(
+                    write_storage_timeout_control_page(
                         stream,
-                        "504 Gateway Timeout",
-                        "text/plain; charset=utf-8",
-                        b"Storage timed out validating folder path.",
-                        None,
+                        shared,
+                        &allowed_root,
+                        &req.body,
+                        "Storage timed out or is busy validating folder path. Playback controls (Pause / Next / Play) and other folders remain available.",
                         conn_deadline,
                         stop,
                     );
@@ -823,12 +877,12 @@ fn handle_connection(
                     return;
                 }
                 Err(()) => {
-                    write_response(
+                    write_storage_timeout_control_page(
                         stream,
-                        "504 Gateway Timeout",
-                        "text/plain; charset=utf-8",
-                        b"Storage timed out validating file path.",
-                        None,
+                        shared,
+                        &allowed_root,
+                        &req.body,
+                        "Storage timed out or is busy validating file path. Playback controls (Pause / Next / Play) and other folders remain available.",
                         conn_deadline,
                         stop,
                     );
@@ -910,6 +964,45 @@ fn extract_syntax_only_dir(body: &str, shared: &SharedControl, allowed_root: &Pa
         Ok(norm) if lexically_within_root(&norm, &norm_root) => norm,
         _ => shared.snapshot().active_folder,
     }
+}
+
+/// Render the full interactive HTML control page with an error banner when a `POST /action/play-*`
+/// storage validation times out or its per-volume helper bucket is saturated, so Pause / Next /
+/// parent-folder navigation stay clickable instead of stranding the user on a bare text 504 page
+/// (Review #5 follow-up to Review #4 #3).
+fn write_storage_timeout_control_page(
+    stream: &mut TcpStream,
+    shared: &SharedControl,
+    allowed_root: &Path,
+    body: &str,
+    error_message: &str,
+    deadline: Instant,
+    stop: &AtomicBool,
+) {
+    let snap = shared.snapshot();
+    let display_dir = extract_syntax_only_dir(body, shared, allowed_root);
+    let norm_root = normalize_allowed_root(allowed_root);
+    let parent_dir = display_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .filter(|p| lexically_within_root(p, &norm_root));
+    let listing = FolderListing {
+        current_dir: display_dir,
+        parent_dir,
+        subdirs: Vec::new(),
+        flac_files: Vec::new(),
+        error: Some(error_message.to_string()),
+    };
+    let html = render_control_page(&snap, &listing);
+    write_response(
+        stream,
+        "504 Gateway Timeout",
+        "text/html; charset=utf-8",
+        html.as_bytes(),
+        None,
+        deadline,
+        stop,
+    );
 }
 
 fn redirect_to_dir(stream: &mut TcpStream, dir: &Path, deadline: Instant, stop: &AtomicBool) {
@@ -1117,5 +1210,48 @@ fn write_response(
     if write_all_with_deadline(stream, head.as_bytes(), deadline, stop) {
         let _ = write_all_with_deadline(stream, body, deadline, stop);
         let _ = stream.flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fs_volume_key_isolates_reparse_targets_to_destination_volume_and_caps_cycles() {
+        let reader = |p: &Path| -> Option<PathBuf> {
+            let s = p.to_string_lossy();
+            if s.eq_ignore_ascii_case(r"C:\Music\NasLink") {
+                Some(PathBuf::from(r"Z:\NasMusic"))
+            } else if s.eq_ignore_ascii_case(r"C:\Music\UncLink") {
+                Some(PathBuf::from(r"\\192.168.1.50\FLAC"))
+            } else if s.eq_ignore_ascii_case(r"C:\Music\CycleA") {
+                Some(PathBuf::from(r"C:\Music\CycleB"))
+            } else if s.eq_ignore_ascii_case(r"C:\Music\CycleB") {
+                Some(PathBuf::from(r"C:\Music\CycleA"))
+            } else {
+                None
+            }
+        };
+
+        assert_eq!(
+            fs_volume_key_with(Path::new(r"C:\Music\LocalAlbum"), &reader),
+            "drive:c"
+        );
+        assert_eq!(
+            fs_volume_key_with(Path::new(r"C:\Music\NasLink\Jazz"), &reader),
+            "drive:z",
+            "junction on C: pointing to mapped drive Z: must bill to drive:z"
+        );
+        assert_eq!(
+            fs_volume_key_with(Path::new(r"C:\Music\UncLink\Rock"), &reader),
+            r"unc:\\192.168.1.50\flac",
+            "junction on C: pointing to UNC share must bill to that UNC bucket"
+        );
+        assert_eq!(
+            fs_volume_key_with(Path::new(r"C:\Music\CycleA\Sub"), &reader),
+            "drive:c",
+            "cyclic junctions must terminate cleanly at hop limit"
+        );
     }
 }

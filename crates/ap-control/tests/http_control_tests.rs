@@ -966,3 +966,83 @@ fn stalled_root_renders_full_control_html_with_pause_and_never_starves_other_vol
     cv.notify_all();
     let _ = fs::remove_dir_all(&local_dir);
 }
+
+#[test]
+fn review5_post_play_actions_render_html_control_page_on_timeout_and_volume_key_isolates_links() {
+    // Review #5 Finding #31 + follow-up to Review #4 #3:
+    // 1. When POST /action/play-random, /action/play-sequential, or /action/play-file hits a
+    //    saturated/timed-out storage bucket, it MUST render the full HTML control page (with
+    //    Pause, Next, and an error banner) rather than a bare text 504!
+    // 2. A local junction/symlink pointing to another volume (e.g. a different drive or UNC)
+    //    must be billed to the target volume's bucket, not the parent drive's bucket.
+    use ap_control::server::{
+        MAX_FS_HELPERS_PER_ROOT, fs_volume_key, run_fs_op_bounded_for_key,
+    };
+    use std::sync::{Arc as StdArc, Condvar, Mutex};
+    use std::time::Duration;
+
+    let stalled_root = PathBuf::from(r"\\192.0.2.88\PostTimeoutShare");
+    let stalled_key = fs_volume_key(&stalled_root);
+    let release = StdArc::new((Mutex::new(false), Condvar::new()));
+
+    for _ in 0..MAX_FS_HELPERS_PER_ROOT {
+        let rel = StdArc::clone(&release);
+        let res = run_fs_op_bounded_for_key(&stalled_key, Duration::from_millis(15), move || {
+            let (lock, cv) = &*rel;
+            let mut done = lock.lock().unwrap();
+            while !*done {
+                let (g, _) = cv.wait_timeout(done, Duration::from_secs(5)).unwrap();
+                done = g;
+            }
+        });
+        assert!(res.is_err());
+    }
+
+    let shared = SharedControl::new(stalled_root.clone(), "Test DAC");
+    let mut server = ControlServer::start(Arc::clone(&shared), None).unwrap();
+    let port = server.addr().port();
+
+    let enc_dir = ap_control::browser::url_encode(&ap_control::browser::encode_path_token(
+        &stalled_root,
+    ));
+    let enc_file = ap_control::browser::url_encode(&ap_control::browser::encode_path_token(
+        &stalled_root.join("track.flac"),
+    ));
+
+    for (endpoint, body) in [
+        ("/action/play-random", format!("dir={enc_dir}")),
+        ("/action/play-sequential", format!("dir={enc_dir}")),
+        ("/action/play-file", format!("dir={enc_dir}&path={enc_file}")),
+    ] {
+        let resp = http_request(
+            server.addr(),
+            &format!(
+                "POST {endpoint} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://127.0.0.1:{port}\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            ),
+        );
+        assert!(
+            resp.starts_with("HTTP/1.1 504 Gateway Timeout"),
+            "{endpoint}: expected 504 status with HTML body, got: {resp:?}"
+        );
+        assert!(
+            resp.contains("text/html"),
+            "{endpoint}: expected text/html control page on timeout, got: {resp:?}"
+        );
+        assert!(
+            resp.contains("/action/pause") && resp.contains("/action/next"),
+            "{endpoint}: timeout HTML page must keep Pause and Next controls clickable!"
+        );
+        assert!(
+            resp.contains("Storage timed out or is busy"),
+            "{endpoint}: timeout HTML page must show clear error banner!"
+        );
+    }
+
+    server.shutdown();
+
+    let (lock, cv) = &*release;
+    *lock.lock().unwrap() = true;
+    cv.notify_all();
+}

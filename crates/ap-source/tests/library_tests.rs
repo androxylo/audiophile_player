@@ -818,3 +818,108 @@ fn verify_symlink_chain_blocks_intermediate_junction_hop_before_following() {
     let _ = fs::remove_dir(&loop_b);
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn review5_nas_denylist_excludes_qnap_and_synology_snapshot_and_recycle_dirs() {
+    // Review #5 Finding #32: QNAP `@Recycle`, `@Recently-Snapshot` and Synology `#snapshot`
+    // must be skipped even when visible (no HIDDEN/SYSTEM attributes).
+    let root = make_temp_tree("nas_denylist_r5");
+    for excluded in ["@Recycle", "@Recently-Snapshot", "#snapshot"] {
+        let d = root.join(excluded);
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("deleted_track.flac"), b"fLaC").unwrap();
+    }
+    let real_album = root.join("Real Album");
+    fs::create_dir_all(&real_album).unwrap();
+    let real_track = real_album.join("01.flac");
+    fs::write(&real_track, b"fLaC").unwrap();
+
+    let frame = read_dir_frame(&root).unwrap();
+    assert_eq!(frame.subdirs, vec![real_album]);
+    let discovered = discover_flac_files(&root).unwrap();
+    assert_eq!(discovered, vec![real_track]);
+
+    // Review #5 Finding #23: UNC paths report remote; local temp dir reports local.
+    assert!(ap_source::library::is_remote_network_dir(std::path::Path::new(
+        r"\\nas\music"
+    )));
+    assert!(!ap_source::library::is_remote_network_dir(&root));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[cfg(windows)]
+#[test]
+fn review5_lexical_dotdot_resolution_blocks_missing_and_junction_parent_bypass() {
+    // Review #5 Finding #10: Windows collapses `..` lexically BEFORE resolving reparse points.
+    // Both `missing\..\evil` AND `J\..\evil` (where `J` is a junction to a clean folder and
+    // `evil` is an unsafe/cyclic junction) MUST collapse to `evil` and be rejected!
+    use ap_source::library::verify_resolved_path_is_allowed;
+
+    let root = make_temp_tree("lexical_dotdot_r5");
+    let clean_target = root.join("CleanTarget");
+    fs::create_dir_all(&clean_target).unwrap();
+
+    // `J` is a benign junction pointing to CleanTarget.
+    let junc_j = root.join("J");
+    let st_j = std::process::Command::new("cmd")
+        .args([
+            "/C",
+            "mklink",
+            "/J",
+            &junc_j.to_string_lossy(),
+            &clean_target.to_string_lossy(),
+        ])
+        .status()
+        .unwrap();
+    assert!(st_j.success());
+
+    // `evil` is a cyclic/unsafe junction (or UNC-targeting link) in the same directory.
+    // Using a self-cyclic junction (`evil -> evil`) reliably triggers rejection without needing
+    // elevated SeCreateSymbolicLinkPrivilege, AND we also test a real UNC target if possible.
+    let evil = root.join("evil");
+    let st_e = std::process::Command::new("cmd")
+        .args([
+            "/C",
+            "mklink",
+            "/J",
+            &evil.to_string_lossy(),
+            &evil.to_string_lossy(),
+        ])
+        .status()
+        .unwrap();
+    assert!(st_e.success());
+
+    // 1. `missing\..\evil`: before Finding #10 fix, statting `missing` returned NotFound -> Ok(())!
+    let via_missing = root.join("missing").join("..").join("evil");
+    assert!(
+        verify_resolved_path_is_allowed(&via_missing, None).is_err(),
+        "`missing\\..\\evil` MUST lexically collapse to `evil` and reject it"
+    );
+
+    // 2. `J\..\evil`: before Finding #10 fix, POSIX resolution followed `J` -> `CleanTarget\..`
+    //    and checked `root\evil` or `CleanTarget\..\evil` inconsistently; lexical collapse MUST
+    //    directly inspect `root\evil` and reject it!
+    let via_junc = root.join("J").join("..").join("evil");
+    assert!(
+        verify_resolved_path_is_allowed(&via_junc, None).is_err(),
+        "`J\\..\\evil` MUST lexically collapse to `evil` and reject it"
+    );
+
+    // 3. Intermediate NotFound component followed by further components must NOT return Ok(()).
+    let missing_mid = root.join("no_such_dir").join("child.flac");
+    assert!(
+        verify_resolved_path_is_allowed(&missing_mid, None).is_err(),
+        "NotFound on an intermediate component must NOT be treated as safe"
+    );
+    // Final NotFound component with existing parent IS safe.
+    let missing_leaf = root.join("no_such_leaf.flac");
+    assert!(
+        verify_resolved_path_is_allowed(&missing_leaf, None).is_ok(),
+        "NotFound on the final component with no remaining suffix should be allowed"
+    );
+
+    let _ = fs::remove_dir(&junc_j);
+    let _ = fs::remove_dir(&evil);
+    let _ = fs::remove_dir_all(&root);
+}

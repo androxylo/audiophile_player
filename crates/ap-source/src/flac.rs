@@ -344,6 +344,22 @@ fn parse_true_peak_value(raw: &str, unit: TruePeakTagUnit) -> Option<ParsedTrueP
     }
 }
 
+/// Update a true-peak candidate slot without letting a lower-confidence bare-positive linear
+/// candidate overwrite an already-parsed unambiguous true-peak tag (Review #5 Finding #24).
+fn update_tp_candidate(slot: &mut Option<ParsedTruePeak>, parsed: ParsedTruePeak) {
+    match (&*slot, parsed) {
+        (_, ParsedTruePeak::Unambiguous(lin)) => {
+            *slot = Some(ParsedTruePeak::Unambiguous(lin));
+        }
+        (Some(ParsedTruePeak::Unambiguous(_)), ParsedTruePeak::BarePositiveLinearCandidate(_)) => {
+            // Preserve unambiguous tag (e.g. TRUE_PEAK / R128_TRACK_TRUE_PEAK).
+        }
+        (_, cand) => {
+            *slot = Some(cand);
+        }
+    }
+}
+
 /// Parse ReplayGain / peak Vorbis comment tags from a `VorbisComment` metadata block.
 pub fn parse_peak_metadata_fields(fields: &[String]) -> TrackPeakMetadata {
     let mut meta = TrackPeakMetadata::default();
@@ -363,19 +379,19 @@ pub fn parse_peak_metadata_fields(fields: &[String]) -> TrackPeakMetadata {
             "REPLAYGAIN_TRACK_PEAK" => meta.replaygain_track_peak = val_num,
             "TRUE_PEAK" => {
                 if let Some(parsed) = parse_true_peak_value(v, TruePeakTagUnit::TruePeakDbOnly) {
-                    track_tp_candidate = Some(parsed);
+                    update_tp_candidate(&mut track_tp_candidate, parsed);
                 }
             }
             "REPLAYGAIN_TRACK_TRUE_PEAK" => {
                 if let Some(parsed) =
                     parse_true_peak_value(v, TruePeakTagUnit::ReplayGainLinearOrExplicitDb)
                 {
-                    track_tp_candidate = Some(parsed);
+                    update_tp_candidate(&mut track_tp_candidate, parsed);
                 }
             }
             "R128_TRACK_TRUE_PEAK" => {
                 if let Some(parsed) = parse_true_peak_value(v, TruePeakTagUnit::ExplicitDbOnly) {
-                    track_tp_candidate = Some(parsed);
+                    update_tp_candidate(&mut track_tp_candidate, parsed);
                 }
             }
             "REPLAYGAIN_ALBUM_GAIN" => meta.replaygain_album_gain_db = val_num,
@@ -384,12 +400,12 @@ pub fn parse_peak_metadata_fields(fields: &[String]) -> TrackPeakMetadata {
                 if let Some(parsed) =
                     parse_true_peak_value(v, TruePeakTagUnit::ReplayGainLinearOrExplicitDb)
                 {
-                    album_tp_candidate = Some(parsed);
+                    update_tp_candidate(&mut album_tp_candidate, parsed);
                 }
             }
             "R128_ALBUM_TRUE_PEAK" => {
                 if let Some(parsed) = parse_true_peak_value(v, TruePeakTagUnit::ExplicitDbOnly) {
-                    album_tp_candidate = Some(parsed);
+                    update_tp_candidate(&mut album_tp_candidate, parsed);
                 }
             }
             "R128_TRACK_GAIN" => {
