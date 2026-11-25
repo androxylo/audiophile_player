@@ -4,15 +4,15 @@
 
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use ap_control::state::SharedControl;
 
-use crate::gena::{GenaEventHub, GenaService};
+use crate::gena::{GenaEventHub, GenaService, SubscribeError, is_private_or_loopback};
 use crate::services::{
     SoapResponse, handle_av_transport, handle_connection_manager, handle_rendering_control,
     parse_soap_action_name, render_connection_manager_event_xml,
@@ -29,9 +29,19 @@ pub const DEFAULT_UPNP_PORT_END: u16 = 49250;
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_BODY_BYTES: usize = 128 * 1024;
 const MAX_WORKERS: usize = 16;
+/// Maximum concurrent HTTP/SOAP connections allowed from a single peer IP (Review #5 #27).
+const MAX_WORKERS_PER_PEER: usize = 4;
+/// Tight deadline to receive the first request byte on an accepted TCP socket (Review #5 #27).
+const FIRST_BYTE_DEADLINE: Duration = Duration::from_secs(2);
 const READ_DEADLINE: Duration = Duration::from_secs(5);
 const CONN_DEADLINE: Duration = Duration::from_secs(10);
 const SERVER_HEADER: &str = "Windows/10 UPnP/1.0 AudiophilePlayer/0.1";
+
+#[derive(Default)]
+struct WorkerPoolState {
+    total: usize,
+    per_peer: HashMap<IpAddr, usize>,
+}
 
 /// Startup configuration for [`UpnpRendererServer`].
 #[derive(Debug, Clone)]
@@ -60,7 +70,7 @@ pub struct UpnpRendererServer {
     advertised_ip: Ipv4Addr,
     state: Arc<UpnpRendererState>,
     stop: Arc<AtomicBool>,
-    active_workers: Arc<AtomicUsize>,
+    workers: Arc<Mutex<WorkerPoolState>>,
     http_handle: Option<JoinHandle<()>>,
     ssdp: Option<SsdpService>,
 }
@@ -70,11 +80,13 @@ impl UpnpRendererServer {
         control: Arc<SharedControl>,
         cfg: UpnpRendererConfig,
     ) -> Result<Self, String> {
-        let bind_ip = cfg.bind_ip.unwrap_or(Ipv4Addr::UNSPECIFIED);
+        // Review #5 Finding #26: bind specifically to the chosen/advertised interface rather than
+        // 0.0.0.0 across VPN / public Wi-Fi / Hyper-V interfaces (explicit 0.0.0.0 still allowed).
         let advertised_ip = match cfg.bind_ip {
             Some(ip) if !ip.is_unspecified() => ip,
             _ => detect_local_ipv4(),
         };
+        let bind_ip = cfg.bind_ip.unwrap_or(advertised_ip);
         let (listener, port) = match cfg.port {
             Some(p) => bind_upnp_port(bind_ip, p, p)?,
             None => bind_upnp_port(bind_ip, DEFAULT_UPNP_PORT_START, DEFAULT_UPNP_PORT_END)?,
@@ -100,9 +112,9 @@ impl UpnpRendererServer {
         ));
 
         let stop = Arc::new(AtomicBool::new(false));
-        let active_workers = Arc::new(AtomicUsize::new(0));
+        let workers = Arc::new(Mutex::new(WorkerPoolState::default()));
         let stop_bg = Arc::clone(&stop);
-        let workers_bg = Arc::clone(&active_workers);
+        let workers_bg = Arc::clone(&workers);
         let state_bg = Arc::clone(&state);
 
         let http_handle = thread::Builder::new()
@@ -121,7 +133,7 @@ impl UpnpRendererServer {
             advertised_ip,
             state,
             stop,
-            active_workers,
+            workers,
             http_handle: Some(http_handle),
             ssdp,
         })
@@ -157,7 +169,9 @@ impl UpnpRendererServer {
         }
         self.state.gena().shutdown();
         let deadline = Instant::now() + Duration::from_millis(200);
-        while self.active_workers.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
+        while self.workers.lock().unwrap_or_else(|e| e.into_inner()).total > 0
+            && Instant::now() < deadline
+        {
             thread::sleep(Duration::from_millis(5));
         }
     }
@@ -189,36 +203,61 @@ fn bind_upnp_port(
     ))
 }
 
-struct WorkerGuard(Arc<AtomicUsize>);
+struct WorkerGuard {
+    pool: Arc<Mutex<WorkerPoolState>>,
+    peer: IpAddr,
+}
 impl Drop for WorkerGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        let mut st = self.pool.lock().unwrap_or_else(|e| e.into_inner());
+        st.total = st.total.saturating_sub(1);
+        if let Some(cnt) = st.per_peer.get_mut(&self.peer) {
+            *cnt = cnt.saturating_sub(1);
+            if *cnt == 0 {
+                st.per_peer.remove(&self.peer);
+            }
+        }
     }
 }
 
-fn try_acquire_worker(active: &Arc<AtomicUsize>) -> Option<WorkerGuard> {
-    let mut cur = active.load(Ordering::Acquire);
-    while cur < MAX_WORKERS {
-        match active.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => return Some(WorkerGuard(Arc::clone(active))),
-            Err(obs) => cur = obs,
-        }
+fn try_acquire_worker(pool: &Arc<Mutex<WorkerPoolState>>, peer: IpAddr) -> Option<WorkerGuard> {
+    let mut st = pool.lock().unwrap_or_else(|e| e.into_inner());
+    let peer_active = st.per_peer.get(&peer).copied().unwrap_or(0);
+    if st.total >= MAX_WORKERS || peer_active >= MAX_WORKERS_PER_PEER {
+        return None;
     }
-    None
+    st.total += 1;
+    *st.per_peer.entry(peer).or_insert(0) += 1;
+    Some(WorkerGuard {
+        pool: Arc::clone(pool),
+        peer,
+    })
 }
 
 fn accept_loop(
     listener: TcpListener,
     state: Arc<UpnpRendererState>,
     stop: Arc<AtomicBool>,
-    active_workers: Arc<AtomicUsize>,
+    workers: Arc<Mutex<WorkerPoolState>>,
 ) {
     while !stop.load(Ordering::Acquire) {
         match listener.accept() {
-            Ok((mut stream, _)) => {
+            Ok((mut stream, peer_addr)) => {
                 let _ = stream.set_nonblocking(false);
                 let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-                let Some(guard) = try_acquire_worker(&active_workers) else {
+                // Review #5 Finding #26: reject connections from outside loopback/RFC1918/link-local.
+                if !is_private_or_loopback(peer_addr.ip()) {
+                    let _ = write_http_reply(
+                        &mut stream,
+                        "403 Forbidden",
+                        "text/plain; charset=\"utf-8\"",
+                        &[],
+                        b"Forbidden: non-LAN UPnP peer rejected",
+                        false,
+                    );
+                    continue;
+                }
+                let Some(guard) = try_acquire_worker(&workers, peer_addr.ip()) else {
                     let _ = write_http_reply(
                         &mut stream,
                         "503 Service Unavailable",
@@ -473,18 +512,34 @@ fn handle_subscribe(
     };
 
     match state.gena().subscribe(service, cb, timeout_hdr, initial_xml) {
-        Ok((sid, secs)) => {
+        Ok((sid, secs, initial_job)) => {
             let timeout_val = format!("Second-{secs}");
-            let _ = write_http_reply(
+            // Review #5 Finding #33: write and flush the 200 OK response (with SID) BEFORE
+            // enqueueing the initial SEQ: 0 NOTIFY so the control point already knows the SID.
+            let write_ok = write_http_reply(
                 stream,
                 "200 OK",
                 "text/plain",
                 &[("SID", sid.as_str()), ("TIMEOUT", timeout_val.as_str())],
                 b"",
                 false,
+            )
+            .is_ok();
+            if write_ok {
+                state.gena().enqueue_initial(initial_job);
+            }
+        }
+        Err(SubscribeError::CapacityExceeded) => {
+            let _ = write_http_reply(
+                stream,
+                "503 Service Unavailable",
+                "text/plain",
+                &[],
+                b"Too many active GENA subscriptions",
+                false,
             );
         }
-        Err(_) => {
+        Err(SubscribeError::InvalidRequest(_)) => {
             let _ = write_http_reply(
                 stream,
                 "412 Precondition Failed",
@@ -501,7 +556,9 @@ fn read_upnp_http_request(
     stream: &mut TcpStream,
     stop: &AtomicBool,
 ) -> Result<UpnpHttpRequest, &'static str> {
-    let deadline = Instant::now() + READ_DEADLINE;
+    let now = Instant::now();
+    let first_byte_deadline = now + FIRST_BYTE_DEADLINE;
+    let deadline = now + READ_DEADLINE;
     let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
 
     let mut raw = Vec::with_capacity(2048);
@@ -510,7 +567,8 @@ fn read_upnp_http_request(
         if stop.load(Ordering::Acquire) {
             return Err("");
         }
-        if Instant::now() >= deadline {
+        let cur_now = Instant::now();
+        if (raw.is_empty() && cur_now >= first_byte_deadline) || cur_now >= deadline {
             return Err("408 Request Timeout");
         }
         match stream.read(&mut tmp) {

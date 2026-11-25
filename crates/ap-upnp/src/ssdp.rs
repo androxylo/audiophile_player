@@ -85,17 +85,25 @@ pub fn build_msearch_response_packet(location_url: &str, udn: &str, st: &str) ->
     )
 }
 
-/// Parse an incoming SSDP `M-SEARCH` datagram and return the matching `ST` values to answer.
-pub fn match_msearch_request(packet: &str, udn: &str) -> Vec<String> {
+/// Matched SSDP `M-SEARCH` request targets and clamped `MX` delay window (Review #5 #28).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchedMSearch {
+    pub targets: Vec<String>,
+    pub mx_secs: u8,
+}
+
+/// Parse an incoming SSDP `M-SEARCH` datagram and return the matching `ST` values plus `MX`
+/// (clamped to `1..=5` per UPnP Device Architecture 1.1). Multicast searches missing a valid
+/// `MX` header are ignored cleanly.
+pub fn parse_msearch_request(packet: &str, udn: &str) -> Option<MatchedMSearch> {
     let mut lines = packet.split("\r\n");
-    let Some(first) = lines.next() else {
-        return Vec::new();
-    };
+    let first = lines.next()?;
     if !first.trim().to_ascii_uppercase().starts_with("M-SEARCH ") {
-        return Vec::new();
+        return None;
     }
     let mut man_ok = false;
     let mut st: Option<String> = None;
+    let mut mx: Option<u8> = None;
     for line in lines {
         let Some((k, v)) = line.split_once(':') else {
             continue;
@@ -108,21 +116,39 @@ pub fn match_msearch_request(packet: &str, udn: &str) -> Vec<String> {
             }
         } else if key.eq_ignore_ascii_case("ST") {
             st = Some(val.to_string());
+        } else if key.eq_ignore_ascii_case("MX") {
+            if let Ok(parsed) = val.parse::<u32>() {
+                if parsed >= 1 {
+                    mx = Some(parsed.min(5) as u8);
+                }
+            }
         }
     }
     if !man_ok {
-        return Vec::new();
+        return None;
     }
-    let Some(st_val) = st else {
-        return Vec::new();
-    };
+    let mx_secs = mx?;
+    let st_val = st?;
     let all = advertised_targets(udn);
-    if st_val.eq_ignore_ascii_case("ssdp:all") {
-        return all.to_vec();
+    let targets: Vec<String> = if st_val.eq_ignore_ascii_case("ssdp:all") {
+        all.to_vec()
+    } else {
+        all.into_iter()
+            .filter(|t| t.eq_ignore_ascii_case(&st_val))
+            .collect()
+    };
+    if targets.is_empty() {
+        None
+    } else {
+        Some(MatchedMSearch { targets, mx_secs })
     }
-    all.into_iter()
-        .filter(|t| t.eq_ignore_ascii_case(&st_val))
-        .collect()
+}
+
+/// Convenience helper returning only the matched `ST` values for valid `M-SEARCH` packets.
+pub fn match_msearch_request(packet: &str, udn: &str) -> Vec<String> {
+    parse_msearch_request(packet, udn)
+        .map(|m| m.targets)
+        .unwrap_or_default()
 }
 
 /// Detect the primary local LAN IPv4 address via zero-packet UDP route lookup (falling back to
@@ -283,8 +309,29 @@ fn ssdp_loop(local_ip: Ipv4Addr, location_url: String, udn: String, stop: Arc<At
 
     let mut last_notify = Instant::now();
     let mut buf = [0u8; 4096];
+    let mut pending_replies: Vec<(Instant, SocketAddr, Vec<String>)> = Vec::new();
+    let mut rng_state: u64 = 0x9E37_79B9_7F4A_7C15 ^ (local_ip.to_bits() as u64);
 
     while !stop.load(Ordering::Acquire) {
+        let now = Instant::now();
+        if !pending_replies.is_empty() {
+            let reply_sock = send_sock.as_ref().or(recv_sock.as_ref());
+            let mut idx = 0;
+            while idx < pending_replies.len() {
+                if now >= pending_replies[idx].0 {
+                    let (_, dest, targets) = pending_replies.swap_remove(idx);
+                    if let Some(sock) = reply_sock {
+                        for st in targets {
+                            let resp = build_msearch_response_packet(&location_url, &udn, &st);
+                            let _ = sock.send_to(resp.as_bytes(), dest);
+                        }
+                    }
+                } else {
+                    idx += 1;
+                }
+            }
+        }
+
         if last_notify.elapsed() >= SSDP_NOTIFY_INTERVAL {
             if let Some(ref s) = send_sock {
                 send_all_notifies(s, mcast_dest, &location_url, &udn, true);
@@ -295,17 +342,33 @@ fn ssdp_loop(local_ip: Ipv4Addr, location_url: String, udn: String, stop: Arc<At
         if let Some(ref rs) = recv_sock {
             match rs.recv_from(&mut buf) {
                 Ok((n, src)) => {
+                    // Reject M-SEARCH from non-LAN / public peers (amplification hardening).
+                    if !crate::gena::is_private_or_loopback(src.ip()) {
+                        continue;
+                    }
                     if let Ok(text) = std::str::from_utf8(&buf[..n]) {
-                        let matched = match_msearch_request(text, &udn);
-                        if !matched.is_empty() {
-                            // If a local control point queried from loopback, ensure LOCATION is
-                            // reachable; our HTTP server binds 0.0.0.0 so both local_ip and 127.0.0.1 work.
-                            let _is_loopback = matches!(src.ip(), IpAddr::V4(v4) if v4.is_loopback());
-                            let reply_sock = send_sock.as_ref().unwrap_or(rs);
-                            for st in matched {
-                                let resp =
-                                    build_msearch_response_packet(&location_url, &udn, &st);
-                                let _ = reply_sock.send_to(resp.as_bytes(), src);
+                        if let Some(matched) = parse_msearch_request(text, &udn) {
+                            let is_local_host = matches!(src.ip(), IpAddr::V4(v4) if v4.is_loopback() || v4 == local_ip);
+                            if is_local_host {
+                                // Answer local host (e.g. foobar2000 on same PC) promptly.
+                                let reply_sock = send_sock.as_ref().unwrap_or(rs);
+                                for st in matched.targets {
+                                    let resp =
+                                        build_msearch_response_packet(&location_url, &udn, &st);
+                                    let _ = reply_sock.send_to(resp.as_bytes(), src);
+                                }
+                            } else if pending_replies.len() < 32 {
+                                // Review #5 Finding #28: spread LAN multicast replies over 0..MX s.
+                                rng_state = rng_state
+                                    .wrapping_mul(6364136223846793005)
+                                    .wrapping_add(1442695040888963407);
+                                let max_ms = u64::from(matched.mx_secs) * 800;
+                                let delay_ms = (rng_state >> 32) % max_ms.max(1);
+                                pending_replies.push((
+                                    Instant::now() + Duration::from_millis(delay_ms),
+                                    src,
+                                    matched.targets,
+                                ));
                             }
                         }
                     }

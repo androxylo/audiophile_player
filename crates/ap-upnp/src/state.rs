@@ -72,6 +72,10 @@ impl UpnpTrackDescriptor {
     }
 
     pub fn to_play_request(&self) -> UpnpPlayRequest {
+        self.to_play_request_at(None)
+    }
+
+    pub fn to_play_request_at(&self, seek_offset_s: Option<f64>) -> UpnpPlayRequest {
         UpnpPlayRequest {
             uri: self.uri.clone(),
             display_name: self.display_name(),
@@ -80,6 +84,7 @@ impl UpnpTrackDescriptor {
             channels: self.channels,
             bits_per_sample: self.bits_per_sample,
             duration_s: self.duration_s,
+            seek_offset_s,
         }
     }
 }
@@ -251,11 +256,14 @@ impl UpnpRendererState {
     }
 
     /// Handle UPnP `AVTransport::Play`.
+    ///
+    /// Resumes from `accumulated_elapsed_s` when called from `PAUSED_PLAYBACK` (Review #5 #7)
+    /// instead of restarting from byte 0.
     pub fn play(&self) -> Result<(), (u16, &'static str)> {
         let req_to_start: Option<UpnpPlayRequest>;
         {
             let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            let req = {
+            let (req, resume_offset) = {
                 let Some(cur) = st.current.as_ref() else {
                     return Err((701, "Transition not available"));
                 };
@@ -266,15 +274,71 @@ impl UpnpRendererState {
                     // Already playing or transitioning to CurrentURI: idempotent 200 OK.
                     return Ok(());
                 }
-                cur.to_play_request()
+                let offset = if st.accumulated_elapsed_s > 0.05 {
+                    Some(st.accumulated_elapsed_s)
+                } else {
+                    None
+                };
+                (cur.to_play_request_at(offset), offset)
             };
             st.transport_state = TransportState::Transitioning;
             st.transport_status = "OK".to_string();
             st.playing_started_at = None;
-            st.accumulated_elapsed_s = 0.0;
+            if resume_offset.is_none() {
+                st.accumulated_elapsed_s = 0.0;
+            }
             req_to_start = Some(req);
         }
         if let Some(req) = req_to_start {
+            self.control.submit_command(ControlCommand::PlayUpnp(req));
+        }
+        self.emit_avt_last_change();
+        Ok(())
+    }
+
+    /// Handle UPnP `AVTransport::Seek` (`Unit = REL_TIME`, Review #5 Finding #8).
+    pub fn seek(&self, unit: &str, target: &str) -> Result<(), (u16, &'static str)> {
+        if !unit.trim().eq_ignore_ascii_case("REL_TIME") {
+            return Err((710, "Seek mode not supported"));
+        }
+        let Some(target_s) = crate::xml::parse_upnp_duration(target) else {
+            return Err((711, "Illegal seek target"));
+        };
+        let play_now: Option<UpnpPlayRequest>;
+        {
+            let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(cur) = st.current.as_ref() else {
+                return Err((701, "Transition not available"));
+            };
+            let clamped_s = if let Some(dur) = st.active_duration_s.or(cur.duration_s) {
+                if dur > 0.0 {
+                    target_s.min(dur)
+                } else {
+                    target_s
+                }
+            } else {
+                target_s
+            };
+            let was_active = matches!(
+                st.transport_state,
+                TransportState::Playing | TransportState::Transitioning
+            );
+            let req = cur.to_play_request_at(if clamped_s > 0.0 {
+                Some(clamped_s)
+            } else {
+                None
+            });
+            st.accumulated_elapsed_s = clamped_s;
+            st.playing_started_at = None;
+            if was_active {
+                st.transport_state = TransportState::Transitioning;
+                st.transport_status = "OK".to_string();
+                play_now = Some(req);
+            } else {
+                play_now = None;
+            }
+        }
+        if let Some(req) = play_now {
             self.control.submit_command(ControlCommand::PlayUpnp(req));
         }
         self.emit_avt_last_change();
@@ -361,26 +425,38 @@ impl UpnpRendererState {
     // Engine-side lifecycle callbacks (called by `ap-cli/src/engine.rs`)
     // -----------------------------------------------------------------------
 
-    /// Called by the engine when a UPnP stream begins playing on the WDM-KS DAC.
+    /// Called by the engine consumer when a UPnP stream actually begins playing on the WDM-KS DAC.
+    ///
+    /// If `uri` matches a prefetched `NextURI` (Review #5 Finding #5), atomically promotes
+    /// `NextURI -> CurrentURI` right when audio becomes audible instead of 12 s early during
+    /// producer decode-ahead.
     pub fn engine_mark_playing(&self, uri: &str, decoded_duration_s: Option<f64>) {
         let mut changed = false;
         {
             let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            let matches_current = st
-                .current
-                .as_ref()
-                .is_some_and(|c| c.uri == uri);
-            if matches_current {
+            let matches_next = st.next.as_ref().is_some_and(|n| n.uri == uri);
+            if matches_next {
+                if let Some(next) = st.next.take() {
+                    st.current = Some(next);
+                    st.accumulated_elapsed_s = 0.0;
+                    st.active_duration_s = decoded_duration_s;
+                    st.transport_state = TransportState::Playing;
+                    st.transport_status = "OK".to_string();
+                    st.playing_started_at = Some(Instant::now());
+                    changed = true;
+                }
+            } else if st.current.as_ref().is_some_and(|c| c.uri == uri) {
                 if st.transport_state != TransportState::Playing {
                     changed = true;
                 }
                 st.transport_state = TransportState::Playing;
                 st.transport_status = "OK".to_string();
                 st.playing_started_at = Some(Instant::now());
-                st.accumulated_elapsed_s = 0.0;
                 if let Some(dur) = decoded_duration_s {
-                    st.active_duration_s = Some(dur);
-                    changed = true;
+                    if st.active_duration_s != Some(dur) {
+                        st.active_duration_s = Some(dur);
+                        changed = true;
+                    }
                 }
             }
         }
@@ -398,6 +474,23 @@ impl UpnpRendererState {
         if let Some(u) = uri {
             self.engine_mark_playing(&u, decoded_duration_s);
         }
+    }
+
+    /// Peek `NextURI` for producer-side gapless prefetch WITHOUT prematurely promoting
+    /// `CurrentURI` or resetting `RelTime` (Review #5 Finding #5).
+    ///
+    /// Returns `Some(req)` only when `st.next` is set and differs from `already_prefetched_uri`
+    /// so the producer never loops on the same queued next URI.
+    pub fn engine_peek_next_for_prefetch(
+        &self,
+        already_prefetched_uri: Option<&str>,
+    ) -> Option<UpnpPlayRequest> {
+        let st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let next = st.next.as_ref()?;
+        if already_prefetched_uri == Some(next.uri.as_str()) {
+            return None;
+        }
+        Some(next.to_play_request())
     }
 
     /// Called by the DSP producer when the current UPnP stream reaches clean EOF:
@@ -509,7 +602,7 @@ impl UpnpRendererState {
             .unwrap_or_else(|| "00:00:00".to_string());
         let nr_tracks = if snap.current.is_some() { 1 } else { 0 };
         let actions = if snap.current.is_some() {
-            "Play,Stop,Pause"
+            "Play,Stop,Pause,Seek"
         } else {
             "Stop"
         };

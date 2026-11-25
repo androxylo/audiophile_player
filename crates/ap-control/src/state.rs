@@ -15,7 +15,7 @@ use crate::security::normalize_allowed_root;
 /// Maximum number of queued relative commands (`Next`) before additional clicks are dropped.
 const MAX_QUEUED_COMMANDS: usize = 16;
 
-/// Metadata accompanying a UPnP `AVTransport::Play` / `SetAVTransportURI` stream request.
+/// Metadata accompanying a UPnP `AVTransport::Play` / `SetAVTransportURI` / `Seek` stream request.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpnpPlayRequest {
     pub uri: String,
@@ -25,6 +25,8 @@ pub struct UpnpPlayRequest {
     pub channels: Option<u16>,
     pub bits_per_sample: Option<u16>,
     pub duration_s: Option<f64>,
+    /// Optional start offset in seconds (used for `AVTransport::Seek` and Pause/Resume).
+    pub seek_offset_s: Option<f64>,
 }
 
 impl Eq for UpnpPlayRequest {}

@@ -312,3 +312,121 @@ fn gena_subscribe_delivers_initial_notify_and_blocks_public_wan_callbacks() {
 
     srv.shutdown();
 }
+
+#[test]
+fn seek_and_pause_resume_preserve_position_and_per_peer_cap_prevents_starvation() {
+    let shared = SharedControl::new(PathBuf::from(r"C:\Music"), "Gungnir 2");
+    let mut srv = UpnpRendererServer::start(
+        shared.clone(),
+        UpnpRendererConfig {
+            friendly_name: "Seek/Resume Test".to_string(),
+            port: None,
+            bind_ip: Some(Ipv4Addr::LOCALHOST),
+            enable_ssdp: false,
+        },
+    )
+    .unwrap();
+    let port = srv.port();
+
+    // Load a 3-minute track and start playing.
+    let _ = soap_post(
+        port,
+        "/upnp/control/AVTransport",
+        "urn:schemas-upnp-org:service:AVTransport:1",
+        "SetAVTransportURI",
+        "<InstanceID>0</InstanceID>\
+         <CurrentURI>http://127.0.0.1:50000/song.flac</CurrentURI>\
+         <CurrentURIMetaData>&lt;DIDL-Lite&gt;&lt;item&gt;&lt;res duration=&quot;0:03:00&quot;&gt;&lt;/res&gt;&lt;/item&gt;&lt;/DIDL-Lite&gt;</CurrentURIMetaData>",
+    );
+    let _ = soap_post(
+        port,
+        "/upnp/control/AVTransport",
+        "urn:schemas-upnp-org:service:AVTransport:1",
+        "Play",
+        "<InstanceID>0</InstanceID><Speed>1</Speed>",
+    );
+    let _ = shared.take_pending_command();
+    srv.state()
+        .engine_mark_playing("http://127.0.0.1:50000/song.flac", Some(180.0));
+
+    // Review #5 Finding #8: Seek(REL_TIME, 00:01:30) succeeds and dispatches PlayUpnp at 90.0 s!
+    let seek_ok = soap_post(
+        port,
+        "/upnp/control/AVTransport",
+        "urn:schemas-upnp-org:service:AVTransport:1",
+        "Seek",
+        "<InstanceID>0</InstanceID><Unit>REL_TIME</Unit><Target>00:01:30</Target>",
+    );
+    assert!(seek_ok.starts_with("HTTP/1.1 200 OK"), "seek failed: {seek_ok}");
+    match shared.take_pending_command() {
+        Some(ControlCommand::PlayUpnp(req)) => {
+            assert_eq!(req.seek_offset_s, Some(90.0));
+        }
+        other => panic!("expected PlayUpnp(seek_offset_s=90.0), got {other:?}"),
+    }
+    srv.state()
+        .engine_mark_playing("http://127.0.0.1:50000/song.flac", Some(180.0));
+
+    // Review #5 Finding #7: Pause then Play resumes from >= 90 s (never resets to 0)!
+    let _ = soap_post(
+        port,
+        "/upnp/control/AVTransport",
+        "urn:schemas-upnp-org:service:AVTransport:1",
+        "Pause",
+        "<InstanceID>0</InstanceID>",
+    );
+    assert_eq!(shared.take_pending_command(), Some(ControlCommand::Pause));
+    assert_eq!(srv.state().snapshot().transport_state, TransportState::PausedPlayback);
+
+    let _ = soap_post(
+        port,
+        "/upnp/control/AVTransport",
+        "urn:schemas-upnp-org:service:AVTransport:1",
+        "Play",
+        "<InstanceID>0</InstanceID><Speed>1</Speed>",
+    );
+    match shared.take_pending_command() {
+        Some(ControlCommand::PlayUpnp(req)) => {
+            assert!(
+                req.seek_offset_s.is_some_and(|s| s >= 90.0),
+                "resume from pause must keep elapsed offset >= 90s, got {:?}",
+                req.seek_offset_s
+            );
+        }
+        other => panic!("expected PlayUpnp resume, got {other:?}"),
+    }
+
+    // Unsupported Seek unit returns 710 cleanly.
+    let bad_seek = soap_post(
+        port,
+        "/upnp/control/AVTransport",
+        "urn:schemas-upnp-org:service:AVTransport:1",
+        "Seek",
+        "<InstanceID>0</InstanceID><Unit>TRACK_NR</Unit><Target>2</Target>",
+    );
+    assert!(bad_seek.starts_with("HTTP/1.1 500"));
+    assert_eq!(extract_xml_element_text(&bad_seek, "errorCode").as_deref(), Some("710"));
+
+    // Review #5 Finding #28: M-SEARCH without MX is rejected cleanly.
+    let msearch_no_mx =
+        "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nST: ssdp:all\r\n\r\n";
+    assert!(match_msearch_request(msearch_no_mx, srv.udn()).is_empty());
+
+    // Review #5 Finding #27: 4 idle connections from one peer trigger 503 on the 5th from that peer.
+    let mut idle_conns = Vec::new();
+    for _ in 0..4 {
+        idle_conns.push(TcpStream::connect(("127.0.0.1", port)).unwrap());
+    }
+    thread::sleep(Duration::from_millis(60));
+    let fifth = send_raw_http(
+        port,
+        &format!("GET /description.xml HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(
+        fifth.starts_with("HTTP/1.1 503"),
+        "5th concurrent connection from same peer must hit per-peer cap: {fifth}"
+    );
+    drop(idle_conns);
+
+    srv.shutdown();
+}

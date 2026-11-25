@@ -165,7 +165,14 @@ pub fn handle_av_transport(
             Err((code, desc)) => SoapResponse::fault(code, desc),
         },
         "Previous" => SoapResponse::fault(701, "Transition not available"),
-        "Seek" => SoapResponse::fault(710, "Seek mode not supported"),
+        "Seek" => {
+            let unit = extract_xml_element_text(body_xml, "Unit").unwrap_or_default();
+            let target = extract_xml_element_text(body_xml, "Target").unwrap_or_default();
+            match state.seek(&unit, &target) {
+                Ok(()) => SoapResponse::ok(AVTRANSPORT_SERVICE_TYPE, "Seek", ""),
+                Err((code, desc)) => SoapResponse::fault(code, desc),
+            }
+        }
         "GetTransportInfo" => {
             let snap = state.snapshot();
             let fields = format!(
@@ -256,7 +263,7 @@ pub fn handle_av_transport(
         "GetCurrentTransportActions" => {
             let snap = state.snapshot();
             let actions = if snap.current.is_some() {
-                "Play,Stop,Pause"
+                "Play,Stop,Pause,Seek"
             } else {
                 "Stop"
             };
