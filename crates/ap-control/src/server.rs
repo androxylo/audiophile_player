@@ -96,23 +96,115 @@ fn lexical_volume_key(path: &Path) -> String {
     "local".to_string()
 }
 
-/// Derive a stable volume/share concurrency bucket key for `path` (e.g. `unc:\\nas\music` or
-/// `drive:c`) so stalled I/O on one share or drive is isolated from every other volume.
-///
-/// Review #5 Finding #31: For local fixed/removable drive paths, inspects local NTFS reparse
-/// tags (`symlink_metadata` + `read_link`, never contacting any remote target) up to 4 hops so a
-/// junction or symlink pointing to another volume (e.g. `C:\Music\NAS -> Z:\Music` or
-/// `C:\Music\Usb -> D:\Archive`) is billed to the **target** volume's bucket instead of starving
-/// local `C:\` folders.
-pub fn fs_volume_key(path: &Path) -> String {
-    fs_volume_key_with(path, &|p| {
+const REPARSE_KEY_CACHE_MAX_ENTRIES: usize = 512;
+
+fn reparse_key_cache() -> &'static Mutex<HashMap<String, String>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn has_unsafe_stat_prefix(path: &Path) -> bool {
+    let Some(Component::Prefix(p)) = path.components().next() else {
+        return false;
+    };
+    match p.kind() {
+        Prefix::DeviceNS(_) => true,
+        Prefix::Verbatim(v) => {
+            let s = v.to_string_lossy();
+            !(s.len() >= 7 && s[..7].eq_ignore_ascii_case("Volume{"))
+        }
+        _ => false,
+    }
+}
+
+fn normalized_cache_path_key(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
+}
+
+fn lookup_cached_reparse_volume_key(path: &Path) -> Option<String> {
+    let Ok(cache) = reparse_key_cache().lock() else {
+        return None;
+    };
+    if cache.is_empty() {
+        return None;
+    }
+    // Check from full path up to ancestors so the deepest cached reparse hop wins.
+    let mut cur = path;
+    loop {
+        let key = normalized_cache_path_key(cur);
+        if let Some(bucket) = cache.get(&key) {
+            return Some(bucket.clone());
+        }
+        match cur.parent() {
+            Some(parent) if parent != cur => cur = parent,
+            _ => break,
+        }
+    }
+    None
+}
+
+/// Populate the in-memory reparse bucket cache strictly INSIDE a bounded filesystem worker thread
+/// (never on the HTTP connection thread, Review #6 Finding #9).
+fn populate_reparse_volume_cache_bounded(path: &Path) {
+    if has_unsafe_stat_prefix(path) || extract_unc_share(path).is_some() {
+        return;
+    }
+    let lexical = lexical_volume_key(path);
+    let resolved = fs_volume_key_with(path, &|p| {
+        if has_unsafe_stat_prefix(p) {
+            return None;
+        }
         let meta = std::fs::symlink_metadata(p).ok()?;
         if meta.file_type().is_symlink() {
             std::fs::read_link(p).ok()
         } else {
             None
         }
-    })
+    });
+    if resolved != lexical {
+        if let Ok(mut cache) = reparse_key_cache().lock() {
+            if cache.len() >= REPARSE_KEY_CACHE_MAX_ENTRIES {
+                cache.clear();
+            }
+            cache.insert(normalized_cache_path_key(path), resolved);
+        }
+    }
+}
+
+/// Pure-lexical pre-validation (ZERO filesystem syscalls) enforcing syntax & allowed-root
+/// containment BEFORE any bounded helper thread or bucket lookup runs (Review #6 Finding #9).
+fn prevalidate_lexical_path_for_root(decoded: &Path, allowed_root: &Path) -> Result<PathBuf, String> {
+    let norm_root = normalize_allowed_root(allowed_root);
+    let allowed_unc = extract_unc_share(&norm_root);
+    let share_ref = allowed_unc
+        .as_ref()
+        .map(|(s, sh)| (s.as_str(), sh.as_str()));
+    let norm = validate_path_syntax_for_root(decoded, share_ref)?;
+    if !lexically_within_root(&norm, &norm_root) {
+        return Err(format!(
+            "path '{}' escapes allowed music root '{}'",
+            norm.display(),
+            norm_root.display()
+        ));
+    }
+    Ok(norm)
+}
+
+/// Derive a stable volume/share concurrency bucket key for `path` (e.g. `unc:\\nas\music` or
+/// `drive:c`) with **ZERO filesystem syscalls** on the HTTP connection thread (Review #6 #9):
+/// - Consults the in-memory reparse-target cache (populated strictly inside bounded worker threads)
+///   so known local junctions pointing to another volume (e.g. `C:\Music\Usb -> D:\Archive`) are
+///   isolated to the target volume's bucket without ever risking an unbounded `symlink_metadata`
+///   hang on the HTTP thread.
+/// - Falls back immediately to purely lexical [`lexical_volume_key`].
+pub fn fs_volume_key(path: &Path) -> String {
+    if has_unsafe_stat_prefix(path) || extract_unc_share(path).is_some() {
+        return lexical_volume_key(path);
+    }
+    lookup_cached_reparse_volume_key(path).unwrap_or_else(|| lexical_volume_key(path))
 }
 
 fn fs_volume_key_with(path: &Path, read_reparse_target: &dyn Fn(&Path) -> Option<PathBuf>) -> String {
@@ -121,7 +213,10 @@ fn fs_volume_key_with(path: &Path, read_reparse_target: &dyn Fn(&Path) -> Option
         remaining_hops: usize,
         read_reparse_target: &dyn Fn(&Path) -> Option<PathBuf>,
     ) -> String {
-        if extract_unc_share(path).is_some() || ap_source::library::is_remote_network_dir(path) {
+        if has_unsafe_stat_prefix(path)
+            || extract_unc_share(path).is_some()
+            || ap_source::library::is_remote_network_dir(path)
+        {
             return lexical_volume_key(path);
         }
         if remaining_hops == 0 {
@@ -639,25 +734,50 @@ fn handle_connection(
             let snap = shared.snapshot();
             let root_for_fs = allowed_root.clone();
             let fallback_dir = snap.active_folder.clone();
-            let display_dir_on_timeout = raw_dir_param
-                .as_deref()
-                .and_then(|raw| decode_path_token(raw).ok())
-                .and_then(|decoded| {
-                    let norm_root = normalize_allowed_root(&allowed_root);
-                    let allowed_unc = extract_unc_share(&norm_root);
-                    let share_ref = allowed_unc
-                        .as_ref()
-                        .map(|(s, sh)| (s.as_str(), sh.as_str()));
-                    validate_path_syntax_for_root(&decoded, share_ref)
-                        .ok()
-                        .filter(|p| lexically_within_root(p, &norm_root))
-                })
-                .unwrap_or_else(|| fallback_dir.clone());
+            // Review #6 Finding #9: purely lexical pre-validation before any bounded worker or
+            // bucket lookup so illegal prefixes / out-of-root paths trigger ZERO syscalls.
+            let display_dir_on_timeout = if let Some(raw) = raw_dir_param.as_deref() {
+                let decoded = match decode_path_token(raw) {
+                    Ok(p) => p,
+                    Err(reason) => {
+                        write_response(
+                            stream,
+                            "403 Forbidden",
+                            "text/plain; charset=utf-8",
+                            format!("Forbidden path: {reason}").as_bytes(),
+                            None,
+                            conn_deadline,
+                            stop,
+                        );
+                        return;
+                    }
+                };
+                match prevalidate_lexical_path_for_root(&decoded, &allowed_root) {
+                    Ok(norm) => norm,
+                    Err(reason) => {
+                        write_response(
+                            stream,
+                            "403 Forbidden",
+                            "text/plain; charset=utf-8",
+                            format!("Forbidden path: {reason}").as_bytes(),
+                            None,
+                            conn_deadline,
+                            stop,
+                        );
+                        return;
+                    }
+                }
+            } else {
+                fallback_dir.clone()
+            };
             let fs_key = fs_volume_key(&display_dir_on_timeout);
             let fs_res = run_fs_op_bounded_for_key(&fs_key, FS_OP_DEADLINE, move || {
                 let browse_dir = match raw_dir_param {
                     Some(raw) => match decode_and_validate_dir(&raw, &root_for_fs) {
-                        Ok(valid) => valid,
+                        Ok(valid) => {
+                            populate_reparse_volume_cache_bounded(&valid);
+                            valid
+                        }
                         Err(reason) => return Err(reason),
                     },
                     None => fallback_dir,
@@ -856,12 +976,33 @@ fn handle_connection(
                     return;
                 }
             };
+            // Review #6 Finding #9: validate syntax and root containment lexically FIRST (zero
+            // syscalls on the HTTP thread) so raw DeviceNS / Verbatim / out-of-root paths never
+            // trigger any filesystem stat or SMB contact.
+            let prevalidated = match prevalidate_lexical_path_for_root(&decoded, &allowed_root) {
+                Ok(p) => p,
+                Err(reason) => {
+                    write_response(
+                        stream,
+                        "403 Forbidden",
+                        "text/plain; charset=utf-8",
+                        format!("Rejected file path: {reason}").as_bytes(),
+                        None,
+                        conn_deadline,
+                        stop,
+                    );
+                    return;
+                }
+            };
             let root_for_fs = allowed_root.clone();
-            let file_fs_key = fs_volume_key(&decoded);
+            let file_fs_key = fs_volume_key(&prevalidated);
             let valid_file = match run_fs_op_bounded_for_key(
                 &file_fs_key,
                 FS_OP_DEADLINE,
-                move || validate_playable_flac_path(&decoded, Some(&root_for_fs)),
+                move || {
+                    populate_reparse_volume_cache_bounded(&prevalidated);
+                    validate_playable_flac_path(&prevalidated, Some(&root_for_fs))
+                },
             ) {
                 Ok(Ok(p)) => p,
                 Ok(Err(reason)) => {
@@ -932,12 +1073,21 @@ fn extract_validated_dir_bounded(
 ) -> Result<Result<PathBuf, String>, ()> {
     match parse_form_param(body, "dir").filter(|s| !s.trim().is_empty()) {
         Some(raw) => {
+            // Review #6 Finding #9: decode + lexical syntax/root validation strictly BEFORE any
+            // bucket key or bounded worker spawn (zero syscalls on invalid / DeviceNS paths!).
+            let decoded = match decode_path_token(&raw) {
+                Ok(p) => p,
+                Err(reason) => return Ok(Err(reason)),
+            };
+            let prevalidated = match prevalidate_lexical_path_for_root(&decoded, allowed_root) {
+                Ok(p) => p,
+                Err(reason) => return Ok(Err(reason)),
+            };
             let root = allowed_root.to_path_buf();
-            let fs_key = decode_path_token(&raw)
-                .map(|p| fs_volume_key(&p))
-                .unwrap_or_else(|_| fs_volume_key(allowed_root));
+            let fs_key = fs_volume_key(&prevalidated);
             run_fs_op_bounded_for_key(&fs_key, FS_OP_DEADLINE, move || {
-                decode_and_validate_dir(&raw, &root)
+                populate_reparse_volume_cache_bounded(&prevalidated);
+                validate_path_within_root(&prevalidated, &root)
             })
         }
         None => Ok(Ok(shared.snapshot().active_folder)),
@@ -1252,6 +1402,31 @@ mod tests {
             fs_volume_key_with(Path::new(r"C:\Music\CycleA\Sub"), &reader),
             "drive:c",
             "cyclic junctions must terminate cleanly at hop limit"
+        );
+
+        // Review #6 Finding #9: DeviceNS and non-Volume{} Verbatim prefixes MUST NEVER invoke
+        // the reparse/stat reader (prevents unsolicited SMB contact from raw POST paths).
+        let panicking_reader = |p: &Path| -> Option<PathBuf> {
+            panic!("must never stat unsafe prefix path: {}", p.display());
+        };
+        let _ = fs_volume_key_with(Path::new(r"\\.\UNC\evilhost\share\x.flac"), &panicking_reader);
+        let _ = fs_volume_key_with(
+            Path::new(r"\\?\GLOBALROOT\Device\Mup\evilhost\share\x.flac"),
+            &panicking_reader,
+        );
+        assert!(
+            prevalidate_lexical_path_for_root(
+                Path::new(r"\\.\UNC\evilhost\share\x.flac"),
+                Path::new(r"C:\Music")
+            )
+            .is_err()
+        );
+        assert!(
+            prevalidate_lexical_path_for_root(
+                Path::new(r"\\?\GLOBALROOT\Device\Mup\evilhost\share\x.flac"),
+                Path::new(r"C:\Music")
+            )
+            .is_err()
         );
     }
 }
