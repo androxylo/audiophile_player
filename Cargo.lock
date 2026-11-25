@@ -11,6 +11,7 @@ dependencies = [
  "ap-dsp",
  "ap-output-win",
  "ap-source",
+ "ap-upnp",
  "flac-codec",
 ]
 
@@ -48,6 +49,16 @@ version = "0.1.0"
 dependencies = [
  "ap-core",
  "flac-codec",
+]
+
+[[package]]
+name = "ap-upnp"
+version = "0.1.0"
+dependencies = [
+ "ap-control",
+ "ap-core",
+ "ap-source",
+ "windows-sys",
 ]
 
 [[package]]

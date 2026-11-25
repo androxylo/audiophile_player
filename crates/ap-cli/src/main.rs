@@ -48,6 +48,7 @@ fn main() -> ExitCode {
             http_port,
             upsampler_policy,
             rew_override,
+            upnp_override,
         } => engine::run_random_music_player(
             config_path,
             music_dir,
@@ -56,6 +57,7 @@ fn main() -> ExitCode {
             http_port,
             upsampler_policy,
             rew_override,
+            upnp_override,
             controller,
         ),
         RunMode::Help => unreachable!(),

@@ -25,3 +25,11 @@
 
 # Option C: Single explicit 2-channel WAV file (used when its sample rate matches).
 # file = 'C:\path\to\room-384000.wav'
+
+[upnp]
+# Built-in UPnP AV MediaRenderer (for foobar2000 >= 2.25 play-to output & BubbleUPnP).
+# Enabled by default; set `enabled = false` or pass `--no-upnp` to disable.
+# enabled = true
+# friendly_name = 'Audiophile Player'
+# port = 49152
+# bind_ip = '192.168.0.187'

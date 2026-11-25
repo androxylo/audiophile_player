@@ -6,6 +6,7 @@
 //! and the local HTTP UI starting at port `8085`. Any non-default mode requires explicit flags.
 
 use std::ffi::OsString;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -16,9 +17,18 @@ use ap_output_win::hygiene::OptimizationLevel;
 
 pub const MANUAL_URL: &str = "https://github.com/androxylo/audiophile_player";
 
+/// Explicit CLI overrides for the built-in UPnP AV MediaRenderer (`--upnp-*` / `--no-upnp`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UpnpCliOverride {
+    pub disabled: bool,
+    pub friendly_name: Option<String>,
+    pub port: Option<u16>,
+    pub bind_ip: Option<Ipv4Addr>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunMode {
-    /// Default zero-option mode: play random FLACs from `music_dir` via WDM-KS + local HTTP UI.
+    /// Default zero-option mode: play random FLACs from `music_dir` via WDM-KS + local HTTP UI + UPnP MediaRenderer.
     PlayRandom {
         config_path: Option<PathBuf>,
         music_dir: Option<PathBuf>,
@@ -28,6 +38,8 @@ pub enum RunMode {
         upsampler_policy: UpsamplerPolicy,
         /// Explicit CLI override for `[convolution]` in `config.toml` (`None` = use config file).
         rew_override: Option<ConvolutionConfig>,
+        /// Explicit CLI overrides for `[upnp]` in `config.toml`.
+        upnp_override: UpnpCliOverride,
     },
     /// Explicit `--idle` mode: keep running without touching audio hardware (for signal tests).
     Idle,
@@ -55,6 +67,7 @@ where
     let mut http_port: Option<u16> = None;
     let mut upsampler_policy = UpsamplerPolicy::default();
     let mut rew_override: Option<ConvolutionConfig> = None;
+    let mut upnp_override = UpnpCliOverride::default();
     let mut idle = false;
 
     while let Some(arg_raw) = iter.next() {
@@ -151,6 +164,43 @@ where
             "--no-conv" => {
                 rew_override = Some(ConvolutionConfig::disabled());
             }
+            "--no-upnp" => {
+                upnp_override.disabled = true;
+            }
+            "--upnp-name" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| "--upnp-name requires a renderer display name".to_string())?;
+                let val_str = require_utf8_arg("--upnp-name", val)?;
+                let trimmed = val_str.trim();
+                if trimmed.is_empty() {
+                    return Err("--upnp-name cannot be empty".to_string());
+                }
+                upnp_override.friendly_name = Some(trimmed.to_string());
+            }
+            "--upnp-port" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| "--upnp-port requires a numeric TCP port".to_string())?;
+                let val_str = require_utf8_arg("--upnp-port", val)?;
+                let port = val_str
+                    .parse::<u16>()
+                    .map_err(|_| format!("invalid --upnp-port '{val_str}'; expected 1..=65535"))?;
+                if port == 0 {
+                    return Err("--upnp-port must be in 1..=65535".to_string());
+                }
+                upnp_override.port = Some(port);
+            }
+            "--upnp-bind" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| "--upnp-bind requires an IPv4 address".to_string())?;
+                let val_str = require_utf8_arg("--upnp-bind", val)?;
+                let ip = val_str
+                    .parse::<Ipv4Addr>()
+                    .map_err(|_| format!("invalid --upnp-bind IPv4 address '{val_str}'"))?;
+                upnp_override.bind_ip = Some(ip);
+            }
             "--opt" => {
                 let val = iter
                     .next()
@@ -189,6 +239,7 @@ where
         http_port,
         upsampler_policy,
         rew_override,
+        upnp_override,
     })
 }
 
@@ -198,16 +249,21 @@ pub fn help_text() -> String {
          Manual: {MANUAL_URL}\n\n\
          USAGE:\n\
            audiophile-player                  Start immediately in highest-quality WDM-KS mode,\n\
-                                              playing random FLACs from ~/Music + local HTTP UI.\n\
+                                              playing random FLACs from ~/Music + local HTTP UI\n\
+                                              + UPnP AV MediaRenderer (for foobar2000 / BubbleUPnP).\n\
            audiophile-player [OPTIONS]\n\n\
          CONFIG FILE:\n\
            Auto-loads .\\audiophile-player.toml or %APPDATA%\\audiophile-player\\config.toml\n\
-           (or pass --config <PATH>). Currently configures [convolution].\n\n\
+           (or pass --config <PATH>). Configures [convolution] and [upnp].\n\n\
          OPTIONS:\n\
            --config <PATH>      Path to TOML config file (default: auto-discover)\n\
            --music-dir <PATH>   Root folder containing FLAC subfolders (default: ~/Music)\n\
            --device <NAME>      WDM-KS DAC name filter (default: auto-select best USB DAC)\n\
            --port <PORT>        Local HTTP UI port (default: auto-pick free port in 8085..8199)\n\
+           --upnp-name <NAME>   UPnP MediaRenderer display name (default: Audiophile Player)\n\
+           --upnp-port <PORT>   UPnP HTTP/SOAP port (default: auto-pick free port in 49152..49250)\n\
+           --upnp-bind <IPV4>   Bind/advertise UPnP renderer on a specific local IPv4 address\n\
+           --no-upnp            Disable the built-in UPnP AV MediaRenderer\n\
            --filter <NAME>      Enforce upsampling filter: auto | gauss-long-lp | gauss-hires-lp |\n\
                                 null | simple-test | gauss-apod-4m | sinc-steep-4m | ext-sharp-lp |\n\
                                 minphase-long | intermediate-long | short-lp | short-mp\n\
@@ -243,6 +299,7 @@ mod tests {
                 http_port: None,
                 upsampler_policy: UpsamplerPolicy::default(),
                 rew_override: None,
+                upnp_override: UpnpCliOverride::default(),
             }
         );
     }
@@ -259,6 +316,12 @@ mod tests {
             "Gungnir 2",
             "--port",
             "8090",
+            "--upnp-name",
+            "Living Room DAC",
+            "--upnp-port",
+            "49170",
+            "--upnp-bind",
+            "192.168.0.187",
             "--filter",
             "sinc-steep-4m",
             "--shaper",
@@ -287,6 +350,12 @@ mod tests {
                 rew_override: Some(ConvolutionConfig::explicit_file(
                     r"C:\Filters\room-384k.wav"
                 )),
+                upnp_override: UpnpCliOverride {
+                    disabled: false,
+                    friendly_name: Some("Living Room DAC".to_string()),
+                    port: Some(49170),
+                    bind_ip: Some(Ipv4Addr::new(192, 168, 0, 187)),
+                },
             }
         );
 

@@ -15,7 +15,21 @@ use crate::security::normalize_allowed_root;
 /// Maximum number of queued relative commands (`Next`) before additional clicks are dropped.
 const MAX_QUEUED_COMMANDS: usize = 16;
 
-/// Unified control commands issued by the rudimentary HTTP interface (no volume control).
+/// Metadata accompanying a UPnP `AVTransport::Play` / `SetAVTransportURI` stream request.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpnpPlayRequest {
+    pub uri: String,
+    pub display_name: String,
+    pub protocol_info: Option<String>,
+    pub sample_rate_hz: Option<u32>,
+    pub channels: Option<u16>,
+    pub bits_per_sample: Option<u16>,
+    pub duration_s: Option<f64>,
+}
+
+impl Eq for UpnpPlayRequest {}
+
+/// Unified control commands issued by the HTTP UI or UPnP MediaRenderer (no volume control).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlCommand {
     /// Play random FLAC files from the selected folder tree (`O(depth)` walk).
@@ -24,6 +38,8 @@ pub enum ControlCommand {
     PlaySequential(PathBuf),
     /// Play a specific selected FLAC file.
     PlayFile(PathBuf),
+    /// Play a network lossless audio stream pushed by a UPnP control point (e.g. foobar2000).
+    PlayUpnp(UpnpPlayRequest),
     /// Skip immediately (with smooth fade-out) to the next track in the active playback mode.
     Next,
     /// Unified Pause/Stop: fade out cleanly and release the WDM-KS DAC pin immediately.
@@ -35,6 +51,7 @@ pub enum PlayModeLabel {
     Random,
     Sequential,
     SingleFile,
+    UpnpRenderer,
     Paused,
 }
 
@@ -44,6 +61,7 @@ impl PlayModeLabel {
             Self::Random => "Play Random",
             Self::Sequential => "Play Sequential",
             Self::SingleFile => "Play File",
+            Self::UpnpRenderer => "UPnP Renderer",
             Self::Paused => "Paused (DAC released)",
         }
     }
@@ -138,6 +156,12 @@ impl SharedControl {
                     st.active_folder = parent.to_path_buf();
                 }
                 st.log.push(format!("Command: Play File -> {}", file.display()));
+            }
+            ControlCommand::PlayUpnp(req) => {
+                st.log.push(format!(
+                    "Command: UPnP Play -> {} ({})",
+                    req.display_name, req.uri
+                ));
             }
             ControlCommand::Next => {
                 st.log.push("Command: Next track");

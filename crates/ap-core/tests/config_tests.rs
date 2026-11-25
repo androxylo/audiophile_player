@@ -215,3 +215,29 @@ fn example_toml_auto_enables_convolution_when_only_dir_is_uncommented() {
         "uncommenting only `dir` in example template must auto-enable convolution"
     );
 }
+
+#[test]
+fn parses_and_validates_upnp_section_with_sensible_defaults() {
+    let default_cfg = PlayerConfig::default();
+    assert!(default_cfg.upnp.enabled);
+    assert_eq!(default_cfg.upnp.friendly_name, "Audiophile Player");
+    assert_eq!(default_cfg.upnp.port, None);
+    assert_eq!(default_cfg.upnp.bind_ip, None);
+
+    let toml = r#"
+[upnp]
+enabled = true
+friendly_name = "Gungnir 2 Living Room"
+port = 49160
+bind_ip = "192.168.0.187"
+"#;
+    let cfg = PlayerConfig::from_toml_str(toml).unwrap();
+    assert!(cfg.upnp.enabled);
+    assert_eq!(cfg.upnp.friendly_name, "Gungnir 2 Living Room");
+    assert_eq!(cfg.upnp.port, Some(49160));
+    assert_eq!(cfg.upnp.bind_ip.as_deref(), Some("192.168.0.187"));
+
+    assert!(PlayerConfig::from_toml_str("[upnp]\nport = 0\n").is_err());
+    assert!(PlayerConfig::from_toml_str("[upnp]\nbind_ip = 'not-an-ip'\n").is_err());
+    assert!(PlayerConfig::from_toml_str("[upnp]\nfriendly_name = ''\n").is_err());
+}

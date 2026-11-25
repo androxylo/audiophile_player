@@ -12,6 +12,7 @@ members = [
     "crates/ap-dsp",
     "crates/ap-output-win",
     "crates/ap-control",
+    "crates/ap-upnp",
     "crates/ap-cli",
 ]
 
@@ -27,6 +28,7 @@ ap-source = { path = "crates/ap-source" }
 ap-dsp = { path = "crates/ap-dsp" }
 ap-output-win = { path = "crates/ap-output-win" }
 ap-control = { path = "crates/ap-control" }
+ap-upnp = { path = "crates/ap-upnp" }
 
 # Optimize third-party codec/DSP dependencies even in dev/test builds so
 # decoding large 32-bit/384 kHz HiRes FLACs stays fast during `cargo test`.

@@ -136,10 +136,31 @@ impl ConvolutionConfig {
     }
 }
 
+/// UPnP AV MediaRenderer configuration loaded from `[upnp]` in `config.toml` or CLI overrides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpnpConfig {
+    pub enabled: bool,
+    pub friendly_name: String,
+    pub port: Option<u16>,
+    pub bind_ip: Option<String>,
+}
+
+impl Default for UpnpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            friendly_name: "Audiophile Player".to_string(),
+            port: None,
+            bind_ip: None,
+        }
+    }
+}
+
 /// Top-level user configuration file (`config.toml` / `audiophile-player.toml`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlayerConfig {
     pub convolution: ConvolutionConfig,
+    pub upnp: UpnpConfig,
 }
 
 /// Result of config file discovery + loading.
@@ -177,16 +198,26 @@ impl PlayerConfig {
         None
     }
 
-    /// Parse a strict TOML config string (`[convolution]` section only for now).
+    /// Parse a strict TOML config string (`[convolution]` and `[upnp]` sections).
     pub fn from_toml_str(input: &str) -> Result<Self, String> {
         // Strip optional UTF-8 BOM (Windows editors such as Notepad may emit it).
         let text = input.strip_prefix('\u{feff}').unwrap_or(input);
 
-        let mut in_convolution = false;
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Section {
+            None,
+            Convolution,
+            Upnp,
+        }
+
+        let mut active_section = Section::None;
         let mut seen_convolution_section = false;
-        let mut seen_keys: HashSet<&str> = HashSet::new();
-        let mut explicit_enabled: Option<bool> = None;
+        let mut seen_upnp_section = false;
+        let mut seen_conv_keys: HashSet<&str> = HashSet::new();
+        let mut seen_upnp_keys: HashSet<&str> = HashSet::new();
+        let mut explicit_conv_enabled: Option<bool> = None;
         let mut conv = ConvolutionConfig::default();
+        let mut upnp = UpnpConfig::default();
 
         for (idx, raw_line) in text.lines().enumerate() {
             let line_no = idx + 1;
@@ -210,20 +241,29 @@ impl PlayerConfig {
                             ));
                         }
                         seen_convolution_section = true;
-                        in_convolution = true;
+                        active_section = Section::Convolution;
+                    }
+                    "upnp" => {
+                        if seen_upnp_section {
+                            return Err(format!(
+                                "config line {line_no}: duplicate section '[upnp]'"
+                            ));
+                        }
+                        seen_upnp_section = true;
+                        active_section = Section::Upnp;
                     }
                     other => {
                         return Err(format!(
-                            "config line {line_no}: unknown section '[{other}]' (currently only [convolution] is supported)"
+                            "config line {line_no}: unknown section '[{other}]' (supported: [convolution], [upnp])"
                         ));
                     }
                 }
                 continue;
             }
 
-            if !in_convolution {
+            if active_section == Section::None {
                 return Err(format!(
-                    "config line {line_no}: key-value entry outside a section (expected [convolution])"
+                    "config line {line_no}: key-value entry outside a section (expected [convolution] or [upnp])"
                 ));
             }
 
@@ -235,54 +275,105 @@ impl PlayerConfig {
             let key = raw_key.trim();
             let val = raw_val.trim();
 
-            if !seen_keys.insert(key) {
-                return Err(format!(
-                    "config line {line_no}: duplicate key '{key}' in [convolution]"
-                ));
-            }
-
-            match key {
-                "enabled" => {
-                    let b = match val {
-                        "true" => true,
-                        "false" => false,
+            match active_section {
+                Section::None => unreachable!(),
+                Section::Convolution => {
+                    if !seen_conv_keys.insert(key) {
+                        return Err(format!(
+                            "config line {line_no}: duplicate key '{key}' in [convolution]"
+                        ));
+                    }
+                    match key {
+                        "enabled" => {
+                            let b = parse_toml_bool(val, line_no, "enabled")?;
+                            explicit_conv_enabled = Some(b);
+                        }
+                        "dir" => {
+                            let s = parse_toml_string(val, line_no, "dir")?;
+                            conv.dir = non_empty_path(s);
+                        }
+                        "file" => {
+                            let s = parse_toml_string(val, line_no, "file")?;
+                            conv.file = non_empty_path(s);
+                        }
+                        "file_352800" => {
+                            let s = parse_toml_string(val, line_no, "file_352800")?;
+                            conv.file_352800 = non_empty_path(s);
+                        }
+                        "file_384000" => {
+                            let s = parse_toml_string(val, line_no, "file_384000")?;
+                            conv.file_384000 = non_empty_path(s);
+                        }
                         other => {
                             return Err(format!(
-                                "config line {line_no}: invalid boolean for 'enabled': '{other}' (expected true or false)"
+                                "config line {line_no}: unknown key '{other}' in [convolution] (allowed: enabled, dir, file, file_352800, file_384000)"
                             ));
                         }
-                    };
-                    explicit_enabled = Some(b);
+                    }
                 }
-                "dir" => {
-                    let s = parse_toml_string(val, line_no, "dir")?;
-                    conv.dir = non_empty_path(s);
-                }
-                "file" => {
-                    let s = parse_toml_string(val, line_no, "file")?;
-                    conv.file = non_empty_path(s);
-                }
-                "file_352800" => {
-                    let s = parse_toml_string(val, line_no, "file_352800")?;
-                    conv.file_352800 = non_empty_path(s);
-                }
-                "file_384000" => {
-                    let s = parse_toml_string(val, line_no, "file_384000")?;
-                    conv.file_384000 = non_empty_path(s);
-                }
-                other => {
-                    return Err(format!(
-                        "config line {line_no}: unknown key '{other}' in [convolution] (allowed: enabled, dir, file, file_352800, file_384000)"
-                    ));
+                Section::Upnp => {
+                    if !seen_upnp_keys.insert(key) {
+                        return Err(format!(
+                            "config line {line_no}: duplicate key '{key}' in [upnp]"
+                        ));
+                    }
+                    match key {
+                        "enabled" => {
+                            upnp.enabled = parse_toml_bool(val, line_no, "enabled")?;
+                        }
+                        "friendly_name" => {
+                            let s = parse_toml_string(val, line_no, "friendly_name")?;
+                            let trimmed = s.trim();
+                            if trimmed.is_empty() {
+                                return Err(format!(
+                                    "config line {line_no}: 'friendly_name' in [upnp] cannot be empty"
+                                ));
+                            }
+                            upnp.friendly_name = trimmed.to_string();
+                        }
+                        "port" => {
+                            let port = val.parse::<u16>().map_err(|_| {
+                                format!(
+                                    "config line {line_no}: invalid integer for 'port' in [upnp]: '{val}'"
+                                )
+                            })?;
+                            if port == 0 {
+                                return Err(format!(
+                                    "config line {line_no}: 'port' in [upnp] must be in 1..=65535"
+                                ));
+                            }
+                            upnp.port = Some(port);
+                        }
+                        "bind_ip" => {
+                            let s = parse_toml_string(val, line_no, "bind_ip")?;
+                            let trimmed = s.trim();
+                            if !trimmed.is_empty() {
+                                trimmed.parse::<std::net::Ipv4Addr>().map_err(|_| {
+                                    format!(
+                                        "config line {line_no}: invalid IPv4 address for 'bind_ip' in [upnp]: '{trimmed}'"
+                                    )
+                                })?;
+                                upnp.bind_ip = Some(trimmed.to_string());
+                            }
+                        }
+                        other => {
+                            return Err(format!(
+                                "config line {line_no}: unknown key '{other}' in [upnp] (allowed: enabled, friendly_name, port, bind_ip)"
+                            ));
+                        }
+                    }
                 }
             }
         }
 
-        // If `enabled` was omitted, enable automatically iff at least one filter source was set.
-        conv.enabled = explicit_enabled.unwrap_or_else(|| conv.has_any_source());
+        // If `enabled` was omitted in [convolution], enable automatically iff at least one filter source was set.
+        conv.enabled = explicit_conv_enabled.unwrap_or_else(|| conv.has_any_source());
         conv.validate()?;
 
-        Ok(Self { convolution: conv })
+        Ok(Self {
+            convolution: conv,
+            upnp,
+        })
     }
 
     /// Read and parse an explicit TOML config file.
@@ -346,6 +437,16 @@ impl PlayerConfig {
             Some(local_path.as_path()),
             user_path.as_deref(),
         )
+    }
+}
+
+fn parse_toml_bool(val: &str, line_no: usize, key: &str) -> Result<bool, String> {
+    match val {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(format!(
+            "config line {line_no}: invalid boolean for '{key}': '{other}' (expected true or false)"
+        )),
     }
 }
 
