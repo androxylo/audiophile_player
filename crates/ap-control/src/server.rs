@@ -185,24 +185,34 @@ pub fn runtime_url_file_path() -> Option<PathBuf> {
     }
 }
 
+/// Best-effort write of the active localhost control UI URL to an explicit file path.
+pub fn write_runtime_url_file_at(path: &Path, url: &str) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, format!("{url}\n"));
+}
+
+/// Best-effort cleanup of an explicit runtime URL file if it still points to `url`.
+pub fn clear_runtime_url_file_at(path: &Path, url: &str) {
+    if let Ok(contents) = std::fs::read_to_string(path) {
+        if contents.trim() == url.trim() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 /// Best-effort write of the active localhost control UI URL for launcher discovery.
 pub fn write_runtime_url_file(url: &str) {
     if let Some(path) = runtime_url_file_path() {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(&path, format!("{url}\n"));
+        write_runtime_url_file_at(&path, url);
     }
 }
 
 /// Best-effort cleanup of the runtime URL file if it still points to `url`.
 pub fn clear_runtime_url_file(url: &str) {
     if let Some(path) = runtime_url_file_path() {
-        if let Ok(contents) = std::fs::read_to_string(&path) {
-            if contents.trim() == url.trim() {
-                let _ = std::fs::remove_file(&path);
-            }
-        }
+        clear_runtime_url_file_at(&path, url);
     }
 }
 

@@ -15,7 +15,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ap_control::security::validate_playable_flac_path;
-use ap_control::server::{ControlServer, clear_runtime_url_file, write_runtime_url_file};
+use ap_control::server::{
+    ControlServer, clear_runtime_url_file_at, runtime_url_file_path, write_runtime_url_file_at,
+};
 use ap_control::state::{ControlCommand, PlayModeLabel, SharedControl, UpnpPlayRequest};
 use ap_core::buffer::DEFAULT_SOURCE_BLOCK_FRAMES;
 use ap_core::config::{ConvolutionConfig, PlayerConfig};
@@ -328,23 +330,23 @@ impl<'a> EngineState<'a> {
         }
     }
 
-    fn dispatch(&mut self, cmd: ControlCommand) -> DispatchOutcome {
-        // Single DAC owner ("last one wins"): any local Web UI playback/pause command pre-empts
-        // an active UPnP session and reflects STOPPED back to UPnP control points.
-        let preempts_upnp = matches!(self.last_play, PlayDirective::UpnpStream { .. })
-            && !matches!(cmd, ControlCommand::PlayUpnp(_) | ControlCommand::Next);
-        if preempts_upnp {
+    fn notify_upnp_preempted(&self) {
+        if matches!(self.last_play, PlayDirective::UpnpStream { .. }) {
             if let Some(ref upnp) = self.upnp_state {
                 upnp.engine_mark_preempted();
             }
         }
+    }
 
+    fn dispatch(&mut self, cmd: ControlCommand) -> DispatchOutcome {
         match cmd {
             ControlCommand::PlayRandom(root) => {
+                self.notify_upnp_preempted();
                 self.start_directive(PlayDirective::Random { root }, true);
                 DispatchOutcome::Applied
             }
             ControlCommand::PlaySequential(root) => {
+                self.notify_upnp_preempted();
                 let seq_gen = self.alloc_seq_gen();
                 self.start_directive(
                     PlayDirective::Sequential {
@@ -362,6 +364,8 @@ impl<'a> EngineState<'a> {
                 let root = self.shared.allowed_root();
                 match validate_playable_flac_path(&file, Some(&root)) {
                     Ok(valid) => {
+                        // Review #5 Finding #19: only preempt UPnP after validation succeeds!
+                        self.notify_upnp_preempted();
                         self.start_directive(PlayDirective::SingleFile { file: valid }, true);
                         DispatchOutcome::Applied
                     }
@@ -469,12 +473,47 @@ impl<'a> EngineState<'a> {
                 DispatchOutcome::Applied
             }
             ControlCommand::Pause => {
+                self.notify_upnp_preempted();
                 self.pause_with_message(
                     "Paused — WDM-KS kernel pin closed (DAC available to Audirvana)",
                 );
                 println!("  [paused] WDM-KS kernel pin closed (DAC released).");
                 let _ = io::stdout().flush();
                 DispatchOutcome::Applied
+            }
+        }
+    }
+}
+
+/// RAII guard ensuring `server.url` is always removed on ANY early startup error (Review #5 #21).
+struct RuntimeUrlGuard {
+    path: Option<PathBuf>,
+    url: String,
+    active: bool,
+}
+
+impl RuntimeUrlGuard {
+    fn write(path: Option<PathBuf>, url: String) -> Self {
+        if let Some(ref p) = path {
+            write_runtime_url_file_at(p, &url);
+        }
+        Self {
+            path,
+            url,
+            active: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for RuntimeUrlGuard {
+    fn drop(&mut self) {
+        if self.active {
+            if let Some(ref p) = self.path {
+                clear_runtime_url_file_at(p, &self.url);
             }
         }
     }
@@ -499,6 +538,10 @@ pub fn run_random_music_player(
     let effective_conv = rew_override.unwrap_or(loaded_cfg.config.convolution);
     effective_conv.validate_paths()?;
 
+    let upnp_explicit = upnp_override.port.is_some()
+        || upnp_override.bind_ip.is_some()
+        || loaded_cfg.config.upnp.port.is_some()
+        || loaded_cfg.config.upnp.bind_ip.is_some();
     let upnp_enabled = loaded_cfg.config.upnp.enabled && !upnp_override.disabled;
     let cfg_bind_ip = loaded_cfg
         .config
@@ -544,10 +587,21 @@ pub fn run_random_music_player(
 
     let http_server = ControlServer::start(shared.clone(), http_port)?;
     let http_url = http_server.url();
-    write_runtime_url_file(&http_url);
+    let url_file_path = runtime_url_file_path();
+    let mut url_guard = RuntimeUrlGuard::write(url_file_path.clone(), http_url.clone());
 
+    // Review #5 Finding #21: explicit UPnP port/bind failures abort cleanly (and RuntimeUrlGuard
+    // removes server.url); default zero-config UPnP bind failure logs a warning and continues!
     let upnp_server = if upnp_enabled {
-        Some(UpnpRendererServer::start(shared.clone(), effective_upnp_cfg)?)
+        match UpnpRendererServer::start(shared.clone(), effective_upnp_cfg) {
+            Ok(srv) => Some(srv),
+            Err(err) if upnp_explicit => return Err(err),
+            Err(err) => {
+                eprintln!("  [upnp warning] could not start UPnP renderer ({err}); continuing without UPnP");
+                shared.record_action(format!("UPnP renderer disabled after bind error: {err}"));
+                None
+            }
+        }
     } else {
         None
     };
@@ -618,12 +672,14 @@ pub fn run_random_music_player(
         }
     }
 
+    url_guard.disarm();
     teardown_player_resources_with_upnp(
         &stream_buf,
         &prod_ctrl,
         state.active_epoch,
         http_server,
         upnp_server,
+        url_file_path.as_deref(),
         &http_url,
         sink,
         producer_thread,
@@ -733,6 +789,16 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
     match event {
         StreamEvent::EndOfQueue(msg) => {
             if matches!(state.last_play, PlayDirective::UpnpStream { .. }) {
+                // Review #5 Finding #6: if a late SetNextAVTransportURI arrived after the
+                // producer already hit EOF and pushed EndOfQueue, promote & start it now!
+                if let Some(next_req) = state
+                    .upnp_state
+                    .as_deref()
+                    .and_then(UpnpRendererState::engine_take_next_for_gapless)
+                {
+                    state.start_directive(PlayDirective::UpnpStream { request: next_req }, true);
+                    return ConsumerStepResult::Continue;
+                }
                 if let Some(ref upnp) = state.upnp_state {
                     upnp.engine_mark_finished();
                 }
@@ -759,6 +825,7 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
         }
         StreamEvent::TrackStart {
             path,
+            upnp_uri,
             mode_label,
             report,
             total_duration_s,
@@ -816,6 +883,7 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
                     state.active_epoch,
                     StreamEvent::TrackStart {
                         path,
+                        upnp_uri,
                         mode_label,
                         report,
                         total_duration_s,
@@ -842,6 +910,7 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
                     state.active_epoch,
                     StreamEvent::TrackStart {
                         path,
+                        upnp_uri,
                         mode_label,
                         report,
                         total_duration_s,
@@ -865,13 +934,20 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
             shared.set_playing(mode_label, track_str, fmt_str);
             if mode_label == PlayModeLabel::UpnpRenderer {
                 if let Some(ref upnp) = state.upnp_state {
-                    upnp.engine_mark_playing_current(total_duration_s);
+                    // Review #5 Finding #5: promote prefetched NextURI -> CurrentURI and start
+                    // RelTime clock strictly here when audio becomes audible on the DAC!
+                    if let Some(ref uri) = upnp_uri {
+                        upnp.engine_mark_playing(uri, total_duration_s);
+                    } else {
+                        upnp.engine_mark_playing_current(total_duration_s);
+                    }
                 }
             }
 
-            // Review #4 Finding #20: if playback is interrupted by a command that is rejected
-            // without changing state/epoch (e.g. TOCTOU-invalidated PlayFile), resume this same
-            // track's remaining PCM blocks instead of discarding them as orphans and skipping to N+1.
+            // Review #4 Finding #20 & Review #5 Finding #19: if playback is interrupted by a
+            // rejected command (e.g. TOCTOU-invalidated PlayFile), drain any remaining queued
+            // commands (e.g. a trailing Next or Pause) before clearing stop_handle, and re-check
+            // immediately after clearing stop_handle so no command ever loses its stop signal.
             loop {
                 let ep_for_stream = state.active_epoch;
                 let buf_for_stream = Arc::clone(stream_buf);
@@ -891,8 +967,32 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
                         if !hit_track_end.load(Ordering::SeqCst)
                             && controller.current_signal().is_none()
                         {
-                            if let Some(cmd) = shared.take_pending_command() {
-                                if state.dispatch(cmd) == DispatchOutcome::Rejected
+                            let mut saw_rejected = false;
+                            let mut applied_any = false;
+                            while let Some(cmd) = shared.take_pending_command() {
+                                if state.dispatch(cmd) == DispatchOutcome::Rejected {
+                                    saw_rejected = true;
+                                } else {
+                                    applied_any = true;
+                                    break;
+                                }
+                            }
+                            if saw_rejected
+                                && !applied_any
+                                && !state.is_paused
+                                && controller.current_signal().is_none()
+                            {
+                                stop_handle.store(false, Ordering::SeqCst);
+                                // Re-check queue immediately after clearing stop_handle so a
+                                // concurrent command cannot be stranded with stop_handle == false.
+                                let mut applied_after = false;
+                                while let Some(cmd) = shared.take_pending_command() {
+                                    if state.dispatch(cmd) != DispatchOutcome::Rejected {
+                                        applied_after = true;
+                                        break;
+                                    }
+                                }
+                                if !applied_after
                                     && !state.is_paused
                                     && controller.current_signal().is_none()
                                 {
@@ -929,41 +1029,13 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
 /// 3. Drop the audio sink (releases WDM-KS DAC pin immediately).
 /// 4. Join the producer thread with a bounded deadline (never hangs on stalled NAS / FFT).
 #[allow(clippy::too_many_arguments)]
-#[cfg(test)]
-fn teardown_player_resources<S>(
-    stream_buf: &BoundedBlockStreamBuffer,
-    prod_ctrl: &ProducerControl,
-    active_epoch: u64,
-    http_server: ControlServer,
-    http_url: &str,
-    sink: S,
-    producer_thread: thread::JoinHandle<()>,
-    controller: &ShutdownController,
-    normal_timeout: Duration,
-    fast_timeout: Duration,
-) -> bool {
-    teardown_player_resources_with_upnp(
-        stream_buf,
-        prod_ctrl,
-        active_epoch,
-        http_server,
-        None,
-        http_url,
-        sink,
-        producer_thread,
-        controller,
-        normal_timeout,
-        fast_timeout,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
 fn teardown_player_resources_with_upnp<S>(
     stream_buf: &BoundedBlockStreamBuffer,
     prod_ctrl: &ProducerControl,
     active_epoch: u64,
     mut http_server: ControlServer,
     mut upnp_server: Option<UpnpRendererServer>,
+    url_file_path: Option<&Path>,
     http_url: &str,
     sink: S,
     producer_thread: thread::JoinHandle<()>,
@@ -977,7 +1049,9 @@ fn teardown_player_resources_with_upnp<S>(
         upnp.shutdown();
     }
     http_server.shutdown();
-    clear_runtime_url_file(http_url);
+    if let Some(p) = url_file_path {
+        clear_runtime_url_file_at(p, http_url);
+    }
     drop(sink);
     join_producer_bounded(producer_thread, controller, normal_timeout, fast_timeout)
 }
@@ -1112,12 +1186,14 @@ fn producer_loop_with_upnp(
             }
 
             let mut cur_req = request;
+            let mut last_prefetched_uri: Option<String> = None;
             let mut aborted = false;
             loop {
                 if ctrl.epoch() != epoch || buf.current_epoch() != epoch {
                     aborted = true;
                     break;
                 }
+                let mut panic_backup_carry: Option<GaplessCarryover> = None;
                 let (outcome, next_carry, next_pend) = match catch_unwind(AssertUnwindSafe(|| {
                     stream_upnp_request(
                         &pipeline,
@@ -1128,11 +1204,15 @@ fn producer_loop_with_upnp(
                         &cur_req,
                         &cancel_flag,
                         &mut carried_tail,
+                        &mut panic_backup_carry,
                         &mut pending_track_end,
                     )
                 })) {
                     Ok(res) => res,
                     Err(_) => {
+                        if carried_tail.is_none() {
+                            carried_tail = panic_backup_carry.take();
+                        }
                         finalize_prev_track(
                             &pipeline,
                             &buf,
@@ -1155,11 +1235,13 @@ fn producer_loop_with_upnp(
                     TrackStreamOutcome::Played => {
                         carried_tail = next_carry;
                         pending_track_end = next_pend;
-                        // Check if the UPnP control point queued a gapless next URI.
-                        if let Some(next_req) = upnp_state
-                            .as_deref()
-                            .and_then(UpnpRendererState::engine_take_next_for_gapless)
-                        {
+                        // Review #5 Finding #5: peek NextURI for producer prefetch WITHOUT
+                        // mutating CurrentURI or resetting RelTime; consumer promotes it when
+                        // TrackStart actually becomes audible on the DAC!
+                        if let Some(next_req) = upnp_state.as_deref().and_then(|u| {
+                            u.engine_peek_next_for_prefetch(last_prefetched_uri.as_deref())
+                        }) {
+                            last_prefetched_uri = Some(next_req.uri.clone());
                             cur_req = next_req;
                             continue;
                         }
@@ -1346,6 +1428,7 @@ fn producer_loop_with_upnp(
             );
         }
 
+        let mut panic_backup_carry: Option<GaplessCarryover> = None;
         let (outcome, next_carryover, next_pending_end) = match catch_unwind(AssertUnwindSafe(|| {
             stream_single_track(
                 &pipeline,
@@ -1356,12 +1439,18 @@ fn producer_loop_with_upnp(
                 &chosen,
                 mode_label,
                 &mut carried_tail,
+                &mut panic_backup_carry,
                 &mut pending_track_end,
                 !is_single_file,
             )
         })) {
             Ok(res) => res,
             Err(_) => {
+                // Review #5 Finding #20: if Track B panicked after attaching A's carryover but
+                // before emitting any PCM, restore the backup clone so A's full REW tail drains!
+                if carried_tail.is_none() {
+                    carried_tail = panic_backup_carry.take();
+                }
                 finalize_prev_track(
                     &pipeline,
                     &buf,
@@ -1476,6 +1565,7 @@ fn stream_single_track(
     chosen: &Path,
     mode_label: PlayModeLabel,
     incoming_carryover: &mut Option<GaplessCarryover>,
+    panic_backup_carry: &mut Option<GaplessCarryover>,
     had_pending_prev_end: &mut bool,
     gapless_carryover: bool,
 ) -> (TrackStreamOutcome, Option<GaplessCarryover>, bool) {
@@ -1644,6 +1734,8 @@ fn stream_single_track(
     let mut attached_carryover_into_session = false;
     if let Some(carry) = incoming_carryover.take() {
         let had_active_tail = !carry.is_empty();
+        // Review #5 Finding #20: keep backup clone until Track B pushes its first PCM block.
+        *panic_backup_carry = Some(carry.clone());
         match pipeline.attach_gapless_carryover(&mut session, carry) {
             Ok(GaplessAttachOutcome::FullHandoff) => {
                 had_gapless_carryover = had_active_tail;
@@ -1658,29 +1750,28 @@ fn stream_single_track(
                 if !upsampler_tail_pcm.is_empty()
                     && !buf.push_for_epoch(epoch, StreamEvent::PcmBlock(upsampler_tail_pcm))
                 {
+                    *panic_backup_carry = None;
                     *had_pending_prev_end = false;
                     return (TrackStreamOutcome::Aborted, None, false);
                 }
             }
             Ok(GaplessAttachOutcome::IncompatibleRate(rejected)) => {
+                *panic_backup_carry = None;
                 *incoming_carryover = Some(rejected);
                 if !flush_prev_on_incompatible(buf, incoming_carryover, had_pending_prev_end) {
                     return (TrackStreamOutcome::Aborted, None, false);
                 }
             }
             Err(err) => {
-                if *had_pending_prev_end {
-                    *had_pending_prev_end = false;
-                    let _ = buf.push_for_epoch(epoch, StreamEvent::TrackEnd);
-                }
-                return (
-                    TrackStreamOutcome::Failed(format!(
-                        "Gapless carryover error on '{}': {err}",
-                        chosen.display()
-                    )),
-                    None,
-                    false,
+                // Review #5 Finding #20: drain A's backup tail cleanly and still play Track B!
+                eprintln!(
+                    "  [gapless warn] carryover attach failed on '{}': {err}; draining previous tail and continuing cleanly",
+                    chosen.display()
                 );
+                *incoming_carryover = panic_backup_carry.take();
+                if !flush_prev_on_incompatible(buf, incoming_carryover, had_pending_prev_end) {
+                    return (TrackStreamOutcome::Aborted, None, false);
+                }
             }
         }
     } else if *had_pending_prev_end {
@@ -1692,6 +1783,7 @@ fn stream_single_track(
 
     let mut pending_start = Some(StreamEvent::TrackStart {
         path: chosen.to_path_buf(),
+        upnp_uri: None,
         mode_label,
         report: session.report().clone(),
         total_duration_s,
@@ -1798,6 +1890,7 @@ fn stream_single_track(
                 return (TrackStreamOutcome::Aborted, None, false);
             }
             pushed_any_pcm = true;
+            *panic_backup_carry = None;
         }
     }
 
@@ -1885,6 +1978,7 @@ fn stream_upnp_request(
     req: &UpnpPlayRequest,
     cancel: &Arc<AtomicBool>,
     incoming_carryover: &mut Option<GaplessCarryover>,
+    panic_backup_carry: &mut Option<GaplessCarryover>,
     had_pending_prev_end: &mut bool,
 ) -> (TrackStreamOutcome, Option<GaplessCarryover>, bool) {
     let hints = HttpStreamHints {
@@ -1894,7 +1988,12 @@ fn stream_upnp_request(
         bits_per_sample: req.bits_per_sample,
     };
 
-    let mut cur_source = match HttpAudioSource::open(&req.uri, &hints, Arc::clone(cancel)) {
+    let mut cur_source = match HttpAudioSource::open_at_offset(
+        &req.uri,
+        &hints,
+        req.seek_offset_s,
+        Arc::clone(cancel),
+    ) {
         Ok(s) => s,
         Err(err) => {
             if ctrl.epoch() != epoch || cancel.load(Ordering::Acquire) {
@@ -1911,7 +2010,6 @@ fn stream_upnp_request(
         }
     };
 
-    let display_path = PathBuf::from(&req.display_name);
     let mut seg_idx = 0usize;
     loop {
         if ctrl.epoch() != epoch || cancel.load(Ordering::Acquire) {
@@ -1943,10 +2041,12 @@ fn stream_upnp_request(
             epoch,
             &mut cur_source,
             &PathBuf::from(&seg_label),
+            Some(&req.uri),
             PlayModeLabel::UpnpRenderer,
             seg_duration,
             UPNP_SOURCE_BLOCK_FRAMES,
             incoming_carryover,
+            panic_backup_carry,
             had_pending_prev_end,
             true,
         );
@@ -1959,7 +2059,6 @@ fn stream_upnp_request(
                     seg_idx += 1;
                     continue;
                 }
-                let _ = display_path;
                 return (
                     TrackStreamOutcome::Played,
                     incoming_carryover.take(),
@@ -1985,10 +2084,12 @@ fn stream_open_audio_source<S: AudioBlockSource>(
     epoch: u64,
     source: &mut S,
     label_path: &Path,
+    upnp_uri: Option<&str>,
     mode_label: PlayModeLabel,
     total_duration_s: Option<f64>,
     block_frames: usize,
     incoming_carryover: &mut Option<GaplessCarryover>,
+    panic_backup_carry: &mut Option<GaplessCarryover>,
     had_pending_prev_end: &mut bool,
     gapless_carryover: bool,
 ) -> (TrackStreamOutcome, Option<GaplessCarryover>, bool) {
@@ -2090,6 +2191,7 @@ fn stream_open_audio_source<S: AudioBlockSource>(
     let mut attached_carryover_into_session = false;
     if let Some(carry) = incoming_carryover.take() {
         let had_active_tail = !carry.is_empty();
+        *panic_backup_carry = Some(carry.clone());
         match pipeline.attach_gapless_carryover(&mut session, carry) {
             Ok(GaplessAttachOutcome::FullHandoff) => {
                 had_gapless_carryover = had_active_tail;
@@ -2104,29 +2206,27 @@ fn stream_open_audio_source<S: AudioBlockSource>(
                 if !upsampler_tail_pcm.is_empty()
                     && !buf.push_for_epoch(epoch, StreamEvent::PcmBlock(upsampler_tail_pcm))
                 {
+                    *panic_backup_carry = None;
                     *had_pending_prev_end = false;
                     return (TrackStreamOutcome::Aborted, None, false);
                 }
             }
             Ok(GaplessAttachOutcome::IncompatibleRate(rejected)) => {
+                *panic_backup_carry = None;
                 *incoming_carryover = Some(rejected);
                 if !flush_prev_on_incompatible(buf, incoming_carryover, had_pending_prev_end) {
                     return (TrackStreamOutcome::Aborted, None, false);
                 }
             }
             Err(err) => {
-                if *had_pending_prev_end {
-                    *had_pending_prev_end = false;
-                    let _ = buf.push_for_epoch(epoch, StreamEvent::TrackEnd);
-                }
-                return (
-                    TrackStreamOutcome::Failed(format!(
-                        "Gapless carryover error on '{}': {err}",
-                        label_path.display()
-                    )),
-                    None,
-                    false,
+                eprintln!(
+                    "  [gapless warn] carryover attach failed on '{}': {err}; draining previous tail and continuing cleanly",
+                    label_path.display()
                 );
+                *incoming_carryover = panic_backup_carry.take();
+                if !flush_prev_on_incompatible(buf, incoming_carryover, had_pending_prev_end) {
+                    return (TrackStreamOutcome::Aborted, None, false);
+                }
             }
         }
     } else if *had_pending_prev_end {
@@ -2138,6 +2238,7 @@ fn stream_open_audio_source<S: AudioBlockSource>(
 
     let mut pending_start = Some(StreamEvent::TrackStart {
         path: label_path.to_path_buf(),
+        upnp_uri: upnp_uri.map(str::to_string),
         mode_label,
         report: session.report().clone(),
         total_duration_s,
@@ -2224,6 +2325,7 @@ fn stream_open_audio_source<S: AudioBlockSource>(
                 return (TrackStreamOutcome::Aborted, None, false);
             }
             pushed_any_pcm = true;
+            *panic_backup_carry = None;
         }
     }
 
@@ -2756,6 +2858,7 @@ mod tests {
 
             // Direct producer-side guard must also reject without blocking on open().
             let mut no_tail = None;
+            let mut no_backup = None;
             let mut no_pending = false;
             let (outcome, next_tail, pending_end) = stream_single_track(
                 &pipeline,
@@ -2766,6 +2869,7 @@ mod tests {
                 &bad,
                 PlayModeLabel::SingleFile,
                 &mut no_tail,
+                &mut no_backup,
                 &mut no_pending,
                 false,
             );
@@ -3158,6 +3262,7 @@ mod tests {
             ep,
             StreamEvent::TrackStart {
                 path: f01.clone(),
+                upnp_uri: None,
                 mode_label: PlayModeLabel::Sequential,
                 report: dummy_report.clone(),
                 total_duration_s: Some(1.0),
@@ -3169,6 +3274,7 @@ mod tests {
             ep,
             StreamEvent::TrackStart {
                 path: f02.clone(),
+                upnp_uri: None,
                 mode_label: PlayModeLabel::Sequential,
                 report: dummy_report,
                 total_duration_s: Some(1.0),
@@ -3229,6 +3335,7 @@ mod tests {
             state.active_epoch,
             StreamEvent::TrackStart {
                 path: f02.clone(),
+                upnp_uri: None,
                 mode_label: PlayModeLabel::Sequential,
                 report: dummy_report.clone(),
                 total_duration_s: Some(1.0),
@@ -3261,6 +3368,7 @@ mod tests {
             ep_before,
             StreamEvent::TrackStart {
                 path: f02,
+                upnp_uri: None,
                 mode_label: PlayModeLabel::Sequential,
                 report: dummy_report,
                 total_duration_s: Some(1.0),
@@ -3287,26 +3395,38 @@ mod tests {
 
     #[test]
     fn teardown_player_resources_releases_http_and_sink_before_producer_join() {
-        // Review #4 Finding #19: deterministic condvar-synchronized teardown order test with zero
-        // sleep races, zero busy-spin, and explicit HTTP-closed + server.url-cleared verification.
-        use ap_control::server::runtime_url_file_path;
-        use std::net::TcpStream;
+        // Review #4 Finding #19 & Review #5 Finding #22: deterministic condvar-synchronized
+        // teardown order test using an isolated temp server.url path (never clobbering the live
+        // %LOCALAPPDATA%\audiophile-player\server.url) AND verifying UPnP teardown too.
+        use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 
         let dir = std::env::temp_dir().join(format!(
             "ap_cli_teardown_order_{}",
             std::process::id()
         ));
         let _ = std::fs::create_dir_all(&dir);
+        let temp_url_file = dir.join("test_server.url");
 
         let shared = SharedControl::new(dir.clone(), "Mock DAC");
         let server = ControlServer::start(shared.clone(), None).unwrap();
+        let upnp_srv = UpnpRendererServer::start(
+            shared.clone(),
+            UpnpRendererConfig {
+                friendly_name: "Teardown Test Renderer".to_string(),
+                port: None,
+                bind_ip: Some(Ipv4Addr::LOCALHOST),
+                enable_ssdp: false,
+            },
+        )
+        .unwrap();
+        let upnp_port = upnp_srv.port();
         let url = server.url();
         let port: u16 = url
             .rsplit(':')
             .next()
             .and_then(|p| p.trim_end_matches('/').parse().ok())
             .expect("valid port in ControlServer URL");
-        write_runtime_url_file(&url);
+        write_runtime_url_file_at(&temp_url_file, &url);
 
         let log = Arc::new(Mutex::new(Vec::<&'static str>::new()));
         let sink_dropped_gate = Arc::new((Mutex::new(false), Condvar::new()));
@@ -3315,28 +3435,39 @@ mod tests {
             log: Arc<Mutex<Vec<&'static str>>>,
             gate: Arc<(Mutex<bool>, Condvar)>,
             http_port: u16,
+            upnp_port: u16,
+            url_file: PathBuf,
             http_url: String,
         }
         impl Drop for MockSink {
             fn drop(&mut self) {
-                // Verify HTTP server is ALREADY shut down before sink drops.
-                let http_closed =
-                    TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], self.http_port)), Duration::from_millis(200))
-                        .is_err();
+                // Verify HTTP and UPnP servers are ALREADY shut down before sink drops.
+                let http_closed = TcpStream::connect_timeout(
+                    &SocketAddr::from(([127, 0, 0, 1], self.http_port)),
+                    Duration::from_millis(200),
+                )
+                .is_err();
                 assert!(
                     http_closed,
                     "HTTP server must already be shut down before dropping the audio sink"
                 );
-                // Verify runtime `server.url` was already cleared before sink drops.
-                if let Some(url_file) = runtime_url_file_path() {
-                    let still_ours = std::fs::read_to_string(&url_file)
-                        .ok()
-                        .is_some_and(|s| s.trim() == self.http_url);
-                    assert!(
-                        !still_ours,
-                        "server.url must already be cleared before dropping the audio sink"
-                    );
-                }
+                let upnp_closed = TcpStream::connect_timeout(
+                    &SocketAddr::from(([127, 0, 0, 1], self.upnp_port)),
+                    Duration::from_millis(200),
+                )
+                .is_err();
+                assert!(
+                    upnp_closed,
+                    "UPnP server must already be shut down before dropping the audio sink"
+                );
+                // Verify isolated temp `server.url` was already cleared before sink drops.
+                let still_ours = std::fs::read_to_string(&self.url_file)
+                    .ok()
+                    .is_some_and(|s| s.trim() == self.http_url);
+                assert!(
+                    !still_ours,
+                    "server.url must already be cleared before dropping the audio sink"
+                );
                 self.log.lock().unwrap().push("http_and_url_closed");
                 self.log.lock().unwrap().push("sink_dropped");
                 let (lock, cv) = &*self.gate;
@@ -3344,7 +3475,6 @@ mod tests {
                 cv.notify_all();
             }
         }
-        use std::net::SocketAddr;
 
         let buf = BoundedBlockStreamBuffer::new(DEFAULT_MAX_BUFFERED_FRAMES);
         let ep = buf.current_epoch();
@@ -3372,16 +3502,20 @@ mod tests {
             log_prod.lock().unwrap().push("producer_exited");
         });
 
-        let joined = teardown_player_resources(
+        let joined = teardown_player_resources_with_upnp(
             &buf,
             &prod_ctrl,
             ep,
             server,
+            Some(upnp_srv),
+            Some(&temp_url_file),
             &url,
             MockSink {
                 log: Arc::clone(&log),
                 gate: Arc::clone(&sink_dropped_gate),
                 http_port: port,
+                upnp_port,
+                url_file: temp_url_file.clone(),
                 http_url: url.clone(),
             },
             producer,
@@ -3748,6 +3882,7 @@ mod tests {
             ep0,
             StreamEvent::TrackStart {
                 path: f02.clone(),
+                upnp_uri: None,
                 mode_label: PlayModeLabel::Sequential,
                 report: dummy_report.clone(),
                 total_duration_s: Some(5.0),
@@ -3822,6 +3957,7 @@ mod tests {
             ep2,
             StreamEvent::TrackStart {
                 path: f01.clone(),
+                upnp_uri: None,
                 mode_label: PlayModeLabel::Sequential,
                 report: dummy_report.clone(),
                 total_duration_s: Some(1.0),
@@ -3847,6 +3983,7 @@ mod tests {
             ep2,
             StreamEvent::TrackStart {
                 path: f02.clone(),
+                upnp_uri: None,
                 mode_label: PlayModeLabel::Sequential,
                 report: dummy_report,
                 total_duration_s: Some(1.0),
@@ -4145,6 +4282,117 @@ mod tests {
         upnp_srv.shutdown();
         producer.join().unwrap();
         media_srv.join().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn late_set_next_after_end_of_queue_still_plays_and_rejected_playfile_does_not_preempt_upnp() {
+        // Review #5 Findings #5, #6, #19:
+        // 1. Rejected PlayFile during active UpnpStream must NOT preempt UPnP (state stays PLAYING, NextURI intact).
+        // 2. Late SetNextAVTransportURI arriving after EndOfQueue is pushed causes consumer EndOfQueue
+        //    to immediately promote & start the late-queued track instead of going STOPPED.
+        use ap_upnp::TransportState;
+        use std::net::Ipv4Addr;
+
+        let root = std::env::temp_dir().join(format!(
+            "ap_cli_upnp_late_next_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&root);
+        let shared = SharedControl::new(root.clone(), "Mock DAC");
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        shared.attach_sink_stop_flag(Arc::clone(&stop_flag));
+
+        let mut upnp_srv = UpnpRendererServer::start(
+            shared.clone(),
+            UpnpRendererConfig {
+                friendly_name: "Late Next Test".to_string(),
+                port: None,
+                bind_ip: Some(Ipv4Addr::LOCALHOST),
+                enable_ssdp: false,
+            },
+        )
+        .unwrap();
+        let upnp_state = Arc::clone(upnp_srv.state());
+
+        let buf = BoundedBlockStreamBuffer::new(DEFAULT_MAX_BUFFERED_FRAMES);
+        let ep0 = buf.current_epoch();
+        let prod_ctrl = ProducerControl::new(ep0, ProducerDirective::Paused);
+        let controller = ShutdownController::new();
+
+        upnp_state.set_av_transport_uri("http://127.0.0.1:59999/a.flac".into(), String::new());
+        upnp_state.play().unwrap();
+        let play_cmd = shared.take_pending_command().unwrap();
+
+        let mut state = EngineState::with_upnp(
+            ep0,
+            PlayDirective::Random { root: root.clone() },
+            &buf,
+            &prod_ctrl,
+            &shared,
+            Some(Arc::clone(&upnp_state)),
+        );
+        assert_eq!(state.dispatch(play_cmd), DispatchOutcome::Applied);
+        upnp_state.engine_mark_playing("http://127.0.0.1:59999/a.flac", Some(10.0));
+        upnp_state.set_next_av_transport_uri("http://127.0.0.1:59999/b.flac".into(), String::new());
+
+        // Finding #19: Rejected PlayFile during active UPnP must NOT set UPnP to STOPPED or clear NextURI!
+        assert_eq!(
+            state.dispatch(ControlCommand::PlayFile(root.join("nonexistent.flac"))),
+            DispatchOutcome::Rejected
+        );
+        let snap_after_reject = upnp_state.snapshot();
+        assert_eq!(snap_after_reject.transport_state, TransportState::Playing);
+        assert_eq!(
+            snap_after_reject.next.as_ref().map(|n| n.uri.as_str()),
+            Some("http://127.0.0.1:59999/b.flac")
+        );
+
+        // Finding #6: Producer already pushed EndOfQueue for Track A while Track B sits in st.next.
+        // Consumer EndOfQueue arm must promote Track B and start PlayDirective::UpnpStream(B)!
+        assert!(buf.push_for_epoch(
+            state.active_epoch,
+            StreamEvent::EndOfQueue("Finished UPnP stream".into())
+        ));
+        struct PanicSink;
+        impl BlockStreamAudioSink for PanicSink {
+            fn play_block_stream<F>(
+                &mut self,
+                _rate: u32,
+                _fmt: DacWireFormat,
+                _next: F,
+            ) -> Result<PlaybackStats, OutputError>
+            where
+                F: FnMut() -> ap_output_win::wdm_ks::StreamBlock,
+            {
+                unreachable!("EndOfQueue step should not open sink")
+            }
+        }
+        let mut sink = PanicSink;
+        assert_eq!(
+            step_consumer_once(
+                &mut state,
+                &buf,
+                &shared,
+                &controller,
+                &stop_flag,
+                &mut sink,
+                || false,
+            ),
+            ConsumerStepResult::Continue
+        );
+        assert!(
+            !state.is_paused,
+            "late SetNextAVTransportURI must prevent pause on EndOfQueue"
+        );
+        match &state.last_play {
+            PlayDirective::UpnpStream { request } => {
+                assert_eq!(request.uri, "http://127.0.0.1:59999/b.flac");
+            }
+            other => panic!("expected UpnpStream for late NextURI, got {other:?}"),
+        }
+
+        upnp_srv.shutdown();
         let _ = std::fs::remove_dir_all(&root);
     }
 }

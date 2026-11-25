@@ -191,8 +191,20 @@ fn bind_upnp_port(
     if start == 0 || start > end {
         return Err(format!("invalid UPnP port range {start}..={end}"));
     }
+    let probe_ip = if bind_ip.is_unspecified() {
+        Ipv4Addr::LOCALHOST
+    } else {
+        bind_ip
+    };
     let mut last_err = String::new();
     for port in start..=end {
+        // Avoid Windows' dual-bind quirk when another process already holds 0.0.0.0:port.
+        if TcpStream::connect_timeout(&SocketAddr::from((probe_ip, port)), Duration::from_millis(20))
+            .is_ok()
+        {
+            last_err = format!("port {port} is already accepting connections on {probe_ip}");
+            continue;
+        }
         match TcpListener::bind((bind_ip, port)) {
             Ok(l) => return Ok((l, port)),
             Err(e) => last_err = e.to_string(),

@@ -34,6 +34,9 @@ pub enum StreamEvent {
     /// Marks the start of a track/stream (carries output sample rate & pipeline metadata).
     TrackStart {
         path: PathBuf,
+        /// Originating UPnP URI (set for `PlayModeLabel::UpnpRenderer` so the consumer promotes
+        /// `CurrentURI` and starts `RelTime` only when this track becomes audible, Review #5 #5).
+        upnp_uri: Option<String>,
         mode_label: PlayModeLabel,
         report: PipelineReport,
         total_duration_s: Option<f64>,
