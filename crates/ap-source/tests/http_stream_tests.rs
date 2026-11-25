@@ -374,3 +374,187 @@ fn cooperative_cancel_aborts_stalled_http_stream_promptly() {
     srv_done.store(true, Ordering::Release);
     srv.join().unwrap();
 }
+
+#[test]
+fn never_misinterprets_non_lpcm_stream_as_raw_pcm_when_didl_has_bits_per_sample() {
+    // Review #5 Finding #1 [HIGH]: an HTML error page or unrecognized codec with
+    // `protocolInfo="http-get:*:audio/flac:*"` and `bits_per_sample=24` MUST be rejected,
+    // never played as full-scale raw LPCM noise!
+    let hints = HttpStreamHints {
+        protocol_info: Some("http-get:*:audio/flac:*".to_string()),
+        sample_rate_hz: Some(96_000),
+        channels: Some(2),
+        bits_per_sample: Some(24),
+    };
+    assert_eq!(parse_lpcm_params(Some("text/html"), &hints), None);
+    assert_eq!(parse_lpcm_params(Some("audio/flac"), &hints), None);
+
+    let (url, srv) = spawn_single_http_server(
+        "text/html",
+        b"<html><body>404 Not Found</body></html>".to_vec(),
+        false,
+    );
+    let cancel = Arc::new(AtomicBool::new(false));
+    let err = match HttpAudioSource::open(&url, &hints, cancel) {
+        Ok(_) => panic!("HTML body with FLAC DIDL hints must be rejected, not played as LPCM"),
+        Err(e) => e,
+    };
+    assert!(
+        err.contains("unsupported HTTP audio stream format"),
+        "unexpected error: {err}"
+    );
+    srv.join().unwrap();
+}
+
+#[test]
+fn skips_leading_id3v2_tag_before_native_flac_stream() {
+    let mut samples = Vec::new();
+    for i in 0..512i32 {
+        samples.push(i * 100);
+        samples.push(-i * 100);
+    }
+    let flac = encode_test_flac_bytes(44_100, 16, &samples);
+    // Prepend a 26-byte ID3v2.3 tag (10-byte header + 16-byte payload).
+    let mut body = Vec::new();
+    body.extend_from_slice(b"ID3");
+    body.extend_from_slice(&[3, 0, 0]); // v2.3, flags=0
+    body.extend_from_slice(&[0, 0, 0, 16]); // synchsafe size = 16
+    body.extend_from_slice(&[0u8; 16]);
+    body.extend_from_slice(&flac);
+
+    let (url, srv) = spawn_single_http_server("audio/flac", body, false);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut src = HttpAudioSource::open(&url, &HttpStreamHints::default(), cancel).unwrap();
+    assert_eq!(src.container_format(), StreamContainerFormat::Flac);
+    let mut total = 0usize;
+    while let Some(b) = src.read_next_block(256).unwrap() {
+        total += b.len();
+    }
+    assert_eq!(total, 512);
+    srv.join().unwrap();
+}
+
+#[test]
+fn detects_content_length_truncation_and_resumes_when_accept_ranges_supported() {
+    // Review #5 Finding #9 [MEDIUM]:
+    // Case A: Server declares Content-Length > bytes sent and no Accept-Ranges -> MUST return Err!
+    let mut pcm = Vec::new();
+    for i in 0..1024i16 {
+        pcm.extend_from_slice(&i.to_le_bytes());
+        pcm.extend_from_slice(&(-i).to_le_bytes());
+    }
+    let full_wav = build_wav_bytes(44_100, 16, &pcm, false);
+    let half = full_wav.len() / 2;
+
+    let listener_a = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr_a = listener_a.local_addr().unwrap();
+    let wav_a = full_wav.clone();
+    let srv_a = thread::spawn(move || {
+        let (mut s, _) = listener_a.accept().unwrap();
+        let mut req = [0u8; 512];
+        let _ = s.read(&mut req);
+        let hdr = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            wav_a.len()
+        );
+        s.write_all(hdr.as_bytes()).unwrap();
+        s.write_all(&wav_a[..half]).unwrap();
+    });
+
+    let mut src_a = HttpAudioSource::open(
+        &format!("http://{addr_a}/trunc.wav"),
+        &HttpStreamHints::default(),
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    let mut saw_err = false;
+    loop {
+        match src_a.read_next_block(256) {
+            Ok(Some(_)) => continue,
+            Ok(None) => break,
+            Err(e) => {
+                assert!(e.contains("truncated") || e.contains("UnexpectedEof") || e.contains("EOF"), "err={e}");
+                saw_err = true;
+                break;
+            }
+        }
+    }
+    assert!(saw_err, "truncated Content-Length stream must report an error instead of silent EOF");
+    srv_a.join().unwrap();
+
+    // Case B: Server advertises Accept-Ranges: bytes -> single Range reconnect finishes all 1024 frames!
+    let listener_b = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr_b = listener_b.local_addr().unwrap();
+    let wav_b = full_wav;
+    let srv_b = thread::spawn(move || {
+        // First connection drops halfway.
+        {
+            let (mut s, _) = listener_b.accept().unwrap();
+            let mut req = [0u8; 512];
+            let _ = s.read(&mut req);
+            let hdr = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                wav_b.len()
+            );
+            s.write_all(hdr.as_bytes()).unwrap();
+            s.write_all(&wav_b[..half]).unwrap();
+        }
+        // Second connection receives `Range: bytes=<half>-` and serves the rest with 206.
+        {
+            let (mut s, _) = listener_b.accept().unwrap();
+            let mut req = [0u8; 512];
+            let n = s.read(&mut req).unwrap();
+            let req_str = String::from_utf8_lossy(&req[..n]);
+            assert!(
+                req_str.contains(&format!("Range: bytes={half}-")),
+                "expected Range resume header, got: {req_str}"
+            );
+            let rest = &wav_b[half..];
+            let hdr = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                rest.len()
+            );
+            s.write_all(hdr.as_bytes()).unwrap();
+            s.write_all(rest).unwrap();
+        }
+    });
+
+    let mut src_b = HttpAudioSource::open(
+        &format!("http://{addr_b}/resume.wav"),
+        &HttpStreamHints::default(),
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    let mut frames = 0usize;
+    while let Some(b) = src_b.read_next_block(256).unwrap() {
+        frames += b.len();
+    }
+    assert_eq!(frames, 1024);
+    srv_b.join().unwrap();
+}
+
+#[test]
+fn open_at_offset_seeks_accurately_into_flac_stream() {
+    let mut samples = Vec::new();
+    for i in 0..4410i32 {
+        samples.push(i);
+        samples.push(-i);
+    }
+    let flac = encode_test_flac_bytes(44_100, 16, &samples);
+    let (url, srv) = spawn_single_http_server("audio/flac", flac, false);
+
+    // Seek to 0.05 s = 2205 frames into 4410-frame (0.10 s) track -> exactly 2205 frames remain.
+    let mut src = HttpAudioSource::open_at_offset(
+        &url,
+        &HttpStreamHints::default(),
+        Some(0.05),
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    let mut remaining = 0usize;
+    while let Some(b) = src.read_next_block(512).unwrap() {
+        remaining += b.len();
+    }
+    assert_eq!(remaining, 2205);
+    srv.join().unwrap();
+}

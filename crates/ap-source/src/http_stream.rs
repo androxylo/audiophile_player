@@ -250,33 +250,53 @@ enum BodyFraming {
 
 /// Streaming HTTP/1.1 response body reader implementing `std::io::Read`.
 pub struct HttpBodyReader {
+    resolved_url: ParsedHttpUrl,
     stream: TcpStream,
     buffered: VecDeque<u8>,
     framing: BodyFraming,
     cancel: Arc<AtomicBool>,
     content_type: Option<String>,
     content_length: Option<u64>,
+    accept_ranges: bool,
+    status_code: u16,
+    bytes_consumed: u64,
+    resumed_once: bool,
 }
 
 impl HttpBodyReader {
     /// Open an HTTP/1.1 GET stream to `url`, following up to 5 redirects.
     pub fn connect(url: &str, cancel: Arc<AtomicBool>) -> Result<Self, String> {
+        Self::connect_with_range(url, None, cancel)
+    }
+
+    /// Open an HTTP/1.1 GET stream to `url`, optionally requesting `Range: bytes=<start>-`.
+    pub fn connect_with_range(
+        url: &str,
+        start_byte: Option<u64>,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Self, String> {
         let mut current = ParsedHttpUrl::parse(url)?;
         for _redirect in 0..=MAX_HTTP_REDIRECTS {
             if cancel.load(Ordering::Acquire) {
                 return Err("HTTP stream cancelled".to_string());
             }
             let stream = connect_with_timeout(&current.host, current.port, &cancel)?;
-            let mut reader = send_get_and_read_headers(stream, &current, Arc::clone(&cancel))?;
+            let mut reader =
+                send_get_and_read_headers(stream, &current, start_byte, Arc::clone(&cancel))?;
             match reader.status_code {
                 200 | 206 => {
                     return Ok(HttpBodyReader {
+                        resolved_url: current,
                         stream: reader.stream,
                         buffered: reader.leftover,
                         framing: reader.framing,
                         cancel,
                         content_type: reader.content_type,
                         content_length: reader.content_length,
+                        accept_ranges: reader.accept_ranges,
+                        status_code: reader.status_code,
+                        bytes_consumed: start_byte.filter(|_| reader.status_code == 206).unwrap_or(0),
+                        resumed_once: false,
                     });
                 }
                 301 | 302 | 303 | 307 | 308 => {
@@ -303,6 +323,50 @@ impl HttpBodyReader {
 
     pub fn content_length(&self) -> Option<u64> {
         self.content_length
+    }
+
+    pub fn accept_ranges(&self) -> bool {
+        self.accept_ranges
+    }
+
+    pub fn is_partial_content(&self) -> bool {
+        self.status_code == 206
+    }
+
+    fn try_resume_content_length(&mut self, remaining: u64) -> io::Result<bool> {
+        if !self.accept_ranges || self.resumed_once || self.bytes_consumed == 0 {
+            return Ok(false);
+        }
+        self.resumed_once = true;
+        let stream = match connect_with_timeout(
+            &self.resolved_url.host,
+            self.resolved_url.port,
+            &self.cancel,
+        ) {
+            Ok(s) => s,
+            Err(_) => return Ok(false),
+        };
+        let parsed = match send_get_and_read_headers(
+            stream,
+            &self.resolved_url,
+            Some(self.bytes_consumed),
+            Arc::clone(&self.cancel),
+        ) {
+            Ok(p) => p,
+            Err(_) => return Ok(false),
+        };
+        if parsed.status_code != 206 {
+            return Ok(false);
+        }
+        // Verify resumed response supplies at least the remaining byte count.
+        if let Some(cl) = parsed.content_length {
+            if cl != remaining {
+                return Ok(false);
+            }
+        }
+        self.stream = parsed.stream;
+        self.buffered = parsed.leftover;
+        Ok(true)
     }
 
     fn read_raw_socket(&mut self, out: &mut [u8]) -> io::Result<usize> {
@@ -362,14 +426,41 @@ impl Read for HttpBodyReader {
         match &mut self.framing {
             BodyFraming::UntilEof => self.read_raw_socket(buf),
             BodyFraming::ContentLength(rem) => {
-                if *rem == 0 {
+                let remaining = *rem;
+                if remaining == 0 {
                     return Ok(0);
                 }
-                let want = (buf.len() as u64).min(*rem) as usize;
+                let want = (buf.len() as u64).min(remaining) as usize;
                 let n = self.read_raw_socket(&mut buf[..want])?;
+                if n == 0 {
+                    // Review #5 Finding #9: premature EOF before declared Content-Length must
+                    // never masquerade as clean end-of-stream. Attempt a single Range resume if
+                    // supported; otherwise fail loudly with UnexpectedEof.
+                    if self.try_resume_content_length(remaining)? {
+                        let n2 = self.read_raw_socket(&mut buf[..want])?;
+                        if n2 == 0 {
+                            return Err(io::Error::new(
+                                ErrorKind::UnexpectedEof,
+                                format!(
+                                    "HTTP stream truncated after resume: {remaining} declared bytes remaining"
+                                ),
+                            ));
+                        }
+                        if let BodyFraming::ContentLength(r) = &mut self.framing {
+                            *r = r.saturating_sub(n2 as u64);
+                        }
+                        self.bytes_consumed = self.bytes_consumed.saturating_add(n2 as u64);
+                        return Ok(n2);
+                    }
+                    return Err(io::Error::new(
+                        ErrorKind::UnexpectedEof,
+                        format!("HTTP stream truncated: {remaining} declared bytes remaining"),
+                    ));
+                }
                 if let BodyFraming::ContentLength(r) = &mut self.framing {
                     *r = r.saturating_sub(n as u64);
                 }
+                self.bytes_consumed = self.bytes_consumed.saturating_add(n as u64);
                 Ok(n)
             }
             BodyFraming::Chunked {
@@ -443,6 +534,7 @@ struct ParsedHttpResponse {
     framing: BodyFraming,
     content_type: Option<String>,
     content_length: Option<u64>,
+    accept_ranges: bool,
     location: Option<String>,
 }
 
@@ -511,13 +603,19 @@ fn read_socket_cancellable(
 fn send_get_and_read_headers(
     mut stream: TcpStream,
     url: &ParsedHttpUrl,
+    range_start: Option<u64>,
     cancel: Arc<AtomicBool>,
 ) -> Result<ParsedHttpResponse, String> {
+    let range_line = match range_start {
+        Some(start) => format!("Range: bytes={start}-\r\n"),
+        None => String::new(),
+    };
     let req = format!(
         "GET {} HTTP/1.1\r\n\
          Host: {}\r\n\
          User-Agent: AudiophilePlayer/0.1 UPnP/1.0\r\n\
          Accept: */*\r\n\
+         {range_line}\
          Connection: close\r\n\r\n",
         url.path_and_query, url.host_header
     );
@@ -559,6 +657,7 @@ fn send_get_and_read_headers(
 
     let mut content_type = None;
     let mut content_length = None;
+    let mut accept_ranges = false;
     let mut chunked = false;
     let mut location = None;
 
@@ -573,6 +672,10 @@ fn send_get_and_read_headers(
         } else if key.eq_ignore_ascii_case("content-length") {
             if let Ok(len) = val.parse::<u64>() {
                 content_length = Some(len);
+            }
+        } else if key.eq_ignore_ascii_case("accept-ranges") {
+            if val.to_ascii_lowercase().contains("bytes") {
+                accept_ranges = true;
             }
         } else if key.eq_ignore_ascii_case("transfer-encoding") {
             if val.to_ascii_lowercase().contains("chunked") {
@@ -603,6 +706,7 @@ fn send_get_and_read_headers(
         framing,
         content_type,
         content_length,
+        accept_ranges,
         location,
     })
 }
@@ -1388,43 +1492,82 @@ impl HttpAudioSource {
         hints: &HttpStreamHints,
         cancel: Arc<AtomicBool>,
     ) -> Result<Self, String> {
-        let mut body = HttpBodyReader::connect(url, cancel)?;
+        Self::open_at_offset(url, hints, None, cancel)
+    }
+
+    /// Open an `http://` audio stream and position playback at `seek_offset_s` (when `Some(> 0)`).
+    ///
+    /// Uses HTTP `Range: bytes=<offset>-` when seeking into finite raw LPCM streams on servers
+    /// advertising `Accept-Ranges: bytes`, and exact decoded-frame skipping for containerized
+    /// FLAC / Ogg-FLAC / WAV streams (guaranteeing zero frame-sync corruption or noise bursts).
+    pub fn open_at_offset(
+        url: &str,
+        hints: &HttpStreamHints,
+        seek_offset_s: Option<f64>,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Self, String> {
+        let mut body = HttpBodyReader::connect(url, Arc::clone(&cancel))?;
         let content_type = body.content_type().map(str::to_string);
         let content_length = body.content_length();
+        let accept_ranges = body.accept_ranges();
 
         // Peek up to 12 bytes to detect container magic reliably.
         let mut peek = [0u8; 12];
-        let mut peeked = 0usize;
-        while peeked < peek.len() {
-            match body.read(&mut peek[peeked..]) {
-                Ok(0) => break,
-                Ok(n) => peeked += n,
-                Err(e) => return Err(format!("failed peeking HTTP audio stream header: {e}")),
-            }
-        }
+        let mut peeked = read_up_to(&mut body, &mut peek)?;
         if peeked == 0 {
             return Err(format!("HTTP audio stream '{url}' returned 0 bytes"));
         }
 
+        // Review #5 Finding #1: optionally skip a leading ID3v2 tag (some FLAC files carry one)
+        // before sniffing for `fLaC`. Never fall through to raw LPCM noise if not FLAC.
+        if peeked >= 10
+            && &peek[0..3] == b"ID3"
+            && peek[3] < 0xFF
+            && peek[4] < 0xFF
+            && (peek[6] & 0x80) == 0
+            && (peek[7] & 0x80) == 0
+            && (peek[8] & 0x80) == 0
+            && (peek[9] & 0x80) == 0
+        {
+            let tag_size = ((peek[6] as u64) << 21)
+                | ((peek[7] as u64) << 14)
+                | ((peek[8] as u64) << 7)
+                | (peek[9] as u64);
+            let footer_len = if (peek[5] & 0x10) != 0 { 10u64 } else { 0u64 };
+            let total_id3 = 10u64.saturating_add(tag_size).saturating_add(footer_len);
+            if total_id3 <= 16 * 1024 * 1024 {
+                let mut to_discard = total_id3.saturating_sub(peeked as u64);
+                let mut discard_buf = [0u8; 4096];
+                while to_discard > 0 {
+                    let want = (to_discard as usize).min(discard_buf.len());
+                    body.read_exact(&mut discard_buf[..want])
+                        .map_err(|e| format!("failed skipping ID3v2 header in '{url}': {e}"))?;
+                    to_discard -= want as u64;
+                }
+                peeked = read_up_to(&mut body, &mut peek)?;
+                if peeked == 0 {
+                    return Err(format!("HTTP stream '{url}' ended immediately after ID3v2 tag"));
+                }
+            }
+        }
+
         let prefixed = PrefixedReader::new(&peek[..peeked], body);
 
-        if peeked >= 4 && &peek[0..4] == b"fLaC" {
+        let mut source = if peeked >= 4 && &peek[0..4] == b"fLaC" {
             let dec = GenericFlacDecoder::open(prefixed, url)?;
-            return Ok(Self {
+            Self {
                 format: StreamContainerFormat::Flac,
                 spec: dec.spec,
                 peak_meta: dec.peak_meta,
                 total_frames: dec.total_frames,
                 decoder: ActiveHttpDecoder::Flac(dec),
                 next_chained_segment: None,
-            });
-        }
-
-        if peeked >= 4 && &peek[0..4] == b"OggS" {
+            }
+        } else if peeked >= 4 && &peek[0..4] == b"OggS" {
             let shared_http = SharedReader(Arc::new(std::sync::Mutex::new(prefixed)));
             let ogg = OggFlacLogicalReader::new(shared_http.clone());
             let dec = GenericFlacDecoder::open(ogg, url)?;
-            return Ok(Self {
+            Self {
                 format: StreamContainerFormat::OggFlac,
                 spec: dec.spec,
                 peak_meta: dec.peak_meta,
@@ -1434,46 +1577,90 @@ impl HttpAudioSource {
                     shared_http,
                 },
                 next_chained_segment: None,
-            });
-        }
-
-        if peeked >= 12 && &peek[0..4] == b"RIFF" && &peek[8..12] == b"WAVE" {
+            }
+        } else if peeked >= 12 && &peek[0..4] == b"RIFF" && &peek[8..12] == b"WAVE" {
             let dec = StreamingWavDecoder::open(prefixed)?;
-            return Ok(Self {
+            Self {
                 format: StreamContainerFormat::Wav,
                 spec: dec.spec,
                 peak_meta: TrackPeakMetadata::default(),
                 total_frames: dec.total_frames,
                 decoder: ActiveHttpDecoder::Wav(dec),
                 next_chained_segment: None,
-            });
-        }
-
-        // Fall back to raw LPCM (audio/L16 or audio/L24) from Content-Type or protocolInfo.
-        if let Some((bits, rate, ch)) =
+            }
+        } else if let Some((bits, rate, ch)) =
             parse_lpcm_params(content_type.as_deref(), hints)
         {
+            let frame_bytes = u64::from(ch) * u64::from(bits / 8);
+            let target_s = seek_offset_s.unwrap_or(0.0);
+            if target_s > 0.0 && accept_ranges && frame_bytes > 0 {
+                let target_frames = (target_s * f64::from(rate)).round().max(0.0) as u64;
+                let byte_offset = target_frames.saturating_mul(frame_bytes);
+                if byte_offset > 0 {
+                    if let Ok(ranged_body) =
+                        HttpBodyReader::connect_with_range(url, Some(byte_offset), cancel)
+                    {
+                        if ranged_body.is_partial_content() {
+                            let rem_len = ranged_body.content_length();
+                            let ranged_prefixed = PrefixedReader::new(&[], ranged_body);
+                            let dec =
+                                RawLpcmBeDecoder::new(ranged_prefixed, rate, ch, bits, rem_len)?;
+                            let format = if bits == 16 {
+                                StreamContainerFormat::Lpcm16Be
+                            } else {
+                                StreamContainerFormat::Lpcm24Be
+                            };
+                            return Ok(Self {
+                                format,
+                                spec: dec.spec,
+                                peak_meta: TrackPeakMetadata::default(),
+                                total_frames: content_length.map(|l| l / frame_bytes),
+                                decoder: ActiveHttpDecoder::LpcmBe(dec),
+                                next_chained_segment: None,
+                            });
+                        }
+                    }
+                }
+            }
             let dec = RawLpcmBeDecoder::new(prefixed, rate, ch, bits, content_length)?;
             let format = if bits == 16 {
                 StreamContainerFormat::Lpcm16Be
             } else {
                 StreamContainerFormat::Lpcm24Be
             };
-            return Ok(Self {
+            Self {
                 format,
                 spec: dec.spec,
                 peak_meta: TrackPeakMetadata::default(),
                 total_frames: dec.total_frames,
                 decoder: ActiveHttpDecoder::LpcmBe(dec),
                 next_chained_segment: None,
-            });
+            }
+        } else {
+            let ct_disp = content_type.as_deref().unwrap_or("<none>");
+            return Err(format!(
+                "unsupported HTTP audio stream format (Content-Type: '{ct_disp}', magic: {:02X?})",
+                &peek[..peeked.min(4)]
+            ));
+        };
+
+        if let Some(target_s) = seek_offset_s {
+            if target_s.is_finite() && target_s > 0.0 {
+                let mut skip_frames =
+                    (target_s * f64::from(source.spec.sample_rate_hz)).round().max(0.0) as u64;
+                while skip_frames > 0 {
+                    let step = (skip_frames as usize).min(16_384);
+                    match source.read_next_block(step)? {
+                        Some(b) if !b.is_empty() => {
+                            skip_frames = skip_frames.saturating_sub(b.len() as u64);
+                        }
+                        _ => break,
+                    }
+                }
+            }
         }
 
-        let ct_disp = content_type.as_deref().unwrap_or("<none>");
-        Err(format!(
-            "unsupported HTTP audio stream format (Content-Type: '{ct_disp}', magic: {:02X?})",
-            &peek[..peeked.min(4)]
-        ))
+        Ok(source)
     }
 
     pub fn container_format(&self) -> StreamContainerFormat {
@@ -1588,8 +1775,21 @@ impl AudioBlockSource for HttpAudioSource {
     }
 }
 
+fn read_up_to<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<usize, String> {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        match r.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) => return Err(format!("failed peeking HTTP audio stream header: {e}")),
+        }
+    }
+    Ok(filled)
+}
+
 /// Extract `(bits_per_sample, sample_rate_hz, channels)` for `audio/L16` or `audio/L24`
-/// from HTTP `Content-Type` and/or UPnP `protocolInfo` / DIDL-Lite hints.
+/// ONLY when HTTP `Content-Type` or UPnP `protocolInfo` explicitly names `audio/L16` or
+/// `audio/L24` (Review #5 Finding #1: never infer raw LPCM from DIDL `bitsPerSample` alone).
 pub fn parse_lpcm_params(
     content_type: Option<&str>,
     hints: &HttpStreamHints,
@@ -1637,10 +1837,8 @@ pub fn parse_lpcm_params(
         inspect(pi);
     }
 
-    let final_bits = bits.or(hints.bits_per_sample)?;
-    if final_bits != 16 && final_bits != 24 {
-        return None;
-    }
+    // Strict gate: raw LPCM requires explicit `audio/L16` or `audio/L24` MIME declaration.
+    let final_bits = bits?;
     let final_rate = rate.or(hints.sample_rate_hz).unwrap_or(44_100);
     let final_ch = channels.or(hints.channels).unwrap_or(2);
     Some((final_bits, final_rate, final_ch))
