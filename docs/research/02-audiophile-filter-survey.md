@@ -65,7 +65,7 @@ Highlighted repeatedly by Jussi Laako (`Miska`) on Audiophile Style and confirme
 
 ## 3. Accessible Algorithm & Implementation Sources (Open-Source & Public)
 
-All public/open-source resources verified so far (with license notes for our public LGPL-style Rust codebase):
+All public/open-source resources verified so far (with license notes for our public `GPL-3.0-or-later` Rust codebase):
 
 ### 3.1 Upsampling Algorithms & Benchmarks
 - **Julius O. Smith III — *Digital Audio Resampling Home Page* (Stanford CCRMA):** https://ccrma.stanford.edu/~jos/resample/ *(Open academic reference: bandlimited sinc interpolation, Kaiser windowing, polyphase structures).*
@@ -79,9 +79,9 @@ All public/open-source resources verified so far (with license notes for our pub
 - **Northern Audio / Grigg Audio HQPlayer Filter Guides:** Public summaries explaining `poly-sinc-gauss`, `sinc-M`, `sinc-L`, `sinc-MGa`, `poly-sinc-ext2/3`, `closed-form`.
 
 ### 3.2 Dither & Noise-Shaping Algorithms & Code
-- **SoX (`chirlu/sox` — GPL/LGPL modules, reference C code in `src/dither.c`):** https://github.com/chirlu/sox *(Contains explicit error-feedback NTF coefficient arrays for `lipshitz`, `f_weighted`, `modified_e_weighted`, `improved_e_weighted`, `shibata`, `low_shibata`, `high_shibata`—note: for our repo we will derive our own high-rate 352.8/384 kHz NTF coefficients mathematically rather than copying GPL code).*
+- **SoX (`chirlu/sox` — GPL/LGPL modules, reference C code in `src/dither.c`):** https://github.com/chirlu/sox *(Contains explicit error-feedback NTF coefficient arrays for `lipshitz`, `f_weighted`, `modified_e_weighted`, `improved_e_weighted`, `shibata`, `low_shibata`, `high_shibata`—note: for our `GPL-3.0-or-later` repo we still derive our own high-rate 352.8/384 kHz NTF coefficients mathematically and preserve attribution where any reference ideas are used).*
 - **FFmpeg `libswresample` (`dither.c` / `dither_template.c` — LGPL-2.1+):** https://github.com/FFmpeg/FFmpeg *(Reference TPDF, triangular high-pass, Lipshitz, F-weighted, modified/improved-e-weighted, Shibata dither implementations).*
-- **CamillaDSP (`dither.rs` — GPL-3.0, study concepts only if we choose LGPL):** https://github.com/HEnquist/camilladsp *(Rust reference for Flat/Highpass/F-weighted/Shibata/Lipshitz dither).*
+- **CamillaDSP (`dither.rs` — GPL-3.0, compatible with our `GPL-3.0-or-later` license with proper attribution):** https://github.com/HEnquist/camilladsp *(Rust reference for Flat/Highpass/F-weighted/Shibata/Lipshitz dither).*
 - **Wikipedia / DSP textbooks on Error-Feedback Noise Shaping & Delta-Sigma:** Public derivations of `H(z)` / NTF stability criteria (Lee's rule / out-of-band gain limits).
 
 ---
