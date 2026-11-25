@@ -14,7 +14,7 @@
 //!   filters of equal length never splice.
 //! - Filter tap counts are strictly capped `<= MAX_FILTER_TAPS` (`4,000,000`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::f64::consts::PI;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -428,14 +428,32 @@ pub fn short_gaussian_spec(
         ));
     }
     let fs_in = source_rate_hz as f64;
-    let f_stop = effective_nyquist_hz
-        .map(|f| (f as f64).min(0.5 * fs_in))
-        .unwrap_or(0.5 * fs_in);
-    let f_pass = if source_rate_hz <= 48_000 {
-        (fs_in * (19_000.0 / 44_100.0)).min(f_stop * 0.90)
-    } else {
-        (0.42 * fs_in).min(f_stop * 0.88)
+    // Review #7 F11: If an untrusted/YAML `effective_nyquist_hz` would force `f_pass` below the
+    // mandatory 19 kHz DR-1 floor, degrade gracefully to native Nyquist (`None`) instead of failing.
+    let mut effective_nyquist_hz = effective_nyquist_hz.filter(|&f| {
+        !(source_rate_hz >= DR1_MIN_SOURCE_RATE_HZ && (f as f64) <= DR1_MIN_PASSBAND_HZ * 1.02)
+    });
+    let compute_edges = |feff: Option<u32>| -> (f64, f64) {
+        let f_stop = feff
+            .map(|f| (f as f64).min(0.5 * fs_in))
+            .unwrap_or(0.5 * fs_in);
+        let f_pass = if source_rate_hz <= 48_000 {
+            (fs_in * (19_000.0 / 44_100.0)).min(f_stop * 0.90)
+        } else {
+            (0.42 * fs_in).min(f_stop * 0.88)
+        };
+        (f_pass, f_stop)
     };
+    let (mut f_pass, mut f_stop) = compute_edges(effective_nyquist_hz);
+    if effective_nyquist_hz.is_some()
+        && source_rate_hz >= DR1_MIN_SOURCE_RATE_HZ
+        && (f_pass + 1e-6 < DR1_MIN_PASSBAND_HZ || f_stop <= f_pass)
+    {
+        effective_nyquist_hz = None;
+        let (p, s) = compute_edges(None);
+        f_pass = p;
+        f_stop = s;
+    }
     if source_rate_hz >= DR1_MIN_SOURCE_RATE_HZ && f_pass + 1e-6 < DR1_MIN_PASSBAND_HZ {
         return Err(format!(
             "DR-1 violation for '{archetype}' at {source_rate_hz} Hz: f_pass={f_pass:.2} Hz < 19000 Hz"
@@ -508,11 +526,25 @@ pub fn gauss_apod_4m_spec(
     // -306 dB (zero dead padding; ultra-steep ~20 Hz Gaussian transition at 65,536 * ratio).
     let sigma_t_seconds = (half_span as f64) / (GAUSS_TRUNCATION_SIGMAS * fs_out);
     let sigma_f_hz = 1.0 / (2.0 * PI * sigma_t_seconds);
-    let f_stop = effective_nyquist_hz
+    let mut effective_nyquist_hz = effective_nyquist_hz.filter(|&f| {
+        !(source_rate_hz >= DR1_MIN_SOURCE_RATE_HZ && (f as f64) <= DR1_MIN_PASSBAND_HZ * 1.02)
+    });
+    let mut f_stop = effective_nyquist_hz
         .map(|f| (f as f64).min(0.5 * fs_in))
         .unwrap_or(0.5 * fs_in);
-    let fc_hz = f_stop - GAUSS_STOPBAND_SIGMAS * sigma_f_hz;
-    let f_pass = fc_hz - GAUSS_PASSBAND_SIGMAS * sigma_f_hz;
+    let mut fc_hz = f_stop - GAUSS_STOPBAND_SIGMAS * sigma_f_hz;
+    let mut f_pass = fc_hz - GAUSS_PASSBAND_SIGMAS * sigma_f_hz;
+
+    if effective_nyquist_hz.is_some()
+        && (f_pass <= 0.0
+            || fc_hz <= 0.0
+            || (source_rate_hz >= DR1_MIN_SOURCE_RATE_HZ && f_pass + 1e-6 < DR1_MIN_PASSBAND_HZ))
+    {
+        effective_nyquist_hz = None;
+        f_stop = 0.5 * fs_in;
+        fc_hz = f_stop - GAUSS_STOPBAND_SIGMAS * sigma_f_hz;
+        f_pass = fc_hz - GAUSS_PASSBAND_SIGMAS * sigma_f_hz;
+    }
 
     if f_pass <= 0.0 || fc_hz <= 0.0 || fc_hz >= 0.5 * fs_in {
         return Err(format!(
@@ -631,11 +663,26 @@ impl KaiserFilterSpec {
 
         // Empirical Kaiser transition width (UPS §4.1) with slight margin so -200 dB hits <= f_stop.
         let delta_f = (a_db - 7.95) * fs_out / (14.36 * (num_taps as f64));
-        let f_stop = effective_nyquist_hz
+        let mut effective_nyquist_hz = effective_nyquist_hz.filter(|&f| {
+            !(source_rate_hz >= DR1_MIN_SOURCE_RATE_HZ && (f as f64) <= DR1_MIN_PASSBAND_HZ * 1.02)
+        });
+        let mut f_stop = effective_nyquist_hz
             .map(|f| (f as f64).min(0.5 * fs_in))
             .unwrap_or(0.5 * fs_in);
-        let fc_hz = f_stop - 0.55 * delta_f;
-        let f_pass = f_stop - 1.15 * delta_f;
+        let mut fc_hz = f_stop - 0.55 * delta_f;
+        let mut f_pass = f_stop - 1.15 * delta_f;
+
+        if effective_nyquist_hz.is_some()
+            && (f_pass <= 0.0
+                || fc_hz <= 0.0
+                || (source_rate_hz >= DR1_MIN_SOURCE_RATE_HZ
+                    && f_pass + 1e-6 < DR1_MIN_PASSBAND_HZ))
+        {
+            effective_nyquist_hz = None;
+            f_stop = 0.5 * fs_in;
+            fc_hz = f_stop - 0.55 * delta_f;
+            f_pass = f_stop - 1.15 * delta_f;
+        }
 
         if f_pass <= 0.0 || fc_hz <= 0.0 || fc_hz >= 0.5 * fs_in {
             return Err(format!(
@@ -1217,69 +1264,142 @@ pub fn design_phase_converted_filter(
     })
 }
 
-fn fft_kernel_cache() -> &'static Mutex<HashMap<FilterIdentity, Arc<PreparedUpsamplerKernel>>> {
-    static CACHE: OnceLock<Mutex<HashMap<FilterIdentity, Arc<PreparedUpsamplerKernel>>>> =
-        OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+/// Concurrent-deduplicating LRU cache (`Review #7 F15`):
+/// - Multiple threads requesting the same uncached `K` share one `OnceLock` slot, so the
+///   expensive filter synthesis runs strictly ONCE.
+/// - Failed builds remove their slot so a subsequent retry can succeed.
+/// - Eviction uses true LRU order (evicting the oldest entry not actively shared externally, or
+///   the oldest entry when all are shared) rather than wiping all hot cached kernels.
+struct LruOnceCache<K, V> {
+    capacity: usize,
+    entries: HashMap<K, Arc<OnceLock<Result<Arc<V>, String>>>>,
+    order: VecDeque<K>,
 }
 
-fn polyphase_filter_cache() -> &'static Mutex<HashMap<FilterIdentity, DesignedFilter>> {
-    static CACHE: OnceLock<Mutex<HashMap<FilterIdentity, DesignedFilter>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+impl<K: Eq + std::hash::Hash + Copy, V> LruOnceCache<K, V> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            entries: HashMap::with_capacity(capacity.max(1)),
+            order: VecDeque::with_capacity(capacity.max(1)),
+        }
+    }
+
+    fn touch(&mut self, key: K) {
+        if let Some(pos) = self.order.iter().position(|k| *k == key) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(key);
+    }
+
+    fn evict_if_needed(&mut self, keep_key: K) {
+        while self.entries.len() > self.capacity {
+            // Prefer evicting the oldest entry whose cached `Arc<V>` has no external borrowers.
+            let victim_pos = self
+                .order
+                .iter()
+                .position(|k| {
+                    *k != keep_key
+                        && self.entries.get(k).is_some_and(|slot| match slot.get() {
+                            Some(Ok(arc)) => Arc::strong_count(arc) == 1,
+                            _ => false,
+                        })
+                })
+                .or_else(|| self.order.iter().position(|k| *k != keep_key));
+            let Some(pos) = victim_pos else {
+                break;
+            };
+            if let Some(victim) = self.order.remove(pos) {
+                self.entries.remove(&victim);
+            }
+        }
+    }
+}
+
+fn lru_cache_get_or_init<K, V>(
+    cache: &Mutex<LruOnceCache<K, V>>,
+    key: K,
+    build_fn: impl FnOnce() -> Result<V, String>,
+) -> Result<Arc<V>, String>
+where
+    K: Eq + std::hash::Hash + Copy,
+{
+    let slot = {
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = guard.entries.get(&key).cloned() {
+            guard.touch(key);
+            existing
+        } else {
+            let fresh = Arc::new(OnceLock::new());
+            guard.entries.insert(key, Arc::clone(&fresh));
+            guard.touch(key);
+            guard.evict_if_needed(key);
+            fresh
+        }
+    };
+
+    let res = slot.get_or_init(|| build_fn().map(Arc::new));
+    match res {
+        Ok(arc) => Ok(Arc::clone(arc)),
+        Err(err) => {
+            let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+            if guard
+                .entries
+                .get(&key)
+                .is_some_and(|cur| Arc::ptr_eq(cur, &slot))
+            {
+                guard.entries.remove(&key);
+                if let Some(pos) = guard.order.iter().position(|k| *k == key) {
+                    guard.order.remove(pos);
+                }
+            }
+            Err(err.clone())
+        }
+    }
+}
+
+fn fft_kernel_cache() -> &'static Mutex<LruOnceCache<FilterIdentity, PreparedUpsamplerKernel>> {
+    static CACHE: OnceLock<Mutex<LruOnceCache<FilterIdentity, PreparedUpsamplerKernel>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(LruOnceCache::new(MAX_CACHED_KERNELS)))
+}
+
+fn polyphase_filter_cache() -> &'static Mutex<LruOnceCache<FilterIdentity, DesignedFilter>> {
+    static CACHE: OnceLock<Mutex<LruOnceCache<FilterIdentity, DesignedFilter>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(LruOnceCache::new(MAX_CACHED_KERNELS)))
 }
 
 fn get_or_prepare_fft_kernel(
     identity: FilterIdentity,
     build_fn: impl FnOnce() -> Result<DesignedFilter, String>,
 ) -> Result<Arc<PreparedUpsamplerKernel>, String> {
-    {
-        let guard = fft_kernel_cache().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(cached) = guard.get(&identity) {
-            return Ok(Arc::clone(cached));
-        }
-    }
-    let designed = build_fn()?;
-    let prepared = Arc::new(PreparedUpsamplerKernel::from_polyphase_bank(
-        designed.name,
-        designed.source_rate_hz,
-        designed.target_rate_hz,
-        designed.ratio,
-        designed.taps_per_phase,
-        designed.pad_lead,
-        designed.pad_tail,
-        designed.bank,
-        designed.metrics,
-        designed.identity,
-    )?);
-    let mut guard = fft_kernel_cache().lock().unwrap_or_else(|e| e.into_inner());
-    if guard.len() >= MAX_CACHED_KERNELS {
-        guard.clear();
-    }
-    guard.insert(designed.identity, Arc::clone(&prepared));
-    Ok(prepared)
+    lru_cache_get_or_init(fft_kernel_cache(), identity, || {
+        let designed = build_fn()?;
+        PreparedUpsamplerKernel::from_polyphase_bank(
+            designed.name,
+            designed.source_rate_hz,
+            designed.target_rate_hz,
+            designed.ratio,
+            designed.taps_per_phase,
+            designed.pad_lead,
+            designed.pad_tail,
+            designed.bank,
+            designed.metrics,
+            designed.identity,
+        )
+    })
 }
 
 fn get_or_design_polyphase(
     identity: FilterIdentity,
     build_fn: impl FnOnce() -> Result<DesignedFilter, String>,
-) -> Result<DesignedFilter, String> {
-    {
-        let guard = polyphase_filter_cache()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if let Some(cached) = guard.get(&identity) {
-            return Ok(cached.clone());
-        }
-    }
-    let designed = build_fn()?;
-    let mut guard = polyphase_filter_cache()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    if guard.len() >= MAX_CACHED_KERNELS {
-        guard.clear();
-    }
-    guard.insert(designed.identity, designed.clone());
-    Ok(designed)
+) -> Result<Arc<DesignedFilter>, String> {
+    lru_cache_get_or_init(polyphase_filter_cache(), identity, || {
+        let mut designed = build_fn()?;
+        // Discard unused flat prototype vector before caching (`PolyphaseFirUpsampler` uses `bank`).
+        designed.prototype = Vec::new();
+        Ok(designed)
+    })
 }
 
 fn build_from_designed_cached(
@@ -1292,8 +1412,48 @@ fn build_from_designed_cached(
         Ok(Box::new(FftUpolsUpsampler::new(kernel)))
     } else {
         let designed = get_or_design_polyphase(identity, build_fn)?;
-        Ok(Box::new(PolyphaseFirUpsampler::from_designed(designed)))
+        Ok(Box::new(PolyphaseFirUpsampler::from_designed(&designed)))
     }
+}
+
+/// Build the Gaussian prototype spec for a plan, honoring `hf_noise_filter` and gracefully
+/// ignoring `effective_nyquist_hz` values that fall below the DR-1 floor (Review #7 F11).
+/// Shared by `GaussLongLp`, `GaussHiresLp`, `MinphaseLong`, and `IntermediateLong`.
+fn gauss_spec_for_plan(
+    archetype: FilterArchetype,
+    plan: &SelectedDspPlan,
+) -> Result<GaussianFilterSpec, String> {
+    if archetype == FilterArchetype::GaussHiresLp && plan.hf_noise_filter {
+        return hires_hf_noise_filter_spec(plan.source_rate_hz, plan.target_rate_hz);
+    }
+    if let Some(f_eff) = plan.effective_nyquist_hz {
+        let fs_in = plan.source_rate_hz as f64;
+        let f_stop = (f_eff as f64).min(0.5 * fs_in);
+        let min_ok = plan.source_rate_hz < DR1_MIN_SOURCE_RATE_HZ
+            || (f_eff as f64) > DR1_MIN_PASSBAND_HZ * 1.02;
+        if min_ok {
+            let f_pass = (f_stop * (20_000.0 / 22_050.0)).max(
+                if plan.source_rate_hz >= DR1_MIN_SOURCE_RATE_HZ {
+                    DR1_MIN_PASSBAND_HZ
+                } else {
+                    f_stop * 0.85
+                },
+            );
+            if f_stop > f_pass + 1.0 {
+                if let Ok(spec) = GaussianFilterSpec::from_pass_stop(
+                    archetype,
+                    plan.source_rate_hz,
+                    plan.target_rate_hz,
+                    f_pass,
+                    f_stop,
+                    Some(f_eff),
+                ) {
+                    return Ok(spec);
+                }
+            }
+        }
+    }
+    GaussianFilterSpec::for_default_archetype(archetype, plan.source_rate_hz, plan.target_rate_hz)
 }
 
 fn require_integer_ratio(plan: &SelectedDspPlan) -> Result<Option<u32>, String> {
@@ -1354,31 +1514,7 @@ pub fn build_upsampler(plan: &SelectedDspPlan) -> Result<Box<dyn Upsampler>, Str
             if require_integer_ratio(plan)?.is_none() {
                 return Ok(Box::new(NullUpsampler::new(plan.target_rate_hz)));
             }
-            let spec = if plan.filter == FilterArchetype::GaussHiresLp && plan.hf_noise_filter {
-                hires_hf_noise_filter_spec(plan.source_rate_hz, plan.target_rate_hz)?
-            } else if let Some(f_eff) = plan.effective_nyquist_hz {
-                let fs_in = plan.source_rate_hz as f64;
-                let f_stop = (f_eff as f64).min(0.5 * fs_in);
-                let f_pass = (f_stop * (20_000.0 / 22_050.0)).max(if plan.source_rate_hz >= DR1_MIN_SOURCE_RATE_HZ {
-                    DR1_MIN_PASSBAND_HZ
-                } else {
-                    f_stop * 0.85
-                });
-                GaussianFilterSpec::from_pass_stop(
-                    plan.filter,
-                    plan.source_rate_hz,
-                    plan.target_rate_hz,
-                    f_pass,
-                    f_stop,
-                    Some(f_eff),
-                )?
-            } else {
-                GaussianFilterSpec::for_default_archetype(
-                    plan.filter,
-                    plan.source_rate_hz,
-                    plan.target_rate_hz,
-                )?
-            };
+            let spec = gauss_spec_for_plan(plan.filter, plan)?;
             if spec.num_taps > cap {
                 return Err(format!(
                     "upsampler '{}' requires {} taps which exceeds --max-taps ({cap})",
@@ -1503,15 +1639,7 @@ pub fn build_upsampler(plan: &SelectedDspPlan) -> Result<Box<dyn Upsampler>, Str
                 } else {
                     FilterArchetype::GaussHiresLp
                 };
-                let s = if ref_arch == FilterArchetype::GaussHiresLp && plan.hf_noise_filter {
-                    hires_hf_noise_filter_spec(plan.source_rate_hz, plan.target_rate_hz)?
-                } else {
-                    GaussianFilterSpec::for_default_archetype(
-                        ref_arch,
-                        plan.source_rate_hz,
-                        plan.target_rate_hz,
-                    )?
-                };
+                let s = gauss_spec_for_plan(ref_arch, plan)?;
                 (s, GAUSS_STOPBAND_ATTENUATION_DB)
             };
             if base_spec.num_taps > cap {
@@ -1719,10 +1847,10 @@ pub struct PolyphaseFirUpsampler {
 
 impl PolyphaseFirUpsampler {
     pub fn from_gaussian(designed: DesignedGaussianFilter) -> Self {
-        Self::from_designed(designed_from_gaussian(designed))
+        Self::from_designed(&designed_from_gaussian(designed))
     }
 
-    pub fn from_designed(designed: DesignedFilter) -> Self {
+    pub fn from_designed(designed: &DesignedFilter) -> Self {
         let lead = designed.pad_lead;
         Self {
             name: designed.name,
@@ -1731,7 +1859,7 @@ impl PolyphaseFirUpsampler {
             ratio: designed.ratio,
             taps_per_phase: designed.taps_per_phase,
             pad_tail: designed.pad_tail,
-            bank: designed.bank,
+            bank: Arc::clone(&designed.bank),
             metrics: designed.metrics,
             identity: designed.identity,
             hist_l: vec![0.0_f64; lead],
@@ -2154,4 +2282,113 @@ fn build_polyphase_bank(ratio: usize, m: usize) -> Vec<Vec<f64>> {
         bank.push(weights);
     }
     bank
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn kernel_cache_dedups_concurrent_builds_and_removes_failed_slots() {
+        let cache: Arc<Mutex<LruOnceCache<u32, usize>>> = Arc::new(Mutex::new(LruOnceCache::new(4)));
+        let builds = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(8));
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let c = Arc::clone(&cache);
+            let b = Arc::clone(&builds);
+            let bar = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                bar.wait();
+                lru_cache_get_or_init(&c, 42, || {
+                    b.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    Ok(12345)
+                })
+            }));
+        }
+        let results: Vec<Arc<usize>> = handles.into_iter().map(|h| h.join().unwrap().unwrap()).collect();
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "F15: 8 concurrent callers for the same key must build strictly ONCE"
+        );
+        for r in &results[1..] {
+            assert!(Arc::ptr_eq(&results[0], r));
+        }
+
+        // Failed build removes slot so a subsequent retry succeeds!
+        let err = lru_cache_get_or_init(&cache, 99, || Err("transient failure".to_string()));
+        assert!(err.is_err());
+        let ok = lru_cache_get_or_init(&cache, 99, || Ok(777)).unwrap();
+        assert_eq!(*ok, 777);
+    }
+
+    #[test]
+    fn kernel_cache_lru_keeps_hot_entry_and_polyphase_shares_bank() {
+        // LRU capacity = 2: insert 1, insert 2, touch 1 (hot), insert 3 -> evicts 2, keeps 1!
+        let cache: Mutex<LruOnceCache<u32, u32>> = Mutex::new(LruOnceCache::new(2));
+        let builds = AtomicUsize::new(0);
+        let a1 = lru_cache_get_or_init(&cache, 1, || {
+            builds.fetch_add(1, Ordering::SeqCst);
+            Ok(10)
+        })
+        .unwrap();
+        let _ = lru_cache_get_or_init(&cache, 2, || {
+            builds.fetch_add(1, Ordering::SeqCst);
+            Ok(20)
+        })
+        .unwrap();
+        // Touch 1 so 1 is MRU and 2 is LRU.
+        let a1_again = lru_cache_get_or_init(&cache, 1, || {
+            builds.fetch_add(1, Ordering::SeqCst);
+            Ok(999)
+        })
+        .unwrap();
+        assert!(Arc::ptr_eq(&a1, &a1_again));
+        // Insert 3 -> evicts 2, NOT hot entry 1!
+        let _ = lru_cache_get_or_init(&cache, 3, || {
+            builds.fetch_add(1, Ordering::SeqCst);
+            Ok(30)
+        })
+        .unwrap();
+        let a1_still_hot = lru_cache_get_or_init(&cache, 1, || {
+            builds.fetch_add(1, Ordering::SeqCst);
+            Ok(888)
+        })
+        .unwrap();
+        assert!(
+            Arc::ptr_eq(&a1, &a1_still_hot),
+            "F15: LRU eviction must keep hot entry 1 cached"
+        );
+        assert_eq!(builds.load(Ordering::SeqCst), 3);
+
+        // Polyphase cache hit shares the exact same `Arc<Vec<Vec<f64>>>` bank without cloning!
+        let spec = GaussianFilterSpec::for_default_archetype(
+            FilterArchetype::GaussHiresLp,
+            176_400,
+            352_800,
+        )
+        .unwrap();
+        let m_half = spec.half_span.div_ceil(spec.ratio);
+        let m = 2 * m_half + 1;
+        let id = FilterIdentity {
+            archetype: spec.archetype,
+            source_rate_hz: spec.source_rate_hz,
+            target_rate_hz: spec.target_rate_hz,
+            ratio: spec.ratio,
+            num_taps: spec.num_taps,
+            taps_per_phase: m,
+            fc_hz_bits: spec.fc_hz.to_bits(),
+            sigma_f_hz_bits: spec.sigma_f_hz.to_bits(),
+            effective_nyquist_hz: spec.effective_nyquist_hz,
+        };
+        let d1 = get_or_design_polyphase(id, || Ok(designed_from_gaussian(design_gaussian_filter(spec)))).unwrap();
+        let d2 = get_or_design_polyphase(id, || Ok(designed_from_gaussian(design_gaussian_filter(spec)))).unwrap();
+        assert!(Arc::ptr_eq(&d1.bank, &d2.bank), "F15: polyphase cache hit must share Arc bank");
+        assert!(d1.prototype.is_empty(), "F15: cached polyphase entry must not retain unused prototype");
+    }
 }

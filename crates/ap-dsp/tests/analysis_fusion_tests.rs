@@ -304,6 +304,7 @@ fn fusion_disproves_stale_peak_tags_and_enforces_strict_evidence_priority() {
 
     // Cached whole-track evidence beats window evidence; user override beats cache.
     let cached = CachedWholeTrackEvidence {
+        results_current: true,
         user_filter: Some("minphase-long".to_string()),
         user_deemphasis: Some(false),
         apod_events: 18,
@@ -321,4 +322,174 @@ fn fusion_disproves_stale_peak_tags_and_enforces_strict_evidence_priority() {
         fused_wt.user_filter.as_ref().map(|e| e.value.as_str()),
         Some("minphase-long")
     );
+}
+
+#[test]
+fn stale_cache_does_not_mask_w30_rules_a_h_l_while_preserving_user_overrides() {
+    use ap_core::track_db::{
+        TrackDbDecision, TrackDbEntry, TrackDbFileInfo, TrackDbResults, TrackDbScanInfo,
+        TrackDbUserOverrides, TRACK_DB_SCHEMA_VERSION,
+    };
+    use ap_dsp::analysis::AnalysisResult;
+
+    let make_entry = |user: TrackDbUserOverrides| TrackDbEntry {
+        schema: TRACK_DB_SCHEMA_VERSION,
+        file: TrackDbFileInfo {
+            path: "test.flac".to_string(),
+            size: 100,
+            mtime_unix_s: 100,
+            streaminfo_md5: None,
+            sample_rate: 96_000,
+            bits: 24,
+        },
+        scan: TrackDbScanInfo {
+            detector_version: 0,
+            scanned_at_unix_s: 100,
+            duration_s: 120.0,
+        },
+        results: TrackDbResults {
+            effective_bandwidth_hz: 48_000,
+            upsampled_from_1x: "negative".to_string(),
+            effective_nyquist_hz: None,
+            ultrasonic_noise_detected: "negative".to_string(),
+            lossy_origin_suspected: false,
+            apod_events: 0,
+            apodizing_needed: "negative".to_string(),
+            integrated_lufs: Some(-18.0),
+            sample_peak: 0.5,
+            true_peak_dbtp: Some(-6.0),
+            clipped_runs: 0,
+            loud_and_clipped: "negative".to_string(),
+            effective_bits: 24,
+            deemphasis_flag: false,
+            post_chain_peaks: Vec::new(),
+        },
+        decision: TrackDbDecision {
+            filter: "gauss-hires-lp".to_string(),
+            rule: "clean".to_string(),
+        },
+        user,
+    };
+
+    let w30 = AnalysisResult {
+        sample_rate_hz: 96_000,
+        container_bits: 24,
+        analyzed_frames: 96_000 * 30,
+        duration_s: 30.0,
+        is_whole_track: false,
+        effective_bandwidth_hz: 21_500,
+        upsampled_from_1x: DetectorVerdict::Positive,
+        effective_nyquist_hz: Some(22_050),
+        lossy_origin_suspected: false,
+        ultrasonic_noise_rise_db: 0.0,
+        ultrasonic_noise_level_dbfs: -120.0,
+        ultrasonic_noise_detected: DetectorVerdict::Negative,
+        onset_count: 20,
+        apod_events: 10,
+        apodizing_needed: DetectorVerdict::Positive,
+        integrated_lufs: Some(-7.5),
+        sample_peak_linear: 1.0,
+        true_peak_linear: 1.05,
+        true_peak_dbtp: 0.42,
+        clipped_runs: 15,
+        loud_and_clipped: DetectorVerdict::Positive,
+        effective_bits: 16,
+        pre_emphasis_shelf_suspected: false,
+    };
+
+    // 1. Stale cache (`results_current = false`) MUST NOT mask W30 Rules A, H, L!
+    let stale_entry = make_entry(TrackDbUserOverrides::default());
+    let stale_wt = CachedWholeTrackEvidence::from_track_db_entry(&stale_entry, false);
+    assert!(!stale_wt.results_current);
+    let fused_stale = fuse_track_evidence(
+        96_000,
+        24,
+        &TrackPeakMetadata::default(),
+        &TrackMetadata::default(),
+        Some(&w30),
+        Some(&stale_wt),
+    );
+    assert!(fused_stale.apodizing.value);
+    assert_eq!(fused_stale.apodizing.source, EvidenceSource::Window);
+    assert_eq!(fused_stale.effective_nyquist_hz.value, Some(22_050));
+    assert_eq!(fused_stale.effective_nyquist_hz.source, EvidenceSource::Window);
+    assert!(fused_stale.loud_and_clipped.value);
+    assert_eq!(fused_stale.loud_and_clipped.source, EvidenceSource::Window);
+
+    // 2. Stale cache MUST STILL preserve explicit `user:` overrides!
+    let stale_with_user = make_entry(TrackDbUserOverrides {
+        filter: None,
+        deemphasis: Some(true),
+        apodizing: Some(false),
+        note: String::new(),
+    });
+    let stale_wt_user = CachedWholeTrackEvidence::from_track_db_entry(&stale_with_user, false);
+    let fused_user = fuse_track_evidence(
+        96_000,
+        24,
+        &TrackPeakMetadata::default(),
+        &TrackMetadata::default(),
+        Some(&w30),
+        Some(&stale_wt_user),
+    );
+    assert!(!fused_user.apodizing.value);
+    assert_eq!(fused_user.apodizing.source, EvidenceSource::User);
+    assert!(fused_user.deemphasis.value);
+    assert_eq!(fused_user.deemphasis.source, EvidenceSource::User);
+    // Non-overridden rules still come from W30!
+    assert_eq!(fused_user.effective_nyquist_hz.value, Some(22_050));
+    assert_eq!(fused_user.effective_nyquist_hz.source, EvidenceSource::Window);
+
+    // 3. Current cache (`results_current = true`) STILL wins over W30!
+    let current_wt = CachedWholeTrackEvidence::from_track_db_entry(&stale_entry, true);
+    assert!(current_wt.results_current);
+    let fused_cur = fuse_track_evidence(
+        96_000,
+        24,
+        &TrackPeakMetadata::default(),
+        &TrackMetadata::default(),
+        Some(&w30),
+        Some(&current_wt),
+    );
+    assert!(!fused_cur.apodizing.value);
+    assert_eq!(fused_cur.apodizing.source, EvidenceSource::Cache);
+    assert_eq!(fused_cur.effective_nyquist_hz.value, None);
+    assert_eq!(fused_cur.effective_nyquist_hz.source, EvidenceSource::Cache);
+    assert!(!fused_cur.loud_and_clipped.value);
+    assert_eq!(fused_cur.loud_and_clipped.source, EvidenceSource::Cache);
+}
+
+#[test]
+fn analyzer_block_size_invariant_bit_identical_f14() {
+    let fs = 44_100usize;
+    let frames = fs * 8;
+    let mut rng = Rng64(0x55AA_33CC_11EE_7799);
+    let mut sig = Vec::with_capacity(frames);
+    for i in 0..frames {
+        let tone = 0.35 * (2.0 * PI * 997.0 * (i as f64) / (fs as f64)).sin();
+        let noise = 0.08 * rng.next_f64();
+        let click = if i % 9_000 == 4_500 { 0.45 } else { 0.0 };
+        sig.push((tone + noise + click).clamp(-1.0, 1.0));
+    }
+
+    let run_with_chunk = |chunk: usize| {
+        let mut an = TrackAnalyzer::new(fs as u32, 16);
+        let mut pos = 0;
+        while pos < sig.len() {
+            let end = (pos + chunk).min(sig.len());
+            an.push_block(&StereoF64Buffer {
+                sample_rate_hz: fs as u32,
+                left: sig[pos..end].to_vec(),
+                right: sig[pos..end].to_vec(),
+            });
+            pos = end;
+        }
+        an.snapshot(true, false, false, false)
+    };
+
+    let whole = run_with_chunk(frames);
+    let chunked_8k = run_with_chunk(8_192);
+    let chunked_37 = run_with_chunk(37);
+    assert_eq!(whole, chunked_8k, "F14: 8192-frame chunking must match whole-buffer snapshot");
+    assert_eq!(whole, chunked_37, "F14: 37-frame chunking must match whole-buffer snapshot");
 }

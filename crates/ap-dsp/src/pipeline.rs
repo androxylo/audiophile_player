@@ -282,6 +282,39 @@ impl StreamingPipelineSession {
         };
     }
 
+    /// Re-evaluate bit-perfect `Bypass` vs dithered/shaped quantization once Ultimate Mode locks
+    /// the real fixed whole-track [`HeadroomDecision`] (Review #7 F2).
+    ///
+    /// During `W2`, sessions are built with a placeholder `ZeroDb / 0.0 dB` headroom. When the
+    /// filter is `Null` with no de-emphasis/REW/delay, that placeholder selects `Bypass` at source
+    /// bit depth. If the real fixed gain turns out negative (`G < 0 dB`), scaling produces
+    /// fractional LSB values that MUST be dithered/shaped at `dac_bits` rather than truncated.
+    pub fn reconfigure_quantizer_for_headroom(
+        &mut self,
+        headroom: &HeadroomDecision,
+    ) -> Result<(), String> {
+        let (requested_shaper, output_bits) = resolve_quantizer_profile(
+            &self.report.dsp_plan,
+            self.report.source_spec.bits_per_sample,
+            self.deemphasis.is_enabled(),
+            headroom,
+            self.convolver.name(),
+            self.delayer.name(),
+        );
+        if requested_shaper != self.report.effective_shaper
+            || output_bits != self.report.output_bits
+        {
+            self.quantizer = StreamingQuantizer::with_rate(
+                requested_shaper,
+                output_bits,
+                self.report.output_rate_hz,
+            )?;
+            self.report.effective_shaper = self.quantizer.effective_shaper();
+            self.report.output_bits = output_bits;
+        }
+        Ok(())
+    }
+
     /// Attach structured Ultimate Mode decision metadata (`U13`) to this session's report.
     pub fn set_ultimate_report(&mut self, report: UltimateDecisionReport) {
         self.report.ultimate_report = Some(report);
@@ -763,37 +796,14 @@ impl AudioPipeline {
 
         convolver.set_output_scale(1.0);
 
-        let untouched_native = dsp_plan.filter == FilterArchetype::Null
-            && !deemphasis.is_enabled()
-            && headroom.mode == HeadroomMode::ZeroDb
-            && headroom.convolution_scale_db == 0.0
-            && convolver.name() == "null-convolver"
-            && delayer.name() == "null-delay";
-
-        let (requested_shaper, output_bits) = if untouched_native
-            && (dsp_plan.dac_bits == 24 || u16::from(dsp_plan.dac_bits) >= spec.bits_per_sample)
-        {
-            let out_bits = (spec.bits_per_sample as u8).clamp(16, 32);
-            let shaper = if !dsp_plan.shaper_overridden
-                && u16::from(out_bits) >= spec.bits_per_sample
-            {
-                NoiseShaperProfile::Bypass
-            } else {
-                dsp_plan.shaper
-            };
-            (shaper, out_bits)
-        } else if dsp_plan.shaper == NoiseShaperProfile::Bypass {
-            let fallback = if !dsp_plan.shaper_overridden
-                && matches!(dsp_plan.target_rate_hz, 352_800 | 384_000)
-            {
-                NoiseShaperProfile::NsGentle2
-            } else {
-                NoiseShaperProfile::TpdfDither
-            };
-            (fallback, dsp_plan.dac_bits)
-        } else {
-            (dsp_plan.shaper, dsp_plan.dac_bits)
-        };
+        let (requested_shaper, output_bits) = resolve_quantizer_profile(
+            &dsp_plan,
+            spec.bits_per_sample,
+            deemphasis.is_enabled(),
+            &headroom,
+            convolver.name(),
+            delayer.name(),
+        );
 
         let quantizer =
             StreamingQuantizer::with_rate(requested_shaper, output_bits, dsp_plan.target_rate_hz)?;
@@ -969,39 +979,14 @@ impl AudioPipeline {
         // the convolver itself runs at unity scale (1.0) and carried tails always match Track A.
         convolver.set_output_scale(1.0);
 
-        let untouched_native = dsp_plan.filter == FilterArchetype::Null
-            && !deemphasis.is_enabled()
-            && headroom.mode == HeadroomMode::ZeroDb
-            && headroom.convolution_scale_db == 0.0
-            && convolver.name() == "null-convolver"
-            && delayer.name() == "null-delay";
-
-        let (requested_shaper, output_bits) = if untouched_native
-            && (dsp_plan.dac_bits == 24 || u16::from(dsp_plan.dac_bits) >= spec.bits_per_sample)
-        {
-            let out_bits = (spec.bits_per_sample as u8).clamp(16, 32);
-            // Truly bit-perfect native pass-through: never add TPDF dither when no DSP modified
-            // the signal and output bit depth can represent every source bit losslessly.
-            let shaper = if !dsp_plan.shaper_overridden
-                && u16::from(out_bits) >= spec.bits_per_sample
-            {
-                NoiseShaperProfile::Bypass
-            } else {
-                dsp_plan.shaper
-            };
-            (shaper, out_bits)
-        } else if dsp_plan.shaper == NoiseShaperProfile::Bypass {
-            let fallback = if !dsp_plan.shaper_overridden
-                && matches!(dsp_plan.target_rate_hz, 352_800 | 384_000)
-            {
-                NoiseShaperProfile::NsGentle2
-            } else {
-                NoiseShaperProfile::TpdfDither
-            };
-            (fallback, dsp_plan.dac_bits)
-        } else {
-            (dsp_plan.shaper, dsp_plan.dac_bits)
-        };
+        let (requested_shaper, output_bits) = resolve_quantizer_profile(
+            &dsp_plan,
+            spec.bits_per_sample,
+            deemphasis.is_enabled(),
+            &headroom,
+            convolver.name(),
+            delayer.name(),
+        );
 
         let quantizer =
             StreamingQuantizer::with_rate(requested_shaper, output_bits, dsp_plan.target_rate_hz)?;
@@ -1359,5 +1344,98 @@ impl AudioPipeline {
         pcm.frames.extend(tail.frames);
         let report = session.report().clone();
         Ok(ProcessedTrack { pcm, report })
+    }
+}
+
+/// Shared quantizer bit-depth & noise-shaper selection used by both normal-mode
+/// `start_track_with_opts` and Ultimate Mode `start_track_with_plan_and_headroom` /
+/// `reconfigure_quantizer_for_headroom` (Review #7 F2).
+fn resolve_quantizer_profile(
+    dsp_plan: &SelectedDspPlan,
+    source_bits_per_sample: u16,
+    deemphasis_enabled: bool,
+    headroom: &HeadroomDecision,
+    convolver_name: &str,
+    delayer_name: &str,
+) -> (NoiseShaperProfile, u8) {
+    let untouched_native = dsp_plan.filter == FilterArchetype::Null
+        && !deemphasis_enabled
+        && headroom.mode == HeadroomMode::ZeroDb
+        && headroom.convolution_scale_db.abs() <= 1e-12
+        && convolver_name == "null-convolver"
+        && delayer_name == "null-delay";
+
+    if untouched_native
+        && (dsp_plan.dac_bits == 24 || u16::from(dsp_plan.dac_bits) >= source_bits_per_sample)
+    {
+        let out_bits = (source_bits_per_sample as u8).clamp(16, 32);
+        // Truly bit-perfect native pass-through: never add TPDF dither when no DSP modified
+        // the signal and output bit depth can represent every source bit losslessly.
+        let shaper = if !dsp_plan.shaper_overridden && u16::from(out_bits) >= source_bits_per_sample
+        {
+            NoiseShaperProfile::Bypass
+        } else {
+            dsp_plan.shaper
+        };
+        (shaper, out_bits)
+    } else if dsp_plan.shaper == NoiseShaperProfile::Bypass {
+        let fallback = if !dsp_plan.shaper_overridden
+            && matches!(dsp_plan.target_rate_hz, 352_800 | 384_000)
+        {
+            NoiseShaperProfile::NsGentle2
+        } else {
+            NoiseShaperProfile::TpdfDither
+        };
+        (fallback, dsp_plan.dac_bits)
+    } else {
+        (dsp_plan.shaper, dsp_plan.dac_bits)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::selector::TrackSourceInfo;
+
+    #[test]
+    fn reconfigure_quantizer_switches_to_tpdf_when_gain_negative() {
+        let policy = UpsamplerPolicy {
+            filter_override: Some(FilterArchetype::Null),
+            ..UpsamplerPolicy::default()
+        };
+        let pipeline = AudioPipeline::new(policy).unwrap();
+        let spec = StreamSpec {
+            sample_rate_hz: 44_100,
+            bits_per_sample: 16,
+            channels: 2,
+        };
+        let src = TrackSourceInfo::from_stream_spec(spec);
+        let plan = UpsamplerPicker::new(policy).unwrap().select(&src);
+        let placeholder_hr = HeadroomDecision {
+            mode: HeadroomMode::ZeroDb,
+            peak_dbfs: None,
+            peak_kind: None,
+            convolution_scale_db: 0.0,
+            reason: "placeholder".to_string(),
+        };
+        let mut session = pipeline
+            .start_track_with_plan_and_headroom(spec, plan, placeholder_hr)
+            .unwrap();
+        assert_eq!(session.report().effective_shaper, NoiseShaperProfile::Bypass);
+        assert_eq!(session.report().output_bits, 16);
+
+        let neg_hr = HeadroomDecision {
+            mode: HeadroomMode::ZeroDb,
+            peak_dbfs: Some(-0.01),
+            peak_kind: None,
+            convolution_scale_db: -0.4,
+            reason: "negative fixed gain".to_string(),
+        };
+        session.reconfigure_quantizer_for_headroom(&neg_hr).unwrap();
+        assert_eq!(
+            session.report().effective_shaper,
+            NoiseShaperProfile::TpdfDither
+        );
+        assert_eq!(session.report().output_bits, 24);
     }
 }

@@ -1007,46 +1007,47 @@ impl ChannelUpolsState {
         )
         .map_err(|e| format!("UPOLS forward FFT failed: {e}"))?;
 
-        // 3. Complex MAC across all non-zero IR partitions.
+        // 3. Complex MAC across all non-zero IR partitions via persistent worker pool (F12).
         let p_count = self.num_partitions;
         let spec_len = self.acc_spec.len();
         let fdl = &self.fdl;
+        let mac_slices = crate::worker_pool::mac_slice_count(true);
 
         if nonzero_count >= REW_PARALLEL_MAC_MIN_PARTITIONS
-            && spec_len >= REW_PARALLEL_MAC_SLICES * 256
+            && nonzero_count.saturating_mul(spec_len) >= crate::worker_pool::MAC_PARALLEL_MIN_WORK
+            && mac_slices > 1
+            && spec_len >= mac_slices * 256
         {
-            // Bit-identical disjoint bin-slice parallelism: each worker sums 0..p_count in exact
-            // order for its own frequency bins (0 ULPs difference vs sequential).
-            let chunk_len = spec_len.div_ceil(REW_PARALLEL_MAC_SLICES);
-            std::thread::scope(|s| {
-                for (slice_idx, acc_chunk) in self.acc_spec.chunks_mut(chunk_len).enumerate() {
-                    let bin_start = slice_idx * chunk_len;
+            // Bit-identical disjoint bin-slice parallelism on persistent MAC pool: slice 0 runs
+            // inline on caller thread and each slice sums 0..p_count in exact order (0 ULPs diff).
+            crate::worker_pool::for_each_mac_slice(
+                &mut self.acc_spec,
+                mac_slices.min(REW_PARALLEL_MAC_SLICES),
+                |_slice_idx, bin_start, acc_chunk| {
                     let bin_end = bin_start + acc_chunk.len();
-                    s.spawn(move || {
-                        for c in acc_chunk.iter_mut() {
-                            *c = Complex::new(0.0, 0.0);
+                    for c in acc_chunk.iter_mut() {
+                        *c = Complex::new(0.0, 0.0);
+                    }
+                    for p in 0..p_count {
+                        if !nonzero[p] {
+                            continue;
                         }
-                        for p in 0..p_count {
-                            if !nonzero[p] {
-                                continue;
-                            }
-                            let fdl_idx = if head >= p {
-                                head - p
-                            } else {
-                                head + p_count - p
-                            };
-                            let x_slice = &fdl[fdl_idx][bin_start..bin_end];
-                            let h_slice = &ir_spectra[p][bin_start..bin_end];
-                            for ((acc, &x), &h) in
-                                acc_chunk.iter_mut().zip(x_slice.iter()).zip(h_slice.iter())
-                            {
-                                acc.re += x.re * h.re - x.im * h.im;
-                                acc.im += x.re * h.im + x.im * h.re;
-                            }
+                        let fdl_idx = if head >= p {
+                            head - p
+                        } else {
+                            head + p_count - p
+                        };
+                        let x_slice = &fdl[fdl_idx][bin_start..bin_end];
+                        let h_slice = &ir_spectra[p][bin_start..bin_end];
+                        for ((acc, &x), &h) in
+                            acc_chunk.iter_mut().zip(x_slice.iter()).zip(h_slice.iter())
+                        {
+                            acc.re += x.re * h.re - x.im * h.im;
+                            acc.im += x.re * h.im + x.im * h.re;
                         }
-                    });
-                }
-            });
+                    }
+                },
+            );
         } else {
             for c in &mut self.acc_spec {
                 *c = Complex::new(0.0, 0.0);
@@ -1280,8 +1281,8 @@ impl PartitionedStereoConvolver {
             let ir = &self.ir;
             let left = &mut self.left;
             let right = &mut self.right;
-            std::thread::scope(|s| -> Result<(Vec<f64>, Vec<f64>), String> {
-                let hl = s.spawn(|| {
+            let (l_res, r_res) = crate::worker_pool::join_stereo(
+                || {
                     left.flush_exact(
                         remaining,
                         ir.r2c.as_ref(),
@@ -1290,20 +1291,19 @@ impl PartitionedStereoConvolver {
                         &ir.nonzero_left,
                         ir.nonzero_count_left,
                     )
-                });
-                let r_res = right.flush_exact(
-                    remaining,
-                    ir.r2c.as_ref(),
-                    ir.c2r.as_ref(),
-                    &ir.ir_spectra_right,
-                    &ir.nonzero_right,
-                    ir.nonzero_count_right,
-                );
-                let l_res = hl
-                    .join()
-                    .map_err(|_| "UPOLS left-channel flush worker panicked".to_string())?;
-                Ok((l_res?, r_res?))
-            })?
+                },
+                || {
+                    right.flush_exact(
+                        remaining,
+                        ir.r2c.as_ref(),
+                        ir.c2r.as_ref(),
+                        &ir.ir_spectra_right,
+                        &ir.nonzero_right,
+                        ir.nonzero_count_right,
+                    )
+                },
+            );
+            (l_res?, r_res?)
         } else {
             let out_l = self.left.flush_exact(
                 remaining,
@@ -1418,8 +1418,8 @@ impl StereoConvolver for PartitionedStereoConvolver {
                 let right = &mut self.right;
                 let in_l = &input.left;
                 let in_r = &input.right;
-                std::thread::scope(|s| -> Result<(Vec<f64>, Vec<f64>), String> {
-                    let hl = s.spawn(|| {
+                let (l_res, r_res) = crate::worker_pool::join_stereo(
+                    || {
                         left.push_samples(
                             in_l,
                             ir.r2c.as_ref(),
@@ -1428,20 +1428,19 @@ impl StereoConvolver for PartitionedStereoConvolver {
                             &ir.nonzero_left,
                             ir.nonzero_count_left,
                         )
-                    });
-                    let r_res = right.push_samples(
-                        in_r,
-                        ir.r2c.as_ref(),
-                        ir.c2r.as_ref(),
-                        &ir.ir_spectra_right,
-                        &ir.nonzero_right,
-                        ir.nonzero_count_right,
-                    );
-                    let l_res = hl
-                        .join()
-                        .map_err(|_| "UPOLS left-channel worker panicked".to_string())?;
-                    Ok((l_res?, r_res?))
-                })?
+                    },
+                    || {
+                        right.push_samples(
+                            in_r,
+                            ir.r2c.as_ref(),
+                            ir.c2r.as_ref(),
+                            &ir.ir_spectra_right,
+                            &ir.nonzero_right,
+                            ir.nonzero_count_right,
+                        )
+                    },
+                );
+                (l_res?, r_res?)
             } else {
                 let out_l = self.left.push_samples(
                     &input.left,

@@ -381,3 +381,62 @@ fn cli_names_and_compatibility_aliases_parse_roundtrip_for_all_filters_and_shape
     );
     assert!(NoiseShaperProfile::from_str("nonexistent").is_err());
 }
+
+#[test]
+fn build_upsampler_low_f_eff_falls_back_not_errors_and_minphase_honours_f_eff_f11() {
+    let spec_96 = StreamSpec {
+        sample_rate_hz: 96_000,
+        bits_per_sample: 24,
+        channels: 2,
+    };
+
+    // 1. F11: Low/corrupt f_eff values below DR-1 floor at 96k->384k MUST gracefully degrade
+    //    to native Nyquist instead of failing the track across all archetypes!
+    for f_eff in [16_000_u32, 18_000, 19_000, 20_000] {
+        for arch in [
+            FilterArchetype::GaussLongLp,
+            FilterArchetype::GaussHiresLp,
+            FilterArchetype::ShortLp,
+            FilterArchetype::ShortMp,
+            FilterArchetype::MinphaseLong,
+            FilterArchetype::IntermediateLong,
+            FilterArchetype::GaussApod4M,
+            FilterArchetype::SincSteep4M,
+            FilterArchetype::ExtSharpLp,
+        ] {
+            let policy = UpsamplerPolicy {
+                filter_override: Some(arch),
+                max_taps: 16_384, // keep mega-tap designs fast in unit tests
+                ..UpsamplerPolicy::default()
+            };
+            let picker = UpsamplerPicker::new(policy).unwrap();
+            let mut src = TrackSourceInfo::from_stream_spec(spec_96);
+            src.effective_nyquist_hz = Some(f_eff);
+            let plan = picker.select(&src);
+            let built = build_upsampler(&plan);
+            assert!(
+                built.is_ok(),
+                "F11: archetype {arch} with f_eff={f_eff} Hz must fall back cleanly, got {:?}",
+                built.err()
+            );
+        }
+    }
+
+    // 2. F11: MinphaseLong & IntermediateLong honor valid fake-hi-res f_eff = 22,050 Hz!
+    for arch in [FilterArchetype::MinphaseLong, FilterArchetype::IntermediateLong] {
+        let policy = UpsamplerPolicy {
+            filter_override: Some(arch),
+            ..UpsamplerPolicy::default()
+        };
+        let picker = UpsamplerPicker::new(policy).unwrap();
+        let mut src = TrackSourceInfo::from_stream_spec(spec_96);
+        src.effective_nyquist_hz = Some(22_050);
+        let plan = picker.select(&src);
+        let up = build_upsampler(&plan).expect("minphase/intermediate build failed");
+        assert_eq!(
+            up.identity().effective_nyquist_hz,
+            Some(22_050),
+            "F11: {arch} must honor effective_nyquist_hz=22050"
+        );
+    }
+}

@@ -1901,6 +1901,7 @@ fn stream_single_track(
             mode_label,
             total_duration_s,
             incoming_carryover,
+            panic_backup_carry,
             had_pending_prev_end,
             gapless_carryover,
             src_block_frames,
@@ -1908,8 +1909,14 @@ fn stream_single_track(
             UltimateStreamResult::Played {
                 next_carryover,
                 next_pending_end,
+                warning,
                 ..
-            } => (TrackStreamOutcome::Played, next_carryover, next_pending_end),
+            } => {
+                if let Some(msg) = warning {
+                    shared.record_action(msg);
+                }
+                (TrackStreamOutcome::Played, next_carryover, next_pending_end)
+            }
             UltimateStreamResult::Aborted => (TrackStreamOutcome::Aborted, None, false),
             UltimateStreamResult::Failed(msg) => (TrackStreamOutcome::Failed(msg), None, false),
         };
@@ -2361,6 +2368,7 @@ fn stream_upnp_request(
                 PlayModeLabel::UpnpRenderer,
                 seg_duration,
                 incoming_carryover,
+                panic_backup_carry,
                 had_pending_prev_end,
                 true,
                 src_block_frames,
@@ -2368,8 +2376,14 @@ fn stream_upnp_request(
                 UltimateStreamResult::Played {
                     next_carryover,
                     next_pending_end,
+                    warning,
                     ..
-                } => (TrackStreamOutcome::Played, next_carryover, next_pending_end),
+                } => {
+                    if let Some(msg) = warning {
+                        shared.record_action(msg);
+                    }
+                    (TrackStreamOutcome::Played, next_carryover, next_pending_end)
+                }
                 UltimateStreamResult::Aborted => (TrackStreamOutcome::Aborted, None, false),
                 UltimateStreamResult::Failed(msg) => (TrackStreamOutcome::Failed(msg), None, false),
             }

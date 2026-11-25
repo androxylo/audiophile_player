@@ -22,6 +22,7 @@ use std::sync::Arc;
 use ap_core::config::{DEFAULT_DAC_BITS, is_valid_dac_bits};
 use ap_core::format::{StreamSpec, TargetDspRate};
 use ap_core::metadata::{GenreClass, PhaseTagOverride};
+use ap_core::track_db::PostChainKey;
 
 use crate::MAX_FILTER_TAPS;
 use crate::fusion::{EvidenceSource, FusedTrackEvidence};
@@ -1226,6 +1227,26 @@ pub fn select_ultimate_plan(
     })
 }
 
+/// Build the canonical [`PostChainKey`] identifying an exact linear DSP chain configuration.
+///
+/// Shared by both `audiophile-player scan --post-chain` and Ultimate Mode playback (`Review #7 F6`)
+/// so scanned whole-track `M` values always match playback lookups identically.
+pub fn build_post_chain_key(
+    plan: &SelectedDspPlan,
+    source_rate_hz: u32,
+    output_rate_hz: u32,
+    rew_filter_hash: Option<&str>,
+) -> PostChainKey {
+    PostChainKey {
+        upsampler: plan.filter.to_string(),
+        f_eff_hz: plan.effective_nyquist_hz.unwrap_or(source_rate_hz / 2),
+        output_rate_hz,
+        deemphasis: plan.deemphasis,
+        hf_noise_filter: plan.hf_noise_filter,
+        rew_filter_hash: rew_filter_hash.unwrap_or("none").to_string(),
+    }
+}
+
 /// Outcome of the Ultimate Mode §4.3 throughput self-check.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ThroughputCheckResult {
@@ -1251,6 +1272,35 @@ pub fn check_ultimate_throughput(
     wall_seconds: f64,
     track_duration_s: Option<f64>,
 ) -> ThroughputCheckResult {
+    check_ultimate_throughput_with_buffer(
+        active_filter,
+        source_rate_hz,
+        rendered_audio_s,
+        wall_seconds,
+        track_duration_s,
+        rendered_audio_s,
+        None,
+        0.0,
+    )
+}
+
+/// Extended throughput check that also enforces the W2 **startup burst** budget against the
+/// currently buffered playback duration (`buffered_s`) ahead of the DAC (Review #7 F9).
+///
+/// When `buffered_s` is `Some(b)` with `b > 0.0` (gapless transition while Track A is playing),
+/// the projected wall-clock time to finish the `w0_total_audio_s` W2 render plus `decode_wall_s`
+/// MUST fit strictly inside `(b - safety_s)` so Track A's queue cannot underrun.
+#[allow(clippy::too_many_arguments)]
+pub fn check_ultimate_throughput_with_buffer(
+    active_filter: FilterArchetype,
+    source_rate_hz: u32,
+    rendered_audio_s: f64,
+    wall_seconds: f64,
+    track_duration_s: Option<f64>,
+    w0_total_audio_s: f64,
+    buffered_s: Option<f64>,
+    decode_wall_s: f64,
+) -> ThroughputCheckResult {
     let wall = wall_seconds.max(1e-9);
     let measured_x_rt = if rendered_audio_s.is_finite() && rendered_audio_s > 0.0 {
         rendered_audio_s / wall
@@ -1258,15 +1308,26 @@ pub fn check_ultimate_throughput(
         0.0
     };
 
-    // §4.3 requirement: with a full 30 s look-ahead cushion, a finite track of length T needs
-    // at least `T / (T + 30 s)` (strictly < 1.0x for short tracks, approaching 1.0x for long
-    // tracks), multiplied by a 1.15x safety margin so transient OS jitter can never cause underruns.
-    // For unknown-duration streams, require >= 1.15x RT unconditionally.
+    // Sustained requirement: >= 1.15x RT on unknown/long streams, scaling gently on finite tracks
+    // while never dropping below 1.0x RT.
     let base_req = match track_duration_s {
         Some(t) if t.is_finite() && t > 0.0 => t / (t + f64::from(ULTIMATE_LOOKAHEAD_SECONDS)),
         _ => 1.0,
     };
-    let required_x_rt = (base_req * 1.15).max(1.0);
+    let sustained_req = (base_req * 1.15).max(1.0);
+
+    // Startup burst constraint (Review #7 F9): when Track A still has `avail_s` buffered ahead of
+    // the DAC, finishing Track B's W2 render (`w0_total_audio_s / x_rt + decode_wall_s`) must
+    // complete with >= 2 s safety cushion (or 25% of `avail_s` for shorter cushions).
+    let burst_req = match buffered_s {
+        Some(avail_s) if avail_s.is_finite() && avail_s > 0.0 && w0_total_audio_s > 0.0 => {
+            let safety_s = 2.0_f64.min(avail_s * 0.25);
+            let budget_s = (avail_s - decode_wall_s.max(0.0) - safety_s).max(0.5);
+            w0_total_audio_s / budget_s
+        }
+        _ => 0.0,
+    };
+    let required_x_rt = sustained_req.max(burst_req);
     let passed = measured_x_rt >= required_x_rt;
 
     if passed {
@@ -1285,14 +1346,62 @@ pub fn check_ultimate_throughput(
         } else {
             FilterArchetype::GaussHiresLp
         };
+        let reason = if burst_req > sustained_req {
+            format!(
+                "W2 burst exceeds {:.1}s buffered cushion (need >= {required_x_rt:.2}x RT)",
+                buffered_s.unwrap_or(0.0)
+            )
+        } else {
+            format!("sustained speed < {required_x_rt:.2}x RT required")
+        };
         ThroughputCheckResult {
             measured_x_rt,
             required_x_rt,
             passed: false,
             detail: format!(
-                "REFUSED {active_filter}: measured {measured_x_rt:.2}x RT < {required_x_rt:.2}x RT required; falling back to lossless {fallback}"
+                "REFUSED {active_filter}: measured {measured_x_rt:.2}x RT ({reason}); falling back to lossless {fallback}"
             ),
             fallback_filter: Some(fallback),
         }
+    }
+}
+
+#[cfg(test)]
+mod throughput_tests {
+    use super::*;
+
+    #[test]
+    fn throughput_check_fails_when_w2_burst_exceeds_buffered_duration() {
+        // Buffered 10 s, rendered 30 s in 20 s wall (1.5x RT) -> burst takes 20 s > 8 s budget!
+        let res = check_ultimate_throughput_with_buffer(
+            FilterArchetype::GaussApod4M,
+            44_100,
+            30.0,
+            20.0,
+            Some(240.0),
+            30.0,
+            Some(10.0),
+            0.0,
+        );
+        assert!(!res.passed, "1.5x RT must fail W2 burst against 10 s buffer");
+        assert!(res.required_x_rt > 3.5);
+        assert_eq!(res.fallback_filter, Some(FilterArchetype::GaussLongLp));
+    }
+
+    #[test]
+    fn throughput_check_passes_with_ample_buffer() {
+        // Buffered 28 s, 30 s rendered in 1.5 s wall (20x RT) -> comfortably passes!
+        let res = check_ultimate_throughput_with_buffer(
+            FilterArchetype::GaussApod4M,
+            44_100,
+            30.0,
+            1.5,
+            Some(240.0),
+            30.0,
+            Some(28.0),
+            0.2,
+        );
+        assert!(res.passed);
+        assert!(res.fallback_filter.is_none());
     }
 }

@@ -10,6 +10,7 @@
 //! - Atomically writes Schema-1 YAML via [`TrackDbStore::save_preserving_user`], always preserving
 //!   any existing hand-edited `user:` overrides.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -22,7 +23,9 @@ use ap_dsp::deemphasis::StereoDeemphasis;
 use ap_dsp::fusion::{
     CachedWholeTrackEvidence, build_track_db_entry, fuse_track_evidence,
 };
-use ap_dsp::selector::{TrackSourceInfo, UpsamplerPicker, UpsamplerPolicy};
+use ap_dsp::selector::{
+    SelectedDspPlan, UpsamplerPolicy, build_post_chain_key, select_ultimate_plan,
+};
 use ap_dsp::upsampler::build_upsampler;
 use ap_source::flac::{AudioBlockSource, FlacBlockReader};
 use ap_source::library::discover_flac_files;
@@ -83,6 +86,7 @@ pub fn scan_folder(
         .rew_override
         .clone()
         .unwrap_or_else(|| loaded_cfg.config.convolution.clone());
+    let genre_rules = loaded_cfg.config.ultimate.genre_rules;
     let rew_factory = RewConvolverFactory::new(conv_cfg).with_full_tail(true);
 
     let db_root = opts
@@ -109,14 +113,34 @@ pub fn scan_folder(
                 if idx >= files.len() {
                     break;
                 }
-                let outcome = scan_single_track(
-                    &files[idx],
-                    &store,
-                    &opts.upsampler_policy,
-                    &rew_factory,
-                    opts.post_chain,
-                    opts.force,
-                );
+                let file_path = &files[idx];
+                let outcome = match catch_unwind(AssertUnwindSafe(|| {
+                    scan_single_track(
+                        file_path,
+                        &store,
+                        &opts.upsampler_policy,
+                        &rew_factory,
+                        genre_rules,
+                        opts.post_chain,
+                        opts.force,
+                    )
+                })) {
+                    Ok(out) => out,
+                    Err(payload) => {
+                        let name = file_path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| file_path.to_string_lossy().into_owned());
+                        let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                            (*s).to_string()
+                        } else if let Some(s) = payload.downcast_ref::<String>() {
+                            s.clone()
+                        } else {
+                            "unknown panic payload".to_string()
+                        };
+                        TrackScanOutcome::Failed(format!("FAIL  {name}: panic: {msg}"))
+                    }
+                };
                 if let Ok(mut guard) = results.lock() {
                     guard.push((idx, outcome));
                 }
@@ -165,14 +189,24 @@ enum TrackScanOutcome {
     Failed(String),
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_single_track(
     path: &Path,
     store: &TrackDbStore,
     policy: &UpsamplerPolicy,
     rew_factory: &RewConvolverFactory,
+    genre_rules: bool,
     measure_post_chain: bool,
     force: bool,
 ) -> TrackScanOutcome {
+    #[cfg(test)]
+    if path
+        .file_name()
+        .is_some_and(|n| n.to_string_lossy().contains("FORCE_PANIC_TEST"))
+    {
+        panic!("injected scanner test panic");
+    }
+
     let display_name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -206,27 +240,13 @@ fn scan_single_track(
         ));
     }
 
-    // Stream the entire track once in bounded blocks through TrackAnalyzer (and optional
-    // unity-gain post-chain peak measurement when `--post-chain` is requested).
+    // Pass 1: Stream the entire track once in bounded blocks through TrackAnalyzer + MD5 verifier.
     let mut analyzer = TrackAnalyzer::new(spec.sample_rate_hz, spec.bits_per_sample);
-
-    let mut post_chain_runner = if measure_post_chain {
-        prepare_post_chain_runner(spec, &track_meta, policy, rew_factory).ok()
-    } else {
-        None
-    };
 
     loop {
         match reader.read_next_block(SCAN_BLOCK_FRAMES) {
             Ok(Some(block)) => {
                 analyzer.push_block(&block);
-                if let Some(ref mut runner) = post_chain_runner {
-                    if let Err(err) = runner.process_block(&block) {
-                        return TrackScanOutcome::Failed(format!(
-                            "FAIL  {display_name}: post-chain DSP error: {err}"
-                        ));
-                    }
-                }
             }
             Ok(None) => break,
             Err(err) => {
@@ -256,6 +276,7 @@ fn scan_single_track(
         .is_some_and(|r| r < spec.sample_rate_hz);
     let analysis = analyzer.snapshot(true, early_digital, orig_below, track_meta.is_dsd_hint);
 
+    // Fuse fresh full-track analysis with any existing `user:` overrides (Review #7 F1 + F6).
     let cached_user_only = existing
         .as_ref()
         .map(|e| CachedWholeTrackEvidence::from_track_db_entry(e, false));
@@ -268,8 +289,26 @@ fn scan_single_track(
         cached_user_only.as_ref(),
     );
 
-    let (decision_filter, decision_rule) =
-        summarize_scan_decision(spec.sample_rate_hz, &fused, policy);
+    // Select the EXACT Ultimate Mode DSP plan so stored `decision.filter`, `decision.rule`, and
+    // `--post-chain` `PostChainKey` match playback identically (Review #7 F6).
+    let selection = match select_ultimate_plan(
+        spec,
+        false,
+        Some(analysis.duration_s),
+        &fused,
+        policy,
+        genre_rules,
+        false,
+    ) {
+        Ok(sel) => sel,
+        Err(err) => {
+            return TrackScanOutcome::Failed(format!(
+                "FAIL  {display_name}: ultimate selection error: {err}"
+            ));
+        }
+    };
+    let decision_filter = selection.plan.filter.to_string();
+    let decision_rule = selection.winning_rule.clone();
 
     let mut entry = build_track_db_entry(
         path.to_string_lossy().into_owned(),
@@ -277,23 +316,58 @@ fn scan_single_track(
         file_mtime,
         final_md5_hex,
         &analysis,
-        fused.deemphasis.value,
+        selection.plan.deemphasis,
         decision_filter.clone(),
         decision_rule.clone(),
     );
 
+    // Pass 2 (only when `--post-chain` is requested): measure unity-gain whole-track peak `M`
+    // through the exact resolved `selection.plan` + REW convolver!
     let mut peak_note = String::new();
-    if let Some(runner) = post_chain_runner {
-        match runner.finish() {
-            Ok((key, peak_dbfs)) if peak_dbfs.is_finite() => {
-                peak_note = format!(" M={peak_dbfs:+.2}dBFS");
-                entry.upsert_post_chain_peak(key, peak_dbfs, false);
+    if measure_post_chain {
+        match prepare_post_chain_runner(spec, &selection.plan, rew_factory) {
+            Ok(mut runner) => {
+                let mut reader2 = match FlacBlockReader::open(path) {
+                    Ok(r) => r,
+                    Err(err) => {
+                        return TrackScanOutcome::Failed(format!(
+                            "FAIL  {display_name}: post-chain reopen error: {err}"
+                        ));
+                    }
+                };
+                loop {
+                    match reader2.read_next_block(SCAN_BLOCK_FRAMES) {
+                        Ok(Some(block)) => {
+                            if let Err(err) = runner.process_block(&block) {
+                                return TrackScanOutcome::Failed(format!(
+                                    "FAIL  {display_name}: post-chain DSP error: {err}"
+                                ));
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(err) => {
+                            return TrackScanOutcome::Failed(format!(
+                                "FAIL  {display_name}: post-chain decode error: {err}"
+                            ));
+                        }
+                    }
+                }
+                match runner.finish() {
+                    Ok((key, peak_dbfs)) if peak_dbfs.is_finite() => {
+                        peak_note = format!(" M={peak_dbfs:+.2}dBFS");
+                        entry.upsert_post_chain_peak(key, peak_dbfs, false);
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        return TrackScanOutcome::Failed(format!(
+                            "FAIL  {display_name}: post-chain flush error: {err}"
+                        ));
+                    }
+                }
             }
-            Ok(_) => {}
             Err(err) => {
-                return TrackScanOutcome::Failed(format!(
-                    "FAIL  {display_name}: post-chain flush error: {err}"
-                ));
+                eprintln!("WARN  {display_name}: post-chain setup failed ({err}); skipping M");
+                peak_note = format!(" WARN(post-chain: {err})");
             }
         }
     }
@@ -318,38 +392,6 @@ fn scan_single_track(
         analysis.loud_and_clipped.as_str(),
         analysis.ultrasonic_noise_detected.as_str(),
     ))
-}
-
-fn summarize_scan_decision(
-    sample_rate_hz: u32,
-    fused: &ap_dsp::fusion::FusedTrackEvidence,
-    policy: &UpsamplerPolicy,
-) -> (String, String) {
-    if let Some(ref f) = policy.filter_override {
-        return (f.to_string(), "cli_override".to_string());
-    }
-    if let Some(ref uf) = fused.user_filter {
-        return (uf.value.clone(), format!("user({})", uf.source.as_str()));
-    }
-    if sample_rate_hz >= 352_800 {
-        return ("null".to_string(), "native_8fs".to_string());
-    }
-    if fused.apodizing.value {
-        return ("gauss-apod-4m".to_string(), "rule_A_apodizing".to_string());
-    }
-    if fused.effective_nyquist_hz.value.is_some() {
-        return ("sinc-steep-4m".to_string(), "rule_H_fake_hires".to_string());
-    }
-    if fused.loud_and_clipped.value {
-        return ("gauss-apod-4m".to_string(), "rule_L_loud_clipped".to_string());
-    }
-    if sample_rate_hz <= 48_000 {
-        ("sinc-steep-4m".to_string(), "rate_1x_clean".to_string())
-    } else if fused.hf_noise_filter.value {
-        ("gauss-hires-lp+hf".to_string(), "rate_hires_hf_noise".to_string())
-    } else {
-        ("gauss-hires-lp".to_string(), "rate_hires_clean".to_string())
-    }
 }
 
 struct PostChainRunner {
@@ -403,37 +445,22 @@ impl PostChainRunner {
 
 fn prepare_post_chain_runner(
     spec: ap_core::format::StreamSpec,
-    track_meta: &ap_core::metadata::TrackMetadata,
-    policy: &UpsamplerPolicy,
+    plan: &SelectedDspPlan,
     rew_factory: &RewConvolverFactory,
 ) -> Result<PostChainRunner, String> {
-    let mut src = TrackSourceInfo::from_stream_spec(spec);
-    src.deemphasis = track_meta
-        .ap_deemphasis
-        .unwrap_or(track_meta.cuesheet_pre_emphasis);
-
-    let picker = UpsamplerPicker::new(*policy)?;
-    let plan = picker.select(&src);
-    let upsampler = build_upsampler(&plan)?;
-    let deemphasis = if src.deemphasis {
+    let upsampler = build_upsampler(plan)?;
+    let deemphasis = if plan.deemphasis {
         Some(StereoDeemphasis::new_50_15us(plan.target_rate_hz)?)
     } else {
         None
     };
     let convolver = rew_factory.create_for_rate(plan.target_rate_hz)?;
-    let rew_hash = convolver
-        .content_hash()
-        .unwrap_or("none")
-        .to_string();
-
-    let key = PostChainKey {
-        upsampler: plan.filter.to_string(),
-        f_eff_hz: plan.effective_nyquist_hz.unwrap_or(spec.sample_rate_hz / 2),
-        output_rate_hz: plan.target_rate_hz,
-        deemphasis: src.deemphasis,
-        hf_noise_filter: plan.hf_noise_filter,
-        rew_filter_hash: rew_hash,
-    };
+    let key = build_post_chain_key(
+        plan,
+        spec.sample_rate_hz,
+        plan.target_rate_hz,
+        convolver.content_hash(),
+    );
 
     Ok(PostChainRunner {
         key,
@@ -558,6 +585,149 @@ mod tests {
             1,
             "existing post_chain_peaks must be preserved across rescans"
         );
+        assert_eq!(
+            reloaded.decision.filter,
+            reloaded.results.post_chain_peaks[0].key.upsampler,
+            "F6: stored decision.filter must match post-chain upsampler key"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn post_chain_key_matches_ultimate_key_and_respects_user_deemphasis_override() {
+        let root = make_temp_dir("f6_keys");
+        let music_dir = root.join("music");
+        let db_dir = root.join("trackdb");
+        fs::create_dir_all(&music_dir).unwrap();
+
+        let flac_path = music_dir.join("01_override.flac");
+        write_test_flac(&flac_path, 44_100, 44_100, 0.4);
+
+        // Pre-seed sidecar with user overrides (`user.deemphasis = true`, `user.filter = short-lp`).
+        let sidecar_path = TrackDbStore::sidecar_path_for(&flac_path);
+        let mut seed = ap_core::track_db::TrackDbEntry {
+            schema: ap_core::track_db::TRACK_DB_SCHEMA_VERSION,
+            file: ap_core::track_db::TrackDbFileInfo {
+                path: flac_path.to_string_lossy().into_owned(),
+                size: 0,
+                mtime_unix_s: 0,
+                streaminfo_md5: None,
+                sample_rate: 44_100,
+                bits: 16,
+            },
+            scan: ap_core::track_db::TrackDbScanInfo {
+                detector_version: 0,
+                scanned_at_unix_s: 0,
+                duration_s: 1.0,
+            },
+            results: ap_core::track_db::TrackDbResults::default(),
+            decision: ap_core::track_db::TrackDbDecision::default(),
+            user: ap_core::track_db::TrackDbUserOverrides {
+                filter: Some("short-lp".to_string()),
+                deemphasis: Some(true),
+                apodizing: None,
+                note: String::new(),
+            },
+        };
+        // Also test a clean 31s-like plan agreement via direct `prepare_post_chain_runner` with
+        // user.deemphasis = true on a 1s track (short track still honors deemphasis!) and with
+        // `select_ultimate_plan` on a Rule-A track.
+        fs::write(&sidecar_path, seed.to_yaml_string()).unwrap();
+
+        let opts = ScanOptions {
+            folder: music_dir.clone(),
+            report: false,
+            sidecar: true,
+            post_chain: true,
+            force: true,
+            trackdb_dir: Some(db_dir.clone()),
+            config_path: None,
+            rew_override: Some(ConvolutionConfig::disabled()),
+            upsampler_policy: UpsamplerPolicy::default(),
+        };
+        let s = scan_folder(&opts, None).unwrap();
+        assert_eq!(s.scanned, 1);
+        assert_eq!(s.failed, 0);
+
+        seed = ap_core::track_db::TrackDbEntry::from_yaml_str(&fs::read_to_string(&sidecar_path).unwrap())
+            .unwrap();
+        assert_eq!(seed.results.post_chain_peaks.len(), 1);
+        let key = &seed.results.post_chain_peaks[0].key;
+        assert!(
+            key.deemphasis,
+            "F6: post_chain_key must respect YAML user.deemphasis override"
+        );
+        assert_eq!(seed.decision.filter, key.upsampler);
+
+        // Verify Rule-A track key built via `select_ultimate_plan` matches `build_post_chain_key`.
+        let spec = ap_core::format::StreamSpec {
+            sample_rate_hz: 44_100,
+            bits_per_sample: 16,
+            channels: 2,
+        };
+        let mut fake_analysis = ap_dsp::analysis::TrackAnalyzer::new(44_100, 16)
+            .snapshot(true, false, false, false);
+        fake_analysis.apodizing_needed = ap_dsp::analysis::DetectorVerdict::Positive;
+        let fused = fuse_track_evidence(
+            44_100,
+            16,
+            &ap_core::headroom::TrackPeakMetadata::default(),
+            &ap_core::metadata::TrackMetadata::default(),
+            Some(&fake_analysis),
+            None,
+        );
+        let sel = select_ultimate_plan(
+            spec,
+            false,
+            Some(120.0),
+            &fused,
+            &UpsamplerPolicy::default(),
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(sel.plan.filter.to_string(), "gauss-apod-4m");
+        let k_scan = build_post_chain_key(&sel.plan, spec.sample_rate_hz, sel.plan.target_rate_hz, None);
+        let k_ult = build_post_chain_key(&sel.plan, spec.sample_rate_hz, sel.plan.target_rate_hz, None);
+        assert_eq!(k_scan, k_ult);
+        assert_eq!(k_scan.upsampler, "gauss-apod-4m");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_folder_continues_after_track_panic() {
+        let root = make_temp_dir("fc1_panic");
+        let music_dir = root.join("music");
+        let db_dir = root.join("trackdb");
+        fs::create_dir_all(&music_dir).unwrap();
+
+        let bad_path = music_dir.join("01_FORCE_PANIC_TEST.flac");
+        let good_path = music_dir.join("02_good.flac");
+        write_test_flac(&bad_path, 44_100, 44_100, 0.3);
+        write_test_flac(&good_path, 44_100, 44_100, 0.3);
+
+        let opts = ScanOptions {
+            folder: music_dir.clone(),
+            report: false,
+            sidecar: true,
+            post_chain: false,
+            force: true,
+            trackdb_dir: Some(db_dir.clone()),
+            config_path: None,
+            rew_override: Some(ConvolutionConfig::disabled()),
+            upsampler_policy: UpsamplerPolicy::default(),
+        };
+        let summary = scan_folder(&opts, None).expect("scan_folder must catch per-track panic");
+        assert_eq!(summary.total_files, 2);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.scanned, 1);
+        assert!(
+            summary.report_lines.iter().any(|l| l.contains("panic:")),
+            "expected panic failure line in summary"
+        );
+        assert!(TrackDbStore::sidecar_path_for(&good_path).is_file());
 
         let _ = fs::remove_dir_all(&root);
     }

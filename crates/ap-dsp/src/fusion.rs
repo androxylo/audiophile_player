@@ -63,6 +63,10 @@ impl<T> Evidence<T> {
 /// Optional cached whole-track (`WT`) results loaded from the track's own Schema-1 YAML entry.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CachedWholeTrackEvidence {
+    /// True only when the cached detector results match the current `DETECTOR_VERSION` and file
+    /// identity (Review #7 F1). When `false`, only `user_*` overrides are consulted and fresh
+    /// `W30`/whole-track analysis drives all detector rules (`A`, `H`, `L`, `HF`, `B`, peak).
+    pub results_current: bool,
     pub user_filter: Option<String>,
     pub user_deemphasis: Option<bool>,
     pub user_apodizing: Option<bool>,
@@ -84,6 +88,7 @@ impl CachedWholeTrackEvidence {
     /// detector results are left `Inconclusive` / `None`.
     pub fn from_track_db_entry(entry: &TrackDbEntry, results_current: bool) -> Self {
         let mut out = Self {
+            results_current,
             user_filter: entry.user.filter.clone(),
             user_deemphasis: entry.user.deemphasis,
             user_apodizing: entry.user.apodizing,
@@ -190,13 +195,16 @@ pub fn fuse_track_evidence(
     cached_wt: Option<&CachedWholeTrackEvidence>,
 ) -> FusedTrackEvidence {
     let mut notices = Vec::new();
+    // Gate all detector-result lookups on `results_current` so stale entries never mask fresh
+    // W30 / whole-track analysis, while `cached_wt` still provides `user:` overrides (Review #7 F1).
+    let wt_results = cached_wt.filter(|c| c.results_current);
 
     // --- Row 3: Source peak P + Stale Peak Tag Disproof Check (safety-critical!) ---
     let mut peak_meta = *raw_peak_meta;
     let mut stale_peak_tag_disproved = false;
     let mut stale_peak_tag_detail = None;
 
-    if let Some(wt) = cached_wt {
+    if let Some(wt) = wt_results {
         if let Some(wt_tp_db) = wt.true_peak_dbtp {
             peak_meta = peak_meta.with_full_scan_true_peak_dbtp(wt_tp_db);
         }
@@ -302,7 +310,7 @@ pub fn fuse_track_evidence(
         Evidence::new(u_ap, EvidenceSource::User, format!("YAML user.apodizing={u_ap}"))
     } else if let Some(tag_ap) = track_meta.ap_apodizing {
         Evidence::new(tag_ap, EvidenceSource::User, format!("AP_APODIZING={tag_ap}"))
-    } else if let Some(wt) = cached_wt {
+    } else if let Some(wt) = wt_results {
         let pos = wt.apodizing_needed == DetectorVerdict::Positive;
         Evidence::new(
             pos,
@@ -331,23 +339,48 @@ pub fn fuse_track_evidence(
     };
 
     // --- Row 6: Effective bandwidth / Fake hi-res (Rule H) — WT > W30; ORIGINALSAMPLERATE prior only ---
-    let effective_nyquist_hz = if let Some(wt) = cached_wt {
+    // Review #7 F11: Reject out-of-range `f_eff` values (<= 19 kHz DR-1 floor + 2% margin, or > fs/2)
+    // gracefully with a notice instead of letting them fail filter synthesis downstream.
+    let validate_feff = |feff_opt: Option<u32>, notices: &mut Vec<String>| -> Option<u32> {
+        let feff = feff_opt?;
+        let min_valid = 19_380_u32; // DR1_MIN_PASSBAND_HZ (19_000) * 1.02
+        let max_valid = sample_rate_hz / 2;
+        if (sample_rate_hz >= 44_100 && feff <= min_valid) || feff > max_valid {
+            notices.push(format!(
+                "f_eff={feff} Hz outside valid DR-1/Nyquist bounds ({min_valid}..={max_valid} Hz); ignored"
+            ));
+            None
+        } else {
+            Some(feff)
+        }
+    };
+    let effective_nyquist_hz = if let Some(wt) = wt_results {
         if wt.upsampled_from_1x == DetectorVerdict::Positive {
-            Evidence::new(
-                wt.effective_nyquist_hz,
-                EvidenceSource::Cache,
-                format!("WT fake hi-res f_eff={:?} Hz", wt.effective_nyquist_hz),
-            )
+            let valid_feff = validate_feff(wt.effective_nyquist_hz, &mut notices);
+            if let Some(f) = valid_feff {
+                Evidence::new(
+                    Some(f),
+                    EvidenceSource::Cache,
+                    format!("WT fake hi-res f_eff={f} Hz"),
+                )
+            } else {
+                Evidence::new(None, EvidenceSource::Cache, "WT f_eff out of DR-1 range; ignored")
+            }
         } else {
             Evidence::new(None, EvidenceSource::Cache, "WT bandwidth native")
         }
     } else if let Some(w) = window {
         if w.upsampled_from_1x == DetectorVerdict::Positive {
-            Evidence::new(
-                w.effective_nyquist_hz,
-                EvidenceSource::Window,
-                format!("W30 spectral cliff f_eff={:?} Hz", w.effective_nyquist_hz),
-            )
+            let valid_feff = validate_feff(w.effective_nyquist_hz, &mut notices);
+            if let Some(f) = valid_feff {
+                Evidence::new(
+                    Some(f),
+                    EvidenceSource::Window,
+                    format!("W30 spectral cliff f_eff={f} Hz"),
+                )
+            } else {
+                Evidence::new(None, EvidenceSource::Window, "W30 f_eff out of DR-1 range; ignored")
+            }
         } else {
             Evidence::new(None, EvidenceSource::Window, "W30 bandwidth native")
         }
@@ -356,7 +389,7 @@ pub fn fuse_track_evidence(
     };
 
     // --- Row 4: Loud and clipped (Rule L) — WT > RG tag + W30 clipping > W30 alone ---
-    let loud_and_clipped = if let Some(wt) = cached_wt {
+    let loud_and_clipped = if let Some(wt) = wt_results {
         let pos = wt.loud_and_clipped == DetectorVerdict::Positive;
         Evidence::new(
             pos,
@@ -412,7 +445,7 @@ pub fn fuse_track_evidence(
 
     // --- Row 7: DSD-origin / ultrasonic ADC noise above 40 kHz (`OQ-37`) ---
     let hf_noise_filter = if sample_rate_hz >= 88_200 {
-        let wt_pos = cached_wt
+        let wt_pos = wt_results
             .is_some_and(|wt| wt.ultrasonic_noise_detected == DetectorVerdict::Positive);
         let w_pos = window
             .is_some_and(|w| w.ultrasonic_noise_detected == DetectorVerdict::Positive);
@@ -443,7 +476,7 @@ pub fn fuse_track_evidence(
     };
 
     // --- Row 9: Real bit depth (Rule B, report only) ---
-    let eff_bits = cached_wt
+    let eff_bits = wt_results
         .and_then(|c| c.effective_bits)
         .or_else(|| window.map(|w| w.effective_bits));
     if let Some(eb) = eff_bits {

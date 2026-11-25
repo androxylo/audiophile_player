@@ -8,7 +8,8 @@ use ap_core::metadata::{GenreClass, PhaseTagOverride, TrackMetadata};
 use ap_dsp::analysis::{AnalysisResult, DetectorVerdict};
 use ap_dsp::fusion::{CachedWholeTrackEvidence, fuse_track_evidence};
 use ap_dsp::selector::{
-    FilterArchetype, UpsamplerPolicy, check_ultimate_throughput, select_ultimate_plan,
+    FilterArchetype, UpsamplerPolicy, build_post_chain_key, check_ultimate_throughput,
+    select_ultimate_plan,
 };
 
 fn clean_analysis(rate: u32, bits: u16, dur_s: f64) -> AnalysisResult {
@@ -333,4 +334,56 @@ fn throughput_self_check_passes_ryzen_speed_and_loudly_refuses_too_slow_filter()
     assert!(!slow.passed);
     assert_eq!(slow.fallback_filter, Some(FilterArchetype::GaussLongLp));
     assert!(slow.detail.contains("REFUSED"));
+}
+
+#[test]
+fn post_chain_key_helper_is_deterministic_and_captures_all_chain_axes() {
+    let spec = StreamSpec {
+        sample_rate_hz: 96_000,
+        bits_per_sample: 24,
+        channels: 2,
+    };
+    let mut w = clean_analysis(96_000, 24, 180.0);
+    w.upsampled_from_1x = DetectorVerdict::Positive;
+    w.effective_nyquist_hz = Some(22_050);
+    let meta = TrackMetadata {
+        ap_deemphasis: Some(true),
+        ..TrackMetadata::default()
+    };
+    let fused = fuse_track_evidence(
+        96_000,
+        24,
+        &TrackPeakMetadata::default(),
+        &meta,
+        Some(&w),
+        None,
+    );
+    let sel = select_ultimate_plan(
+        spec,
+        false,
+        Some(180.0),
+        &fused,
+        &UpsamplerPolicy::default(),
+        true,
+        false,
+    )
+    .unwrap();
+    let k1 = build_post_chain_key(
+        &sel.plan,
+        spec.sample_rate_hz,
+        sel.plan.target_rate_hz,
+        Some("abc123"),
+    );
+    let k2 = build_post_chain_key(
+        &sel.plan,
+        spec.sample_rate_hz,
+        sel.plan.target_rate_hz,
+        Some("abc123"),
+    );
+    assert_eq!(k1, k2);
+    assert_eq!(k1.upsampler, "sinc-steep-4m");
+    assert_eq!(k1.f_eff_hz, 22_050);
+    assert_eq!(k1.output_rate_hz, 384_000);
+    assert!(k1.deemphasis);
+    assert_eq!(k1.rew_filter_hash, "abc123");
 }

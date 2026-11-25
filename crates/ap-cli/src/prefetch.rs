@@ -10,8 +10,9 @@
 //! - Epoch-guarded instant flush (`reset_and_flush`) on Pause or mode/folder switch drops stale
 //!   buffered blocks immediately and discards in-flight producer work cleanly.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -38,9 +39,45 @@ pub const ULTIMATE_MAX_BUFFERED_FRAMES: usize = 384_000 * (ULTIMATE_MAX_BUFFERED
 /// Minimum cushion buffered before starting a new local WDM-KS stream (`4 s` at output rate).
 pub const PREBUFFER_SECONDS: u32 = 4;
 
-/// Maximum consumed PCM blocks held in the deferred-drop queue so the real-time MMCSS WaveRT
-/// thread never invokes `HeapFree` / `VirtualFree` on large PCM allocations.
-const MAX_DEFERRED_DROP_BLOCKS: usize = 16;
+/// Pre-allocated deferred-drop queue capacity (`256` blocks >= 40 s @ 384 kHz / 65,536 frames)
+/// so the real-time MMCSS WaveRT thread NEVER executes `VirtualUnlock`, `HeapFree`, or
+/// `VirtualFree` during `recycle_consumed_block` (Review #7 F10).
+const INITIAL_DEFERRED_DROP_CAPACITY: usize = 256;
+
+/// Wrapper around [`MemoryLockGuard`] with optional `#[cfg(test)]` lifecycle hooks so unit tests
+/// can assert exact unlock-before-free ordering and zero-lock-contention pinning (Review #7 F10).
+struct PinGuard {
+    _real: MemoryLockGuard,
+    #[cfg(test)]
+    on_drop: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl PinGuard {
+    fn lock_slice(
+        slice: &[[i32; 2]],
+        #[cfg(test)] on_lock: Option<&Arc<dyn Fn() + Send + Sync>>,
+        #[cfg(test)] on_unlock: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> Self {
+        #[cfg(test)]
+        if let Some(cb) = on_lock {
+            cb();
+        }
+        Self {
+            _real: MemoryLockGuard::lock_slice(slice),
+            #[cfg(test)]
+            on_drop: on_unlock,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for PinGuard {
+    fn drop(&mut self) {
+        if let Some(cb) = self.on_drop.take() {
+            cb();
+        }
+    }
+}
 
 /// Ordered stream events flowing from the DSP Producer into the WDM-KS Consumer.
 #[derive(Debug)]
@@ -113,6 +150,16 @@ fn event_metrics(ev: &StreamEvent) -> (usize, u128, usize) {
 
 struct BufferInner {
     epoch: u64,
+    /// Active `VirtualLock` guards keyed by `frames.as_ptr() as usize` while a block is queued
+    /// or currently playing on the RT DMA thread.
+    /// NOTE: Declared BEFORE `events` and `deferred_drops` so Rust's deterministic drop order
+    /// ALWAYS unlocks pages BEFORE freeing their backing buffers (Review #7 F10).
+    pinned_guards: HashMap<usize, PinGuard>,
+    /// Guards corresponding to `deferred_drops`, ALWAYS unlocked BEFORE `deferred_drops` are freed.
+    deferred_guards: Vec<PinGuard>,
+    /// Pointer keys of PCM blocks currently popped and in-flight on the RT DMA thread (never
+    /// unlocked by `flush_locked` / `close` until `recycle_consumed_block` returns them).
+    in_flight_ptrs: HashSet<usize>,
     events: VecDeque<StreamEvent>,
     buffered_frames: usize,
     buffered_duration_ns: u128,
@@ -125,29 +172,64 @@ struct BufferInner {
     /// Consumed PCM blocks handed off by the real-time WaveRT thread so large `Vec<[i32; 2]>`
     /// buffers are deallocated exclusively on the non-RT producer/control thread.
     deferred_drops: Vec<InterleavedInt32Buffer>,
-    /// When `true` (Ultimate Mode `U11`), each queued PCM block is `VirtualLock`-pinned on the
-    /// producer thread and unlocked strictly off-RT on drop/flush.
-    pin_blocks: bool,
-    /// Active `VirtualLock` guards keyed by `frames.as_ptr() as usize` while a block is queued
-    /// or currently playing on the RT DMA thread.
-    pinned_guards: HashMap<usize, MemoryLockGuard>,
-    /// Guards corresponding to `deferred_drops`, unlocked BEFORE `deferred_drops` are freed.
-    deferred_guards: Vec<MemoryLockGuard>,
     closed: bool,
 }
 
+struct FlushPayload {
+    epoch: u64,
+    guards: Vec<PinGuard>,
+    events: VecDeque<StreamEvent>,
+    drops: Vec<InterleavedInt32Buffer>,
+}
+
+impl FlushPayload {
+    /// Strictly unlock all pages BEFORE freeing any queued or deferred PCM buffers (Review #7 F10).
+    fn drop_unlock_before_free(self) {
+        let Self {
+            epoch: _,
+            guards,
+            events,
+            drops,
+        } = self;
+        drop(guards);
+        drop(events);
+        drop(drops);
+    }
+}
+
 impl BufferInner {
-    fn flush_locked(&mut self) -> (u64, Vec<MemoryLockGuard>, Vec<InterleavedInt32Buffer>) {
+    fn flush_locked(&mut self) -> FlushPayload {
         self.epoch = self.epoch.wrapping_add(1);
-        self.events.clear();
+        let events = std::mem::take(&mut self.events);
         self.buffered_frames = 0;
         self.buffered_duration_ns = 0;
         self.terminal_markers = 0;
         self.track_min_buffered_ns = None;
+
         let mut guards = std::mem::take(&mut self.deferred_guards);
-        guards.extend(self.pinned_guards.drain().map(|(_, g)| g));
+        // Remove and unlock ONLY guards for queued (non-in-flight) blocks; preserve the guard for
+        // any block currently being read by the RT DMA thread until `recycle_consumed_block`!
+        let mut release_keys = Vec::new();
+        for ev in &events {
+            if let StreamEvent::PcmBlock(b) = ev {
+                let ptr_key = b.frames.as_ptr() as usize;
+                if !self.in_flight_ptrs.contains(&ptr_key) {
+                    release_keys.push(ptr_key);
+                }
+            }
+        }
+        for key in release_keys {
+            if let Some(g) = self.pinned_guards.remove(&key) {
+                guards.push(g);
+            }
+        }
         let drops = std::mem::take(&mut self.deferred_drops);
-        (self.epoch, guards, drops)
+        FlushPayload {
+            epoch: self.epoch,
+            guards,
+            events,
+            drops,
+        }
     }
 
     fn push_back_event(&mut self, ev: StreamEvent) {
@@ -184,6 +266,12 @@ impl BufferInner {
 pub struct BoundedBlockStreamBuffer {
     inner: Mutex<BufferInner>,
     cv: Condvar,
+    /// Read outside `inner` so `VirtualLock` runs lock-free without blocking the RT thread (F10).
+    pin_blocks: AtomicBool,
+    #[cfg(test)]
+    test_on_lock: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    test_on_unlock: Mutex<Option<Arc<dyn Fn(usize) + Send + Sync>>>,
 }
 
 impl BoundedBlockStreamBuffer {
@@ -211,6 +299,9 @@ impl BoundedBlockStreamBuffer {
         Arc::new(Self {
             inner: Mutex::new(BufferInner {
                 epoch: 0,
+                pinned_guards: HashMap::with_capacity(INITIAL_DEFERRED_DROP_CAPACITY),
+                deferred_guards: Vec::with_capacity(INITIAL_DEFERRED_DROP_CAPACITY),
+                in_flight_ptrs: HashSet::with_capacity(8),
                 events: VecDeque::new(),
                 buffered_frames: 0,
                 buffered_duration_ns: 0,
@@ -218,18 +309,30 @@ impl BoundedBlockStreamBuffer {
                 max_buffered_frames: max_buffered_frames.max(65_536),
                 max_buffered_duration_ns: max_buffered_duration.as_nanos().max(1),
                 track_min_buffered_ns: None,
-                deferred_drops: Vec::with_capacity(MAX_DEFERRED_DROP_BLOCKS),
-                pin_blocks,
-                pinned_guards: HashMap::new(),
-                deferred_guards: Vec::with_capacity(MAX_DEFERRED_DROP_BLOCKS),
+                deferred_drops: Vec::with_capacity(INITIAL_DEFERRED_DROP_CAPACITY),
                 closed: false,
             }),
             cv: Condvar::new(),
+            pin_blocks: AtomicBool::new(pin_blocks),
+            #[cfg(test)]
+            test_on_lock: Mutex::new(None),
+            #[cfg(test)]
+            test_on_unlock: Mutex::new(None),
         })
     }
 
     pub fn current_epoch(&self) -> u64 {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).epoch
+    }
+
+    /// Current buffered audio duration in seconds ahead of the DAC (used by F9 W2 startup budget).
+    pub fn buffered_duration_seconds(&self) -> f64 {
+        let ns = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .buffered_duration_ns;
+        (ns as f64) / 1_000_000_000.0
     }
 
     /// Reset per-track buffer low-water telemetry right before starting hardware DMA.
@@ -249,25 +352,16 @@ impl BoundedBlockStreamBuffer {
     }
 
     /// Hand a consumed PCM block off the real-time MMCSS WaveRT thread for deferred deallocation
-    /// on the producer thread (avoids `HeapFree` / `VirtualFree` / `VirtualUnlock` on the RT thread).
+    /// on a non-RT thread. NEVER runs `VirtualUnlock`, `HeapFree`, or `VirtualFree` on the caller
+    /// (RT) thread even under sustained W2 producer stalls (Review #7 F10).
     pub fn recycle_consumed_block(&self, buf: InterleavedInt32Buffer) {
         let ptr_key = buf.frames.as_ptr() as usize;
-        let (overflow_guard, overflow_buf) = {
-            let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            let guard = st.pinned_guards.remove(&ptr_key);
-            if st.deferred_drops.len() < MAX_DEFERRED_DROP_BLOCKS {
-                if let Some(g) = guard {
-                    st.deferred_guards.push(g);
-                }
-                st.deferred_drops.push(buf);
-                (None, None)
-            } else {
-                (guard, Some(buf))
-            }
-        };
-        // Unlock before freeing if overflow occurred.
-        drop(overflow_guard);
-        drop(overflow_buf);
+        let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        st.in_flight_ptrs.remove(&ptr_key);
+        if let Some(g) = st.pinned_guards.remove(&ptr_key) {
+            st.deferred_guards.push(g);
+        }
+        st.deferred_drops.push(buf);
     }
 
     /// Explicitly unlock and drop any deferred consumed PCM blocks on a non-RT thread.
@@ -302,14 +396,14 @@ impl BoundedBlockStreamBuffer {
 
     /// Increment epoch and immediately drop all queued PCM blocks (frees RAM on Pause / switch).
     pub fn reset_and_flush(&self) -> u64 {
-        let (ep, guards, drops) = {
+        let payload = {
             let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let res = st.flush_locked();
             self.cv.notify_all();
             res
         };
-        drop(guards);
-        drop(drops);
+        let ep = payload.epoch;
+        payload.drop_unlock_before_free();
         ep
     }
 
@@ -400,46 +494,73 @@ impl BoundedBlockStreamBuffer {
                 }
             }
         }
-        let (ep, guards, drops) = st.flush_locked();
+        let payload = st.flush_locked();
         self.cv.notify_all();
         drop(st);
-        drop(guards);
-        drop(drops);
+        let ep = payload.epoch;
+        payload.drop_unlock_before_free();
         (false, ep, skipped_front_path)
     }
 
     /// Permanently close the buffer for graceful shutdown, waking all blocked threads.
     pub fn close(&self) {
-        let (guards, drops) = {
+        let payload = {
             let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             st.closed = true;
-            st.events.clear();
-            st.buffered_frames = 0;
-            st.buffered_duration_ns = 0;
-            st.terminal_markers = 0;
-            st.track_min_buffered_ns = None;
-            let mut g = std::mem::take(&mut st.deferred_guards);
-            g.extend(st.pinned_guards.drain().map(|(_, guard)| guard));
-            let d = std::mem::take(&mut st.deferred_drops);
+            let p = st.flush_locked();
             self.cv.notify_all();
-            (g, d)
+            p
         };
-        drop(guards);
-        drop(drops);
+        payload.drop_unlock_before_free();
     }
 
     /// Producer side: push a stream event, applying backpressure whenever buffered PCM reaches
     /// either the duration cap (`24 s` normal / `30 s` ultimate) or `max_buffered_frames`.
-    /// Also drains any RT-recycled PCM blocks so `VirtualUnlock` / `HeapFree` runs here off-RT.
+    ///
+    /// Review #7 F10: `VirtualLock` pinning runs strictly OUTSIDE `self.inner` so the RT consumer
+    /// thread never contends on page-locking or working-set expansion syscalls.
     pub fn push_for_epoch(&self, epoch: u64, event: StreamEvent) -> bool {
         let (frames_in_event, dur_ns_in_event, _) = event_metrics(&event);
+
+        // Pin PCM pages BEFORE acquiring `self.inner` so RT pops never stall on `VirtualLock`!
+        let mut pre_pinned: Option<(usize, PinGuard)> =
+            if self.pin_blocks.load(Ordering::Relaxed) {
+                if let StreamEvent::PcmBlock(ref b) = event {
+                    if !b.frames.is_empty() {
+                        let ptr_key = b.frames.as_ptr() as usize;
+                        #[cfg(test)]
+                        let on_lock = self.test_on_lock.lock().unwrap().clone();
+                        #[cfg(test)]
+                        let on_unlock = self.test_on_unlock.lock().unwrap().clone().map(|cb| {
+                            let f: Arc<dyn Fn() + Send + Sync> = Arc::new(move || cb(ptr_key));
+                            f
+                        });
+                        let guard = PinGuard::lock_slice(
+                            &b.frames,
+                            #[cfg(test)]
+                            on_lock.as_ref(),
+                            #[cfg(test)]
+                            on_unlock,
+                        );
+                        Some((ptr_key, guard))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
         let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let mut guards = std::mem::take(&mut st.deferred_guards);
         let mut drops = std::mem::take(&mut st.deferred_drops);
-        let should_pin = st.pin_blocks;
         loop {
             if st.closed || st.epoch != epoch {
                 drop(st);
+                drop(pre_pinned);
+                drop(event);
                 drop(guards);
                 drop(drops);
                 return false;
@@ -452,14 +573,8 @@ impl BoundedBlockStreamBuffer {
                     && st.buffered_duration_ns.saturating_add(dur_ns_in_event)
                         <= st.max_buffered_duration_ns)
             {
-                if should_pin {
-                    if let StreamEvent::PcmBlock(ref b) = event {
-                        if !b.frames.is_empty() {
-                            let ptr_key = b.frames.as_ptr() as usize;
-                            let guard = MemoryLockGuard::lock_slice(&b.frames);
-                            st.pinned_guards.insert(ptr_key, guard);
-                        }
-                    }
+                if let Some((ptr_key, guard)) = pre_pinned.take() {
+                    st.pinned_guards.insert(ptr_key, guard);
                 }
                 st.push_back_event(event);
                 if !st.deferred_guards.is_empty() {
@@ -517,6 +632,11 @@ impl BoundedBlockStreamBuffer {
             return None;
         }
         let ev = st.pop_front_event()?;
+        if let StreamEvent::PcmBlock(ref b) = ev {
+            if !b.frames.is_empty() {
+                st.in_flight_ptrs.insert(b.frames.as_ptr() as usize);
+            }
+        }
         self.cv.notify_all();
         Some(ev)
     }
@@ -593,6 +713,9 @@ impl BoundedBlockStreamBuffer {
         match st.events.front() {
             Some(StreamEvent::PcmBlock(_)) => {
                 if let Some(StreamEvent::PcmBlock(b)) = st.pop_front_event() {
+                    if !b.frames.is_empty() {
+                        st.in_flight_ptrs.insert(b.frames.as_ptr() as usize);
+                    }
                     if st.terminal_markers == 0 {
                         let rem = st.buffered_duration_ns;
                         st.track_min_buffered_ns = Some(match st.track_min_buffered_ns {
@@ -896,5 +1019,133 @@ mod tests {
         buf.drain_deferred_drops();
         assert_eq!(buf.deferred_drop_count(), 0);
         buf.close();
+    }
+
+    #[test]
+    fn recycle_overflow_never_drops_on_caller_thread() {
+        use std::sync::atomic::AtomicUsize;
+
+        let buf = BoundedBlockStreamBuffer::with_limits_and_pinning(
+            ULTIMATE_MAX_BUFFERED_FRAMES,
+            Duration::from_secs(ULTIMATE_MAX_BUFFERED_SECONDS),
+            true,
+        );
+        let unlocks = Arc::new(AtomicUsize::new(0));
+        let u_clone = Arc::clone(&unlocks);
+        *buf.test_on_unlock.lock().unwrap() = Some(Arc::new(move |_| {
+            u_clone.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        let ep = buf.current_epoch();
+        // Push, pop, and recycle 64 blocks (far above old 16-block cap) without draining:
+        // ZERO unlocks/drops may run on the recycling (RT) thread!
+        for _ in 0..64 {
+            assert!(buf.push_for_epoch(ep, StreamEvent::PcmBlock(make_block_at(44_100, 1_024))));
+            if let PopBlockResult::Block(b) = buf.try_pop_track_pcm_block(ep) {
+                buf.recycle_consumed_block(b);
+            } else {
+                panic!("expected block");
+            }
+            // Note: push_for_epoch drains deferred drops on producer side, so push 64 first instead!
+        }
+        buf.drain_deferred_drops();
+        unlocks.store(0, Ordering::SeqCst);
+
+        // Now push 64 blocks all at once, then pop & recycle all 64 on the RT side!
+        for _ in 0..64 {
+            assert!(buf.push_for_epoch(ep, StreamEvent::PcmBlock(make_block_at(44_100, 1_024))));
+        }
+        assert_eq!(unlocks.load(Ordering::SeqCst), 0);
+        for _ in 0..64 {
+            if let PopBlockResult::Block(b) = buf.try_pop_track_pcm_block(ep) {
+                buf.recycle_consumed_block(b);
+            } else {
+                panic!("expected block");
+            }
+        }
+        assert_eq!(
+            unlocks.load(Ordering::SeqCst),
+            0,
+            "F10: recycle_consumed_block must NEVER unlock/drop on the RT thread"
+        );
+        assert_eq!(buf.deferred_drop_count(), 64);
+
+        buf.drain_deferred_drops();
+        assert_eq!(unlocks.load(Ordering::SeqCst), 64);
+        assert_eq!(buf.deferred_drop_count(), 0);
+    }
+
+    #[test]
+    fn flush_unlocks_queued_blocks_and_preserves_in_flight_guard_until_recycled() {
+        let buf = BoundedBlockStreamBuffer::with_limits_and_pinning(
+            ULTIMATE_MAX_BUFFERED_FRAMES,
+            Duration::from_secs(ULTIMATE_MAX_BUFFERED_SECONDS),
+            true,
+        );
+        let unlocked_ptrs = Arc::new(Mutex::new(Vec::<usize>::new()));
+        let u_clone = Arc::clone(&unlocked_ptrs);
+        *buf.test_on_unlock.lock().unwrap() = Some(Arc::new(move |ptr| {
+            u_clone.lock().unwrap().push(ptr);
+        }));
+
+        let ep = buf.current_epoch();
+        let b_inflight = make_block_at(44_100, 2_048);
+        let ptr_inflight = b_inflight.frames.as_ptr() as usize;
+        let b_queued = make_block_at(44_100, 2_048);
+        let ptr_queued = b_queued.frames.as_ptr() as usize;
+
+        assert!(buf.push_for_epoch(ep, StreamEvent::PcmBlock(b_inflight)));
+        assert!(buf.push_for_epoch(ep, StreamEvent::PcmBlock(b_queued)));
+
+        // RT thread pops the first block (now in-flight!).
+        let popped = match buf.try_pop_track_pcm_block(ep) {
+            PopBlockResult::Block(b) => b,
+            other => panic!("expected block, got {other:?}"),
+        };
+        assert_eq!(popped.frames.as_ptr() as usize, ptr_inflight);
+
+        // Flush while `popped` is in-flight: queued block unlocks cleanly, in-flight block stays pinned!
+        let _ = buf.reset_and_flush();
+        {
+            let log = unlocked_ptrs.lock().unwrap();
+            assert!(log.contains(&ptr_queued), "queued block must be unlocked on flush");
+            assert!(
+                !log.contains(&ptr_inflight),
+                "F10: in-flight RT block must stay pinned across flush until recycled!"
+            );
+        }
+
+        // Now RT finishes with `popped` and recycles it -> unlocks only on off-RT drain.
+        buf.recycle_consumed_block(popped);
+        assert!(!unlocked_ptrs.lock().unwrap().contains(&ptr_inflight));
+        buf.drain_deferred_drops();
+        assert!(unlocked_ptrs.lock().unwrap().contains(&ptr_inflight));
+    }
+
+    #[test]
+    fn push_does_not_hold_lock_during_pin() {
+        let buf = BoundedBlockStreamBuffer::with_limits_and_pinning(
+            ULTIMATE_MAX_BUFFERED_FRAMES,
+            Duration::from_secs(ULTIMATE_MAX_BUFFERED_SECONDS),
+            true,
+        );
+        let saw_unlocked = Arc::new(AtomicBool::new(false));
+        let buf_weak = Arc::downgrade(&buf);
+        let flag = Arc::clone(&saw_unlocked);
+        *buf.test_on_lock.lock().unwrap() = Some(Arc::new(move || {
+            if let Some(b) = buf_weak.upgrade() {
+                // `try_lock()` MUST succeed from inside `lock_slice`, proving `inner` is NOT held!
+                if b.inner.try_lock().is_ok() {
+                    flag.store(true, Ordering::SeqCst);
+                }
+            }
+        }));
+
+        let ep = buf.current_epoch();
+        assert!(buf.push_for_epoch(ep, StreamEvent::PcmBlock(make_block_at(44_100, 1_024))));
+        assert!(
+            saw_unlocked.load(Ordering::SeqCst),
+            "F10: inner mutex must NOT be held during VirtualLock"
+        );
     }
 }

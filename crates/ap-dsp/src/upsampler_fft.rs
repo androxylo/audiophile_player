@@ -351,47 +351,49 @@ impl ChannelTiledUpolsState {
             )
             .map_err(|e| format!("FFT upsampler forward RFFT failed: {e}"))?;
 
-        // 3. Tiled complex MAC across all non-zero IR partitions.
+        // 3. Tiled complex MAC across all non-zero IR partitions via persistent worker pool (F12).
         let p_count = self.num_partitions;
         let spec_out_len = b_out + 1;
         let ir_spectra = &kernel.ir_spectra;
         let nonzero = &kernel.nonzero;
         let fdl = &self.fdl;
+        let mac_slices = crate::worker_pool::mac_slice_count(true);
 
         if kernel.nonzero_partitions >= PARALLEL_MAC_MIN_PARTITIONS
-            && spec_out_len >= PARALLEL_MAC_SLICES * 256
+            && kernel.nonzero_partitions.saturating_mul(spec_out_len)
+                >= crate::worker_pool::MAC_PARALLEL_MIN_WORK
+            && mac_slices > 1
+            && spec_out_len >= mac_slices * 256
         {
-            // Bit-identical bin-slice parallelism: each worker owns a disjoint slice of `acc_spec`
-            // and sums partitions in the exact 0..p_count order (0 ULPs difference vs sequential).
-            let chunk_len = spec_out_len.div_ceil(PARALLEL_MAC_SLICES);
-            std::thread::scope(|s| {
-                for (slice_idx, acc_chunk) in self.acc_spec.chunks_mut(chunk_len).enumerate() {
-                    let bin_start = slice_idx * chunk_len;
-                    s.spawn(move || {
-                        for c in acc_chunk.iter_mut() {
-                            *c = Complex::new(0.0, 0.0);
+            // Bit-identical bin-slice parallelism on persistent MAC pool: slice 0 runs inline on
+            // caller thread and each slice sums 0..p_count in exact order (0 ULPs diff).
+            crate::worker_pool::for_each_mac_slice(
+                &mut self.acc_spec,
+                mac_slices.min(PARALLEL_MAC_SLICES),
+                |_slice_idx, bin_start, acc_chunk| {
+                    for c in acc_chunk.iter_mut() {
+                        *c = Complex::new(0.0, 0.0);
+                    }
+                    for p in 0..p_count {
+                        if !nonzero[p] {
+                            continue;
                         }
-                        for p in 0..p_count {
-                            if !nonzero[p] {
-                                continue;
-                            }
-                            let fdl_idx = if head >= p {
-                                head - p
-                            } else {
-                                head + p_count - p
-                            };
-                            accumulate_tiled_partition_slice(
-                                acc_chunk,
-                                &ir_spectra[p],
-                                &fdl[fdl_idx],
-                                n_in,
-                                b_in,
-                                bin_start,
-                            );
-                        }
-                    });
-                }
-            });
+                        let fdl_idx = if head >= p {
+                            head - p
+                        } else {
+                            head + p_count - p
+                        };
+                        accumulate_tiled_partition_slice(
+                            acc_chunk,
+                            &ir_spectra[p],
+                            &fdl[fdl_idx],
+                            n_in,
+                            b_in,
+                            bin_start,
+                        );
+                    }
+                },
+            );
         } else {
             for c in &mut self.acc_spec {
                 *c = Complex::new(0.0, 0.0);
@@ -578,20 +580,17 @@ impl FftUpolsUpsampler {
         }
     }
 
-    /// Process both channels in parallel via `std::thread::scope` (bit-identical to sequential).
+    /// Process both channels in parallel via persistent worker pool (bit-identical to sequential).
     fn push_stereo(&mut self, in_l: &[f64], in_r: &[f64]) -> Result<(Vec<f64>, Vec<f64>), String> {
         let kernel = &self.kernel;
         let left = &mut self.left;
         let right = &mut self.right;
         if kernel.num_partitions >= 2 || in_l.len() >= kernel.b_in {
-            std::thread::scope(|s| {
-                let h_l = s.spawn(|| left.push_samples(in_l, kernel));
-                let r_res = right.push_samples(in_r, kernel);
-                let l_res = h_l
-                    .join()
-                    .map_err(|_| "FFT upsampler left-channel worker panicked".to_string())?;
-                Ok((l_res?, r_res?))
-            })
+            let (l_res, r_res) = crate::worker_pool::join_stereo(
+                || left.push_samples(in_l, kernel),
+                || right.push_samples(in_r, kernel),
+            );
+            Ok((l_res?, r_res?))
         } else {
             let out_l = left.push_samples(in_l, kernel)?;
             let out_r = right.push_samples(in_r, kernel)?;
@@ -607,14 +606,11 @@ impl FftUpolsUpsampler {
         let left = &mut self.left;
         let right = &mut self.right;
         if kernel.num_partitions >= 2 || remaining >= kernel.b_out {
-            std::thread::scope(|s| {
-                let h_l = s.spawn(|| left.flush_exact(remaining, kernel));
-                let r_res = right.flush_exact(remaining, kernel);
-                let l_res = h_l
-                    .join()
-                    .map_err(|_| "FFT upsampler left-channel flush worker panicked".to_string())?;
-                Ok((l_res?, r_res?))
-            })
+            let (l_res, r_res) = crate::worker_pool::join_stereo(
+                || left.flush_exact(remaining, kernel),
+                || right.flush_exact(remaining, kernel),
+            );
+            Ok((l_res?, r_res?))
         } else {
             let out_l = left.flush_exact(remaining, kernel)?;
             let out_r = right.flush_exact(remaining, kernel)?;
@@ -669,25 +665,25 @@ pub(crate) fn flush_carryover_via_fft(
     let mut left_st = ChannelTiledUpolsState::new(&kernel, discard);
     let mut right_st = ChannelTiledUpolsState::new(&kernel, discard);
 
-    let (mut out_l, mut out_r) = std::thread::scope(|s| -> Result<(Vec<f64>, Vec<f64>), String> {
-        let hl = s.spawn(|| -> Result<Vec<f64>, String> {
+    let (l_res, r_res) = crate::worker_pool::join_stereo(
+        || -> Result<Vec<f64>, String> {
             let mut v = left_st.push_samples(&carryover.hist_l, &kernel)?;
             let rem = total_out.saturating_sub(v.len());
             let tail = left_st.flush_exact(rem, &kernel)?;
             v.extend_from_slice(&tail);
             v.truncate(total_out);
             Ok(v)
-        });
-        let mut r = right_st.push_samples(&carryover.hist_r, &kernel)?;
-        let rem_r = total_out.saturating_sub(r.len());
-        let tail_r = right_st.flush_exact(rem_r, &kernel)?;
-        r.extend_from_slice(&tail_r);
-        r.truncate(total_out);
-        let l = hl
-            .join()
-            .map_err(|_| "FFT carryover flush left worker panicked".to_string())??;
-        Ok((l, r))
-    })?;
+        },
+        || -> Result<Vec<f64>, String> {
+            let mut r = right_st.push_samples(&carryover.hist_r, &kernel)?;
+            let rem_r = total_out.saturating_sub(r.len());
+            let tail_r = right_st.flush_exact(rem_r, &kernel)?;
+            r.extend_from_slice(&tail_r);
+            r.truncate(total_out);
+            Ok(r)
+        },
+    );
+    let (mut out_l, mut out_r) = (l_res?, r_res?);
 
     debug_assert_eq!(out_l.len(), total_out);
     debug_assert_eq!(out_r.len(), total_out);

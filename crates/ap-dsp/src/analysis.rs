@@ -437,12 +437,15 @@ impl TrackAnalyzer {
             self.apod_pending.push(mono);
         }
 
-        // Process ready Welch PSD frames for Detector H (50% overlap).
+        // Process ready Welch PSD frames for Detector H (50% overlap) with O(N) read-offset
+        // compaction instead of per-hop Vec::drain memmove (Review #7 F14).
         let hop_h = self.fft_len / 2;
-        while self.fft_pending.len() >= self.fft_len {
+        let mut off_h = 0usize;
+        while self.fft_pending.len() - off_h >= self.fft_len {
+            let frame = &self.fft_pending[off_h..off_h + self.fft_len];
             let mut sq = 0.0;
             for j in 0..self.fft_len {
-                let s = self.fft_pending[j];
+                let s = frame[j];
                 sq += s * s;
                 self.fft_time[j] = s * self.hann[j];
             }
@@ -461,7 +464,10 @@ impl TrackAnalyzer {
                     self.psd_frames += 1;
                 }
             }
-            self.fft_pending.drain(0..hop_h);
+            off_h += hop_h;
+        }
+        if off_h > 0 {
+            self.fft_pending.drain(..off_h);
         }
 
         // Process ready short STFT frames for Detector A (near-Nyquist onset pre-ringing).
@@ -478,9 +484,11 @@ impl TrackAnalyzer {
         let nyq_lo = ((0.43 * (win as f64)).round() as usize).clamp(1, spec_len - 1);
         let nyq_hi = ((0.495 * (win as f64)).round() as usize).clamp(nyq_lo, spec_len - 1);
 
-        while self.apod_pending.len() >= win {
+        let mut off = 0usize;
+        while self.apod_pending.len() - off >= win {
+            let frame = &self.apod_pending[off..off + win];
             for j in 0..win {
-                self.apod_time[j] = self.apod_pending[j] * self.apod_hann[j];
+                self.apod_time[j] = frame[j] * self.apod_hann[j];
             }
             if self
                 .apod_r2c
@@ -526,7 +534,7 @@ impl TrackAnalyzer {
                         .iter()
                         .all(|x| center_bb >= x.0 - 1e-9);
                     if !is_local_max {
-                        self.apod_pending.drain(0..hop);
+                        off += hop;
                         continue;
                     }
 
@@ -555,7 +563,10 @@ impl TrackAnalyzer {
                     }
                 }
             }
-            self.apod_pending.drain(0..hop);
+            off += hop;
+        }
+        if off > 0 {
+            self.apod_pending.drain(..off);
         }
     }
 

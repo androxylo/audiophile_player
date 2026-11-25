@@ -127,13 +127,127 @@ impl TrackMetadata {
 }
 
 /// Classify a single cleaned genre token into a [`GenreClass`] (`FILTER_SELECTION_RESEARCH.md` §5).
+///
+/// Uses word-boundary tokenization, exact full-string overrides, multi-word phrases, and
+/// head-noun resolution (last matching word wins) rather than unordered substring matching
+/// (Review #7 F13).
 pub fn classify_genre_token(token: &str) -> GenreClass {
-    let g = token.trim().to_ascii_lowercase();
-    if g.is_empty() {
+    let raw = token.trim().to_ascii_lowercase();
+    if raw.is_empty() {
         return GenreClass::Unknown;
     }
 
-    const CLASSICAL: &[&str] = &[
+    // Normalize common punctuation variants before word splitting.
+    let normalized = raw
+        .replace("o.s.t.", " ost ")
+        .replace("o.s.t", " ost ")
+        .replace("r & b", " r&b ")
+        .replace("drum & bass", " drum and bass ")
+        .replace("drum'n'bass", " drum and bass ")
+        .replace("drum n bass", " drum and bass ");
+
+    let words: Vec<&str> = normalized
+        .split(|c: char| !c.is_alphanumeric() && c != '&')
+        .filter(|w| !w.is_empty())
+        .collect();
+    if words.is_empty() {
+        return GenreClass::Unknown;
+    }
+    let joined = words.join(" ");
+
+    // 1. Exact full-string table for well-known compound genres and special cases.
+    const EXACT: &[(&str, GenreClass)] = &[
+        // Classical
+        ("classical", GenreClass::Classical),
+        ("modern classical", GenreClass::Classical),
+        ("contemporary classical", GenreClass::Classical),
+        ("early music", GenreClass::Classical),
+        ("chamber music", GenreClass::Classical),
+        // Jazz / Acoustic
+        ("chamber jazz", GenreClass::JazzAcoustic),
+        ("vocal jazz", GenreClass::JazzAcoustic),
+        ("post bop", GenreClass::JazzAcoustic),
+        ("hard bop", GenreClass::JazzAcoustic),
+        ("singer songwriter", GenreClass::JazzAcoustic),
+        ("bossa nova", GenreClass::JazzAcoustic),
+        ("jazz fusion", GenreClass::JazzAcoustic),
+        // Rock / Pop / Electronic (including compounds whose modifiers look classical/jazz)
+        ("symphonic metal", GenreClass::RockPopElectronic),
+        ("symphonic rock", GenreClass::RockPopElectronic),
+        ("rock opera", GenreClass::RockPopElectronic),
+        ("pop opera", GenreClass::RockPopElectronic),
+        ("new romantic", GenreClass::RockPopElectronic),
+        ("baroque pop", GenreClass::RockPopElectronic),
+        ("chamber pop", GenreClass::RockPopElectronic),
+        ("folk rock", GenreClass::RockPopElectronic),
+        ("blues rock", GenreClass::RockPopElectronic),
+        ("acoustic rock", GenreClass::RockPopElectronic),
+        ("jazz rock", GenreClass::RockPopElectronic),
+        ("post rock", GenreClass::RockPopElectronic),
+        ("post punk", GenreClass::RockPopElectronic),
+        ("hip hop", GenreClass::RockPopElectronic),
+        ("drum and bass", GenreClass::RockPopElectronic),
+        // Ambient / Soundtrack
+        ("ost", GenreClass::AmbientSoundtrack),
+        ("film score", GenreClass::AmbientSoundtrack),
+        ("original soundtrack", GenreClass::AmbientSoundtrack),
+        ("new age", GenreClass::AmbientSoundtrack),
+        ("chill out", GenreClass::AmbientSoundtrack),
+    ];
+    if let Some((_, class)) = EXACT.iter().find(|(k, _)| *k == joined) {
+        return *class;
+    }
+
+    // 2. Multi-word phrase matches on contiguous word slices (rightmost phrase wins).
+    const PHRASES: &[(&[&str], GenreClass)] = &[
+        (&["modern", "classical"], GenreClass::Classical),
+        (&["contemporary", "classical"], GenreClass::Classical),
+        (&["early", "music"], GenreClass::Classical),
+        (&["chamber", "music"], GenreClass::Classical),
+        (&["chamber", "jazz"], GenreClass::JazzAcoustic),
+        (&["vocal", "jazz"], GenreClass::JazzAcoustic),
+        (&["post", "bop"], GenreClass::JazzAcoustic),
+        (&["hard", "bop"], GenreClass::JazzAcoustic),
+        (&["singer", "songwriter"], GenreClass::JazzAcoustic),
+        (&["bossa", "nova"], GenreClass::JazzAcoustic),
+        (&["symphonic", "metal"], GenreClass::RockPopElectronic),
+        (&["symphonic", "rock"], GenreClass::RockPopElectronic),
+        (&["rock", "opera"], GenreClass::RockPopElectronic),
+        (&["pop", "opera"], GenreClass::RockPopElectronic),
+        (&["new", "romantic"], GenreClass::RockPopElectronic),
+        (&["baroque", "pop"], GenreClass::RockPopElectronic),
+        (&["chamber", "pop"], GenreClass::RockPopElectronic),
+        (&["folk", "rock"], GenreClass::RockPopElectronic),
+        (&["blues", "rock"], GenreClass::RockPopElectronic),
+        (&["acoustic", "rock"], GenreClass::RockPopElectronic),
+        (&["jazz", "rock"], GenreClass::RockPopElectronic),
+        (&["hip", "hop"], GenreClass::RockPopElectronic),
+        (&["drum", "and", "bass"], GenreClass::RockPopElectronic),
+        (&["film", "score"], GenreClass::AmbientSoundtrack),
+        (&["new", "age"], GenreClass::AmbientSoundtrack),
+        (&["chill", "out"], GenreClass::AmbientSoundtrack),
+    ];
+
+    let mut phrase_hit: Option<(usize, GenreClass)> = None;
+    for &(pat, class) in PHRASES {
+        if pat.len() <= words.len() {
+            for start in 0..=(words.len() - pat.len()) {
+                if &words[start..start + pat.len()] == pat {
+                    let end = start + pat.len();
+                    if phrase_hit.is_none_or(|(prev_end, _)| end >= prev_end) {
+                        phrase_hit = Some((end, class));
+                    }
+                }
+            }
+        }
+    }
+    if let Some((_, class)) = phrase_hit {
+        return class;
+    }
+
+    // 3. Single whole-word head-noun rule: last matching word wins ("symphonic metal" -> metal,
+    //    "chamber jazz" -> jazz, "folk rock" -> rock). `"ost"` only matches as a whole word.
+    const CLASSICAL_WORDS: &[&str] = &[
         "classical",
         "orchestral",
         "symphony",
@@ -145,12 +259,9 @@ pub fn classify_genre_token(token: &str) -> GenreClass {
         "concerto",
         "sonata",
         "romantic",
-        "modern classical",
-        "contemporary classical",
-        "early music",
         "renaissance",
     ];
-    const JAZZ_ACOUSTIC: &[&str] = &[
+    const JAZZ_WORDS: &[&str] = &[
         "jazz",
         "blues",
         "acoustic",
@@ -159,16 +270,13 @@ pub fn classify_genre_token(token: &str) -> GenreClass {
         "bossa",
         "swing",
         "bebop",
+        "bop",
         "fusion",
-        "singer-songwriter",
-        "singer/songwriter",
         "americana",
-        "chamber jazz",
-        "vocal jazz",
         "flamenco",
         "country",
     ];
-    const ROCK_POP_ELEC: &[&str] = &[
+    const ROCK_WORDS: &[&str] = &[
         "rock",
         "pop",
         "electronic",
@@ -178,15 +286,14 @@ pub fn classify_genre_token(token: &str) -> GenreClass {
         "house",
         "trance",
         "dubstep",
-        "drum and bass",
         "dnb",
         "synth",
+        "synthpop",
+        "synthwave",
         "metal",
         "punk",
         "indie",
         "alternative",
-        "hip-hop",
-        "hip hop",
         "rap",
         "r&b",
         "rnb",
@@ -202,30 +309,36 @@ pub fn classify_genre_token(token: &str) -> GenreClass {
         "industrial",
         "hardcore",
     ];
-    const AMBIENT_OST: &[&str] = &[
+    const AMBIENT_WORDS: &[&str] = &[
         "ambient",
         "soundtrack",
-        "film score",
         "score",
         "ost",
-        "new age",
         "drone",
-        "minimal",
         "downtempo",
         "chillout",
     ];
 
-    if CLASSICAL.iter().any(|k| g.contains(k)) {
-        GenreClass::Classical
-    } else if JAZZ_ACOUSTIC.iter().any(|k| g.contains(k)) {
-        GenreClass::JazzAcoustic
-    } else if ROCK_POP_ELEC.iter().any(|k| g.contains(k)) {
-        GenreClass::RockPopElectronic
-    } else if AMBIENT_OST.iter().any(|k| g.contains(k)) {
-        GenreClass::AmbientSoundtrack
-    } else {
-        GenreClass::Unknown
+    let word_class = |w: &str| -> Option<GenreClass> {
+        if ROCK_WORDS.contains(&w) {
+            Some(GenreClass::RockPopElectronic)
+        } else if JAZZ_WORDS.contains(&w) {
+            Some(GenreClass::JazzAcoustic)
+        } else if CLASSICAL_WORDS.contains(&w) {
+            Some(GenreClass::Classical)
+        } else if AMBIENT_WORDS.contains(&w) {
+            Some(GenreClass::AmbientSoundtrack)
+        } else {
+            None
+        }
+    };
+
+    for &w in words.iter().rev() {
+        if let Some(c) = word_class(w) {
+            return c;
+        }
     }
+    GenreClass::Unknown
 }
 
 /// Normalize a list of genre strings + classical credit hint into one [`GenreClass`].
@@ -251,22 +364,18 @@ pub fn resolve_genre_class(genres: &[String], has_classical_credits: bool) -> Ge
 }
 
 /// Parse a strict 4-digit year in `1900..=2100` from a date string like `"1987"`, `"1987-05-14"`,
-/// or `"1987/05"`.
+/// or `"1987/05"`. Operates on raw bytes so multi-byte UTF-8 dates never panic (Review #7 F3).
 pub fn parse_year_tag(raw: &str) -> Option<u16> {
-    let s = raw.trim();
-    if s.len() < 4 {
+    let b = raw.trim().as_bytes();
+    let p = b.get(..4)?;
+    if !p.iter().all(u8::is_ascii_digit) {
         return None;
     }
-    let prefix = &s[..4];
-    if !prefix.bytes().all(|b| b.is_ascii_digit()) {
+    if b.get(4).is_some_and(u8::is_ascii_digit) {
         return None;
     }
-    let year = prefix.parse::<u16>().ok()?;
-    if (1900..=2100).contains(&year) {
-        Some(year)
-    } else {
-        None
-    }
+    let year = p.iter().fold(0_u16, |acc, &d| acc * 10 + u16::from(d - b'0'));
+    (1900..=2100).contains(&year).then_some(year)
 }
 
 /// Parse a boolean `AP_*` tag (`1`/`true`/`yes`/`on` vs `0`/`false`/`no`/`off`).
@@ -455,5 +564,54 @@ mod tests {
         assert_eq!(meta.original_year, None);
         assert_eq!(meta.original_sample_rate_hz, None);
         assert_eq!(meta.ap_deemphasis, None);
+    }
+
+    #[test]
+    fn parse_year_tag_non_ascii_never_panics_and_rejects_5_digit_prefix() {
+        for bad in ["199é", "平成10年", "é", "1é", "😀1987", "19875", "1899", "2101"] {
+            assert_eq!(parse_year_tag(bad), None, "expected None for {bad:?}");
+        }
+        assert_eq!(parse_year_tag("1987"), Some(1987));
+        assert_eq!(parse_year_tag("1987-05-14"), Some(1987));
+        assert_eq!(parse_year_tag(" 1995/01 "), Some(1995));
+
+        let fields = vec!["DATE=平成10年".to_string(), "GENRE=Jazz".to_string()];
+        let meta = parse_track_metadata_fields(&fields);
+        assert_eq!(meta.original_year, None);
+        assert_eq!(meta.genre_class, GenreClass::JazzAcoustic);
+    }
+
+    #[test]
+    fn genre_token_word_boundaries_and_head_noun_classification() {
+        let cases = [
+            ("post-bop", GenreClass::JazzAcoustic),
+            ("chamber jazz", GenreClass::JazzAcoustic),
+            ("symphonic metal", GenreClass::RockPopElectronic),
+            ("symphonic rock", GenreClass::RockPopElectronic),
+            ("rock opera", GenreClass::RockPopElectronic),
+            ("pop opera", GenreClass::RockPopElectronic),
+            ("new romantic", GenreClass::RockPopElectronic),
+            ("baroque pop", GenreClass::RockPopElectronic),
+            ("chamber pop", GenreClass::RockPopElectronic),
+            ("folk rock", GenreClass::RockPopElectronic),
+            ("blues rock", GenreClass::RockPopElectronic),
+            ("acoustic rock", GenreClass::RockPopElectronic),
+            ("jazz rock", GenreClass::RockPopElectronic),
+            ("post-rock", GenreClass::RockPopElectronic),
+            ("OST", GenreClass::AmbientSoundtrack),
+            ("O.S.T.", GenreClass::AmbientSoundtrack),
+            ("Film Score", GenreClass::AmbientSoundtrack),
+            ("Classical", GenreClass::Classical),
+            ("Symphony", GenreClass::Classical),
+            ("ghost", GenreClass::Unknown),
+            ("minimalism", GenreClass::Unknown),
+        ];
+        for (tok, expected) in cases {
+            assert_eq!(
+                classify_genre_token(tok),
+                expected,
+                "genre token {tok:?} misclassified"
+            );
+        }
     }
 }

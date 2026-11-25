@@ -490,6 +490,22 @@ impl TrackDbEntry {
         if !saw_schema {
             return Err("trackdb YAML missing required 'schema: 1' header".to_string());
         }
+        // Review #7 F11: Sanitize out-of-range effective_nyquist_hz (must exceed DR-1 floor
+        // 19 kHz + margin and not exceed the file's own Nyquist frequency).
+        if let Some(feff) = entry.results.effective_nyquist_hz {
+            const MIN_VALID_FEFF_HZ: u32 = 19_380; // DR1_MIN_PASSBAND_HZ (19_000) * 1.02
+            let max_valid = if entry.file.sample_rate > 0 {
+                entry.file.sample_rate / 2
+            } else {
+                384_000 / 2
+            };
+            if feff <= MIN_VALID_FEFF_HZ || feff > max_valid {
+                eprintln!(
+                    "  [trackdb warn] ignoring out-of-range effective_nyquist_hz={feff} Hz (valid: ({MIN_VALID_FEFF_HZ}..={max_valid}])"
+                );
+                entry.results.effective_nyquist_hz = None;
+            }
+        }
         Ok(entry)
     }
 }
@@ -609,6 +625,14 @@ impl TrackDbStore {
     }
 
     /// Atomically persist `entry`, preserving any existing hand-edited `user:` section on disk.
+    ///
+    /// - **Deterministic target (Review #7 F4 & F-A1):** For local tracks, saves to the sidecar
+    ///   (when enabled) or the central **by-path** file so `load_for_track` always finds entries
+    ///   even when `STREAMINFO.md5` is unset, and duplicate audio at two paths never shares or
+    ///   ping-pongs `user:` overrides.
+    /// - **File-identity-checked peak merge (Review #7 F5):** Existing `post_chain_peaks` are
+    ///   merged only when the on-disk entry describes the same underlying audio file (matching MD5,
+    ///   or matching size + mtime tolerance when MD5 is absent).
     pub fn save_preserving_user(
         &self,
         track_path: Option<&Path>,
@@ -624,28 +648,60 @@ impl TrackDbStore {
             } else {
                 return Err("cannot determine trackdb save path (no path or MD5)".to_string());
             }
-        } else if let Some(ref md5) = entry.file.streaminfo_md5 {
-            self.central_path_for_md5(md5)
         } else if let Some(p) = track_path {
             self.central_path_for_file(p)
+        } else if let Some(ref md5) = entry.file.streaminfo_md5 {
+            self.central_path_for_md5(md5)
         } else {
             return Err("cannot determine trackdb save path (no path or MD5)".to_string());
         };
 
-        // Preserve any hand-edited `user:` section already on disk.
-        if let Some(existing) = read_entry_if_exists(&target) {
-            if entry.user == TrackDbUserOverrides::default() {
+        // Read existing target entry (or one-time legacy by-md5 fallback when migrating to by-path).
+        let existing_opt = read_entry_if_exists(&target).or_else(|| {
+            if !self.sidecar_enabled && track_path.is_some() {
+                entry
+                    .file
+                    .streaminfo_md5
+                    .as_deref()
+                    .and_then(|md5| read_entry_if_exists(&self.central_path_for_md5(md5)))
+            } else {
+                None
+            }
+        });
+
+        if let Some(existing) = existing_opt {
+            // Preserve hand-edited `user:` only for the same track path (Review #7 F-A1).
+            let same_path = existing.file.path == entry.file.path
+                || track_path.is_some_and(|p| p.to_string_lossy() == existing.file.path);
+            if same_path && entry.user == TrackDbUserOverrides::default() {
                 entry.user = existing.user;
             }
-            // Also keep any existing post_chain_peaks for other DSP keys.
-            for old_peak in existing.results.post_chain_peaks {
-                if !entry
-                    .results
-                    .post_chain_peaks
-                    .iter()
-                    .any(|p| p.key == old_peak.key)
-                {
-                    entry.results.post_chain_peaks.push(old_peak);
+            // Merge existing post_chain_peaks ONLY if the existing entry describes the same audio
+            // file so replacing a file at the same path never inherits stale `M` (Review #7 F5).
+            let same_file = match (
+                existing.file.streaminfo_md5.as_deref(),
+                entry.file.streaminfo_md5.as_deref(),
+            ) {
+                (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                _ => {
+                    existing.file.size == entry.file.size
+                        && existing
+                            .file
+                            .mtime_unix_s
+                            .abs_diff(entry.file.mtime_unix_s)
+                            <= MTIME_TOLERANCE_SECS
+                }
+            };
+            if same_file {
+                for old_peak in existing.results.post_chain_peaks {
+                    if !entry
+                        .results
+                        .post_chain_peaks
+                        .iter()
+                        .any(|p| p.key == old_peak.key)
+                    {
+                        entry.results.post_chain_peaks.push(old_peak);
+                    }
                 }
             }
         }
@@ -1019,6 +1075,165 @@ mod tests {
         assert_eq!(loaded.results.apod_events, 22);
         assert_eq!(loaded.user.filter.as_deref(), Some("minphase-long"));
         assert_eq!(loaded.user.note, "user hand edit");
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn trackdb_f4_f5_fa1_f11_roundtrips_identity_peaks_duplicate_paths_and_feff_validation() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "ap_trackdb_f4_f5_{}_{}",
+            std::process::id(),
+            now_unix_secs()
+        ));
+        let store = TrackDbStore::new(&tmp_dir, false);
+        let key1 = PostChainKey {
+            upsampler: "gauss-apod-4m".to_string(),
+            f_eff_hz: 22_050,
+            output_rate_hz: 352_800,
+            deemphasis: false,
+            hf_noise_filter: false,
+            rew_filter_hash: "none".to_string(),
+        };
+        let key2 = PostChainKey {
+            upsampler: "sinc-steep-4m".to_string(),
+            ..key1.clone()
+        };
+
+        // 1. F4: Save with computed MD5 when header MD5 is unset -> load with md5=None MUST find it!
+        let p_zero = Path::new(r"C:\Music\zero_md5.flac");
+        let mut e_zero = TrackDbEntry::default();
+        e_zero.file = TrackDbFileInfo {
+            path: p_zero.to_string_lossy().into_owned(),
+            size: 1000,
+            mtime_unix_s: 5000,
+            streaminfo_md5: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
+            sample_rate: 44_100,
+            bits: 16,
+        };
+        store.save_preserving_user(Some(p_zero), e_zero).unwrap();
+        let found_zero = store.load_for_track(Some(p_zero), None);
+        assert!(
+            found_zero.is_some(),
+            "F4: central store must find entry saved with computed MD5 when header MD5 is None"
+        );
+
+        // 2. F5: Replacing file at same path (different MD5) MUST drop old peaks while keeping `user:`!
+        let p_rep = Path::new(r"C:\Music\replace_me.flac");
+        let mut e_old = TrackDbEntry::default();
+        e_old.file = TrackDbFileInfo {
+            path: p_rep.to_string_lossy().into_owned(),
+            size: 2000,
+            mtime_unix_s: 6000,
+            streaminfo_md5: Some("11111111111111111111111111111111".to_string()),
+            sample_rate: 44_100,
+            bits: 16,
+        };
+        e_old.user.filter = Some("short-lp".to_string());
+        e_old.upsert_post_chain_peak(key1.clone(), -3.0, false);
+        store.save_preserving_user(Some(p_rep), e_old).unwrap();
+
+        // Same MD5 with another key -> keeps both peaks!
+        let mut e_same = TrackDbEntry::default();
+        e_same.file = TrackDbFileInfo {
+            path: p_rep.to_string_lossy().into_owned(),
+            size: 2000,
+            mtime_unix_s: 6000,
+            streaminfo_md5: Some("11111111111111111111111111111111".to_string()),
+            sample_rate: 44_100,
+            bits: 16,
+        };
+        e_same.upsert_post_chain_peak(key2.clone(), -2.5, false);
+        store.save_preserving_user(Some(p_rep), e_same).unwrap();
+        let loaded_same = store.load_for_track(Some(p_rep), None).unwrap();
+        assert!(loaded_same.find_post_chain_peak(&key1).is_some());
+        assert!(loaded_same.find_post_chain_peak(&key2).is_some());
+
+        // Different MD5 (remaster replaced at same path) -> drops old K1 peak, preserves `user:`!
+        let mut e_new = TrackDbEntry::default();
+        e_new.file = TrackDbFileInfo {
+            path: p_rep.to_string_lossy().into_owned(),
+            size: 2500,
+            mtime_unix_s: 7000,
+            streaminfo_md5: Some("22222222222222222222222222222222".to_string()),
+            sample_rate: 44_100,
+            bits: 16,
+        };
+        e_new.upsert_post_chain_peak(key2.clone(), 0.8, false);
+        store.save_preserving_user(Some(p_rep), e_new).unwrap();
+        let loaded_new = store.load_for_track(Some(p_rep), None).unwrap();
+        assert!(
+            loaded_new.find_post_chain_peak(&key1).is_none(),
+            "F5: stale peak from replaced file MUST be dropped"
+        );
+        assert_eq!(loaded_new.find_post_chain_peak(&key2), Some(0.8));
+        assert_eq!(loaded_new.user.filter.as_deref(), Some("short-lp"));
+
+        // Size change without MD5 -> also drops old peaks!
+        let p_nomd5 = Path::new(r"C:\Music\nomd5.flac");
+        let mut e_n1 = TrackDbEntry::default();
+        e_n1.file = TrackDbFileInfo {
+            path: p_nomd5.to_string_lossy().into_owned(),
+            size: 1000,
+            mtime_unix_s: 1000,
+            streaminfo_md5: None,
+            sample_rate: 44_100,
+            bits: 16,
+        };
+        e_n1.upsert_post_chain_peak(key1.clone(), -4.0, false);
+        store.save_preserving_user(Some(p_nomd5), e_n1).unwrap();
+        let mut e_n2 = TrackDbEntry::default();
+        e_n2.file = TrackDbFileInfo {
+            path: p_nomd5.to_string_lossy().into_owned(),
+            size: 9999,
+            mtime_unix_s: 1000,
+            streaminfo_md5: None,
+            sample_rate: 44_100,
+            bits: 16,
+        };
+        store.save_preserving_user(Some(p_nomd5), e_n2).unwrap();
+        let loaded_n2 = store.load_for_track(Some(p_nomd5), None).unwrap();
+        assert!(loaded_n2.results.post_chain_peaks.is_empty());
+
+        // 3. F-A1: Duplicate audio (identical MD5) at two paths keeps `user:` strictly per-path!
+        let p_a = Path::new(r"C:\Music\A\dup.flac");
+        let p_b = Path::new(r"C:\Music\B\dup.flac");
+        let shared_md5 = "33333333333333333333333333333333";
+        let mut ea = TrackDbEntry::default();
+        ea.file = TrackDbFileInfo {
+            path: p_a.to_string_lossy().into_owned(),
+            size: 5000,
+            mtime_unix_s: 8000,
+            streaminfo_md5: Some(shared_md5.to_string()),
+            sample_rate: 44_100,
+            bits: 16,
+        };
+        ea.user.filter = Some("sinc-steep-4m".to_string());
+        store.save_preserving_user(Some(p_a), ea).unwrap();
+
+        let mut eb = TrackDbEntry::default();
+        eb.file = TrackDbFileInfo {
+            path: p_b.to_string_lossy().into_owned(),
+            size: 5000,
+            mtime_unix_s: 8000,
+            streaminfo_md5: Some(shared_md5.to_string()),
+            sample_rate: 44_100,
+            bits: 16,
+        };
+        store.save_preserving_user(Some(p_b), eb).unwrap();
+
+        let la = store.load_for_track(Some(p_a), Some(shared_md5)).unwrap();
+        let lb = store.load_for_track(Some(p_b), Some(shared_md5)).unwrap();
+        assert_eq!(la.user.filter.as_deref(), Some("sinc-steep-4m"));
+        assert_eq!(lb.user, TrackDbUserOverrides::default());
+
+        // 4. F11: Out-of-range effective_nyquist_hz in YAML is sanitized to None.
+        let bad_feff_yaml = "schema: 1\nfile:\n  sample_rate: 96000\nresults:\n  effective_nyquist_hz: 18000\n";
+        let parsed_bad = TrackDbEntry::from_yaml_str(bad_feff_yaml).unwrap();
+        assert_eq!(parsed_bad.results.effective_nyquist_hz, None);
+        let ok_feff_yaml = "schema: 1\nfile:\n  sample_rate: 96000\nresults:\n  effective_nyquist_hz: 22050\n";
+        let parsed_ok = TrackDbEntry::from_yaml_str(ok_feff_yaml).unwrap();
+        assert_eq!(parsed_ok.results.effective_nyquist_hz, Some(22_050));
+
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 }
