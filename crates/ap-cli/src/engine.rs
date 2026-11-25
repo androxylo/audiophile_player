@@ -9,7 +9,7 @@
 use std::io::{self, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -23,7 +23,7 @@ use ap_core::format::DacWireFormat;
 use ap_dsp::pipeline::{AudioPipeline, GaplessAttachOutcome, GaplessCarryover};
 use ap_dsp::selector::{UNSUPPORTED_SAMPLE_RATE_PREFIX, UpsamplerPolicy};
 use ap_output_win::hygiene::OptimizationLevel;
-use ap_output_win::sink::OutputError;
+use ap_output_win::sink::{OutputError, PlaybackStats};
 use ap_output_win::wdm_ks::WdmKsSink;
 use ap_source::flac::{
     AudioBlockSource, FlacBlockReader, UNSUPPORTED_CHANNEL_LAYOUT_PREFIX,
@@ -186,6 +186,13 @@ struct EngineState<'a> {
     shared: &'a SharedControl,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DispatchOutcome {
+    Applied,
+    /// Command was rejected (e.g. TOCTOU-invalidated `PlayFile`) with zero state/epoch change.
+    Rejected,
+}
+
 impl<'a> EngineState<'a> {
     fn new(
         initial_epoch: u64,
@@ -275,10 +282,11 @@ impl<'a> EngineState<'a> {
         }
     }
 
-    fn dispatch(&mut self, cmd: ControlCommand) {
+    fn dispatch(&mut self, cmd: ControlCommand) -> DispatchOutcome {
         match cmd {
             ControlCommand::PlayRandom(root) => {
                 self.start_directive(PlayDirective::Random { root }, true);
+                DispatchOutcome::Applied
             }
             ControlCommand::PlaySequential(root) => {
                 let seq_gen = self.alloc_seq_gen();
@@ -292,12 +300,14 @@ impl<'a> EngineState<'a> {
                     },
                     true,
                 );
+                DispatchOutcome::Applied
             }
             ControlCommand::PlayFile(file) => {
                 let root = self.shared.allowed_root();
                 match validate_playable_flac_path(&file, Some(&root)) {
                     Ok(valid) => {
                         self.start_directive(PlayDirective::SingleFile { file: valid }, true);
+                        DispatchOutcome::Applied
                     }
                     Err(reason) => {
                         let msg = format!(
@@ -306,6 +316,7 @@ impl<'a> EngineState<'a> {
                         );
                         eprintln!("  [reject] {msg}");
                         self.shared.record_action(msg);
+                        DispatchOutcome::Rejected
                     }
                 }
             }
@@ -334,7 +345,7 @@ impl<'a> EngineState<'a> {
                     self.last_started_track = Some(file);
                     self.awaiting_post_skip_start = true;
                     self.just_skipped_track = true;
-                    return;
+                    return DispatchOutcome::Applied;
                 }
 
                 if !self.is_paused {
@@ -347,7 +358,7 @@ impl<'a> EngineState<'a> {
                     self.active_epoch = ep;
                     self.just_skipped_track = true;
                     if reused_prebuffered {
-                        return;
+                        return DispatchOutcome::Applied;
                     }
                     // Non-reuse flush: if another flush-Next already ran before a new TrackStart
                     // started, increment `pending_flush_skips` so consecutive Next clicks advance
@@ -367,7 +378,7 @@ impl<'a> EngineState<'a> {
                     };
                     self.last_play = restart_dir.clone();
                     self.prod_ctrl.set(ep, ProducerDirective::Active(restart_dir));
-                    return;
+                    return DispatchOutcome::Applied;
                 }
 
                 // Paused -> Next: resume the next track in the last active mode/folder, anchored
@@ -382,6 +393,7 @@ impl<'a> EngineState<'a> {
                 self.start_directive(resume_dir, false);
                 self.awaiting_post_skip_start = true;
                 self.just_skipped_track = true;
+                DispatchOutcome::Applied
             }
             ControlCommand::Pause => {
                 self.pause_with_message(
@@ -389,6 +401,7 @@ impl<'a> EngineState<'a> {
                 );
                 println!("  [paused] WDM-KS kernel pin closed (DAC released).");
                 let _ = io::stdout().flush();
+                DispatchOutcome::Applied
             }
         }
     }
@@ -476,186 +489,17 @@ pub fn run_random_music_player(
     );
 
     while controller.current_signal().is_none() {
-        if let Some(cmd) = shared.take_pending_command() {
-            state.dispatch(cmd);
-            continue;
-        }
-
-        if state.is_paused {
-            // DAC WDM-KS pin is completely closed & released — Audirvana can play freely!
-            match shared.wait_for_command_or_shutdown() {
-                Some(cmd) => {
-                    state.dispatch(cmd);
-                    continue;
-                }
-                None => break,
-            }
-        }
-
-        let Some(event) =
-            stream_buf.pop_for_epoch_timeout(state.active_epoch, Duration::from_millis(50))
-        else {
-            if producer_thread.is_finished() && controller.current_signal().is_none() {
-                let msg = "DSP producer thread stopped unexpectedly — paused & DAC released";
-                eprintln!("  [error] {msg}");
-                state.pause_with_message(msg);
-            }
-            continue;
-        };
-
-        if controller.current_signal().is_some() {
-            break;
-        }
-        // If a command arrived right as `pop_for_epoch_timeout` returned, put the popped event
-        // back at the front before dispatching so a late `Next` does not double-skip a TrackStart.
-        if let Some(cmd) = shared.take_pending_command() {
-            let _ = stream_buf.push_front_for_epoch(state.active_epoch, event);
-            state.dispatch(cmd);
-            continue;
-        }
-
-        match event {
-            StreamEvent::EndOfQueue(msg) | StreamEvent::FatalError(msg) => {
-                state.pause_with_message(msg);
-            }
-            StreamEvent::ErrorThresholdPause {
-                message,
-                last_attempted,
-            } => {
-                state.record_anchor(last_attempted);
-                state.pause_with_message(message);
-            }
-            StreamEvent::PcmBlock(_) | StreamEvent::TrackEnd => {
-                // Orphaned block/marker from an interrupted track — ignore safely.
-                continue;
-            }
-            StreamEvent::TrackStart {
-                path,
-                mode_label,
-                report,
-                total_duration_s,
-                had_gapless_carryover,
-            } => {
-                let out_rate = report.output_rate_hz;
-                let watermark_frames = (out_rate as usize) * (PREBUFFER_SECONDS as usize);
-
-                // Wait until ~2 seconds of PCM are pre-buffered in RAM (or TrackEnd for short clips)
-                // while remaining immediately responsive to Pause / Next / Ctrl+C.
-                let mut aborted_prebuffer = false;
-                let mut pending_cmd: Option<ControlCommand> = None;
-                loop {
-                    if controller.current_signal().is_some() {
-                        aborted_prebuffer = true;
-                        break;
-                    }
-                    if let Some(cmd) = shared.take_pending_command() {
-                        pending_cmd = Some(cmd);
-                        aborted_prebuffer = true;
-                        break;
-                    }
-                    match stream_buf.wait_prebuffer_watermark(
-                        state.active_epoch,
-                        watermark_frames,
-                        Duration::from_millis(50),
-                    ) {
-                        Some(true) => break,
-                        Some(false) => {
-                            if producer_thread.is_finished() {
-                                let msg =
-                                    "DSP producer thread stopped unexpectedly — paused & DAC released";
-                                eprintln!("  [error] {msg}");
-                                state.pause_with_message(msg);
-                                aborted_prebuffer = true;
-                                break;
-                            }
-                        }
-                        None => {
-                            aborted_prebuffer = true;
-                            break;
-                        }
-                    }
-                }
-
-                // Review #3 Finding #27: re-queue the popped TrackStart before dispatching so
-                // skip_to_next_track_or_flush applies identical just_skipped_track protection
-                // across line 505, prebuffer, and stop_flag windows (no double-skip after natural EOF).
-                if let Some(cmd) = pending_cmd {
-                    let _ = stream_buf.push_front_for_epoch(
-                        state.active_epoch,
-                        StreamEvent::TrackStart {
-                            path,
-                            mode_label,
-                            report,
-                            total_duration_s,
-                            had_gapless_carryover,
-                        },
-                    );
-                    state.dispatch(cmd);
-                    continue;
-                }
-
-                if aborted_prebuffer || state.is_paused || controller.current_signal().is_some() {
-                    continue;
-                }
-
-                // Arm `stop_flag` here BEFORE the final signal/command check (never inside
-                // `wdm_ks.rs`) so any Ctrl+C, Pause, or Next arriving right before open is
-                // either caught immediately below or leaves `stop_flag == true` for the sink.
-                stop_handle.store(false, Ordering::SeqCst);
-                if controller.current_signal().is_some() {
-                    break;
-                }
-                if let Some(cmd) = shared.take_pending_command() {
-                    let _ = stream_buf.push_front_for_epoch(
-                        state.active_epoch,
-                        StreamEvent::TrackStart {
-                            path,
-                            mode_label,
-                            report,
-                            total_duration_s,
-                            had_gapless_carryover,
-                        },
-                    );
-                    state.dispatch(cmd);
-                    continue;
-                }
-
-                // Record the track actually started by the consumer (not producer decode-ahead).
-                state.record_anchor(path.clone());
-                state.just_skipped_track = false;
-
-                let fmt_str = report.format_summary(total_duration_s);
-                let track_str = path.display().to_string();
-                println!("  [playing]  {track_str} ({fmt_str})");
-                println!("  [pipeline] {}", report.log_line());
-                let _ = io::stdout().flush();
-                shared.record_action(report.log_line());
-                shared.set_playing(mode_label, track_str, fmt_str);
-
-                let ep_for_stream = state.active_epoch;
-                let buf_for_stream = Arc::clone(&stream_buf);
-                match sink.play_block_stream(out_rate, DacWireFormat::Int32, move || {
-                    match buf_for_stream.try_pop_track_pcm_block(ep_for_stream) {
-                        PopBlockResult::Block(b) => ap_output_win::wdm_ks::StreamBlock::Ready(b),
-                        PopBlockResult::Underrun => ap_output_win::wdm_ks::StreamBlock::Underrun,
-                        PopBlockResult::TrackEnd | PopBlockResult::StaleOrClosed => {
-                            ap_output_win::wdm_ks::StreamBlock::EndOfTrack
-                        }
-                    }
-                }) {
-                    Ok(_stats) => {}
-                    Err(err @ OutputError::DeviceBusy { .. }) => {
-                        let msg = format!("DAC busy ({err}) — staying paused");
-                        eprintln!("  [busy] {msg}");
-                        state.pause_with_message(msg);
-                    }
-                    Err(err) => {
-                        let msg = format!("Output error ({err}) — paused & DAC released");
-                        eprintln!("  [error] {msg}");
-                        state.pause_with_message(msg);
-                    }
-                }
-            }
+        match step_consumer_once(
+            &mut state,
+            &stream_buf,
+            &shared,
+            controller,
+            &stop_handle,
+            &mut sink,
+            || producer_thread.is_finished(),
+        ) {
+            ConsumerStepResult::Continue => {}
+            ConsumerStepResult::Exit => break,
         }
     }
 
@@ -680,6 +524,264 @@ pub fn run_random_music_player(
     }
 
     Ok(())
+}
+
+/// Narrow streaming-sink abstraction shared by `WdmKsSink` and mock-sink consumer tests
+/// (Review #4 Finding #15).
+trait BlockStreamAudioSink {
+    fn play_block_stream<F>(
+        &mut self,
+        sample_rate_hz: u32,
+        wire_format: DacWireFormat,
+        next_block: F,
+    ) -> Result<PlaybackStats, OutputError>
+    where
+        F: FnMut() -> ap_output_win::wdm_ks::StreamBlock;
+}
+
+impl BlockStreamAudioSink for WdmKsSink {
+    fn play_block_stream<F>(
+        &mut self,
+        sample_rate_hz: u32,
+        wire_format: DacWireFormat,
+        next_block: F,
+    ) -> Result<PlaybackStats, OutputError>
+    where
+        F: FnMut() -> ap_output_win::wdm_ks::StreamBlock,
+    {
+        WdmKsSink::play_block_stream(self, sample_rate_hz, wire_format, next_block)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConsumerStepResult {
+    Continue,
+    Exit,
+}
+
+/// Execute one iteration of the playback consumer loop (command handling, TrackStart prebuffer
+/// with re-queue protection, `stop_flag` arming, streaming playback, and seamless resume on
+/// rejected commands).
+#[allow(clippy::too_many_arguments)]
+fn step_consumer_once<S: BlockStreamAudioSink>(
+    state: &mut EngineState<'_>,
+    stream_buf: &Arc<BoundedBlockStreamBuffer>,
+    shared: &SharedControl,
+    controller: &ShutdownController,
+    stop_handle: &AtomicBool,
+    sink: &mut S,
+    producer_finished: impl Fn() -> bool,
+) -> ConsumerStepResult {
+    if controller.current_signal().is_some() {
+        return ConsumerStepResult::Exit;
+    }
+
+    if let Some(cmd) = shared.take_pending_command() {
+        let _ = state.dispatch(cmd);
+        return ConsumerStepResult::Continue;
+    }
+
+    if state.is_paused {
+        // DAC WDM-KS pin is completely closed & released — Audirvana can play freely!
+        return match shared.wait_for_command_or_shutdown() {
+            Some(cmd) => {
+                let _ = state.dispatch(cmd);
+                ConsumerStepResult::Continue
+            }
+            None => ConsumerStepResult::Exit,
+        };
+    }
+
+    let Some(event) =
+        stream_buf.pop_for_epoch_timeout(state.active_epoch, Duration::from_millis(50))
+    else {
+        if producer_finished() && controller.current_signal().is_none() {
+            let msg = "DSP producer thread stopped unexpectedly — paused & DAC released";
+            eprintln!("  [error] {msg}");
+            state.pause_with_message(msg);
+        }
+        return ConsumerStepResult::Continue;
+    };
+
+    if controller.current_signal().is_some() {
+        return ConsumerStepResult::Exit;
+    }
+    // If a command arrived right as `pop_for_epoch_timeout` returned, put the popped event
+    // back at the front before dispatching so a late `Next` does not double-skip a TrackStart.
+    if let Some(cmd) = shared.take_pending_command() {
+        let _ = stream_buf.push_front_for_epoch(state.active_epoch, event);
+        let _ = state.dispatch(cmd);
+        return ConsumerStepResult::Continue;
+    }
+
+    match event {
+        StreamEvent::EndOfQueue(msg) | StreamEvent::FatalError(msg) => {
+            state.pause_with_message(msg);
+        }
+        StreamEvent::ErrorThresholdPause {
+            message,
+            last_attempted,
+        } => {
+            state.record_anchor(last_attempted);
+            state.pause_with_message(message);
+        }
+        StreamEvent::PcmBlock(_) | StreamEvent::TrackEnd => {
+            // Orphaned block/marker from an interrupted track — ignore safely.
+        }
+        StreamEvent::TrackStart {
+            path,
+            mode_label,
+            report,
+            total_duration_s,
+            had_gapless_carryover,
+        } => {
+            let out_rate = report.output_rate_hz;
+            let watermark_frames = (out_rate as usize) * (PREBUFFER_SECONDS as usize);
+
+            // Wait until ~2 seconds of PCM are pre-buffered in RAM (or TrackEnd for short clips)
+            // while remaining immediately responsive to Pause / Next / Ctrl+C.
+            let mut aborted_prebuffer = false;
+            let mut pending_cmd: Option<ControlCommand> = None;
+            loop {
+                if controller.current_signal().is_some() {
+                    aborted_prebuffer = true;
+                    break;
+                }
+                if let Some(cmd) = shared.take_pending_command() {
+                    pending_cmd = Some(cmd);
+                    aborted_prebuffer = true;
+                    break;
+                }
+                match stream_buf.wait_prebuffer_watermark(
+                    state.active_epoch,
+                    watermark_frames,
+                    Duration::from_millis(50),
+                ) {
+                    Some(true) => break,
+                    Some(false) => {
+                        if producer_finished() {
+                            let msg =
+                                "DSP producer thread stopped unexpectedly — paused & DAC released";
+                            eprintln!("  [error] {msg}");
+                            state.pause_with_message(msg);
+                            aborted_prebuffer = true;
+                            break;
+                        }
+                    }
+                    None => {
+                        aborted_prebuffer = true;
+                        break;
+                    }
+                }
+            }
+
+            // Re-queue the popped TrackStart before dispatching so skip_to_next_track_or_flush
+            // applies identical just_skipped_track protection across all arrival windows.
+            if let Some(cmd) = pending_cmd {
+                let _ = stream_buf.push_front_for_epoch(
+                    state.active_epoch,
+                    StreamEvent::TrackStart {
+                        path,
+                        mode_label,
+                        report,
+                        total_duration_s,
+                        had_gapless_carryover,
+                    },
+                );
+                let _ = state.dispatch(cmd);
+                return ConsumerStepResult::Continue;
+            }
+
+            if aborted_prebuffer || state.is_paused || controller.current_signal().is_some() {
+                return ConsumerStepResult::Continue;
+            }
+
+            // Arm `stop_flag` here BEFORE the final signal/command check (never inside
+            // `wdm_ks.rs`) so any Ctrl+C, Pause, or Next arriving right before open is
+            // either caught immediately below or leaves `stop_flag == true` for the sink.
+            stop_handle.store(false, Ordering::SeqCst);
+            if controller.current_signal().is_some() {
+                return ConsumerStepResult::Exit;
+            }
+            if let Some(cmd) = shared.take_pending_command() {
+                let _ = stream_buf.push_front_for_epoch(
+                    state.active_epoch,
+                    StreamEvent::TrackStart {
+                        path,
+                        mode_label,
+                        report,
+                        total_duration_s,
+                        had_gapless_carryover,
+                    },
+                );
+                let _ = state.dispatch(cmd);
+                return ConsumerStepResult::Continue;
+            }
+
+            // Record the track actually started by the consumer (not producer decode-ahead).
+            state.record_anchor(path.clone());
+            state.just_skipped_track = false;
+
+            let fmt_str = report.format_summary(total_duration_s);
+            let track_str = path.display().to_string();
+            println!("  [playing]  {track_str} ({fmt_str})");
+            println!("  [pipeline] {}", report.log_line());
+            let _ = io::stdout().flush();
+            shared.record_action(report.log_line());
+            shared.set_playing(mode_label, track_str, fmt_str);
+
+            // Review #4 Finding #20: if playback is interrupted by a command that is rejected
+            // without changing state/epoch (e.g. TOCTOU-invalidated PlayFile), resume this same
+            // track's remaining PCM blocks instead of discarding them as orphans and skipping to N+1.
+            loop {
+                let ep_for_stream = state.active_epoch;
+                let buf_for_stream = Arc::clone(stream_buf);
+                let hit_track_end = Arc::new(AtomicBool::new(false));
+                let hit_end_cb = Arc::clone(&hit_track_end);
+                match sink.play_block_stream(out_rate, DacWireFormat::Int32, move || {
+                    match buf_for_stream.try_pop_track_pcm_block(ep_for_stream) {
+                        PopBlockResult::Block(b) => ap_output_win::wdm_ks::StreamBlock::Ready(b),
+                        PopBlockResult::Underrun => ap_output_win::wdm_ks::StreamBlock::Underrun,
+                        PopBlockResult::TrackEnd | PopBlockResult::StaleOrClosed => {
+                            hit_end_cb.store(true, Ordering::SeqCst);
+                            ap_output_win::wdm_ks::StreamBlock::EndOfTrack
+                        }
+                    }
+                }) {
+                    Ok(_stats) => {
+                        if !hit_track_end.load(Ordering::SeqCst)
+                            && controller.current_signal().is_none()
+                        {
+                            if let Some(cmd) = shared.take_pending_command() {
+                                if state.dispatch(cmd) == DispatchOutcome::Rejected
+                                    && !state.is_paused
+                                    && controller.current_signal().is_none()
+                                {
+                                    stop_handle.store(false, Ordering::SeqCst);
+                                    continue;
+                                }
+                            }
+                        }
+                        break;
+                    }
+                    Err(err @ OutputError::DeviceBusy { .. }) => {
+                        let msg = format!("DAC busy ({err}) — staying paused");
+                        eprintln!("  [busy] {msg}");
+                        state.pause_with_message(msg);
+                        break;
+                    }
+                    Err(err) => {
+                        let msg = format!("Output error ({err}) — paused & DAC released");
+                        eprintln!("  [error] {msg}");
+                        state.pause_with_message(msg);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    ConsumerStepResult::Continue
 }
 
 /// Ordered graceful teardown shared by `run_random_music_player` and teardown-order tests:
@@ -1230,40 +1332,32 @@ fn stream_single_track(
         );
     }
 
-    // Commit the gapless carryover handoff now that Track B has a real validated first block:
-    // - Same output rate + same upsampler geometry -> FullHandoff (0 drain frames)
-    // - Same output rate + different upsampler geometry -> ConvolverOnlyHandoff (drain only short
-    //   upsampler history onto Track A, keep full REW tail on Track B with zero IR gap!)
-    // - Different output rate -> drain full carryover onto Track A before closing TrackEnd(prev).
+    // Commit the gapless carryover handoff now that Track B has a real validated first block,
+    // while keeping `*had_pending_prev_end` open until Track B actually yields its first non-empty
+    // PCM block (Review #4 Finding #2). If Track B fails after handoff but before producing any
+    // PCM (e.g., short valid prefix < UPOLS B=65536 followed by decode error, or DSP block error),
+    // we flush `session` directly onto Track A before closing `TrackEnd(prev)` so Track A's REW
+    // reverb tail and upsampler history are NEVER dropped!
     let mut had_gapless_carryover = false;
+    let mut attached_carryover_into_session = false;
     if let Some(carry) = incoming_carryover.take() {
         let had_active_tail = !carry.is_empty();
         match pipeline.attach_gapless_carryover(&mut session, carry) {
             Ok(GaplessAttachOutcome::FullHandoff) => {
                 had_gapless_carryover = had_active_tail;
-                if *had_pending_prev_end {
-                    *had_pending_prev_end = false;
-                    if !buf.push_for_epoch(epoch, StreamEvent::TrackEnd) {
-                        return (TrackStreamOutcome::Aborted, None, false);
-                    }
-                }
+                attached_carryover_into_session = had_active_tail;
             }
             Ok(GaplessAttachOutcome::ConvolverOnlyHandoff {
                 upsampler_tail_pcm,
                 attached_convolver_tail,
             }) => {
                 had_gapless_carryover = attached_convolver_tail;
+                attached_carryover_into_session = attached_convolver_tail;
                 if !upsampler_tail_pcm.is_empty()
                     && !buf.push_for_epoch(epoch, StreamEvent::PcmBlock(upsampler_tail_pcm))
                 {
                     *had_pending_prev_end = false;
                     return (TrackStreamOutcome::Aborted, None, false);
-                }
-                if *had_pending_prev_end {
-                    *had_pending_prev_end = false;
-                    if !buf.push_for_epoch(epoch, StreamEvent::TrackEnd) {
-                        return (TrackStreamOutcome::Aborted, None, false);
-                    }
                 }
             }
             Ok(GaplessAttachOutcome::IncompatibleRate(rejected)) => {
@@ -1306,6 +1400,51 @@ fn stream_single_track(
     let mut first_block_error: Option<String> = None;
     let mut pending_first_block = Some(first_src);
 
+    // Helper closing TrackEnd(prev) right before TrackStart(B) + PcmBlock(B).
+    let emit_track_b_pcm = |buf: &BoundedBlockStreamBuffer,
+                            pending_prev_end: &mut bool,
+                            pending_start: &mut Option<StreamEvent>,
+                            pcm: ap_core::buffer::InterleavedInt32Buffer|
+     -> bool {
+        if *pending_prev_end {
+            *pending_prev_end = false;
+            if !buf.push_for_epoch(epoch, StreamEvent::TrackEnd) {
+                return false;
+            }
+        }
+        if let Some(start_ev) = pending_start.take() {
+            if !buf.push_for_epoch(epoch, start_ev) {
+                return false;
+            }
+        }
+        buf.push_for_epoch(epoch, StreamEvent::PcmBlock(pcm))
+    };
+
+    // Helper draining an already-attached carryover from `session` onto Track A when Track B
+    // errors before emitting any PCM (closes TrackEnd(prev) without opening TrackStart(B)).
+    let drain_attached_tail_onto_prev = |session: &mut ap_dsp::pipeline::StreamingPipelineSession,
+                                         buf: &BoundedBlockStreamBuffer,
+                                         pending_prev_end: &mut bool,
+                                         attached: bool|
+     -> bool {
+        if attached {
+            if let Ok(tail_pcm) = session.flush() {
+                if !tail_pcm.is_empty() && !buf.push_for_epoch(epoch, StreamEvent::PcmBlock(tail_pcm))
+                {
+                    *pending_prev_end = false;
+                    return false;
+                }
+            }
+        }
+        if *pending_prev_end {
+            *pending_prev_end = false;
+            if !buf.push_for_epoch(epoch, StreamEvent::TrackEnd) {
+                return false;
+            }
+        }
+        true
+    };
+
     loop {
         if ctrl.epoch() != epoch {
             return (TrackStreamOutcome::Aborted, None, false);
@@ -1335,6 +1474,14 @@ fn stream_single_track(
             Err(err) => {
                 let msg = format!("DSP block error on '{}': {err}", chosen.display());
                 if !pushed_any_pcm {
+                    if !drain_attached_tail_onto_prev(
+                        &mut session,
+                        buf,
+                        had_pending_prev_end,
+                        attached_carryover_into_session,
+                    ) {
+                        return (TrackStreamOutcome::Aborted, None, false);
+                    }
                     return (TrackStreamOutcome::Failed(msg), None, false);
                 }
                 eprintln!("  [dsp] {msg}");
@@ -1345,12 +1492,7 @@ fn stream_single_track(
         };
 
         if !pcm_block.is_empty() {
-            if let Some(start_ev) = pending_start.take() {
-                if !buf.push_for_epoch(epoch, start_ev) {
-                    return (TrackStreamOutcome::Aborted, None, false);
-                }
-            }
-            if !buf.push_for_epoch(epoch, StreamEvent::PcmBlock(pcm_block)) {
+            if !emit_track_b_pcm(buf, had_pending_prev_end, &mut pending_start, pcm_block) {
                 return (TrackStreamOutcome::Aborted, None, false);
             }
             pushed_any_pcm = true;
@@ -1372,12 +1514,7 @@ fn stream_single_track(
         if let Ok((tail_pcm, carry)) = flushed {
             next_carryover = carry;
             if !tail_pcm.is_empty() {
-                if let Some(start_ev) = pending_start.take() {
-                    if !buf.push_for_epoch(epoch, start_ev) {
-                        return (TrackStreamOutcome::Aborted, None, false);
-                    }
-                }
-                if !buf.push_for_epoch(epoch, StreamEvent::PcmBlock(tail_pcm)) {
+                if !emit_track_b_pcm(buf, had_pending_prev_end, &mut pending_start, tail_pcm) {
                     return (TrackStreamOutcome::Aborted, None, false);
                 }
                 pushed_any_pcm = true;
@@ -1388,16 +1525,11 @@ fn stream_single_track(
     if !pushed_any_pcm {
         // Ultra-short track (< upsampler half-window) where all samples landed cleanly in carryover:
         // flush immediately so it still plays as its own track rather than being dropped.
-        if source_frames_read > 0 {
+        if first_block_error.is_none() && source_frames_read > 0 {
             if let Some(carry) = next_carryover.take() {
                 if let Ok(pcm) = pipeline.drain_gapless_carryover(carry) {
                     if !pcm.is_empty() {
-                        if let Some(start_ev) = pending_start.take() {
-                            if !buf.push_for_epoch(epoch, start_ev) {
-                                return (TrackStreamOutcome::Aborted, None, false);
-                            }
-                        }
-                        if !buf.push_for_epoch(epoch, StreamEvent::PcmBlock(pcm)) {
+                        if !emit_track_b_pcm(buf, had_pending_prev_end, &mut pending_start, pcm) {
                             return (TrackStreamOutcome::Aborted, None, false);
                         }
                         if !buf.push_for_epoch(epoch, StreamEvent::TrackEnd) {
@@ -1407,6 +1539,16 @@ fn stream_single_track(
                     }
                 }
             }
+        }
+        // Track B errored (or produced zero output) before emitting any PCM: drain any already-
+        // attached REW tail & upsampler history onto Track A and close TrackEnd(prev) cleanly!
+        if !drain_attached_tail_onto_prev(
+            &mut session,
+            buf,
+            had_pending_prev_end,
+            attached_carryover_into_session,
+        ) {
+            return (TrackStreamOutcome::Aborted, None, false);
         }
         return (
             TrackStreamOutcome::Failed(first_block_error.unwrap_or_else(|| {
@@ -2421,41 +2563,88 @@ mod tests {
 
     #[test]
     fn teardown_player_resources_releases_http_and_sink_before_producer_join() {
-        // Follow-up Engine #2: verify exact non-idle teardown order without needing live DAC hardware.
+        // Review #4 Finding #19: deterministic condvar-synchronized teardown order test with zero
+        // sleep races, zero busy-spin, and explicit HTTP-closed + server.url-cleared verification.
+        use ap_control::server::runtime_url_file_path;
+        use std::net::TcpStream;
+
         let dir = std::env::temp_dir().join(format!(
             "ap_cli_teardown_order_{}",
             std::process::id()
         ));
         let _ = std::fs::create_dir_all(&dir);
 
-        let log = Arc::new(Mutex::new(Vec::<&'static str>::new()));
-        struct MockSink {
-            log: Arc<Mutex<Vec<&'static str>>>,
-        }
-        impl Drop for MockSink {
-            fn drop(&mut self) {
-                self.log.lock().unwrap().push("sink_dropped");
-            }
-        }
-
         let shared = SharedControl::new(dir.clone(), "Mock DAC");
         let server = ControlServer::start(shared.clone(), None).unwrap();
         let url = server.url();
+        let port: u16 = url
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.trim_end_matches('/').parse().ok())
+            .expect("valid port in ControlServer URL");
+        write_runtime_url_file(&url);
+
+        let log = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let sink_dropped_gate = Arc::new((Mutex::new(false), Condvar::new()));
+
+        struct MockSink {
+            log: Arc<Mutex<Vec<&'static str>>>,
+            gate: Arc<(Mutex<bool>, Condvar)>,
+            http_port: u16,
+            http_url: String,
+        }
+        impl Drop for MockSink {
+            fn drop(&mut self) {
+                // Verify HTTP server is ALREADY shut down before sink drops.
+                let http_closed =
+                    TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], self.http_port)), Duration::from_millis(200))
+                        .is_err();
+                assert!(
+                    http_closed,
+                    "HTTP server must already be shut down before dropping the audio sink"
+                );
+                // Verify runtime `server.url` was already cleared before sink drops.
+                if let Some(url_file) = runtime_url_file_path() {
+                    let still_ours = std::fs::read_to_string(&url_file)
+                        .ok()
+                        .is_some_and(|s| s.trim() == self.http_url);
+                    assert!(
+                        !still_ours,
+                        "server.url must already be cleared before dropping the audio sink"
+                    );
+                }
+                self.log.lock().unwrap().push("http_and_url_closed");
+                self.log.lock().unwrap().push("sink_dropped");
+                let (lock, cv) = &*self.gate;
+                *lock.lock().unwrap() = true;
+                cv.notify_all();
+            }
+        }
+        use std::net::SocketAddr;
+
         let buf = BoundedBlockStreamBuffer::new(DEFAULT_MAX_BUFFERED_FRAMES);
         let ep = buf.current_epoch();
-        let prod_ctrl = ProducerControl::new(
-            ep,
-            ProducerDirective::Active(PlayDirective::Random { root: dir.clone() }),
-        );
+        // Start paused so the mock producer blocks cleanly at 0% CPU inside `wait_active()`
+        // until teardown publishes `Shutdown` (zero busy-spin).
+        let prod_ctrl = ProducerControl::new(ep, ProducerDirective::Paused);
         let controller = ShutdownController::new();
         controller.trigger(ShutdownSignal::CtrlC);
 
         let log_prod = Arc::clone(&log);
+        let gate_prod = Arc::clone(&sink_dropped_gate);
         let prod_ctrl_bg = Arc::clone(&prod_ctrl);
         let producer = thread::spawn(move || {
-            // Wait for Shutdown signal, pause briefly so sink drop clearly precedes producer exit.
-            while prod_ctrl_bg.wait_active().is_some() {}
-            thread::sleep(Duration::from_millis(30));
+            // Blocks cleanly in Condvar::wait until teardown publishes Shutdown.
+            assert!(prod_ctrl_bg.wait_active().is_none());
+            // Wait deterministically until MockSink::drop has fired (proves teardown drops sink
+            // BEFORE joining the producer thread, with zero sleep race).
+            let (lock, cv) = &*gate_prod;
+            let mut dropped = lock.lock().unwrap();
+            while !*dropped {
+                let (g, timeout) = cv.wait_timeout(dropped, Duration::from_secs(2)).unwrap();
+                dropped = g;
+                assert!(!timeout.timed_out(), "sink was NOT dropped before producer join!");
+            }
             log_prod.lock().unwrap().push("producer_exited");
         });
 
@@ -2467,6 +2656,9 @@ mod tests {
             &url,
             MockSink {
                 log: Arc::clone(&log),
+                gate: Arc::clone(&sink_dropped_gate),
+                http_port: port,
+                http_url: url.clone(),
             },
             producer,
             &controller,
@@ -2478,8 +2670,501 @@ mod tests {
         assert!(joined, "producer thread should join cleanly on teardown");
         assert_eq!(
             *log.lock().unwrap(),
-            vec!["sink_dropped", "producer_exited"],
-            "sink must be dropped BEFORE waiting on producer join"
+            vec!["http_and_url_closed", "sink_dropped", "producer_exited"],
+            "teardown must close HTTP + server.url, then drop sink, then join producer"
         );
+    }
+
+    #[test]
+    fn producer_loop_preserves_rew_tail_when_next_track_has_short_valid_prefix_then_corrupts_under_64k_ir() {
+        // Review #4 Finding #2 (MEDIUM):
+        // With a 65,536-tap REW IR (active_taps > 32768 -> UPOLS block_size = 65536), Track A
+        // (44.1 kHz) hands off its REW reverb tail to Track B (44.1 kHz) whose first FLAC frame
+        // (4096 frames -> ~32,768 upsampled < 65,536 -> 0 PCM emitted!) is valid, followed by
+        // mid-stream corruption causing block 2 to error. Track A's full REW reverb tail MUST
+        // still be flushed onto Track A before TrackEnd(A), and Track B MUST NOT open TrackStart!
+        use flac_codec::encode::{FlacSampleWriter, Options};
+        use std::fs::{self, File};
+        use std::io::Write as _;
+
+        let root = std::env::temp_dir().join(format!(
+            "ap_cli_short_prefix_corrupt_64k_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let ir_dir = root.join("ir");
+        let music_dir = root.join("music");
+        fs::create_dir_all(&ir_dir).unwrap();
+        fs::create_dir_all(&music_dir).unwrap();
+
+        // 40,000-tap stereo 352.8 kHz IR (> 32,768 -> UPOLS block_size = 65,536!) with a strong
+        // echo at tap 35,000 so Track A's REW reverb tail clearly extends ~35k samples past Track A.
+        let ir_taps = 40_000_usize;
+        let mut ir = vec![0.0_f32; ir_taps * 2];
+        ir[0] = 0.5;
+        ir[1] = 0.5;
+        ir[35_000 * 2] = 0.35;
+        ir[35_000 * 2 + 1] = -0.35;
+        let data_bytes = (ir.len() * 4) as u32;
+        {
+            let mut f = File::create(ir_dir.join("ir_352800.wav")).unwrap();
+            f.write_all(b"RIFF").unwrap();
+            f.write_all(&(36u32 + data_bytes).to_le_bytes()).unwrap();
+            f.write_all(b"WAVE").unwrap();
+            f.write_all(b"fmt ").unwrap();
+            f.write_all(&16u32.to_le_bytes()).unwrap();
+            f.write_all(&3u16.to_le_bytes()).unwrap();
+            f.write_all(&2u16.to_le_bytes()).unwrap();
+            f.write_all(&352_800u32.to_le_bytes()).unwrap();
+            f.write_all(&(352_800u32 * 8).to_le_bytes()).unwrap();
+            f.write_all(&8u16.to_le_bytes()).unwrap();
+            f.write_all(&32u16.to_le_bytes()).unwrap();
+            f.write_all(b"data").unwrap();
+            f.write_all(&data_bytes.to_le_bytes()).unwrap();
+            for s in ir {
+                f.write_all(&s.to_le_bytes()).unwrap();
+            }
+        }
+
+        let write_flac = |path: &Path, frames: usize, amp: i32| {
+            let mut w = FlacSampleWriter::create(
+                path,
+                Options::default(),
+                44_100,
+                16,
+                2,
+                Some((frames * 2) as u64),
+            )
+            .unwrap();
+            let samples: Vec<i32> = (0..(frames * 2))
+                .map(|i| if i % 2 == 0 { amp } else { -amp })
+                .collect();
+            w.write(&samples).unwrap();
+            w.finalize().unwrap();
+        };
+
+        // 01_a.flac: valid 44.1 kHz track (10,000 frames = 80,000 upsampled > 65,536).
+        let n_a = 10_000_usize;
+        write_flac(&music_dir.join("01_a.flac"), n_a, 14_000);
+
+        // 02_b_prefix_corrupt.flac: write 8192 frames (two 4096-frame FLAC blocks) then corrupt
+        // the second half of the file so frame 1 (~4096 frames -> 32,768 upsampled < 65,536)
+        // decodes cleanly and frame 2 errors!
+        let b_path = music_dir.join("02_b_prefix_corrupt.flac");
+        write_flac(&b_path, 8_192, 500);
+        {
+            let mut bytes = fs::read(&b_path).unwrap();
+            let mid = (bytes.len() * 2) / 3;
+            for b in &mut bytes[mid..] {
+                *b ^= 0xA5;
+            }
+            fs::write(&b_path, &bytes).unwrap();
+        }
+
+        let pipeline = AudioPipeline::with_rew_config(
+            UpsamplerPolicy::default(),
+            ConvolutionConfig::auto_dir(ir_dir),
+        )
+        .unwrap();
+        let shared = SharedControl::new(music_dir.clone(), "Mock DAC");
+        let buf = BoundedBlockStreamBuffer::new(DEFAULT_MAX_BUFFERED_FRAMES);
+        let ep = buf.reset_and_flush();
+        let ctrl = ProducerControl::new(
+            ep,
+            ProducerDirective::Active(PlayDirective::Sequential {
+                root: music_dir.clone(),
+                seq_gen: 1,
+                start_after: None,
+                folder_only: false,
+                skip_count: 0,
+            }),
+        );
+
+        let p_ctrl = Arc::clone(&ctrl);
+        let p_buf = Arc::clone(&buf);
+        let p_shared = Arc::clone(&shared);
+        let handle = thread::spawn(move || producer_loop(pipeline, p_ctrl, p_buf, p_shared));
+
+        let mut started_paths: Vec<PathBuf> = Vec::new();
+        let mut track_a_frames: Vec<[i32; 2]> = Vec::new();
+        let mut saw_end_of_queue = false;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            match buf.pop_for_epoch_timeout(ep, Duration::from_millis(50)) {
+                Some(StreamEvent::TrackStart { path, .. }) => {
+                    started_paths.push(path);
+                    loop {
+                        match buf.try_pop_track_pcm_block(ep) {
+                            PopBlockResult::Block(b) => {
+                                if started_paths.len() == 1 {
+                                    track_a_frames.extend_from_slice(&b.frames);
+                                }
+                            }
+                            PopBlockResult::Underrun => thread::sleep(Duration::from_millis(2)),
+                            PopBlockResult::TrackEnd | PopBlockResult::StaleOrClosed => break,
+                        }
+                    }
+                }
+                Some(StreamEvent::EndOfQueue(_)) => {
+                    saw_end_of_queue = true;
+                    break;
+                }
+                Some(StreamEvent::FatalError(err)) => panic!("unexpected FatalError: {err}"),
+                _ => {}
+            }
+        }
+
+        buf.close();
+        ctrl.set(ep + 1, ProducerDirective::Shutdown);
+        handle.join().unwrap();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(saw_end_of_queue, "expected EndOfQueue after corrupt Track B");
+        assert_eq!(
+            started_paths.len(),
+            1,
+            "corrupt pre-PCM Track B must NOT emit TrackStart: {started_paths:?}"
+        );
+        // Track A produced n_a * 8 = 80,000 main frames + ~35,000-tap echo tail -> MUST exceed
+        // 80,000 + 30,000 frames and contain non-zero echo energy in the tail!
+        assert!(
+            track_a_frames.len() >= n_a * 8 + 30_000,
+            "Track A REW tail was lost after Track B's short valid prefix errored! got {} frames",
+            track_a_frames.len()
+        );
+        let echo_tail_energy: i64 = track_a_frames[(n_a * 8 + 10_000)..(n_a * 8 + 30_000)]
+            .iter()
+            .map(|f| i64::from(f[0]).abs())
+            .sum();
+        assert!(
+            echo_tail_energy > 0,
+            "Track A REW echo tail energy must be preserved across Track B post-handoff failure"
+        );
+    }
+
+    #[test]
+    fn convolver_only_handoff_without_rew_keeps_clean_carryover_flag_for_zero_ms_next() {
+        // Review #4 Finding #14: with REW off (default), 44.1k -> 88.2k uses ConvolverOnlyHandoff
+        // which drains all upsampler history onto A and attaches NOTHING to B. TrackStart(B) MUST
+        // have `had_gapless_carryover == false` so mid-track Next on A reuses B without flushing!
+        use flac_codec::encode::{FlacSampleWriter, Options};
+        use std::fs;
+
+        let root = std::env::temp_dir().join(format!(
+            "ap_cli_conv_only_no_rew_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let write_flac = |path: &Path, rate: u32, frames: usize| {
+            let mut w = FlacSampleWriter::create(path, Options::default(), rate, 16, 2, None)
+                .unwrap();
+            let samples = vec![4_000_i32; frames * 2];
+            w.write(&samples).unwrap();
+            w.finalize().unwrap();
+        };
+        write_flac(&root.join("01_44k.flac"), 44_100, 512);
+        write_flac(&root.join("02_88k.flac"), 88_200, 512);
+
+        let pipeline = AudioPipeline::new(UpsamplerPolicy::default()).unwrap();
+        let shared = SharedControl::new(root.clone(), "Mock DAC");
+        let buf = BoundedBlockStreamBuffer::new(DEFAULT_MAX_BUFFERED_FRAMES);
+        let ep = buf.reset_and_flush();
+        let ctrl = ProducerControl::new(
+            ep,
+            ProducerDirective::Active(PlayDirective::Sequential {
+                root: root.clone(),
+                seq_gen: 1,
+                start_after: None,
+                folder_only: false,
+                skip_count: 0,
+            }),
+        );
+
+        let p_ctrl = Arc::clone(&ctrl);
+        let p_buf = Arc::clone(&buf);
+        let p_shared = Arc::clone(&shared);
+        let handle = thread::spawn(move || producer_loop(pipeline, p_ctrl, p_buf, p_shared));
+
+        let mut starts: Vec<(PathBuf, bool)> = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && starts.len() < 2 {
+            match buf.pop_for_epoch_timeout(ep, Duration::from_millis(50)) {
+                Some(StreamEvent::TrackStart {
+                    path,
+                    had_gapless_carryover,
+                    ..
+                }) => {
+                    starts.push((path, had_gapless_carryover));
+                    loop {
+                        match buf.try_pop_track_pcm_block(ep) {
+                            PopBlockResult::Block(_) => {}
+                            PopBlockResult::Underrun => thread::sleep(Duration::from_millis(2)),
+                            PopBlockResult::TrackEnd | PopBlockResult::StaleOrClosed => break,
+                        }
+                    }
+                }
+                Some(StreamEvent::EndOfQueue(_)) => break,
+                _ => {}
+            }
+        }
+
+        buf.close();
+        ctrl.set(ep + 1, ProducerDirective::Shutdown);
+        handle.join().unwrap();
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(starts.len(), 2);
+        assert_eq!(
+            starts[1].1, false,
+            "44.1k->88.2k ConvolverOnlyHandoff with REW off must NOT set had_gapless_carryover=true on Track B"
+        );
+    }
+
+    #[test]
+    fn consumer_step_handles_prebuffer_requeue_and_resumes_interrupted_track_on_rejected_playfile() {
+        // Review #4 Findings #15 & #20: exercise REAL `step_consumer_once` with a mock sink to
+        // verify:
+        // 1. Next arriving during TrackStart prebuffer after natural Track 1 EOF re-queues
+        //    TrackStart(02) and plays 02 (no double-skip to 03).
+        // 2. A rejected TOCTOU PlayFile interrupting an active track resumes playing that track's
+        //    remaining PCM blocks instead of discarding them as orphans and jumping to Track 2!
+        let root = std::env::temp_dir().join(format!(
+            "ap_cli_consumer_step_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&root);
+        let f01 = root.join("01.flac");
+        let f02 = root.join("02.flac");
+
+        let dummy_report = AudioPipeline::new(UpsamplerPolicy::default())
+            .unwrap()
+            .start_track(
+                ap_core::format::StreamSpec {
+                    sample_rate_hz: 44_100,
+                    bits_per_sample: 16,
+                    channels: 2,
+                },
+                &ap_core::headroom::TrackPeakMetadata::default(),
+                false,
+            )
+            .unwrap()
+            .report()
+            .clone();
+
+        struct MockBlockSink {
+            stop_flag: Arc<AtomicBool>,
+            /// Optional command injected on first block pull to simulate mid-track interruption.
+            inject_once: Option<(Arc<SharedControl>, ControlCommand)>,
+            frames_consumed_per_call: Vec<usize>,
+        }
+        impl BlockStreamAudioSink for MockBlockSink {
+            fn play_block_stream<F>(
+                &mut self,
+                sample_rate_hz: u32,
+                wire_format: DacWireFormat,
+                mut next_block: F,
+            ) -> Result<PlaybackStats, OutputError>
+            where
+                F: FnMut() -> ap_output_win::wdm_ks::StreamBlock,
+            {
+                let mut frames = 0usize;
+                loop {
+                    if self.stop_flag.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    match next_block() {
+                        ap_output_win::wdm_ks::StreamBlock::Ready(b) => {
+                            frames += b.frames.len();
+                            if let Some((shared, cmd)) = self.inject_once.take() {
+                                shared.submit_command(cmd);
+                                break;
+                            }
+                        }
+                        ap_output_win::wdm_ks::StreamBlock::Underrun => break,
+                        ap_output_win::wdm_ks::StreamBlock::EndOfTrack => break,
+                    }
+                }
+                self.frames_consumed_per_call.push(frames);
+                Ok(PlaybackStats {
+                    device_name: "Mock DAC".to_string(),
+                    sample_rate_hz,
+                    wire_format,
+                    frames_played: frames,
+                    wavert_buffer_bytes: 0,
+                    notifications: 1,
+                    mmcss_pro_audio: false,
+                })
+            }
+        }
+
+        // Part 1 (Finding #15): Next arrives during TrackStart(02) prebuffer after natural Track 01 EOF.
+        let buf = BoundedBlockStreamBuffer::new(DEFAULT_MAX_BUFFERED_FRAMES);
+        let ep0 = buf.current_epoch();
+        let init = PlayDirective::Sequential {
+            root: root.clone(),
+            seq_gen: 1,
+            start_after: None,
+            folder_only: false,
+            skip_count: 0,
+        };
+        let prod_ctrl = ProducerControl::new(ep0, ProducerDirective::Active(init.clone()));
+        let shared = SharedControl::new(root.clone(), "Mock DAC");
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        shared.attach_sink_stop_flag(Arc::clone(&stop_flag));
+        let controller = ShutdownController::new();
+        let mut state = EngineState::new(ep0, init, &buf, &prod_ctrl, &shared);
+        state.record_anchor(f01.clone());
+        state.just_skipped_track = false;
+
+        // Push TrackStart(02) with only 64 frames (below 2 s prebuffer watermark, no TrackEnd yet)
+        // so `step_consumer_once` enters the real prebuffer loop at lines 546-577.
+        assert!(buf.push_for_epoch(
+            ep0,
+            StreamEvent::TrackStart {
+                path: f02.clone(),
+                mode_label: PlayModeLabel::Sequential,
+                report: dummy_report.clone(),
+                total_duration_s: Some(5.0),
+                had_gapless_carryover: true,
+            }
+        ));
+        assert!(buf.push_for_epoch(
+            ep0,
+            StreamEvent::PcmBlock(ap_core::buffer::InterleavedInt32Buffer {
+                sample_rate_hz: 352_800,
+                frames: vec![[1, -1]; 64],
+            })
+        ));
+        let shared_bg = shared.clone();
+        let injector = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(25));
+            shared_bg.submit_command(ControlCommand::Next);
+        });
+        let mut mock_sink = MockBlockSink {
+            stop_flag: Arc::clone(&stop_flag),
+            inject_once: None,
+            frames_consumed_per_call: Vec::new(),
+        };
+        assert_eq!(
+            step_consumer_once(
+                &mut state,
+                &buf,
+                &shared,
+                &controller,
+                &stop_flag,
+                &mut mock_sink,
+                || false,
+            ),
+            ConsumerStepResult::Continue
+        );
+        injector.join().unwrap();
+        // TrackStart(02) must have been re-queued and retained (NOT double-skipped!).
+        assert!(mock_sink.frames_consumed_per_call.is_empty());
+        assert!(buf.push_for_epoch(ep0, StreamEvent::TrackEnd));
+        assert_eq!(
+            step_consumer_once(
+                &mut state,
+                &buf,
+                &shared,
+                &controller,
+                &stop_flag,
+                &mut mock_sink,
+                || false,
+            ),
+            ConsumerStepResult::Continue
+        );
+        assert_eq!(mock_sink.frames_consumed_per_call, vec![64]);
+        assert_eq!(state.last_started_track.as_ref(), Some(&f02));
+
+        // Part 2 (Finding #20): Rejected TOCTOU PlayFile during active Track 01 resumes Track 01!
+        let buf2 = BoundedBlockStreamBuffer::new(DEFAULT_MAX_BUFFERED_FRAMES);
+        let ep2 = buf2.current_epoch();
+        let init2 = PlayDirective::Sequential {
+            root: root.clone(),
+            seq_gen: 2,
+            start_after: None,
+            folder_only: false,
+            skip_count: 0,
+        };
+        let prod_ctrl2 = ProducerControl::new(ep2, ProducerDirective::Active(init2.clone()));
+        let shared2 = SharedControl::new(root.clone(), "Mock DAC");
+        let stop_flag2 = Arc::new(AtomicBool::new(false));
+        shared2.attach_sink_stop_flag(Arc::clone(&stop_flag2));
+        let mut state2 = EngineState::new(ep2, init2, &buf2, &prod_ctrl2, &shared2);
+
+        assert!(buf2.push_for_epoch(
+            ep2,
+            StreamEvent::TrackStart {
+                path: f01.clone(),
+                mode_label: PlayModeLabel::Sequential,
+                report: dummy_report.clone(),
+                total_duration_s: Some(1.0),
+                had_gapless_carryover: false,
+            }
+        ));
+        assert!(buf2.push_for_epoch(
+            ep2,
+            StreamEvent::PcmBlock(ap_core::buffer::InterleavedInt32Buffer {
+                sample_rate_hz: 352_800,
+                frames: vec![[10, -10]; 100],
+            })
+        ));
+        assert!(buf2.push_for_epoch(
+            ep2,
+            StreamEvent::PcmBlock(ap_core::buffer::InterleavedInt32Buffer {
+                sample_rate_hz: 352_800,
+                frames: vec![[20, -20]; 200],
+            })
+        ));
+        assert!(buf2.push_for_epoch(ep2, StreamEvent::TrackEnd));
+        assert!(buf2.push_for_epoch(
+            ep2,
+            StreamEvent::TrackStart {
+                path: f02.clone(),
+                mode_label: PlayModeLabel::Sequential,
+                report: dummy_report,
+                total_duration_s: Some(1.0),
+                had_gapless_carryover: false,
+            }
+        ));
+
+        let mut sink2 = MockBlockSink {
+            stop_flag: Arc::clone(&stop_flag2),
+            // After consuming block 1 (100 frames), inject a deleted/nonexistent PlayFile!
+            inject_once: Some((
+                shared2.clone(),
+                ControlCommand::PlayFile(root.join("deleted_toctou.flac")),
+            )),
+            frames_consumed_per_call: Vec::new(),
+        };
+        assert_eq!(
+            step_consumer_once(
+                &mut state2,
+                &buf2,
+                &shared2,
+                &controller,
+                &stop_flag2,
+                &mut sink2,
+                || false,
+            ),
+            ConsumerStepResult::Continue
+        );
+        // Must have played block 1 (100 frames), caught rejected PlayFile, and immediately
+        // resumed block 2 (200 frames) of Track 01 without discarding it or jumping to Track 02!
+        assert_eq!(
+            sink2.frames_consumed_per_call,
+            vec![100, 200],
+            "rejected PlayFile must resume remaining 200 frames of Track 01 instead of discarding them"
+        );
+        assert_eq!(state2.last_started_track.as_ref(), Some(&f01));
+        // Track 02 must still sit cleanly at the front of the buffer ready to play next!
+        match buf2.pop_for_epoch_timeout(ep2, Duration::from_millis(20)) {
+            Some(StreamEvent::TrackStart { path, .. }) => assert_eq!(path, f02),
+            other => panic!("expected TrackStart(02.flac) still queued, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
