@@ -297,12 +297,39 @@ fn parses_true_peak_tags_in_linear_and_dbtp_forms_separately_from_sample_peak() 
     let m_q78_tp = parse_peak_metadata_fields(&["TRUE_PEAK=-768".to_string()]);
     assert_eq!(m_q78_tp.true_peak_linear, None);
 
-    // REPLAYGAIN_TRACK_TRUE_PEAK uses linear amplitude by spec (rejecting '+0.3' dBTP syntax).
-    let m2 = parse_peak_metadata_fields(&["REPLAYGAIN_TRACK_TRUE_PEAK=0.625".to_string()]);
+    // Review #4 Follow-up flac.rs:267: bare positive REPLAYGAIN_TRACK_TRUE_PEAK without a
+    // companion REPLAYGAIN_TRACK_PEAK tag (e.g. "0.5" meant as +0.5 dBTP) MUST be rejected!
+    let m2_ambig = parse_peak_metadata_fields(&["REPLAYGAIN_TRACK_TRUE_PEAK=0.5".to_string()]);
+    assert_eq!(m2_ambig.true_peak_linear, None);
+    assert!(!m2_ambig.has_verified_true_peak());
+
+    // When accompanied by a confirming REPLAYGAIN_TRACK_PEAK (standard loudgain/foobar2000 pair),
+    // bare positive linear REPLAYGAIN_TRACK_TRUE_PEAK is accepted.
+    let m2 = parse_peak_metadata_fields(&[
+        "REPLAYGAIN_TRACK_PEAK=0.600000".to_string(),
+        "REPLAYGAIN_TRACK_TRUE_PEAK=0.625000".to_string(),
+    ]);
     assert_eq!(m2.true_peak_linear, Some(0.625));
     assert!(m2.has_verified_true_peak());
-    let m2_plus = parse_peak_metadata_fields(&["REPLAYGAIN_TRACK_TRUE_PEAK=+0.3".to_string()]);
+    let m2_plus = parse_peak_metadata_fields(&[
+        "REPLAYGAIN_TRACK_PEAK=0.600000".to_string(),
+        "REPLAYGAIN_TRACK_TRUE_PEAK=+0.3".to_string(),
+    ]);
     assert_eq!(m2_plus.true_peak_linear, None);
+
+    // Explicit dBTP or bare negative dBTP on REPLAYGAIN_TRACK_TRUE_PEAK is unambiguous even alone.
+    let m2_db = parse_peak_metadata_fields(&["REPLAYGAIN_TRACK_TRUE_PEAK=-4.0 dBTP".to_string()]);
+    assert!((m2_db.true_peak_linear.unwrap() - 10.0_f64.powf(-4.0 / 20.0)).abs() < 1e-12);
+    let m2_neg = parse_peak_metadata_fields(&["REPLAYGAIN_TRACK_TRUE_PEAK=-4.0".to_string()]);
+    assert!((m2_neg.true_peak_linear.unwrap() - 10.0_f64.powf(-4.0 / 20.0)).abs() < 1e-12);
+
+    // True peak > +6 dBTP counts as unknown (cannot unlock 0 dB or drop ISP allowance).
+    let m_over_6 = parse_peak_metadata_fields(&[
+        "REPLAYGAIN_TRACK_PEAK=0.5".to_string(),
+        "TRUE_PEAK=+7.5 dBTP".to_string(),
+    ]);
+    assert_eq!(m_over_6.classified_peak(), None);
+    assert!(!m_over_6.has_verified_true_peak());
 
     // R128_TRACK_TRUE_PEAK requires explicit dB/dBTP suffix so bare Q7.8 integer '-768' is rejected.
     let m3_bad = parse_peak_metadata_fields(&["R128_TRACK_TRUE_PEAK=-768".to_string()]);

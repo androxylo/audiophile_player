@@ -81,14 +81,13 @@ Every processing stage must prioritize mathematical purity:
 - **No Compromise for Lower-Rate DACs:** Output runs natively at `352.8 / 384 kHz` with **zero downsampling** on Gungnir 2 (and other Unison 384 / 384 kHz-capable DACs such as Bifrost 3). Users with DACs that do not support `352.8 / 384 kHz` accept a slight penalty (e.g., end-stage downsampling if ever added) and are gently recommended to upgrade.
 - Because there is **no real-time constraint**, computationally intensive algorithms (up to the strict **4,000,000-tap cap**, offline/whole-track or large-block processing, pure high-precision floating-point arithmetic) are viable and encouraged wherever they improve fidelity.
 
-### 5.2 Safety Headroom (`-3 dB` to `0 dB`, Never Boosting)
+### 5.2 Safety Headroom (`-3 dB` / `0 dB` Upsampler & Excess-Only Convolution Scaling, Never Boosting)
 - **No user volume control.**
 - **Never increase volume (strictly ≤ 0 dB gain):** Digital gain boosting (`> 0 dB`) is strictly non-audiophile-compliant and forbidden.
-- **FLAC ReplayGain & True Peak Aware Attenuation (`-3 dB` vs. `0 dB`):**
-  - Read **ReplayGain** and **True Peak** metadata annotations in FLAC files when present.
-  - For quiet / well-mastered tracks where the peak level does not require `-3 dB` safety attenuation, skip the `-3 dB` reduction (`0 dB` gain), giving low-volume recordings a natural leveling advantage without ever boosting.
-  - **Unknown Peak Fail-Safe:** Whenever a track's maximum level is unknown (e.g., untagged FLAC or live Tidal stream), **always apply the full `-3 dB` safety attenuation**.
-  - Exact switching threshold / curve between `-3 dB` and `0 dB` (and interaction with REW convolution peak gain) will be finalized in `INV-04`.
+- **Decided Per-Track Headroom Policy (`HEADROOM_DESIGN.md`):**
+  - Read **ReplayGain** and **True Peak** metadata annotations in FLAC files when present (with realism checks: sample-peak tags `> 0 dBFS` count as true peaks; true peaks `> +6 dBTP` count as unknown; ambiguous unitless positive true-peak tags without confirming sample-peak tags are rejected).
+  - **Upsampler gain `G_up` is strictly `-3 dB` or `0 dB`:** `0 dB` when the realistic metadata (or full-scan) peak is `<= -3.0 dBFS`, and `-3 dB` otherwise. An unknown peak (e.g., untagged FLAC or live Tidal stream) counts as `0.0 dBFS` (`-3 dB` fail-safe).
+  - **Convolution excess-only scaling:** REW filters are never normalized at load so their boosts fill hardware dips on purpose. Active convolution is scaled only by the excess over `0 dBFS` of `P + A_isp + G_up + max(G_c, 0)` (or `M + G_up` when a full-scan post-chain peak `M` exists), where `A_isp = 3 dB` for sample-peak or unknown peaks and `0 dB` for true peaks, and `G_c = max |H(f)|` has no cap. Time-domain `L1` is diagnostic only.
 
 ### 5.3 Stereo Convolution (REW) — Core First-Class Feature
 - **Main Feature (Not a Sidecar):** Applying **stereo convolution filters** produced by **REW (Room EQ Wizard)** is a primary, first-class feature of the engine, deeply integrated into the locked `352.8 / 384 kHz` floating-point DSP pipeline.

@@ -264,8 +264,10 @@ pub struct DecodedFlacInt32 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TruePeakTagUnit {
-    /// `REPLAYGAIN_*_TRUE_PEAK`: ReplayGain convention is linear amplitude (`> 0.0`, no `'+'`),
-    /// or explicit `dB` / `dBTP` suffix.
+    /// `REPLAYGAIN_*_TRUE_PEAK`: explicit `dB`/`dBTP` suffix, bare negative dBTP (`[-120, 0]`),
+    /// or bare positive linear amplitude ONLY when cross-checked against a companion
+    /// `REPLAYGAIN_*_PEAK` sample-peak tag (prevents bare `+0.5 dBTP` written as `"0.5"` without
+    /// a sample-peak tag from being misinterpreted as `-6.02 dBFS`).
     ReplayGainLinearOrExplicitDb,
     /// `TRUE_PEAK`: explicit `dB` / `dBTP` suffix, or unambiguous bare negative dBTP in
     /// `[-120.0, 0.0]`. Bare positive values (`0.3`, `+0.3`) are ambiguous between hot dBTP and
@@ -276,10 +278,18 @@ enum TruePeakTagUnit {
     ExplicitDbOnly,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ParsedTruePeak {
+    /// Unambiguous value (from explicit `dB`/`dBTP` suffix or bare negative dBTP).
+    Unambiguous(f64),
+    /// Bare positive ReplayGain linear candidate requiring companion sample-peak cross-check.
+    BarePositiveLinearCandidate(f64),
+}
+
 /// Parse a True Peak Vorbis comment value with strict unit disambiguation so a hot master
-/// tagged as unitless positive dBTP (`+0.3` / `0.3`) or an R128 Q7.8 integer (`-768`) can NEVER
-/// be misinterpreted as a quiet linear peak.
-fn parse_true_peak_linear(raw: &str, unit: TruePeakTagUnit) -> Option<f64> {
+/// tagged as unitless positive dBTP (`+0.3` / `0.3` / `0.5`) or an R128 Q7.8 integer (`-768`)
+/// can NEVER be misinterpreted as a quiet linear peak.
+fn parse_true_peak_value(raw: &str, unit: TruePeakTagUnit) -> Option<ParsedTruePeak> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
@@ -302,16 +312,20 @@ fn parse_true_peak_linear(raw: &str, unit: TruePeakTagUnit) -> Option<f64> {
 
     if has_db_suffix {
         if (-120.0..=24.0).contains(&val) {
-            Some(10.0_f64.powf(val / 20.0))
+            Some(ParsedTruePeak::Unambiguous(10.0_f64.powf(val / 20.0)))
         } else {
             None
         }
     } else {
         match unit {
             TruePeakTagUnit::ReplayGainLinearOrExplicitDb => {
-                // Reject leading '+' (almost certainly dBTP) and implausible amplitudes.
-                if !num_str.starts_with('+') && val > 0.0 && val <= 16.0 {
-                    Some(val)
+                if num_str.starts_with('-') && (-120.0..=0.0).contains(&val) {
+                    // Negative values cannot be linear amplitudes -> unambiguous dBTP.
+                    Some(ParsedTruePeak::Unambiguous(10.0_f64.powf(val / 20.0)))
+                } else if !num_str.starts_with('+') && val > 0.0 && val <= 16.0 {
+                    // Bare positive linear candidate: requires companion sample-peak tag to
+                    // rule out unitless hot dBTP like `REPLAYGAIN_TRACK_TRUE_PEAK=0.5`.
+                    Some(ParsedTruePeak::BarePositiveLinearCandidate(val))
                 } else {
                     None
                 }
@@ -320,7 +334,7 @@ fn parse_true_peak_linear(raw: &str, unit: TruePeakTagUnit) -> Option<f64> {
                 // Only unambiguous bare negative dBTP (e.g. `-4.2`); reject bare positive (`0.3`,
                 // `+0.3`, `0.0`) and Q7.8-like `< -120.0`.
                 if num_str.starts_with('-') && (-120.0..=0.0).contains(&val) {
-                    Some(10.0_f64.powf(val / 20.0))
+                    Some(ParsedTruePeak::Unambiguous(10.0_f64.powf(val / 20.0)))
                 } else {
                     None
                 }
@@ -333,7 +347,8 @@ fn parse_true_peak_linear(raw: &str, unit: TruePeakTagUnit) -> Option<f64> {
 /// Parse ReplayGain / peak Vorbis comment tags from a `VorbisComment` metadata block.
 pub fn parse_peak_metadata_fields(fields: &[String]) -> TrackPeakMetadata {
     let mut meta = TrackPeakMetadata::default();
-    let mut album_true_peak: Option<f64> = None;
+    let mut track_tp_candidate: Option<ParsedTruePeak> = None;
+    let mut album_tp_candidate: Option<ParsedTruePeak> = None;
     for field in fields {
         let Some((k, v)) = field.split_once('=') else {
             continue;
@@ -347,34 +362,34 @@ pub fn parse_peak_metadata_fields(fields: &[String]) -> TrackPeakMetadata {
             "REPLAYGAIN_TRACK_GAIN" => meta.replaygain_track_gain_db = val_num,
             "REPLAYGAIN_TRACK_PEAK" => meta.replaygain_track_peak = val_num,
             "TRUE_PEAK" => {
-                if let Some(lin) = parse_true_peak_linear(v, TruePeakTagUnit::TruePeakDbOnly) {
-                    meta.true_peak_linear = Some(lin);
+                if let Some(parsed) = parse_true_peak_value(v, TruePeakTagUnit::TruePeakDbOnly) {
+                    track_tp_candidate = Some(parsed);
                 }
             }
             "REPLAYGAIN_TRACK_TRUE_PEAK" => {
-                if let Some(lin) =
-                    parse_true_peak_linear(v, TruePeakTagUnit::ReplayGainLinearOrExplicitDb)
+                if let Some(parsed) =
+                    parse_true_peak_value(v, TruePeakTagUnit::ReplayGainLinearOrExplicitDb)
                 {
-                    meta.true_peak_linear = Some(lin);
+                    track_tp_candidate = Some(parsed);
                 }
             }
             "R128_TRACK_TRUE_PEAK" => {
-                if let Some(lin) = parse_true_peak_linear(v, TruePeakTagUnit::ExplicitDbOnly) {
-                    meta.true_peak_linear = Some(lin);
+                if let Some(parsed) = parse_true_peak_value(v, TruePeakTagUnit::ExplicitDbOnly) {
+                    track_tp_candidate = Some(parsed);
                 }
             }
             "REPLAYGAIN_ALBUM_GAIN" => meta.replaygain_album_gain_db = val_num,
             "REPLAYGAIN_ALBUM_PEAK" => meta.replaygain_album_peak = val_num,
             "REPLAYGAIN_ALBUM_TRUE_PEAK" => {
-                if let Some(lin) =
-                    parse_true_peak_linear(v, TruePeakTagUnit::ReplayGainLinearOrExplicitDb)
+                if let Some(parsed) =
+                    parse_true_peak_value(v, TruePeakTagUnit::ReplayGainLinearOrExplicitDb)
                 {
-                    album_true_peak = Some(lin);
+                    album_tp_candidate = Some(parsed);
                 }
             }
             "R128_ALBUM_TRUE_PEAK" => {
-                if let Some(lin) = parse_true_peak_linear(v, TruePeakTagUnit::ExplicitDbOnly) {
-                    album_true_peak = Some(lin);
+                if let Some(parsed) = parse_true_peak_value(v, TruePeakTagUnit::ExplicitDbOnly) {
+                    album_tp_candidate = Some(parsed);
                 }
             }
             "R128_TRACK_GAIN" => {
@@ -386,9 +401,30 @@ pub fn parse_peak_metadata_fields(fields: &[String]) -> TrackPeakMetadata {
             _ => {}
         }
     }
-    if meta.true_peak_linear.is_none() {
-        meta.true_peak_linear = album_true_peak;
-    }
+
+    let resolve_candidate = |cand: Option<ParsedTruePeak>, companion_sp: Option<f64>| -> Option<f64> {
+        match cand? {
+            ParsedTruePeak::Unambiguous(lin) => Some(lin),
+            ParsedTruePeak::BarePositiveLinearCandidate(lin) => {
+                // Only accept a bare positive ReplayGain true-peak value when a realistic
+                // companion sample-peak tag confirms linear scaling (`tp >= sp * 0.995`).
+                let sp = companion_sp?;
+                if sp.is_finite() && sp > 0.0 && lin >= sp * 0.995 {
+                    Some(lin)
+                } else {
+                    None
+                }
+            }
+        }
+    };
+
+    meta.true_peak_linear = resolve_candidate(track_tp_candidate, meta.replaygain_track_peak)
+        .or_else(|| {
+            resolve_candidate(
+                album_tp_candidate,
+                meta.replaygain_album_peak.or(meta.replaygain_track_peak),
+            )
+        });
 
     // Mathematical sanity cross-check: True Peak can never be lower than discrete sample peak.
     // If a mis-tagged or mis-unit-ed True Peak falls below the track's sample peak (beyond 0.5%

@@ -441,20 +441,12 @@ impl AudioPipeline {
             .delayer_factory
             .create_for_rate(dsp_plan.target_rate_hz)?;
 
-        // When a verified True Peak tag is present, inter-sample peaks are already measured
-        // directly; otherwise add the conservative sample-peak ISP safety margin whenever a
-        // non-null upsampler reconstructs inter-sample peaks.
-        let upsampler_isp_margin_db =
-            if dsp_plan.filter != FilterArchetype::Null && !peak_meta.has_verified_true_peak() {
-                UPSAMPLER_ISP_SAFETY_MARGIN_DB
-            } else {
-                0.0
-            };
-        let mut headroom = select_headroom(
-            peak_meta,
-            is_streaming_source,
-            convolver.peak_gain_bound_db() + upsampler_isp_margin_db,
-        );
+        let active_conv_gain_db = if convolver.name() != "null-convolver" {
+            Some(convolver.peak_gain_bound_db())
+        } else {
+            None
+        };
+        let mut headroom = select_headroom(peak_meta, is_streaming_source, active_conv_gain_db, None);
 
         // If an equal-rate decaying REW tail from the previous track will overlap-add onto this
         // track's opening (either via full handoff or convolver-only handoff), ensure
@@ -476,14 +468,14 @@ impl AudioPipeline {
                         let track_peak_lin = peak_meta
                             .effective_peak_linear()
                             .map_or(1.0, |(p, _)| p);
-                        let bound_lin = 10.0_f64.powf(
-                            (convolver.peak_gain_bound_db() + upsampler_isp_margin_db) / 20.0,
-                        );
+                        let bound_lin = 10.0_f64.powf(convolver.peak_gain_bound_db() / 20.0);
                         let combined_peak = track_peak_lin * bound_lin + total_tail_peak;
                         if combined_peak > 1.0 {
                             headroom = HeadroomDecision {
                                 mode: HeadroomMode::Minus3Db,
                                 peak_dbfs: headroom.peak_dbfs,
+                                peak_kind: headroom.peak_kind,
+                                convolution_scale_db: headroom.convolution_scale_db,
                                 reason: format!(
                                     "incoming gapless REW tail ({:.3}) + track peak bound ({:.3}) = {:.3} > 1.0 -> -3 dB",
                                     total_tail_peak,
