@@ -82,7 +82,8 @@ function Find-PlayerUiUrlFast([int[]]$ProcessIds) {
 
 function Find-PlayerUiUrlFallbackScan {
     # Final fallback only if both server.url and Get-NetTCPConnection failed to identify the port.
-    for ($port = 8085; $port -le 8105; $port++) {
+    # Scans the full server port range (8085..8199) matching ap-control's DEFAULT_PORT_START..END.
+    for ($port = 8085; $port -le 8199; $port++) {
         $tcp = New-Object System.Net.Sockets.TcpClient
         $connected = $false
         try {

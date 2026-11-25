@@ -19,18 +19,19 @@
 //!   connections to bounded short-lived worker threads so slow clients or drives never stall
 //!   `/api/status` or `ControlServer::shutdown`.
 
+use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::browser::{
-    decode_path_token, encode_path_token, list_folder_entries_in_root, parse_form_param,
-    url_encode,
+    FolderListing, decode_path_token, encode_path_token, list_folder_entries_in_root,
+    parse_form_param, url_encode,
 };
 use crate::html::{render_control_page, render_status_json};
 use crate::security::{
@@ -61,43 +62,110 @@ pub const CONNECTION_TOTAL_DEADLINE: Duration = Duration::from_secs(10);
 const RESPONSE_WRITE_CHUNK_BYTES: usize = 16 * 1024;
 /// Maximum concurrent connection worker threads.
 pub const MAX_CONCURRENT_WORKERS: usize = 16;
+/// Maximum concurrent blocking filesystem helpers allowed for a single storage root/volume
+/// (`MAX_FS_HELPERS_PER_ROOT < MAX_CONCURRENT_WORKERS`), so one stalled NAS share or dead USB
+/// drive can NEVER saturate the global helper pool and starve local drives (Review #4 Finding #3).
+pub const MAX_FS_HELPERS_PER_ROOT: usize = 4;
 
-static ACTIVE_FS_HELPERS: AtomicUsize = AtomicUsize::new(0);
+#[derive(Default)]
+struct FsHelperPoolState {
+    total: usize,
+    per_root: HashMap<String, usize>,
+}
+
+fn fs_helper_pool() -> &'static Mutex<FsHelperPoolState> {
+    static POOL: OnceLock<Mutex<FsHelperPoolState>> = OnceLock::new();
+    POOL.get_or_init(|| Mutex::new(FsHelperPoolState::default()))
+}
+
+/// Derive a stable volume/share concurrency bucket key for `path` (e.g. `unc:\\nas\music` or
+/// `drive:c`) so stalled I/O on one share or drive is isolated from every other volume.
+pub fn fs_volume_key(path: &Path) -> String {
+    if let Some((srv, share)) = extract_unc_share(path) {
+        return format!("unc:\\\\{srv}\\{share}");
+    }
+    if let Some(Component::Prefix(p)) = path.components().next() {
+        match p.kind() {
+            Prefix::Disk(d) | Prefix::VerbatimDisk(d) => {
+                return format!("drive:{}", (d as char).to_ascii_lowercase());
+            }
+            Prefix::Verbatim(v) => {
+                return format!("vol:{}", v.to_string_lossy().to_ascii_lowercase());
+            }
+            _ => {}
+        }
+    }
+    "local".to_string()
+}
 
 /// Run a potentially blocking filesystem validation or directory-listing closure with a strict
-/// wall-clock timeout and a bounded concurrency cap so a stalled NAS/USB drive can never pin
-/// HTTP worker slots or prevent `POST /action/pause` from releasing the DAC.
+/// wall-clock timeout, a per-volume concurrency cap ([`MAX_FS_HELPERS_PER_ROOT`]), and a global
+/// cap ([`MAX_CONCURRENT_WORKERS`]) so a stalled NAS/USB drive can never starve local drives or
+/// prevent `POST /action/pause` from releasing the DAC.
+pub fn run_fs_op_bounded_for_key<T, F>(key: &str, timeout: Duration, op: F) -> Result<T, ()>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let key_owned = key.to_string();
+    {
+        let mut pool = fs_helper_pool().lock().unwrap_or_else(|e| e.into_inner());
+        let root_active = pool.per_root.get(&key_owned).copied().unwrap_or(0);
+        if pool.total >= MAX_CONCURRENT_WORKERS || root_active >= MAX_FS_HELPERS_PER_ROOT {
+            return Err(());
+        }
+        pool.total += 1;
+        *pool.per_root.entry(key_owned.clone()).or_insert(0) += 1;
+    }
+
+    struct HelperGuard {
+        key: String,
+    }
+    impl Drop for HelperGuard {
+        fn drop(&mut self) {
+            let mut pool = fs_helper_pool().lock().unwrap_or_else(|e| e.into_inner());
+            pool.total = pool.total.saturating_sub(1);
+            if let Some(cnt) = pool.per_root.get_mut(&self.key) {
+                *cnt = cnt.saturating_sub(1);
+                if *cnt == 0 {
+                    pool.per_root.remove(&self.key);
+                }
+            }
+        }
+    }
+
+    let (tx, rx) = mpsc::sync_channel(1);
+    let key_for_thread = key_owned.clone();
+    let spawned = thread::Builder::new()
+        .name("ap-http-fs".to_string())
+        .spawn(move || {
+            let _guard = HelperGuard {
+                key: key_for_thread,
+            };
+            let _ = tx.send(op());
+        });
+    if spawned.is_err() {
+        let mut pool = fs_helper_pool().lock().unwrap_or_else(|e| e.into_inner());
+        pool.total = pool.total.saturating_sub(1);
+        if let Some(cnt) = pool.per_root.get_mut(&key_owned) {
+            *cnt = cnt.saturating_sub(1);
+            if *cnt == 0 {
+                pool.per_root.remove(&key_owned);
+            }
+        }
+        return Err(());
+    }
+
+    rx.recv_timeout(timeout).map_err(|_| ())
+}
+
+/// Convenience wrapper around [`run_fs_op_bounded_for_key`] using the default bucket key.
 pub fn run_fs_op_bounded<T, F>(timeout: Duration, op: F) -> Result<T, ()>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    let prev = ACTIVE_FS_HELPERS.fetch_add(1, Ordering::AcqRel);
-    if prev >= MAX_CONCURRENT_WORKERS {
-        ACTIVE_FS_HELPERS.fetch_sub(1, Ordering::AcqRel);
-        return Err(());
-    }
-
-    struct HelperGuard;
-    impl Drop for HelperGuard {
-        fn drop(&mut self) {
-            ACTIVE_FS_HELPERS.fetch_sub(1, Ordering::AcqRel);
-        }
-    }
-
-    let (tx, rx) = mpsc::sync_channel(1);
-    let spawned = thread::Builder::new()
-        .name("ap-http-fs".to_string())
-        .spawn(move || {
-            let _guard = HelperGuard;
-            let _ = tx.send(op());
-        });
-    if spawned.is_err() {
-        ACTIVE_FS_HELPERS.fetch_sub(1, Ordering::AcqRel);
-        return Err(());
-    }
-
-    rx.recv_timeout(timeout).map_err(|_| ())
+    run_fs_op_bounded_for_key("default", timeout, op)
 }
 
 /// Path to the runtime URL discovery file (`%LOCALAPPDATA%\audiophile-player\server.url` on
@@ -507,7 +575,22 @@ fn handle_connection(
             let snap = shared.snapshot();
             let root_for_fs = allowed_root.clone();
             let fallback_dir = snap.active_folder.clone();
-            let fs_res = run_fs_op_bounded(FS_OP_DEADLINE, move || {
+            let display_dir_on_timeout = raw_dir_param
+                .as_deref()
+                .and_then(|raw| decode_path_token(raw).ok())
+                .and_then(|decoded| {
+                    let norm_root = normalize_allowed_root(&allowed_root);
+                    let allowed_unc = extract_unc_share(&norm_root);
+                    let share_ref = allowed_unc
+                        .as_ref()
+                        .map(|(s, sh)| (s.as_str(), sh.as_str()));
+                    validate_path_syntax_for_root(&decoded, share_ref)
+                        .ok()
+                        .filter(|p| lexically_within_root(p, &norm_root))
+                })
+                .unwrap_or_else(|| fallback_dir.clone());
+            let fs_key = fs_volume_key(&display_dir_on_timeout);
+            let fs_res = run_fs_op_bounded_for_key(&fs_key, FS_OP_DEADLINE, move || {
                 let browse_dir = match raw_dir_param {
                     Some(raw) => match decode_and_validate_dir(&raw, &root_for_fs) {
                         Ok(valid) => valid,
@@ -532,16 +615,24 @@ fn handle_connection(
                     return;
                 }
                 Err(()) => {
-                    write_response(
-                        stream,
-                        "504 Gateway Timeout",
-                        "text/plain; charset=utf-8",
-                        b"Storage timed out while reading folder; playback controls (Pause / Next) remain available.",
-                        None,
-                        conn_deadline,
-                        stop,
-                    );
-                    return;
+                    // Review #4 Finding #3: NEVER strand the user on a bare 504 text page with no
+                    // Pause/Next buttons! Render the full HTML control page with an empty listing
+                    // and a clear error banner so Pause, Next, and other folders stay reachable.
+                    let norm_root = normalize_allowed_root(&allowed_root);
+                    let parent_dir = display_dir_on_timeout
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .filter(|p| lexically_within_root(p, &norm_root));
+                    FolderListing {
+                        current_dir: display_dir_on_timeout,
+                        parent_dir,
+                        subdirs: Vec::new(),
+                        flac_files: Vec::new(),
+                        error: Some(
+                            "Storage timed out or is busy while reading this folder. Playback controls (Pause / Next / Play) and other folders remain available."
+                                .to_string(),
+                        ),
+                    }
                 }
             };
             let html = render_control_page(&snap, &listing);
@@ -702,9 +793,12 @@ fn handle_connection(
                 }
             };
             let root_for_fs = allowed_root.clone();
-            let valid_file = match run_fs_op_bounded(FS_OP_DEADLINE, move || {
-                validate_playable_flac_path(&decoded, Some(&root_for_fs))
-            }) {
+            let file_fs_key = fs_volume_key(&decoded);
+            let valid_file = match run_fs_op_bounded_for_key(
+                &file_fs_key,
+                FS_OP_DEADLINE,
+                move || validate_playable_flac_path(&decoded, Some(&root_for_fs)),
+            ) {
                 Ok(Ok(p)) => p,
                 Ok(Err(reason)) => {
                     write_response(
@@ -775,7 +869,12 @@ fn extract_validated_dir_bounded(
     match parse_form_param(body, "dir").filter(|s| !s.trim().is_empty()) {
         Some(raw) => {
             let root = allowed_root.to_path_buf();
-            run_fs_op_bounded(FS_OP_DEADLINE, move || decode_and_validate_dir(&raw, &root))
+            let fs_key = decode_path_token(&raw)
+                .map(|p| fs_volume_key(&p))
+                .unwrap_or_else(|_| fs_volume_key(allowed_root));
+            run_fs_op_bounded_for_key(&fs_key, FS_OP_DEADLINE, move || {
+                decode_and_validate_dir(&raw, &root)
+            })
         }
         None => Ok(Ok(shared.snapshot().active_folder)),
     }

@@ -881,3 +881,88 @@ fn pause_and_next_never_touch_filesystem_and_fs_ops_enforce_bounded_timeout() {
         "bounded FS op took too long to time out: {elapsed_fs:?}"
     );
 }
+
+#[test]
+fn stalled_root_renders_full_control_html_with_pause_and_never_starves_other_volumes() {
+    // Review #4 Finding #3 (MEDIUM):
+    // 1. Saturating the per-root helper budget for a stalled NAS (`unc:\\stalled-nas\music`)
+    //    must NOT starve operations on a local drive (`drive:c` or another root).
+    // 2. When `GET /` hits a stalled/saturated root, it MUST render the full HTML control page
+    //    (with Pause, Next, Play buttons + error banner) instead of a bare 504 text page!
+    use ap_control::server::{
+        MAX_FS_HELPERS_PER_ROOT, fs_volume_key, run_fs_op_bounded_for_key,
+    };
+    use std::sync::{Arc as StdArc, Condvar, Mutex};
+    use std::time::Duration;
+
+    let stalled_root = PathBuf::from(r"\\192.0.2.99\StalledShare");
+    let stalled_key = fs_volume_key(&stalled_root);
+    let local_dir = make_temp_music_dir("local_unstarved");
+    let local_key = fs_volume_key(&local_dir);
+    assert_ne!(stalled_key, local_key);
+
+    let release = StdArc::new((Mutex::new(false), Condvar::new()));
+
+    // Fill ALL `MAX_FS_HELPERS_PER_ROOT` slots for `stalled_key` with blocked helper threads.
+    for _ in 0..MAX_FS_HELPERS_PER_ROOT {
+        let rel = StdArc::clone(&release);
+        let res = run_fs_op_bounded_for_key(&stalled_key, Duration::from_millis(15), move || {
+            let (lock, cv) = &*rel;
+            let mut done = lock.lock().unwrap();
+            while !*done {
+                let (g, _) = cv.wait_timeout(done, Duration::from_secs(5)).unwrap();
+                done = g;
+            }
+        });
+        assert!(res.is_err(), "blocked helper should time out while holding its per-root slot");
+    }
+
+    // Now the stalled NAS bucket is 100% saturated:
+    // (a) A local-drive HTTP GET / MUST still succeed immediately (unstarved!).
+    let local_shared = SharedControl::new(local_dir.clone(), "Test DAC");
+    let mut local_server = ControlServer::start(Arc::clone(&local_shared), None).unwrap();
+    let local_port = local_server.addr().port();
+    let local_resp = http_request(
+        local_server.addr(),
+        &format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{local_port}\r\n\r\n"),
+    );
+    assert!(
+        local_resp.starts_with("HTTP/1.1 200 OK"),
+        "local drive must NOT be starved by stalled NAS helpers, got: {local_resp:?}"
+    );
+    assert!(local_resp.contains("/action/pause"));
+    local_server.shutdown();
+
+    // (b) GET / on the saturated stalled NAS MUST return full HTML with Pause/Next buttons and
+    // an error banner (NOT a bare text 504 page!).
+    let stalled_shared = SharedControl::new(stalled_root, "Test DAC");
+    let mut stalled_server = ControlServer::start(Arc::clone(&stalled_shared), None).unwrap();
+    let stalled_port = stalled_server.addr().port();
+    let stalled_resp = http_request(
+        stalled_server.addr(),
+        &format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{stalled_port}\r\n\r\n"),
+    );
+    assert!(
+        stalled_resp.starts_with("HTTP/1.1 200 OK"),
+        "GET / on stalled root must render HTML control page, not bare 504: {stalled_resp:?}"
+    );
+    assert!(
+        stalled_resp.contains("text/html"),
+        "expected text/html content-type: {stalled_resp:?}"
+    );
+    assert!(
+        stalled_resp.contains("/action/pause") && stalled_resp.contains("/action/next"),
+        "fallback page must keep Pause and Next buttons reachable!"
+    );
+    assert!(
+        stalled_resp.contains("Storage timed out or is busy"),
+        "fallback page must show clear error banner: {stalled_resp:?}"
+    );
+    stalled_server.shutdown();
+
+    // Release blocked helper threads cleanly.
+    let (lock, cv) = &*release;
+    *lock.lock().unwrap() = true;
+    cv.notify_all();
+    let _ = fs::remove_dir_all(&local_dir);
+}
