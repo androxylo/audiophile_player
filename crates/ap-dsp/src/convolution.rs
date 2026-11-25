@@ -82,9 +82,16 @@ fn compute_ir_content_hash(sample_rate_hz: u32, left: &[f64], right: &[f64]) -> 
 }
 
 /// Flush-tail threshold (`-200 dB`, 56 dB below 24-bit PCM) applied only when an IR exceeds
-/// `MAX_PARTITION_BLOCK` taps, preventing multi-second sub-`-250 dB` float noise gaps between
-/// tracks while convolving 100% of all non-zero taps during active playback.
+/// `MAX_PARTITION_BLOCK` taps in normal mode (`full_tail = false`), preventing multi-second
+/// sub-`-250 dB` float noise gaps between tracks while convolving 100% of all non-zero taps
+/// during active playback. Ultimate mode sets `full_tail = true` (U7: zero tail truncation).
 const LONG_IR_FLUSH_THRESHOLD: f64 = 1e-10;
+
+/// Minimum non-zero UPOLS partitions before spawning bit-identical bin-slice MAC threads per channel.
+const REW_PARALLEL_MAC_MIN_PARTITIONS: usize = 16;
+
+/// Number of disjoint frequency-bin worker slices per channel for large REW IRs.
+const REW_PARALLEL_MAC_SLICES: usize = 4;
 
 /// Microsoft `WAVE_FORMAT_EXTENSIBLE` SubFormat GUIDs (first 16 bytes).
 const KSDATAFORMAT_SUBTYPE_PCM: [u8; 16] = [
@@ -680,12 +687,16 @@ pub struct PreparedStereoIr {
     pub l1_norm_db: f64,
     /// Deterministic content hash (`fnv1a128:<32-hex>`) over exact loaded stereo taps and rate.
     pub content_hash: String,
+    /// True when constructed in lossless full-tail mode (`U7`: zero `-200 dB` flush truncation).
+    pub full_tail: bool,
     r2c: Arc<dyn RealToComplex<f64>>,
     c2r: Arc<dyn ComplexToReal<f64>>,
     ir_spectra_left: Vec<Vec<Complex<f64>>>,
     ir_spectra_right: Vec<Vec<Complex<f64>>>,
     nonzero_left: Vec<bool>,
     nonzero_right: Vec<bool>,
+    nonzero_count_left: usize,
+    nonzero_count_right: usize,
 }
 
 impl std::fmt::Debug for PreparedStereoIr {
@@ -715,6 +726,19 @@ impl PreparedStereoIr {
         sample_rate_hz: u32,
         left: &[f64],
         right: &[f64],
+    ) -> Result<Self, String> {
+        Self::from_stereo_ir_with_options(label, sample_rate_hz, left, right, false)
+    }
+
+    /// Prepare UPOLS FFT partitions with explicit `full_tail` control (`U7` in Ultimate Mode:
+    /// when `full_tail == true`, never truncate `flush_tail_samples` at `-200 dB`; skip only
+    /// partitions whose taps are literally `0.0`).
+    pub fn from_stereo_ir_with_options(
+        label: impl Into<String>,
+        sample_rate_hz: u32,
+        left: &[f64],
+        right: &[f64],
+        full_tail: bool,
     ) -> Result<Self, String> {
         let label = label.into();
         if left.len() != right.len() {
@@ -776,9 +800,10 @@ impl PreparedStereoIr {
             0.0
         };
 
-        // Convolve 100% of all non-zero taps during active playback; for ultra-long (>64k)
-        // REW WAVs, flush the full audible & ultrasonic tail down to -200 dB (1e-10).
-        let flush_tail_samples = if active_taps <= MAX_PARTITION_BLOCK {
+        // Convolve 100% of all non-zero taps during active playback. In ultimate mode (`full_tail`),
+        // preserve the complete active impulse tail with zero `-200 dB` truncation (`U7`); in normal
+        // mode, trim sub-`-200 dB` flush tails on ultra-long (`> 64k`) IRs.
+        let flush_tail_samples = if full_tail || active_taps <= MAX_PARTITION_BLOCK {
             active_taps.saturating_sub(1)
         } else {
             left[..active_taps]
@@ -840,6 +865,8 @@ impl PreparedStereoIr {
         }
 
         let content_hash = compute_ir_content_hash(sample_rate_hz, left, right);
+        let nonzero_count_left = nonzero_left.iter().filter(|&&b| b).count();
+        let nonzero_count_right = nonzero_right.iter().filter(|&&b| b).count();
 
         Ok(Self {
             label,
@@ -853,17 +880,30 @@ impl PreparedStereoIr {
             l1_norm,
             l1_norm_db,
             content_hash,
+            full_tail,
             r2c,
             c2r,
             ir_spectra_left,
             ir_spectra_right,
             nonzero_left,
             nonzero_right,
+            nonzero_count_left,
+            nonzero_count_right,
         })
     }
 
     pub fn from_wav(wav: &StereoImpulseWav) -> Result<Self, String> {
         Self::from_stereo_ir(&wav.label, wav.sample_rate_hz, &wav.left, &wav.right)
+    }
+
+    pub fn from_wav_with_options(wav: &StereoImpulseWav, full_tail: bool) -> Result<Self, String> {
+        Self::from_stereo_ir_with_options(
+            &wav.label,
+            wav.sample_rate_hz,
+            &wav.left,
+            &wav.right,
+            full_tail,
+        )
     }
 }
 
@@ -939,6 +979,7 @@ impl ChannelUpolsState {
     }
 
     /// Execute one exact `B`-sample UPOLS block (`[prev_block, block] -> y[B..2B]`).
+    #[allow(clippy::too_many_arguments)]
     fn process_one_block(
         &mut self,
         block: &[f64],
@@ -946,6 +987,7 @@ impl ChannelUpolsState {
         c2r: &dyn ComplexToReal<f64>,
         ir_spectra: &[Vec<Complex<f64>>],
         nonzero: &[bool],
+        nonzero_count: usize,
         out: &mut Vec<f64>,
     ) -> Result<(), String> {
         let b = self.block_size;
@@ -966,25 +1008,65 @@ impl ChannelUpolsState {
         .map_err(|e| format!("UPOLS forward FFT failed: {e}"))?;
 
         // 3. Complex MAC across all non-zero IR partitions.
-        for c in &mut self.acc_spec {
-            *c = Complex::new(0.0, 0.0);
-        }
-
         let p_count = self.num_partitions;
-        for p in 0..p_count {
-            if !nonzero[p] {
-                continue;
+        let spec_len = self.acc_spec.len();
+        let fdl = &self.fdl;
+
+        if nonzero_count >= REW_PARALLEL_MAC_MIN_PARTITIONS
+            && spec_len >= REW_PARALLEL_MAC_SLICES * 256
+        {
+            // Bit-identical disjoint bin-slice parallelism: each worker sums 0..p_count in exact
+            // order for its own frequency bins (0 ULPs difference vs sequential).
+            let chunk_len = spec_len.div_ceil(REW_PARALLEL_MAC_SLICES);
+            std::thread::scope(|s| {
+                for (slice_idx, acc_chunk) in self.acc_spec.chunks_mut(chunk_len).enumerate() {
+                    let bin_start = slice_idx * chunk_len;
+                    let bin_end = bin_start + acc_chunk.len();
+                    s.spawn(move || {
+                        for c in acc_chunk.iter_mut() {
+                            *c = Complex::new(0.0, 0.0);
+                        }
+                        for p in 0..p_count {
+                            if !nonzero[p] {
+                                continue;
+                            }
+                            let fdl_idx = if head >= p {
+                                head - p
+                            } else {
+                                head + p_count - p
+                            };
+                            let x_slice = &fdl[fdl_idx][bin_start..bin_end];
+                            let h_slice = &ir_spectra[p][bin_start..bin_end];
+                            for ((acc, &x), &h) in
+                                acc_chunk.iter_mut().zip(x_slice.iter()).zip(h_slice.iter())
+                            {
+                                acc.re += x.re * h.re - x.im * h.im;
+                                acc.im += x.re * h.im + x.im * h.re;
+                            }
+                        }
+                    });
+                }
+            });
+        } else {
+            for c in &mut self.acc_spec {
+                *c = Complex::new(0.0, 0.0);
             }
-            let fdl_idx = if head >= p {
-                head - p
-            } else {
-                head + p_count - p
-            };
-            let x_spec = &self.fdl[fdl_idx];
-            let h_spec = &ir_spectra[p];
-            for ((acc, &x), &h) in self.acc_spec.iter_mut().zip(x_spec.iter()).zip(h_spec.iter()) {
-                acc.re += x.re * h.re - x.im * h.im;
-                acc.im += x.re * h.im + x.im * h.re;
+            for p in 0..p_count {
+                if !nonzero[p] {
+                    continue;
+                }
+                let fdl_idx = if head >= p {
+                    head - p
+                } else {
+                    head + p_count - p
+                };
+                let x_spec = &fdl[fdl_idx];
+                let h_spec = &ir_spectra[p];
+                for ((acc, &x), &h) in self.acc_spec.iter_mut().zip(x_spec.iter()).zip(h_spec.iter())
+                {
+                    acc.re += x.re * h.re - x.im * h.im;
+                    acc.im += x.re * h.im + x.im * h.re;
+                }
             }
         }
 
@@ -1004,6 +1086,7 @@ impl ChannelUpolsState {
     }
 
     /// Push arbitrary-length input slice and emit all completed `B`-sample output blocks.
+    #[allow(clippy::too_many_arguments)]
     fn push_samples(
         &mut self,
         input: &[f64],
@@ -1011,6 +1094,7 @@ impl ChannelUpolsState {
         c2r: &dyn ComplexToReal<f64>,
         ir_spectra: &[Vec<Complex<f64>>],
         nonzero: &[bool],
+        nonzero_count: usize,
     ) -> Result<Vec<f64>, String> {
         let b = self.block_size;
         let total = self.pending_in.len() + input.len();
@@ -1029,7 +1113,15 @@ impl ChannelUpolsState {
             self.pending_in.extend_from_slice(&input[..need]);
             offset = need;
             let staged = std::mem::take(&mut self.pending_in);
-            self.process_one_block(&staged, r2c, c2r, ir_spectra, nonzero, &mut out)?;
+            self.process_one_block(
+                &staged,
+                r2c,
+                c2r,
+                ir_spectra,
+                nonzero,
+                nonzero_count,
+                &mut out,
+            )?;
             self.pending_in = staged;
             self.pending_in.clear();
         }
@@ -1042,6 +1134,7 @@ impl ChannelUpolsState {
                 c2r,
                 ir_spectra,
                 nonzero,
+                nonzero_count,
                 &mut out,
             )?;
             offset += b;
@@ -1056,6 +1149,7 @@ impl ChannelUpolsState {
     }
 
     /// Flush exactly `remaining_output` samples by feeding zeros through the UPOLS engine.
+    #[allow(clippy::too_many_arguments)]
     fn flush_exact(
         &mut self,
         remaining_output: usize,
@@ -1063,6 +1157,7 @@ impl ChannelUpolsState {
         c2r: &dyn ComplexToReal<f64>,
         ir_spectra: &[Vec<Complex<f64>>],
         nonzero: &[bool],
+        nonzero_count: usize,
     ) -> Result<Vec<f64>, String> {
         if remaining_output == 0 {
             return Ok(Vec::new());
@@ -1075,12 +1170,28 @@ impl ChannelUpolsState {
         if !self.pending_in.is_empty() {
             let mut block = std::mem::take(&mut self.pending_in);
             block.resize(b, 0.0);
-            self.process_one_block(&block, r2c, c2r, ir_spectra, nonzero, &mut out)?;
+            self.process_one_block(
+                &block,
+                r2c,
+                c2r,
+                ir_spectra,
+                nonzero,
+                nonzero_count,
+                &mut out,
+            )?;
         }
 
         let zero_block = vec![0.0_f64; b];
         while out.len() < remaining_output {
-            self.process_one_block(&zero_block, r2c, c2r, ir_spectra, nonzero, &mut out)?;
+            self.process_one_block(
+                &zero_block,
+                r2c,
+                c2r,
+                ir_spectra,
+                nonzero,
+                nonzero_count,
+                &mut out,
+            )?;
         }
 
         out.truncate(remaining_output);
@@ -1164,20 +1275,54 @@ impl PartitionedStereoConvolver {
         let target_total = self.total_input_frames + self.ir.flush_tail_samples;
         let remaining = target_total.saturating_sub(self.total_emitted_frames);
 
-        let mut out_l = self.left.flush_exact(
-            remaining,
-            self.ir.r2c.as_ref(),
-            self.ir.c2r.as_ref(),
-            &self.ir.ir_spectra_left,
-            &self.ir.nonzero_left,
-        )?;
-        let mut out_r = self.right.flush_exact(
-            remaining,
-            self.ir.r2c.as_ref(),
-            self.ir.c2r.as_ref(),
-            &self.ir.ir_spectra_right,
-            &self.ir.nonzero_right,
-        )?;
+        let (mut out_l, mut out_r) = if self.ir.num_partitions >= 2 && remaining >= self.ir.block_size
+        {
+            let ir = &self.ir;
+            let left = &mut self.left;
+            let right = &mut self.right;
+            std::thread::scope(|s| -> Result<(Vec<f64>, Vec<f64>), String> {
+                let hl = s.spawn(|| {
+                    left.flush_exact(
+                        remaining,
+                        ir.r2c.as_ref(),
+                        ir.c2r.as_ref(),
+                        &ir.ir_spectra_left,
+                        &ir.nonzero_left,
+                        ir.nonzero_count_left,
+                    )
+                });
+                let r_res = right.flush_exact(
+                    remaining,
+                    ir.r2c.as_ref(),
+                    ir.c2r.as_ref(),
+                    &ir.ir_spectra_right,
+                    &ir.nonzero_right,
+                    ir.nonzero_count_right,
+                );
+                let l_res = hl
+                    .join()
+                    .map_err(|_| "UPOLS left-channel flush worker panicked".to_string())?;
+                Ok((l_res?, r_res?))
+            })?
+        } else {
+            let out_l = self.left.flush_exact(
+                remaining,
+                self.ir.r2c.as_ref(),
+                self.ir.c2r.as_ref(),
+                &self.ir.ir_spectra_left,
+                &self.ir.nonzero_left,
+                self.ir.nonzero_count_left,
+            )?;
+            let out_r = self.right.flush_exact(
+                remaining,
+                self.ir.r2c.as_ref(),
+                self.ir.c2r.as_ref(),
+                &self.ir.ir_spectra_right,
+                &self.ir.nonzero_right,
+                self.ir.nonzero_count_right,
+            )?;
+            (out_l, out_r)
+        };
         debug_assert_eq!(out_l.len(), out_r.len());
         self.apply_output_scale(&mut out_l, &mut out_r);
 
@@ -1266,20 +1411,56 @@ impl StereoConvolver for PartitionedStereoConvolver {
 
         self.total_input_frames += input.len();
 
-        let mut out_l = self.left.push_samples(
-            &input.left,
-            self.ir.r2c.as_ref(),
-            self.ir.c2r.as_ref(),
-            &self.ir.ir_spectra_left,
-            &self.ir.nonzero_left,
-        )?;
-        let mut out_r = self.right.push_samples(
-            &input.right,
-            self.ir.r2c.as_ref(),
-            self.ir.c2r.as_ref(),
-            &self.ir.ir_spectra_right,
-            &self.ir.nonzero_right,
-        )?;
+        let (mut out_l, mut out_r) =
+            if self.ir.num_partitions >= 2 && input.left.len() + self.left.pending_in.len() >= self.ir.block_size {
+                let ir = &self.ir;
+                let left = &mut self.left;
+                let right = &mut self.right;
+                let in_l = &input.left;
+                let in_r = &input.right;
+                std::thread::scope(|s| -> Result<(Vec<f64>, Vec<f64>), String> {
+                    let hl = s.spawn(|| {
+                        left.push_samples(
+                            in_l,
+                            ir.r2c.as_ref(),
+                            ir.c2r.as_ref(),
+                            &ir.ir_spectra_left,
+                            &ir.nonzero_left,
+                            ir.nonzero_count_left,
+                        )
+                    });
+                    let r_res = right.push_samples(
+                        in_r,
+                        ir.r2c.as_ref(),
+                        ir.c2r.as_ref(),
+                        &ir.ir_spectra_right,
+                        &ir.nonzero_right,
+                        ir.nonzero_count_right,
+                    );
+                    let l_res = hl
+                        .join()
+                        .map_err(|_| "UPOLS left-channel worker panicked".to_string())?;
+                    Ok((l_res?, r_res?))
+                })?
+            } else {
+                let out_l = self.left.push_samples(
+                    &input.left,
+                    self.ir.r2c.as_ref(),
+                    self.ir.c2r.as_ref(),
+                    &self.ir.ir_spectra_left,
+                    &self.ir.nonzero_left,
+                    self.ir.nonzero_count_left,
+                )?;
+                let out_r = self.right.push_samples(
+                    &input.right,
+                    self.ir.r2c.as_ref(),
+                    self.ir.c2r.as_ref(),
+                    &self.ir.ir_spectra_right,
+                    &self.ir.nonzero_right,
+                    self.ir.nonzero_count_right,
+                )?;
+                (out_l, out_r)
+            };
         debug_assert_eq!(out_l.len(), out_r.len());
 
         if !out_l.is_empty() {
@@ -1372,6 +1553,8 @@ struct CachedIrEntry {
 /// because room-correction filters are user-specific and cannot have a universal default.
 pub struct RewConvolverFactory {
     config: ConvolutionConfig,
+    /// When `true` (`U7` Ultimate Mode), never truncate long IR flush tails at `-200 dB`.
+    full_tail: bool,
     cache: Mutex<HashMap<u32, CachedIrEntry>>,
     /// Negative cache of invalid `(path, modified, len)` WAVs so broken newest files in `dir`
     /// are not re-read from disk on every track start until modified (Review #5 Finding #17).
@@ -1384,11 +1567,22 @@ impl RewConvolverFactory {
     pub fn new(config: ConvolutionConfig) -> Self {
         Self {
             config,
+            full_tail: false,
             cache: Mutex::new(HashMap::new()),
             failed_cache: Mutex::new(HashMap::new()),
             warned_keys: Mutex::new(HashSet::new()),
             warnings: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Enable or disable lossless full-tail REW convolution (`U7`: zero `-200 dB` flush truncation).
+    pub fn with_full_tail(mut self, full_tail: bool) -> Self {
+        self.full_tail = full_tail;
+        self
+    }
+
+    pub fn is_full_tail(&self) -> bool {
+        self.full_tail
     }
 
     pub fn config(&self) -> &ConvolutionConfig {
@@ -1467,7 +1661,10 @@ impl RewConvolverFactory {
                     rate_hz
                 ));
             }
-            Ok(Arc::new(PreparedStereoIr::from_wav(&wav)?))
+            Ok(Arc::new(PreparedStereoIr::from_wav_with_options(
+                &wav,
+                self.full_tail,
+            )?))
         })();
 
         let prepared = match load_res {

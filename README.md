@@ -52,6 +52,7 @@ audiophile_player/
 - [docs/research/04-noise-shapers.md](docs/research/04-noise-shapers.md) — INV-04 final quantization, TPDF dither, clean-room 8fS Levinson–Durbin error-feedback noise shapers (`ns-gentle-2`, `ns5-class`, `lns15-class`, `wide40-9`), NOS R-2R code-activity analysis, and `dac_bits` hardware probes.
 - [docs/research/05-rew-convolution-and-delay.md](docs/research/05-rew-convolution-and-delay.md) — REW stereo convolution and channel delay design.
 - [docs/research/06-windows-kernel-streaming.md](docs/research/06-windows-kernel-streaming.md) — WASAPI Exclusive vs. Audirvana-style WDM-KS (`usbaudio2.sys` / WaveRT), bit-perfect verification, and minimal-effort zero-mixer POC design.
+- [docs/research/07-ultimate-mode.md](docs/research/07-ultimate-mode.md) — Opt-in Ultimate Mode specification (30 s look-ahead cap, lossless-only FFT/UPOLS optimizations, content-adaptive filters & detectors, metadata × analyser fusion, learn-on-play YAML DB, and showcase decision report).
 - [poc/README.md](poc/README.md) — Prototype setup, hardware probe, and test-tone/FLAC verification commands.
 
 ## License

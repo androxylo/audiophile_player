@@ -12,6 +12,7 @@ pub mod quantize;
 pub mod selector;
 pub mod shaper_design;
 pub mod upsampler;
+pub mod upsampler_fft;
 
 /// Strict upper bound on filter length (4,000,000 taps).
 pub const MAX_FILTER_TAPS: usize = 4_000_000;

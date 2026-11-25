@@ -57,7 +57,7 @@ pub struct UpsamplerCarryover {
     pub ratio: usize,
     pub taps_per_phase: usize,
     pub pad_tail: usize,
-    bank: Arc<Vec<Vec<f64>>>,
+    pub(crate) bank: Arc<Vec<Vec<f64>>>,
     pub hist_l: Vec<f64>,
     pub hist_r: Vec<f64>,
 }
@@ -103,6 +103,12 @@ impl UpsamplerCarryover {
             return StereoF64Buffer::empty(self.target_rate_hz);
         }
         let full_pad = self.taps_per_phase.saturating_sub(1);
+        if self.taps_per_phase > 2_048 {
+            let bank = Arc::clone(&self.bank);
+            if let Ok(buf) = crate::upsampler_fft::flush_carryover_via_fft(&self, bank) {
+                return buf;
+            }
+        }
         if full_pad > 0 {
             self.hist_l.resize(self.hist_l.len() + full_pad, 0.0_f64);
             self.hist_r.resize(self.hist_r.len() + full_pad, 0.0_f64);
