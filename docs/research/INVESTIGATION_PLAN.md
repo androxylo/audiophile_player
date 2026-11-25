@@ -27,7 +27,7 @@
    - **Safety headroom (`-3 dB` to `0 dB`, never boosting > 0 dB)** informed by FLAC ReplayGain & True Peak annotations (always `-3 dB` when max level is unknown), no user volume control, stereo REW convolution, optional single-channel delay only, no other DSP.
    - **No real-time constraint**; **Windows-only**; **headless** (no desktop GUI — only an extremely rudimentary local HTTP page to pick a file/folder, Play/Stop, and link to the GitHub manual); **Schiit Gungnir 2** reference DAC; **local FLAC + Tidal only**.
    - **Zero Windows mixer anywhere in the pipeline** (input or output); **non-exclusive mode strictly forbidden in any form**; mixer-involving virtual audio cables are **non-compliant**; target **Audirvana-style Windows kernel-mode streaming**.
-   - **Public repo / copyright compliance:** No copyrighted music or any other restrictively copyrighted materials committed (papers, articles, proprietary blobs/SDKs/code); open-source license (LGPL-like, TBD); **TDD** in small steps; **Rust** as final production language, with any language allowed for prototyping/POC/tests (port to Rust only once working).
+   - **Public repo / copyright compliance:** No copyrighted music or any other restrictively copyrighted materials committed (papers, articles, proprietary blobs/SDKs/code); open-source license (`GPL-3.0-or-later`); **TDD** in small steps; **Rust** as final production language, with any language allowed for prototyping/POC/tests (port to Rust only once working).
 
 ---
 
@@ -126,7 +126,7 @@
 ### INV-08 — Rust Production Architecture, Prototyping Stack, Licensing & TDD Verification Plan
 - **Objective:** Finalize the Rust production architecture, prototyping/POC toolchain, open-source license compatibility, and TDD verification/benchmarking suite before writing production code.
 - **What to investigate:**
-  - **Rust Production Crates & Bindings (with LGPL-compatible open-source licensing):**
+  - **Rust Production Crates & Bindings (with GPL-compatible open-source licensing):**
     - Win32 WDM-KS (`windows-rs` / direct Win32 `ks.h`/`ksmedia.h` FFI vs thin C/Rust interop module).
     - High-precision 64-bit FFT engines (`RustFFT`/`RealFFT` MIT/Apache-2.0 vs `PocketFFT` BSD vs `FFTW3` GPL licensing caveat!), SIMD (AVX2/AVX-512), and deterministic memory management.
     - Lossless FLAC decoding (pure Rust `claxon`/`symphonia` vs `libFLAC` BSD — bit-exactness verification).

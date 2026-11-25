@@ -41,7 +41,7 @@ Source f64 blocks (<= 65,536 frames)
 
 ## 3. Uniform Partitioned Overlap-Save (UPOLS) in Pure `f64`
 
-- **FFT Engine:** `realfft` + `rustfft` (`MIT OR Apache-2.0`, LGPL-3.0 compatible, runtime x86_64 AVX2/FMA SIMD).
+- **FFT Engine:** `realfft` + `rustfft` (`MIT OR Apache-2.0`, GPL-3.0 compatible, runtime x86_64 AVX2/FMA SIMD).
 - **Partitioning:** Dynamic block size `B = active_taps.next_power_of_two().clamp(1024, 65_536)` with real FFT size `N = 2 * B` (`131,072` for 4M-tap IRs → `64` partitions max, `170.7 ms` block quantum at `384 kHz`, ~5% of one CPU core at 384 kHz stereo!).
 - **Exactness & Gapless Continuity:**
   - Every non-zero partition up to the last non-zero tap is convolved verbatim in `f64` (zero audible or ultrasonic truncation during playback); exact-zero partitions are skipped without changing a single bit.

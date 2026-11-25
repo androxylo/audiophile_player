@@ -8,7 +8,7 @@
 //!
 //! ## Algorithm & Headroom Safety
 //! Uniform Partitioned Overlap-Save (**UPOLS**) using `realfft` (`f64`, AVX2/FMA SIMD,
-//! MIT/Apache-2.0 — LGPL-3.0 compatible). Supports arbitrary-length stereo WAV impulse responses
+//! MIT/Apache-2.0 — GPL-3.0 compatible). Supports arbitrary-length stereo WAV impulse responses
 //! including full `2^22 = 4,194,304`-tap REW filters at `352.8 / 384 kHz` with bit-exact
 //! streaming equivalence across arbitrary block sizes.
 //!

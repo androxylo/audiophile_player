@@ -53,6 +53,6 @@ audiophile_player/
 
 ## License
 
-This project is licensed under the **GNU Lesser General Public License v3.0 or later (`LGPL-3.0-or-later`)**.
+This project is licensed under the **GNU General Public License v3.0 or later (`GPL-3.0-or-later`)**.
 
-See [LICENSE](LICENSE) (GNU LGPL v3.0) and [COPYING](COPYING) (GNU GPL v3.0, incorporated by reference) for full terms.
+See [LICENSE](LICENSE) (or [COPYING](COPYING)) for the full GNU GPL v3.0 terms.

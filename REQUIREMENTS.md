@@ -24,7 +24,7 @@ Build an extreme, best-in-class headless audiophile playback engine for Windows 
 
 ### Licensing & Copyright Compliance
 - **Public Open-Source Repository:** The repository is public and must strictly respect copyright laws.
-- **License:** **GNU Lesser General Public License v3.0 or later (`LGPL-3.0-or-later`)** (see [LICENSE](LICENSE) and [COPYING](COPYING)). All third-party library choices must be vetted for LGPL-3.0 open-source license compatibility.
+- **License:** **GNU General Public License v3.0 or later (`GPL-3.0-or-later`)** (see [LICENSE](LICENSE) and [COPYING](COPYING)). All third-party library choices must be vetted for GPL-3.0 open-source license compatibility.
 - **No Copyrighted or Restrictively Licensed Content in Repo:** The repository must **never** contain copyrighted music files **or any other restrictively copyrighted materials** (such as paywalled papers, copied articles, proprietary binaries/SDKs, proprietary filter coefficients, or restrictively licensed third-party code).
   - Real-world music tests run strictly against an external local folder (e.g., `~/Music`).
   - Automated tests in the repository may use programmatically generated test signals and/or AI-generated, non-copyrighted synthetic music samples.
