@@ -889,6 +889,7 @@ impl AudioPositionCursorSelector {
 }
 
 const LAG_HISTORY_WINDOW: usize = 8;
+const CLOCK_ANCHOR_BLOCK: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WaveRtWakeDecision {
@@ -902,9 +903,10 @@ enum WaveRtWakeDecision {
 /// - Position-authoritative, continuously lag-tracked half-boundary detection with a 1/4-half
 ///   pre-boundary guard band, unified wall-clock multi-ring unwrapping, and spurious-wake
 ///   rejection. Late-but-not-coalesced wakes never trigger false coalescing or invert half phase,
-///   late/stale first wakes converge to true driver lag instead of locking in a bad estimate,
-///   genuine coalesced wakes resynchronize on every wake, and `Unavailable` position sources use
-///   an anchored `run_start + n * half_duration` clock that never absorbs steady wake latency.
+///   late/stale first wakes converge to true driver lag (including lags up to a full half) instead
+///   of locking in a bad estimate, genuine coalesced wakes resynchronize on every wake, and
+///   `Unavailable` position sources use a bidirectionally drift-tracked `run_start + n * half`
+///   clock that tracks crystal drift in either direction without absorbing steady wake latency.
 /// - Stop fade-out that waits for the fade half to finish playing (`trailing_silent_halves >= 2`).
 /// - Non-blocking underrun handling (emits digital silence without ending playback).
 /// - Accurate `frames_played` counting only real audio frames whose half completed DMA playback.
@@ -922,9 +924,14 @@ pub struct WaveRtLoopController {
     wrap_mode: PositionWrapMode,
     observed_wrap: bool,
     half_duration: Option<Duration>,
-    /// Offset (ns) of boundary 0 relative to `run_start`. Trimmed only on early wakes so steady
-    /// thread wake latency is never absorbed into the boundary reference.
+    /// Offset (ns) of boundary 0 relative to `run_start`. Tracked bidirectionally across
+    /// non-coalesced wake blocks against `baseline_wake_latency_ns` so slow/fast crystal drift
+    /// is followed without absorbing steady wake latency (Review #5 #2 & #11).
     clock_anchor_offset_ns: i128,
+    baseline_wake_latency_ns: Option<i128>,
+    anchor_block_min_raw_ns: i128,
+    anchor_block_count: usize,
+    anchor_blocks_completed: u64,
     last_wake_instant: Option<Duration>,
     half_audio_frames: [usize; 2],
     completed_audio_frames: usize,
@@ -950,6 +957,10 @@ impl WaveRtLoopController {
             observed_wrap: false,
             half_duration: None,
             clock_anchor_offset_ns: 0,
+            baseline_wake_latency_ns: None,
+            anchor_block_min_raw_ns: 0,
+            anchor_block_count: 0,
+            anchor_blocks_completed: 0,
             last_wake_instant: None,
             half_audio_frames: [0, 0],
             completed_audio_frames: 0,
@@ -1015,6 +1026,10 @@ impl WaveRtLoopController {
         self.lag_history_cursor = 0;
         self.observed_wrap = false;
         self.clock_anchor_offset_ns = 0;
+        self.baseline_wake_latency_ns = None;
+        self.anchor_block_min_raw_ns = 0;
+        self.anchor_block_count = 0;
+        self.anchor_blocks_completed = 0;
         self.last_wake_instant = Some(Duration::ZERO);
         self.spurious_wakes = 0;
         Ok(())
@@ -1074,29 +1089,132 @@ impl WaveRtLoopController {
         };
     }
 
-    /// Trim the wall-clock boundary anchor ONLY when a wake arrives slightly *early* (audio
-    /// crystal faster than QPC). Never pulls the anchor forward on late wakes, so steady wake
-    /// latency is never absorbed into the boundary reference.
-    fn trim_clock_anchor_if_early(
+    /// Compute wall-clock wake latency in bytes for `boundary_idx` so lag samples are unbiased
+    /// (Review #5 #13). Returns `0` when wall-clock timing is unavailable or the wake was early.
+    fn wake_latency_bytes(&self, now_since_run: Option<Duration>, boundary_idx: u64) -> u64 {
+        let (Some(now), Some(half_dur)) = (now_since_run, self.half_duration) else {
+            return 0;
+        };
+        if half_dur.is_zero() {
+            return 0;
+        }
+        let now_ns = now.as_nanos() as i128;
+        let ideal_ns = self.ideal_boundary_ns(boundary_idx, half_dur);
+        let lat_ns = (now_ns - ideal_ns).max(0) as u128;
+        let half = self.layout.half_len() as u64;
+        (((lat_ns.saturating_mul(u128::from(half))) / half_dur.as_nanos()) as u64).min(half)
+    }
+
+    /// Update the wall-clock boundary anchor bidirectionally from trustworthy wakes (Review #5 #2
+    /// & #11):
+    /// - On an early first wake (DMA started before `run_start`), immediately anchors boundary 0.
+    /// - Tracks the minimum `now - boundary_idx * half` over blocks of [`CLOCK_ANCHOR_BLOCK`]
+    ///   non-coalesced wakes relative to `baseline_wake_latency_ns`, following slow or fast audio
+    ///   crystal drift (±500 ppm) cleanly over 20,000+ halves without absorbing steady wake latency.
+    fn update_clock_anchor(
         &mut self,
         now_since_run: Option<Duration>,
         boundary_idx: u64,
+        coalesced: bool,
+        is_first_wake: bool,
     ) {
         let (Some(now), Some(half_dur)) = (now_since_run, self.half_duration) else {
             return;
         };
+        if half_dur.is_zero() {
+            return;
+        }
         let now_ns = now.as_nanos() as i128;
-        let ideal_ns = self.ideal_boundary_ns(boundary_idx, half_dur);
-        if now_ns < ideal_ns {
-            // Wake arrived slightly before the ideal boundary: shift anchor gently earlier.
-            let deficit = ideal_ns - now_ns;
-            let max_step = (half_dur.as_nanos() as i128) / 8;
-            let adj = (deficit / 4).max(1).min(max_step);
+        let half_ns = half_dur.as_nanos() as i128;
+        let raw_residual = now_ns - (boundary_idx as i128).saturating_mul(half_ns);
+
+        if is_first_wake && !coalesced {
+            if raw_residual < 0 {
+                // DMA started before `run_start` was captured: anchor directly to first wake.
+                self.clock_anchor_offset_ns = raw_residual;
+                self.baseline_wake_latency_ns = Some(0);
+            } else {
+                self.baseline_wake_latency_ns = Some(raw_residual.min(half_ns / 2));
+            }
+            self.anchor_block_min_raw_ns = raw_residual;
+            self.anchor_block_count = 1;
+            return;
+        }
+
+        if coalesced {
+            let ideal_ns = self.ideal_boundary_ns(boundary_idx, half_dur);
+            if now_ns < ideal_ns {
+                let deficit = ideal_ns - now_ns;
+                let max_step = half_ns / 8;
+                let adj = (deficit / 4).max(1).min(max_step);
+                self.clock_anchor_offset_ns = self.clock_anchor_offset_ns.saturating_sub(adj);
+            }
+            return;
+        }
+
+        // Non-coalesced wake: immediate early trim if wake arrives before current ideal boundary.
+        if raw_residual < self.clock_anchor_offset_ns {
+            let deficit = self.clock_anchor_offset_ns - raw_residual;
+            let max_step = half_ns / 8;
+            let adj = (deficit / 2).max(1).min(max_step);
             self.clock_anchor_offset_ns = self.clock_anchor_offset_ns.saturating_sub(adj);
+            self.baseline_wake_latency_ns = Some(0);
+        } else if self.anchor_blocks_completed == 0 {
+            // During the initial warmup block, tighten baseline latency downward if a lower-latency
+            // wake arrives after a late first wake.
+            let rel_lat = raw_residual - self.clock_anchor_offset_ns;
+            self.baseline_wake_latency_ns = Some(
+                self.baseline_wake_latency_ns
+                    .map_or(rel_lat, |b| b.min(rel_lat))
+                    .min(half_ns / 2),
+            );
+        }
+
+        if self.anchor_block_count == 0 {
+            self.anchor_block_min_raw_ns = raw_residual;
+        } else {
+            self.anchor_block_min_raw_ns = self.anchor_block_min_raw_ns.min(raw_residual);
+        }
+        self.anchor_block_count += 1;
+
+        if self.anchor_block_count >= CLOCK_ANCHOR_BLOCK {
+            let block_min = self.anchor_block_min_raw_ns;
+            self.anchor_block_count = 0;
+            self.anchor_blocks_completed = self.anchor_blocks_completed.saturating_add(1);
+
+            let base_lat = *self.baseline_wake_latency_ns.get_or_insert_with(|| {
+                (block_min - self.clock_anchor_offset_ns)
+                    .max(0)
+                    .min(half_ns / 2)
+            });
+            let expected_min = self.clock_anchor_offset_ns.saturating_add(base_lat);
+            let err = block_min - expected_min;
+            // Allow up to ±500 ppm crystal drift per block of CLOCK_ANCHOR_BLOCK halves.
+            let max_drift_per_block =
+                (((CLOCK_ANCHOR_BLOCK as i128) * half_ns) / 2000).max(1);
+
+            if err >= -max_drift_per_block && err <= max_drift_per_block {
+                self.clock_anchor_offset_ns = self.clock_anchor_offset_ns.saturating_add(err);
+            } else if err > max_drift_per_block {
+                self.clock_anchor_offset_ns = self
+                    .clock_anchor_offset_ns
+                    .saturating_add(max_drift_per_block);
+            } else {
+                // Sharp drop in wake latency below previous baseline (not crystal drift):
+                // re-lower baseline latency and trim anchor if block_min fell below anchor.
+                let new_base = (block_min - self.clock_anchor_offset_ns).max(0);
+                self.baseline_wake_latency_ns = Some(new_base);
+                if block_min < self.clock_anchor_offset_ns {
+                    let deficit = self.clock_anchor_offset_ns - block_min;
+                    let adj = deficit.min(half_ns / 4);
+                    self.clock_anchor_offset_ns = self.clock_anchor_offset_ns.saturating_sub(adj);
+                }
+            }
         }
     }
 
     fn step_wall_clock_fallback(&mut self, now_since_run: Option<Duration>) -> WaveRtWakeDecision {
+        let is_first_wake = self.last_boundary_idx == 0;
         let next_bidx = self.last_boundary_idx.saturating_add(1);
         let new_bidx = match (now_since_run, self.half_duration) {
             (Some(now), Some(half_dur)) => {
@@ -1105,21 +1223,21 @@ impl WaveRtLoopController {
                 let ideal_next_ns = self.ideal_boundary_ns(next_bidx, half_dur);
                 let early_margin_ns = half_ns / 8;
 
-                // Ignore stale/spurious wakes arriving < half/2 after the previous processed wake
-                // while still before the next ideal boundary, or any wake well before ideal_next.
-                if self.last_boundary_idx > 0 {
+                // Review #5 #11: NEVER reject the very first wake (last_boundary_idx == 0) as
+                // Spurious — DMA may have started slightly before `run_start` was captured.
+                if !is_first_wake {
                     if let Some(prev_wake) = self.last_wake_instant {
                         if now.saturating_sub(prev_wake) < half_dur / 2 && now_ns < ideal_next_ns {
                             return WaveRtWakeDecision::Spurious;
                         }
                     }
-                }
-                if now_ns.saturating_add(early_margin_ns) < ideal_next_ns {
-                    return WaveRtWakeDecision::Spurious;
+                    if now_ns.saturating_add(early_margin_ns) < ideal_next_ns {
+                        return WaveRtWakeDecision::Spurious;
+                    }
                 }
 
                 if now_ns < ideal_next_ns {
-                    // Slightly early crystal wake within [ideal_next - H/8, ideal_next).
+                    // First wake before nominal 1*half, or slightly early crystal wake within H/8.
                     next_bidx
                 } else {
                     let anchored_ns = now_ns.saturating_sub(self.clock_anchor_offset_ns).max(0);
@@ -1131,7 +1249,8 @@ impl WaveRtLoopController {
         };
 
         let halves_elapsed = new_bidx.saturating_sub(self.last_boundary_idx);
-        self.trim_clock_anchor_if_early(now_since_run, new_bidx);
+        let coalesced = halves_elapsed >= 2;
+        self.update_clock_anchor(now_since_run, new_bidx, coalesced, is_first_wake);
         if let Some(now) = now_since_run {
             self.last_wake_instant = Some(now);
         }
@@ -1139,7 +1258,7 @@ impl WaveRtLoopController {
         let write_half = ((new_bidx as usize) & 1) ^ 1;
         WaveRtWakeDecision::Write {
             write_half,
-            coalesced: halves_elapsed >= 2,
+            coalesced,
         }
     }
 
@@ -1164,6 +1283,7 @@ impl WaveRtLoopController {
             _ => None,
         };
 
+        let is_first_wake = self.last_raw_pos.is_none();
         let unwrapped: u64 = match (self.last_raw_pos, self.last_unwrapped_pos) {
             (None, _) => {
                 // First wake after KSSTATE_RUN (DMA started at byte 0).
@@ -1179,7 +1299,13 @@ impl WaveRtLoopController {
                             self.lag_bytes = 0;
                             pos.saturating_add(extra_rings.saturating_mul(buf))
                         } else {
-                            if pos < half {
+                            // Non-coalesced first wake: record unbiased lag sample using clock
+                            // wake latency so a late first wake does not underestimate lag.
+                            if now < hd.saturating_add(hd / 2) {
+                                let wake_lat = self.wake_latency_bytes(Some(now), 1);
+                                let est_dma = half.saturating_add(wake_lat);
+                                self.record_lag_sample(est_dma.saturating_sub(pos));
+                            } else if pos < half {
                                 self.record_lag_sample(half - pos);
                             } else {
                                 self.record_lag_sample(0);
@@ -1187,7 +1313,11 @@ impl WaveRtLoopController {
                             pos
                         }
                     } else {
-                        if pos < half {
+                        if now < hd.saturating_add(hd / 2) {
+                            let wake_lat = self.wake_latency_bytes(Some(now), 1);
+                            let est_dma = half.saturating_add(wake_lat);
+                            self.record_lag_sample(est_dma.saturating_sub(pos));
+                        } else if pos < half {
                             self.record_lag_sample(half - pos);
                         } else {
                             self.record_lag_sample(0);
@@ -1280,6 +1410,21 @@ impl WaveRtLoopController {
         let adj_pos = unwrapped.saturating_add(self.lag_bytes);
         let mut raw_bidx = self.boundary_idx_for_byte(adj_pos);
 
+        // Review #5 #13: Small upper-boundary guard with wall-clock confirmation so a coalesced
+        // wake landing just after a boundary is never placed one boundary early by tiny residual
+        // lag underestimation.
+        if let Some((now, hd)) = clock_info {
+            let candidate_next = raw_bidx.saturating_add(1);
+            let next_byte = self.boundary_byte(candidate_next);
+            let upper_margin = (half / 16).max(self.layout.bytes_per_frame() as u64);
+            if adj_pos < next_byte
+                && next_byte - adj_pos <= upper_margin
+                && (now.as_nanos() as i128) >= self.ideal_boundary_ns(candidate_next, hd)
+            {
+                raw_bidx = candidate_next;
+            }
+        }
+
         // Guard against an initially overestimated stale lag sample falsely triggering coalescing
         // when the wall clock proves the subsequent boundary has not yet been reached.
         if raw_bidx == next_expected_bidx.saturating_add(1) {
@@ -1301,32 +1446,41 @@ impl WaveRtLoopController {
             (raw_bidx, true, false)
         } else if raw_bidx == next_expected_bidx {
             // Exactly 1 half boundary crossed (including late-but-not-coalesced wakes).
-            (raw_bidx, false, self.last_raw_pos.is_some())
+            (raw_bidx, false, !is_first_wake)
         } else {
             // Position is still short of `next_expected_byte`.
             let shortfall = next_expected_byte.saturating_sub(adj_pos);
             if shortfall <= guard {
                 // Inside pre-boundary jitter guard band: trust expected half boundary.
-                (next_expected_bidx, false, self.last_raw_pos.is_some())
+                (next_expected_bidx, false, !is_first_wake)
             } else {
                 // Outside guard band: distinguish a genuine boundary wake whose true cursor lag
                 // was underestimated (e.g. wake #1 arrived late) from a spurious/duplicate wake.
+                // Review #5 #12: When the wall clock proves we are at `next_expected_bidx` (and
+                // not yet at `next_expected_bidx + 1`), accept lags up to a full `half` (use the
+                // stricter `half / 2` cap only when no wall clock is available).
                 let candidate_lag = next_expected_byte.saturating_sub(unwrapped);
-                let clock_reached_boundary = match clock_info {
+                let (clock_reached_boundary, effective_max_lag) = match clock_info {
                     Some((now, hd)) => {
                         let now_ns = now.as_nanos() as i128;
                         let ideal_next = self.ideal_boundary_ns(next_expected_bidx, hd);
+                        let ideal_after =
+                            self.ideal_boundary_ns(next_expected_bidx.saturating_add(1), hd);
                         let early_margin = (hd.as_nanos() as i128) / 8;
-                        now_ns.saturating_add(early_margin) >= ideal_next
+                        let reached = now_ns.saturating_add(early_margin) >= ideal_next
+                            && now_ns.saturating_add(early_margin) < ideal_after;
+                        (reached, half)
                     }
-                    None => self
-                        .last_unwrapped_pos
-                        .map(|prev| unwrapped.saturating_sub(prev) >= half / 2)
-                        .unwrap_or(false),
+                    None => (
+                        self.last_unwrapped_pos
+                            .map(|prev| unwrapped.saturating_sub(prev) >= half / 2)
+                            .unwrap_or(false),
+                        max_plausible_lag,
+                    ),
                 };
 
-                if self.last_raw_pos.is_some()
-                    && candidate_lag <= max_plausible_lag
+                if !is_first_wake
+                    && candidate_lag <= effective_max_lag
                     && clock_reached_boundary
                 {
                     (next_expected_bidx, false, true)
@@ -1339,12 +1493,15 @@ impl WaveRtLoopController {
         };
 
         if record_lag {
-            // Update the sliding lag estimator from this non-coalesced wake.
-            let observed_lag = self.boundary_byte(new_bidx).saturating_sub(unwrapped);
+            // Update the sliding lag estimator with an unbiased lag sample that accounts for
+            // wall-clock wake latency (Review #5 #13).
+            let wake_lat_bytes = self.wake_latency_bytes(now_since_run, new_bidx);
+            let estimated_dma_byte = self.boundary_byte(new_bidx).saturating_add(wake_lat_bytes);
+            let observed_lag = estimated_dma_byte.saturating_sub(unwrapped);
             self.record_lag_sample(observed_lag);
         }
 
-        self.trim_clock_anchor_if_early(now_since_run, new_bidx);
+        self.update_clock_anchor(now_since_run, new_bidx, coalesced, is_first_wake);
         if let Some(now) = now_since_run {
             self.last_wake_instant = Some(now);
         }
@@ -1896,10 +2053,12 @@ impl WdmKsSink {
         }
 
         // 8. Transition pin: ACQUIRE -> PAUSE -> RUN.
+        // Capture `run_start` right before `KSSTATE_RUN` so DMA cannot start meaningfully before
+        // `run_start` (Review #5 #11).
         state_guard.set_state(KSSTATE_ACQUIRE)?;
         state_guard.set_state(KSSTATE_PAUSE)?;
-        state_guard.set_state(KSSTATE_RUN)?;
         let run_start = Instant::now();
+        state_guard.set_state(KSSTATE_RUN)?;
 
         // 9. Event-driven WaveRT loop: each notification signals a completed half-buffer.
         let mut notifications: usize = 0;

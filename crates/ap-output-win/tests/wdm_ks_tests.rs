@@ -1375,3 +1375,288 @@ fn live_wdm_ks_plays_generated_nocturne_24_96_flac_on_gungnir2() {
         Err(err) => panic!("Native Rust WDM-KS FLAC playback failed: {err}"),
     }
 }
+
+#[test]
+fn review5_unavailable_anchor_tracks_plus_minus_100ppm_drift_over_20000_halves() {
+    // Review #5 Finding #2: Unavailable position source, 50 ms nominal halves, steady 2 ms wake
+    // latency, audio crystal drifting -100 ppm (slower) AND +100 ppm (faster) over 20,000 halves,
+    // including periodic coalesced wakes landing 0.2 ms after a boundary. Must achieve 0 wrong-half
+    // writes across all 20,000 halves in BOTH drift directions!
+    let layout = WaveRtRingLayout::new(6400, 8).unwrap();
+    let half_nom_ns: f64 = 50_000_000.0;
+    let half_dur = Duration::from_millis(50);
+
+    for ppm in [-100.0_f64, 100.0_f64] {
+        // Real crystal half duration: slow crystal (-100 ppm) has LONGER half duration (+100 ppm
+        // in wall-clock ns per half); fast crystal (+100 ppm) has SHORTER half duration.
+        let real_half_ns = half_nom_ns * (1.0 - ppm * 1e-6);
+        let mut ring = vec![0u8; 6400];
+        let mut frames_pool = vec![[11_i32, -11_i32]; 400];
+        let mut ctrl = WaveRtLoopController::new(layout).with_half_duration(half_dur);
+        {
+            let mut pump = WaveRtFramePump::new(&frames_pool, DacWireFormat::Int32);
+            ctrl.prefill(&mut ring, &mut pump).unwrap();
+        }
+
+        let mut k: u64 = 1;
+        while k <= 20_000 {
+            let is_coalesced = k > 100 && k % 2500 == 0;
+            if is_coalesced {
+                k += 1; // miss 1 boundary, wake lands 0.2 ms after boundary k
+            }
+            let wake_lat_ns: f64 = if is_coalesced { 200_000.0 } else { 2_000_000.0 };
+            let now_ns = ((k as f64) * real_half_ns + wake_lat_ns).round() as u64;
+            // Refill fresh audio pump so controller stays in active Continue state.
+            frames_pool[0][0] = (k & 0x7FFF) as i32;
+            let mut pump = WaveRtFramePump::new(&frames_pool, DacWireFormat::Int32);
+            let (written_half, outcome) = ctrl
+                .on_notification_at(
+                    &mut ring,
+                    &mut pump,
+                    false,
+                    None,
+                    Some(Duration::from_nanos(now_ns)),
+                )
+                .unwrap();
+            let dma_half = (k & 1) as usize;
+            let safe_half = dma_half ^ 1;
+            assert_eq!(
+                outcome,
+                WaveRtStepOutcome::Continue,
+                "ppm={ppm} k={k} coalesced={is_coalesced}: unexpected outcome {outcome:?}"
+            );
+            assert_eq!(
+                written_half, safe_half,
+                "ppm={ppm} k={k} coalesced={is_coalesced}: wrote active DMA half {dma_half} instead of safe half {safe_half}"
+            );
+            k += 1;
+        }
+        assert_eq!(ctrl.spurious_wakes(), 0, "ppm={ppm}: expected 0 spurious wakes");
+    }
+}
+
+#[test]
+fn review5_unavailable_early_first_wake_does_not_reject_or_invert_phase() {
+    // Review #5 Finding #11: DMA starts 10 ms before `run_start` is captured, so wake 1 arrives
+    // at 41 ms (> half/8 early relative to 50 ms). Controller must NEVER reject wake 1 as
+    // Spurious, must anchor boundary 0 from it, and keep all subsequent wakes strictly in phase.
+    let layout = WaveRtRingLayout::new(6400, 8).unwrap();
+    let frames = vec![[33_i32, -33_i32]; 12_000];
+    let mut ring = vec![0u8; 6400];
+    let mut pump = WaveRtFramePump::new(&frames, DacWireFormat::Int32);
+    let mut ctrl = WaveRtLoopController::new(layout).with_half_duration(Duration::from_millis(50));
+    ctrl.prefill(&mut ring, &mut pump).unwrap();
+
+    for k in 1u64..=20 {
+        // Real boundaries at k*50 - 10 ms, wakes arrive 1 ms after real boundary.
+        let t_ms = k * 50 - 9;
+        let (h, out) = ctrl
+            .on_notification_at(&mut ring, &mut pump, false, None, Some(Duration::from_millis(t_ms)))
+            .unwrap();
+        let expected_safe = ((k as usize) & 1) ^ 1;
+        assert_eq!(out, WaveRtStepOutcome::Continue, "wake {k} at {t_ms} ms");
+        assert_eq!(
+            h, expected_safe,
+            "wake {k} at {t_ms} ms wrote wrong half {h} (expected safe half {expected_safe})"
+        );
+    }
+    assert_eq!(ctrl.spurious_wakes(), 0);
+    assert_eq!(ctrl.frames_played(), 20 * 400);
+}
+
+#[test]
+fn review5_large_cursor_lag_over_half_over_two_after_late_first_wake_stays_in_phase() {
+    // Review #5 Finding #12: AUDIO_POSITION PlayOffset lagging 1700 B, 1920 B, or 2200 B (> half/2
+    // on a 3200 B = 50 ms half) with a 14 ms late first wake, followed by on-time wakes.
+    let layout = WaveRtRingLayout::new(6400, 8).unwrap();
+    let frames = vec![[44_i32, -44_i32]; 12_000];
+    let half_dur = Duration::from_millis(50);
+
+    for true_lag in [1700u64, 1920, 2200] {
+        for wrap_mode in [PositionWrapMode::Monotonic, PositionWrapMode::Modular] {
+            let mut ring = vec![0u8; 6400];
+            let mut pump = WaveRtFramePump::new(&frames, DacWireFormat::Int32);
+            let mut ctrl = WaveRtLoopController::new(layout)
+                .with_half_duration(half_dur)
+                .with_wrap_mode(wrap_mode);
+            ctrl.prefill(&mut ring, &mut pump).unwrap();
+
+            // Wake 1: 14 ms late (t = 64 ms), real DMA = 3200 + 896 = 4096.
+            let rep1 = 4096u64 - true_lag;
+            let pos1 = if wrap_mode == PositionWrapMode::Modular {
+                rep1 % 6400
+            } else {
+                rep1
+            };
+            let (h1, out1) = ctrl
+                .on_notification_at(
+                    &mut ring,
+                    &mut pump,
+                    false,
+                    Some(pos1),
+                    Some(Duration::from_millis(64)),
+                )
+                .unwrap();
+            assert_eq!(out1, WaveRtStepOutcome::Continue);
+            assert_eq!(h1, 0, "lag={true_lag} mode={wrap_mode:?} wake 1");
+
+            // Wakes 2..=15: on-time at real k*3200 + 64 (1 ms after boundary).
+            for k in 2u64..=15 {
+                let real = k * 3200 + 64;
+                let rep = real - true_lag;
+                let pos = if wrap_mode == PositionWrapMode::Modular {
+                    rep % 6400
+                } else {
+                    rep
+                };
+                let (h, out) = ctrl
+                    .on_notification_at(
+                        &mut ring,
+                        &mut pump,
+                        false,
+                        Some(pos),
+                        Some(Duration::from_millis(k * 50 + 1)),
+                    )
+                    .unwrap();
+                let safe_half = ((k as usize) & 1) ^ 1;
+                assert_eq!(
+                    out,
+                    WaveRtStepOutcome::Continue,
+                    "lag={true_lag} mode={wrap_mode:?} wake {k}"
+                );
+                assert_eq!(
+                    h, safe_half,
+                    "lag={true_lag} mode={wrap_mode:?} wake {k}: wrote active half instead of {safe_half}"
+                );
+            }
+            assert_eq!(ctrl.spurious_wakes(), 0);
+            assert_eq!(ctrl.frames_played(), 15 * 400);
+        }
+    }
+}
+
+#[test]
+fn review5_unbiased_lag_estimator_and_upper_boundary_guard_survive_randomized_stalls() {
+    // Review #5 Finding #13:
+    // Part A: exact scenario from Finding #13 — 640 B lag, 0.8 ms steady wake latency, then a
+    // stall waking at t = 11100.03 ms (0.03 ms after boundary 222). Must write safe half 1 (DMA
+    // in half 0), NOT active half 0!
+    let layout = WaveRtRingLayout::new(6400, 8).unwrap();
+    let half_dur = Duration::from_millis(50);
+    let mut ring = vec![0u8; 6400];
+    let mut frames_pool = vec![[66_i32, -66_i32]; 400];
+    let mut ctrl = WaveRtLoopController::new(layout)
+        .with_half_duration(half_dur)
+        .with_wrap_mode(PositionWrapMode::Monotonic);
+    {
+        let mut pump = WaveRtFramePump::new(&frames_pool, DacWireFormat::Int32);
+        ctrl.prefill(&mut ring, &mut pump).unwrap();
+    }
+
+    let true_lag = 640u64;
+    for k in 1u64..=219 {
+        // 0.8 ms = 51.2 bytes after boundary
+        let now_us = k * 50_000 + 800;
+        let real = (now_us * 3200) / 50_000;
+        let mut pump = WaveRtFramePump::new(&frames_pool, DacWireFormat::Int32);
+        let (h, out) = ctrl
+            .on_notification_at(
+                &mut ring,
+                &mut pump,
+                false,
+                Some(real - true_lag),
+                Some(Duration::from_micros(now_us)),
+            )
+            .unwrap();
+        assert_eq!(out, WaveRtStepOutcome::Continue);
+        assert_eq!(h, ((k as usize) & 1) ^ 1);
+    }
+    // Stall wakes at 11_100.03 ms (0.03 ms after boundary 222 -> real DMA = 710_401.92 -> 710_402).
+    let stall_ns: u64 = 11_100_030_000;
+    let stall_real: u64 = ((u128::from(stall_ns) * 3200) / 50_000_000) as u64;
+    assert_eq!(stall_real / 3200, 222);
+    {
+        let mut pump = WaveRtFramePump::new(&frames_pool, DacWireFormat::Int32);
+        let (h_stall, out_stall) = ctrl
+            .on_notification_at(
+                &mut ring,
+                &mut pump,
+                false,
+                Some(stall_real - true_lag),
+                Some(Duration::from_nanos(stall_ns)),
+            )
+            .unwrap();
+        assert_eq!(out_stall, WaveRtStepOutcome::Continue);
+        assert_eq!(
+            h_stall, 1,
+            "stall waking 0.03 ms after boundary 222 (DMA in half 0) must write safe half 1"
+        );
+    }
+
+    // Part B: deterministic randomized stall simulation (30 runs x 300 wakes, 5% stalls of
+    // 5..140 ms, lags 640..1500 B, both Monotonic and Modular) — assert 0 wrong-half writes!
+    let mut rng: u64 = 0x5EED_CAFE_BABE_1234;
+    let mut next_u64 = || {
+        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng
+    };
+
+    for run in 0..30usize {
+        let lag = 640 + (next_u64() % 861); // [640, 1500]
+        let wrap_mode = if run % 2 == 0 {
+            PositionWrapMode::Monotonic
+        } else {
+            PositionWrapMode::Modular
+        };
+        let mut ring = vec![0u8; 6400];
+        let mut ctrl = WaveRtLoopController::new(layout)
+            .with_half_duration(half_dur)
+            .with_wrap_mode(wrap_mode);
+        {
+            let mut pump = WaveRtFramePump::new(&frames_pool, DacWireFormat::Int32);
+            ctrl.prefill(&mut ring, &mut pump).unwrap();
+        }
+
+        let mut cur_bidx: u64 = 0;
+        for step in 0..300usize {
+            let is_stall = step > 2 && (next_u64() % 20 == 0);
+            let extra_us = if is_stall {
+                5_000 + (next_u64() % 135_000) // 5..140 ms stall
+            } else {
+                200 + (next_u64() % 1_500) // 0.2..1.7 ms normal wake latency
+            };
+            let target_bidx = cur_bidx + 1;
+            let now_us = target_bidx * 50_000 + extra_us;
+            let real = (now_us * 3200) / 50_000;
+            let actual_bidx = real / 3200;
+            let rep = real - lag;
+            let pos = if wrap_mode == PositionWrapMode::Modular {
+                rep % 6400
+            } else {
+                rep
+            };
+            frames_pool[0][0] = (step as i32) + 1;
+            let mut pump = WaveRtFramePump::new(&frames_pool, DacWireFormat::Int32);
+            let (h, out) = ctrl
+                .on_notification_at(
+                    &mut ring,
+                    &mut pump,
+                    false,
+                    Some(pos),
+                    Some(Duration::from_micros(now_us)),
+                )
+                .unwrap();
+            let safe_half = ((actual_bidx as usize) & 1) ^ 1;
+            assert_eq!(
+                out,
+                WaveRtStepOutcome::Continue,
+                "run={run} step={step} lag={lag} mode={wrap_mode:?} stall={is_stall}"
+            );
+            assert_eq!(
+                h, safe_half,
+                "run={run} step={step} lag={lag} mode={wrap_mode:?} actual_bidx={actual_bidx} extra_us={extra_us}: wrote active DMA half!"
+            );
+            cur_bidx = actual_bidx;
+        }
+    }
+}
