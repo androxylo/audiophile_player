@@ -1197,8 +1197,19 @@ pub fn select_ultimate_plan(
     let mut src = TrackSourceInfo::from_stream_spec(spec);
     src.is_streaming_source = is_streaming_source;
     src.apodizing_needed = fused.apodizing.value;
-    src.effective_nyquist_hz = fused.effective_nyquist_hz.value;
-    src.hf_noise_filter = fused.hf_noise_filter.value && fused.effective_nyquist_hz.value.is_none();
+    src.effective_nyquist_hz = match fused.effective_nyquist_hz.value {
+        Some(feff)
+            if (spec.sample_rate_hz >= 44_100 && feff <= 19_380)
+                || feff > spec.sample_rate_hz / 2 =>
+        {
+            warnings.push(format!(
+                "f_eff={feff} Hz below DR-1 floor or above Nyquist; ignored"
+            ));
+            None
+        }
+        other => other,
+    };
+    src.hf_noise_filter = fused.hf_noise_filter.value && src.effective_nyquist_hz.is_none();
     src.deemphasis = fused.deemphasis.value;
 
     let selector = Arc::new(UltimateSelector {
@@ -1288,8 +1299,9 @@ pub fn check_ultimate_throughput(
 /// currently buffered playback duration (`buffered_s`) ahead of the DAC (Review #7 F9).
 ///
 /// When `buffered_s` is `Some(b)` with `b > 0.0` (gapless transition while Track A is playing),
-/// the projected wall-clock time to finish the `w0_total_audio_s` W2 render plus `decode_wall_s`
-/// MUST fit strictly inside `(b - safety_s)` so Track A's queue cannot underrun.
+/// the projected wall-clock time to finish the `w0_total_audio_s` W2 render plus any *remaining*
+/// unelapsed `decode_wall_s` (`0.0` when `buffered_s` was already sampled after W0 decode, per
+/// Review #7 re-review R2) MUST fit strictly inside `(b - safety_s)` so Track A's queue cannot underrun.
 #[allow(clippy::too_many_arguments)]
 pub fn check_ultimate_throughput_with_buffer(
     active_filter: FilterArchetype,

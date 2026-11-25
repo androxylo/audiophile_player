@@ -537,3 +537,43 @@ fn u7_full_tail_rew_preserves_sub_minus_200db_tail_and_is_bit_deterministic() {
     assert_eq!(o1.left, o2.left, "parallel REW UPOLS must be bit-deterministic (L)");
     assert_eq!(o1.right, o2.right, "parallel REW UPOLS must be bit-deterministic (R)");
 }
+
+#[test]
+fn parallel_pool_fft_upsampler_bit_identical_to_sequential_f12() {
+    // 16-partition 44.1 -> 352.8 kHz FFT upsampler (exercises both `join_stereo` and
+    // `for_each_mac_slice` on the persistent worker pool): every single output sample MUST be
+    // 0-ULP (`to_bits()`) identical to forced-sequential execution (Review #7 F12).
+    let spec = GaussianFilterSpec::for_default_archetype(
+        FilterArchetype::GaussLongLp,
+        44_100,
+        352_800,
+    )
+    .expect("spec");
+    let designed = design_gaussian_filter(spec);
+    let input = synth_stereo_signal(44_100, 20_000);
+
+    let mut par_up = FftUpolsUpsampler::from_gaussian(designed.clone()).expect("par fft");
+    let par_out = run_chunked(&mut par_up, &input, &[4_096, 8_192, 7_712]);
+
+    let seq_out = ap_dsp::worker_pool::with_force_sequential(|| {
+        let mut seq_up = FftUpolsUpsampler::from_gaussian(designed).expect("seq fft");
+        run_chunked(&mut seq_up, &input, &[4_096, 8_192, 7_712])
+    });
+
+    assert_eq!(par_out.left.len(), seq_out.left.len());
+    assert_eq!(par_out.right.len(), seq_out.right.len());
+    for (idx, (&p, &s)) in par_out.left.iter().zip(seq_out.left.iter()).enumerate() {
+        assert_eq!(
+            p.to_bits(),
+            s.to_bits(),
+            "F12: FFT upsampler L sample {idx} differs between parallel pool and sequential"
+        );
+    }
+    for (idx, (&p, &s)) in par_out.right.iter().zip(seq_out.right.iter()).enumerate() {
+        assert_eq!(
+            p.to_bits(),
+            s.to_bits(),
+            "F12: FFT upsampler R sample {idx} differs between parallel pool and sequential"
+        );
+    }
+}

@@ -276,17 +276,20 @@ fn scan_single_track(
         .is_some_and(|r| r < spec.sample_rate_hz);
     let analysis = analyzer.snapshot(true, early_digital, orig_below, track_meta.is_dsd_hint);
 
-    // Fuse fresh full-track analysis with any existing `user:` overrides (Review #7 F1 + F6).
-    let cached_user_only = existing
-        .as_ref()
-        .map(|e| CachedWholeTrackEvidence::from_track_db_entry(e, false));
+    // Fuse fresh full-track analysis as current whole-track (`WT`) evidence alongside any existing
+    // `user:` overrides (Review #7 F1 + F6 + re-review R4) so scan and cached playback take the
+    // exact same `WT` branches in `fuse_track_evidence` (Rules A, H, L, HF-noise, bits, peak).
+    let wt_evidence = CachedWholeTrackEvidence::from_whole_track_analysis(
+        &analysis,
+        existing.as_ref().map(|e| &e.user),
+    );
     let fused = fuse_track_evidence(
         spec.sample_rate_hz,
         spec.bits_per_sample,
         &raw_peak_meta,
         &track_meta,
         Some(&analysis),
-        cached_user_only.as_ref(),
+        Some(&wt_evidence),
     );
 
     // Select the EXACT Ultimate Mode DSP plan so stored `decision.filter`, `decision.rule`, and
@@ -728,6 +731,170 @@ mod tests {
             "expected panic failure line in summary"
         );
         assert!(TrackDbStore::sidecar_path_for(&good_path).is_file());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_zero_md5_flac_then_second_scan_skips_f4() {
+        let root = make_temp_dir("f4_zero_md5");
+        let music_dir = root.join("music");
+        let db_dir = root.join("trackdb");
+        fs::create_dir_all(&music_dir).unwrap();
+
+        let flac_path = music_dir.join("01_zero_md5.flac");
+        write_test_flac(&flac_path, 44_100, 44_100, 0.4);
+
+        // Zero STREAMINFO MD5 bytes (RFC 9639: fLaC[0..4], block header[4..8], STREAMINFO[8..42],
+        // MD5 is the final 16 bytes of STREAMINFO at offset 26..42).
+        let mut raw = fs::read(&flac_path).unwrap();
+        assert_eq!(&raw[0..4], b"fLaC");
+        for b in &mut raw[26..42] {
+            *b = 0;
+        }
+        fs::write(&flac_path, &raw).unwrap();
+
+        // Confirm reader sees header MD5 == None.
+        let r_check = FlacBlockReader::open(&flac_path).unwrap();
+        assert!(
+            r_check.streaminfo_md5().is_none(),
+            "test fixture must have zeroed STREAMINFO MD5"
+        );
+        drop(r_check);
+
+        // Sidecar disabled -> central DB by-path!
+        let opts = ScanOptions {
+            folder: music_dir.clone(),
+            report: false,
+            sidecar: false,
+            post_chain: false,
+            force: false,
+            trackdb_dir: Some(db_dir.clone()),
+            config_path: None,
+            rew_override: Some(ConvolutionConfig::disabled()),
+            upsampler_policy: UpsamplerPolicy::default(),
+        };
+        let s1 = scan_folder(&opts, None).unwrap();
+        assert_eq!(s1.scanned, 1);
+        assert_eq!(s1.skipped_current, 0);
+
+        let s2 = scan_folder(&opts, None).unwrap();
+        assert_eq!(
+            s2.skipped_current, 1,
+            "F4: second scan of zero-MD5 FLAC in central DB must hit cache and skip"
+        );
+        assert_eq!(s2.scanned, 0);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_post_chain_key_matches_real_playback_lookup_f6_r4() {
+        // Non-tautological F6 + R4 round-trip: scan a real 31 s clipped loud FLAC with
+        // `--post-chain`, reload the YAML entry through `TrackDbStore::load_for_track`, then run
+        // the exact cached-playback fusion + `select_ultimate_plan` + `build_post_chain_key` path
+        // (including a ReplayGain tag that would diverge if scan used `window` while playback used
+        // `WT`!) and assert `entry.find_post_chain_peak(&playback_key)` hits!
+        let root = make_temp_dir("f6_r4_real");
+        let music_dir = root.join("music");
+        let db_dir = root.join("trackdb");
+        fs::create_dir_all(&music_dir).unwrap();
+
+        // 31 s @ 44.1 kHz loud clipped square-ish sine (amp 1.25 -> clipped_runs > 0, LUFS > -10).
+        let flac_path = music_dir.join("01_loud_31s.flac");
+        {
+            let rate = 44_100u32;
+            let frames = (rate as usize) * 31;
+            let mut interleaved = Vec::with_capacity(frames * 2);
+            for n in 0..frames {
+                let raw = (2.0 * PI * 440.0 * n as f64 / rate as f64).sin() * 1.35;
+                let clamped = raw.clamp(-1.0, 1.0);
+                let v = (clamped * 32767.0).round() as i32;
+                interleaved.push(v);
+                interleaved.push(v);
+            }
+            let mut writer = FlacSampleWriter::create(
+                &flac_path,
+                Options::default(),
+                rate,
+                16,
+                2,
+                Some(interleaved.len() as u64),
+            )
+            .unwrap();
+            writer.write(&interleaved).unwrap();
+            writer.finalize().unwrap();
+        }
+
+        let policy = UpsamplerPolicy::default();
+        let opts = ScanOptions {
+            folder: music_dir.clone(),
+            report: false,
+            sidecar: true,
+            post_chain: true,
+            force: true,
+            trackdb_dir: Some(db_dir.clone()),
+            config_path: None,
+            rew_override: Some(ConvolutionConfig::disabled()),
+            upsampler_policy: policy,
+        };
+        let summary = scan_folder(&opts, None).unwrap();
+        assert_eq!(summary.scanned, 1);
+        assert_eq!(summary.failed, 0);
+
+        // Reload via playback's exact `TrackDbStore` lookup + `CachedWholeTrackEvidence::from_track_db_entry(..., true)`.
+        let store = TrackDbStore::new(db_dir.clone(), true);
+        let reader = FlacBlockReader::open(&flac_path).unwrap();
+        let spec = reader.spec();
+        let header_md5_hex = reader.streaminfo_md5().as_ref().map(md5_to_hex);
+        let entry = store
+            .load_for_track(Some(&flac_path), header_md5_hex.as_deref())
+            .expect("scanned YAML must load for playback");
+        assert!(
+            !entry.results.post_chain_peaks.is_empty(),
+            "post_chain_peaks must be populated"
+        );
+
+        let cached_wt = CachedWholeTrackEvidence::from_track_db_entry(&entry, true);
+        // Simulate playback even when a ReplayGain tag is present (R4 verifies WT branch parity).
+        let mut peak_meta = reader.peak_meta();
+        peak_meta.replaygain_track_gain_db = Some(-10.5);
+        let playback_fused = fuse_track_evidence(
+            spec.sample_rate_hz,
+            spec.bits_per_sample,
+            &peak_meta,
+            &reader.track_meta(),
+            None,
+            Some(&cached_wt),
+        );
+        let playback_sel = select_ultimate_plan(
+            spec,
+            false,
+            Some(31.0),
+            &playback_fused,
+            &policy,
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            playback_sel.plan.filter.to_string(),
+            "gauss-apod-4m",
+            "loud clipped 31 s track must trigger Rule L -> gauss-apod-4m"
+        );
+        let playback_key = build_post_chain_key(
+            &playback_sel.plan,
+            spec.sample_rate_hz,
+            playback_sel.plan.target_rate_hz,
+            None,
+        );
+        assert!(
+            entry.find_post_chain_peak(&playback_key).is_some(),
+            "F6/R4: scanned post_chain_peaks {:?} MUST match playback key {:?}",
+            entry.results.post_chain_peaks,
+            playback_key
+        );
+        assert_eq!(entry.decision.filter, playback_key.upsampler);
 
         let _ = fs::remove_dir_all(&root);
     }

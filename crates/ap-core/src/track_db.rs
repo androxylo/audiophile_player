@@ -541,6 +541,24 @@ fn db_write_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+fn normalize_path_for_eq(s: &str) -> String {
+    let trimmed = s.trim();
+    #[cfg(windows)]
+    {
+        trimmed.replace('/', "\\").to_ascii_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        trimmed.to_string()
+    }
+}
+
+fn paths_equivalent(a: &str, b: &str) -> bool {
+    let na = normalize_path_for_eq(a);
+    let nb = normalize_path_for_eq(b);
+    !na.is_empty() && na == nb
+}
+
 impl TrackDbStore {
     pub fn new(root_dir: impl Into<PathBuf>, sidecar_enabled: bool) -> Self {
         Self {
@@ -615,7 +633,9 @@ impl TrackDbStore {
             let by_md5 = self.central_path_for_md5(md5);
             if let Some(mut e) = read_entry_if_exists(&by_md5) {
                 // FSR §7.9: an MD5 match never carries `user` overrides across different paths.
-                if track_path.is_some_and(|p| p.to_string_lossy() != e.file.path) {
+                if track_path
+                    .is_some_and(|p| !paths_equivalent(&p.to_string_lossy(), &e.file.path))
+                {
                     e.user = TrackDbUserOverrides::default();
                 }
                 return Some(e);
@@ -630,6 +650,10 @@ impl TrackDbStore {
     ///   (when enabled) or the central **by-path** file so `load_for_track` always finds entries
     ///   even when `STREAMINFO.md5` is unset, and duplicate audio at two paths never shares or
     ///   ping-pongs `user:` overrides.
+    /// - **Per-file `user:` preservation (Review #7 re-review R3):** Sidecar and central by-path
+    ///   targets belong exclusively to one track, so `user:` is ALWAYS preserved even when a
+    ///   hand-written sidecar omits `file.path` or a library was moved with its sidecars. The
+    ///   path-equivalence guard applies ONLY when inheriting from a shared central `by-md5` file.
     /// - **File-identity-checked peak merge (Review #7 F5):** Existing `post_chain_peaks` are
     ///   merged only when the on-disk entry describes the same underlying audio file (matching MD5,
     ///   or matching size + mtime tolerance when MD5 is absent).
@@ -640,40 +664,48 @@ impl TrackDbStore {
     ) -> Result<PathBuf, String> {
         let _guard = db_write_lock().lock().unwrap_or_else(|e| e.into_inner());
 
-        let target = if self.sidecar_enabled {
+        let (target, target_is_shared_md5) = if self.sidecar_enabled {
             if let Some(p) = track_path {
-                Self::sidecar_path_for(p)
+                (Self::sidecar_path_for(p), false)
             } else if let Some(ref md5) = entry.file.streaminfo_md5 {
-                self.central_path_for_md5(md5)
+                (self.central_path_for_md5(md5), true)
             } else {
                 return Err("cannot determine trackdb save path (no path or MD5)".to_string());
             }
         } else if let Some(p) = track_path {
-            self.central_path_for_file(p)
+            (self.central_path_for_file(p), false)
         } else if let Some(ref md5) = entry.file.streaminfo_md5 {
-            self.central_path_for_md5(md5)
+            (self.central_path_for_md5(md5), true)
         } else {
             return Err("cannot determine trackdb save path (no path or MD5)".to_string());
         };
 
         // Read existing target entry (or one-time legacy by-md5 fallback when migrating to by-path).
-        let existing_opt = read_entry_if_exists(&target).or_else(|| {
-            if !self.sidecar_enabled && track_path.is_some() {
-                entry
+        let (existing_opt, existing_from_shared_md5) =
+            if let Some(e) = read_entry_if_exists(&target) {
+                (Some(e), target_is_shared_md5)
+            } else if !self.sidecar_enabled && track_path.is_some() {
+                let legacy = entry
                     .file
                     .streaminfo_md5
                     .as_deref()
-                    .and_then(|md5| read_entry_if_exists(&self.central_path_for_md5(md5)))
+                    .and_then(|md5| read_entry_if_exists(&self.central_path_for_md5(md5)));
+                (legacy, true)
             } else {
-                None
-            }
-        });
+                (None, false)
+            };
 
         if let Some(existing) = existing_opt {
-            // Preserve hand-edited `user:` only for the same track path (Review #7 F-A1).
-            let same_path = existing.file.path == entry.file.path
-                || track_path.is_some_and(|p| p.to_string_lossy() == existing.file.path);
-            if same_path && entry.user == TrackDbUserOverrides::default() {
+            // Preserve hand-edited `user:`: ALWAYS for per-file sidecar/by-path targets (R3), and
+            // only for matching track paths when loaded from a shared central by-md5 entry (F-A1).
+            let allow_user_inherit = if existing_from_shared_md5 {
+                paths_equivalent(&existing.file.path, &entry.file.path)
+                    || track_path
+                        .is_some_and(|p| paths_equivalent(&p.to_string_lossy(), &existing.file.path))
+            } else {
+                true
+            };
+            if allow_user_inherit && entry.user == TrackDbUserOverrides::default() {
                 entry.user = existing.user;
             }
             // Merge existing post_chain_peaks ONLY if the existing entry describes the same audio
@@ -1233,6 +1265,56 @@ mod tests {
         let ok_feff_yaml = "schema: 1\nfile:\n  sample_rate: 96000\nresults:\n  effective_nyquist_hz: 22050\n";
         let parsed_ok = TrackDbEntry::from_yaml_str(ok_feff_yaml).unwrap();
         assert_eq!(parsed_ok.results.effective_nyquist_hz, Some(22_050));
+
+        // 5. R3: Hand-written sidecar (empty `file.path`) and moved sidecar (old `file.path`)
+        //    MUST ALWAYS preserve `user:` overrides on `save_preserving_user`!
+        let sidecar_store = TrackDbStore::new(tmp_dir.clone(), true);
+        let moved_track = tmp_dir.join("moved_album").join("01_track.flac");
+        fs::create_dir_all(moved_track.parent().unwrap()).unwrap();
+        let sc_path = TrackDbStore::sidecar_path_for(&moved_track);
+
+        // 5a. Hand-written minimal sidecar with empty `file.path`.
+        fs::write(
+            &sc_path,
+            "schema: 1\nuser:\n  filter: short-lp\n  deemphasis: true\n  note: hand-written\n",
+        )
+        .unwrap();
+        let mut fresh_entry = TrackDbEntry::default();
+        fresh_entry.file.path = moved_track.to_string_lossy().into_owned();
+        fresh_entry.file.sample_rate = 44_100;
+        fresh_entry.file.bits = 16;
+        sidecar_store
+            .save_preserving_user(Some(&moved_track), fresh_entry)
+            .unwrap();
+        let reloaded_hand = sidecar_store.load_for_track(Some(&moved_track), None).unwrap();
+        assert_eq!(
+            reloaded_hand.user.filter.as_deref(),
+            Some("short-lp"),
+            "R3: hand-written sidecar with empty path must preserve user.filter"
+        );
+        assert_eq!(reloaded_hand.user.deemphasis, Some(true));
+        assert_eq!(reloaded_hand.user.note, "hand-written");
+
+        // 5b. Moved sidecar whose recorded `file.path` still points to the old library drive.
+        let mut old_sidecar = reloaded_hand;
+        old_sidecar.file.path = r"D:\OldLibrary\01_track.flac".to_string();
+        old_sidecar.user.apodizing = Some(false);
+        fs::write(&sc_path, old_sidecar.to_yaml_string()).unwrap();
+
+        let mut after_move = TrackDbEntry::default();
+        after_move.file.path = moved_track.to_string_lossy().into_owned();
+        after_move.file.sample_rate = 44_100;
+        after_move.file.bits = 16;
+        sidecar_store
+            .save_preserving_user(Some(&moved_track), after_move)
+            .unwrap();
+        let reloaded_moved = sidecar_store.load_for_track(Some(&moved_track), None).unwrap();
+        assert_eq!(
+            reloaded_moved.user.filter.as_deref(),
+            Some("short-lp"),
+            "R3: moved library sidecar must preserve user.filter"
+        );
+        assert_eq!(reloaded_moved.user.apodizing, Some(false));
 
         let _ = fs::remove_dir_all(&tmp_dir);
     }

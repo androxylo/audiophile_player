@@ -1487,6 +1487,82 @@ fn review5_loaded_wav_ir_matches_file_samples_bit_exact_and_negative_cache_skips
 }
 
 #[test]
+fn parallel_pool_convolver_bit_identical_to_sequential_f12() {
+    // 18-partition 384 kHz REW convolver (exercises both `join_stereo` and `for_each_mac_slice`
+    // in `convolution.rs`): every output sample MUST match forced-sequential to 0 ULPs (`to_bits()`).
+    let ir_len = 65_536 * 18;
+    let mut h_l = vec![0.0_f64; ir_len];
+    let mut h_r = vec![0.0_f64; ir_len];
+    for p in 0..18 {
+        h_l[p * 65_536 + p * 13] = 0.04 / ((p + 1) as f64);
+        h_r[p * 65_536 + p * 17] = -0.03 / ((p + 1) as f64);
+    }
+    let ir = Arc::new(
+        PreparedStereoIr::from_stereo_ir_with_options("f12-par-vs-seq", 384_000, &h_l, &h_r, true)
+            .expect("prepared ir"),
+    );
+
+    let sig_len = 140_000;
+    let sig = StereoF64Buffer {
+        sample_rate_hz: 384_000,
+        left: (0..sig_len)
+            .map(|i| ((i as f64) * 0.013).sin() * 0.4 + ((i as f64) * 0.071).cos() * 0.2)
+            .collect(),
+        right: (0..sig_len)
+            .map(|i| ((i as f64) * 0.019).cos() * 0.35 - ((i as f64) * 0.053).sin() * 0.25)
+            .collect(),
+    };
+
+    let run = |ir_ref: Arc<PreparedStereoIr>| {
+        let mut conv = PartitionedStereoConvolver::new(ir_ref);
+        let mut out_l = Vec::new();
+        let mut out_r = Vec::new();
+        let b1 = conv
+            .process_block(StereoF64Buffer {
+                sample_rate_hz: 384_000,
+                left: sig.left[..70_000].to_vec(),
+                right: sig.right[..70_000].to_vec(),
+            })
+            .unwrap();
+        out_l.extend_from_slice(&b1.left);
+        out_r.extend_from_slice(&b1.right);
+        let b2 = conv
+            .process_block(StereoF64Buffer {
+                sample_rate_hz: 384_000,
+                left: sig.left[70_000..].to_vec(),
+                right: sig.right[70_000..].to_vec(),
+            })
+            .unwrap();
+        out_l.extend_from_slice(&b2.left);
+        out_r.extend_from_slice(&b2.right);
+        let fl = conv.flush().unwrap();
+        out_l.extend_from_slice(&fl.left);
+        out_r.extend_from_slice(&fl.right);
+        (out_l, out_r)
+    };
+
+    let (par_l, par_r) = run(Arc::clone(&ir));
+    let (seq_l, seq_r) = ap_dsp::worker_pool::with_force_sequential(|| run(ir));
+
+    assert_eq!(par_l.len(), seq_l.len());
+    assert_eq!(par_r.len(), seq_r.len());
+    for (idx, (&p, &s)) in par_l.iter().zip(seq_l.iter()).enumerate() {
+        assert_eq!(
+            p.to_bits(),
+            s.to_bits(),
+            "F12: convolver L sample {idx} differs between parallel pool and sequential"
+        );
+    }
+    for (idx, (&p, &s)) in par_r.iter().zip(seq_r.iter()).enumerate() {
+        assert_eq!(
+            p.to_bits(),
+            s.to_bits(),
+            "F12: convolver R sample {idx} differs between parallel pool and sequential"
+        );
+    }
+}
+
+#[test]
 #[ignore = "requires local C:\\Program Files\\EqualizerAPO\\config REW WAVs"]
 fn real_equalizer_apo_rew_filters_load_and_stream_4m_taps_if_present() {
     let dir = Path::new(r"C:\Program Files\EqualizerAPO\config");

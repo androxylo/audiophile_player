@@ -10,8 +10,8 @@
 //!   cutting forward-FFT work and FDL RAM by `L×` while keeping the exact output-rate linear
 //!   convolution.
 //! - **Bit-exact deterministic parallelism:** Parallelizes stereo L/R channels and disjoint
-//!   frequency-bin slices via `std::thread::scope` (zero external dependencies) with an unchanged
-//!   per-bin partition summation order — 100% bit-identical to single-threaded execution.
+//!   frequency-bin slices via [`crate::worker_pool`] (persistent zero-dependency worker pools) with
+//!   an unchanged per-bin partition summation order — 100% bit-identical to single-threaded execution.
 //! - **General phase support:** Works identically for linear-phase, minimum-phase, and
 //!   intermediate-phase polyphase banks via explicit `(pad_lead, pad_tail)` alignment.
 

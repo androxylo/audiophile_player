@@ -180,6 +180,8 @@ struct FlushPayload {
     guards: Vec<PinGuard>,
     events: VecDeque<StreamEvent>,
     drops: Vec<InterleavedInt32Buffer>,
+    #[cfg(test)]
+    on_free_phase: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl FlushPayload {
@@ -190,15 +192,24 @@ impl FlushPayload {
             guards,
             events,
             drops,
+            #[cfg(test)]
+            on_free_phase,
         } = self;
         drop(guards);
+        #[cfg(test)]
+        if let Some(cb) = on_free_phase {
+            cb();
+        }
         drop(events);
         drop(drops);
     }
 }
 
 impl BufferInner {
-    fn flush_locked(&mut self) -> FlushPayload {
+    fn flush_locked(
+        &mut self,
+        #[cfg(test)] on_free_phase: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> FlushPayload {
         self.epoch = self.epoch.wrapping_add(1);
         let events = std::mem::take(&mut self.events);
         self.buffered_frames = 0;
@@ -206,7 +217,14 @@ impl BufferInner {
         self.terminal_markers = 0;
         self.track_min_buffered_ns = None;
 
-        let mut guards = std::mem::take(&mut self.deferred_guards);
+        // Review #7 re-review R6: Use `drain(..)` instead of `std::mem::take` so `deferred_guards`
+        // and `deferred_drops` permanently retain their pre-allocated capacity (>= 256) and the RT
+        // thread NEVER heap-allocates during `recycle_consumed_block`!
+        let mut guards: Vec<PinGuard> = if self.deferred_guards.is_empty() {
+            Vec::new()
+        } else {
+            self.deferred_guards.drain(..).collect()
+        };
         // Remove and unlock ONLY guards for queued (non-in-flight) blocks; preserve the guard for
         // any block currently being read by the RT DMA thread until `recycle_consumed_block`!
         let mut release_keys = Vec::new();
@@ -223,12 +241,18 @@ impl BufferInner {
                 guards.push(g);
             }
         }
-        let drops = std::mem::take(&mut self.deferred_drops);
+        let drops: Vec<InterleavedInt32Buffer> = if self.deferred_drops.is_empty() {
+            Vec::new()
+        } else {
+            self.deferred_drops.drain(..).collect()
+        };
         FlushPayload {
             epoch: self.epoch,
             guards,
             events,
             drops,
+            #[cfg(test)]
+            on_free_phase,
         }
     }
 
@@ -272,6 +296,8 @@ pub struct BoundedBlockStreamBuffer {
     test_on_lock: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     test_on_unlock: Mutex<Option<Arc<dyn Fn(usize) + Send + Sync>>>,
+    #[cfg(test)]
+    test_on_free_phase: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl BoundedBlockStreamBuffer {
@@ -318,6 +344,8 @@ impl BoundedBlockStreamBuffer {
             test_on_lock: Mutex::new(None),
             #[cfg(test)]
             test_on_unlock: Mutex::new(None),
+            #[cfg(test)]
+            test_on_free_phase: Mutex::new(None),
         })
     }
 
@@ -365,13 +393,22 @@ impl BoundedBlockStreamBuffer {
     }
 
     /// Explicitly unlock and drop any deferred consumed PCM blocks on a non-RT thread.
+    /// Review #7 re-review R6: drains in place so `deferred_guards` / `deferred_drops` keep their
+    /// pre-allocated capacity (`>= 256`) and the RT thread NEVER allocates in `recycle_consumed_block`.
     pub fn drain_deferred_drops(&self) {
         let (guards, drops) = {
             let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            (
-                std::mem::take(&mut st.deferred_guards),
-                std::mem::take(&mut st.deferred_drops),
-            )
+            let g: Vec<PinGuard> = if st.deferred_guards.is_empty() {
+                Vec::new()
+            } else {
+                st.deferred_guards.drain(..).collect()
+            };
+            let d: Vec<InterleavedInt32Buffer> = if st.deferred_drops.is_empty() {
+                Vec::new()
+            } else {
+                st.deferred_drops.drain(..).collect()
+            };
+            (g, d)
         };
         drop(guards);
         drop(drops);
@@ -396,9 +433,14 @@ impl BoundedBlockStreamBuffer {
 
     /// Increment epoch and immediately drop all queued PCM blocks (frees RAM on Pause / switch).
     pub fn reset_and_flush(&self) -> u64 {
+        #[cfg(test)]
+        let on_free = self.test_on_free_phase.lock().unwrap().clone();
         let payload = {
             let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            let res = st.flush_locked();
+            let res = st.flush_locked(
+                #[cfg(test)]
+                on_free,
+            );
             self.cv.notify_all();
             res
         };
@@ -494,7 +536,12 @@ impl BoundedBlockStreamBuffer {
                 }
             }
         }
-        let payload = st.flush_locked();
+        #[cfg(test)]
+        let on_free = self.test_on_free_phase.lock().unwrap().clone();
+        let payload = st.flush_locked(
+            #[cfg(test)]
+            on_free,
+        );
         self.cv.notify_all();
         drop(st);
         let ep = payload.epoch;
@@ -504,10 +551,15 @@ impl BoundedBlockStreamBuffer {
 
     /// Permanently close the buffer for graceful shutdown, waking all blocked threads.
     pub fn close(&self) {
+        #[cfg(test)]
+        let on_free = self.test_on_free_phase.lock().unwrap().clone();
         let payload = {
             let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             st.closed = true;
-            let p = st.flush_locked();
+            let p = st.flush_locked(
+                #[cfg(test)]
+                on_free,
+            );
             self.cv.notify_all();
             p
         };
@@ -554,8 +606,16 @@ impl BoundedBlockStreamBuffer {
             };
 
         let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let mut guards = std::mem::take(&mut st.deferred_guards);
-        let mut drops = std::mem::take(&mut st.deferred_drops);
+        let mut guards: Vec<PinGuard> = if st.deferred_guards.is_empty() {
+            Vec::new()
+        } else {
+            st.deferred_guards.drain(..).collect()
+        };
+        let mut drops: Vec<InterleavedInt32Buffer> = if st.deferred_drops.is_empty() {
+            Vec::new()
+        } else {
+            st.deferred_drops.drain(..).collect()
+        };
         loop {
             if st.closed || st.epoch != epoch {
                 drop(st);
@@ -632,12 +692,23 @@ impl BoundedBlockStreamBuffer {
             return None;
         }
         let ev = st.pop_front_event()?;
-        if let StreamEvent::PcmBlock(ref b) = ev {
+        // Review #7 re-review R1: `pop_for_epoch_timeout` is the non-RT control loop pop (only
+        // `pop_track_pcm_locked` marks blocks in-flight for RT playback). If an orphaned `PcmBlock`
+        // is popped here, release its `VirtualLock` guard immediately outside `st` BEFORE returning
+        // `ev` so dropping an orphan block can never leak a pinned guard or free locked pages!
+        let orphan_guard = if let StreamEvent::PcmBlock(ref b) = ev {
             if !b.frames.is_empty() {
-                st.in_flight_ptrs.insert(b.frames.as_ptr() as usize);
+                let ptr_key = b.frames.as_ptr() as usize;
+                st.pinned_guards.remove(&ptr_key)
+            } else {
+                None
             }
-        }
+        } else {
+            None
+        };
         self.cv.notify_all();
+        drop(st);
+        drop(orphan_guard);
         Some(ev)
     }
 
@@ -1147,5 +1218,137 @@ mod tests {
             saw_unlocked.load(Ordering::SeqCst),
             "F10: inner mutex must NOT be held during VirtualLock"
         );
+    }
+
+    #[test]
+    fn orphan_pcm_pop_does_not_leak_pin_guard_or_inflight_r1() {
+        let buf = BoundedBlockStreamBuffer::with_limits_and_pinning(
+            ULTIMATE_MAX_BUFFERED_FRAMES,
+            Duration::from_secs(ULTIMATE_MAX_BUFFERED_SECONDS),
+            true,
+        );
+        let unlocked = Arc::new(Mutex::new(Vec::<usize>::new()));
+        let u_clone = Arc::clone(&unlocked);
+        *buf.test_on_unlock.lock().unwrap() = Some(Arc::new(move |ptr| {
+            u_clone.lock().unwrap().push(ptr);
+        }));
+
+        let ep = buf.current_epoch();
+        let blk = make_block_at(44_100, 2_048);
+        let ptr_key = blk.frames.as_ptr() as usize;
+        assert!(buf.push_for_epoch(ep, StreamEvent::PcmBlock(blk)));
+
+        // Non-RT control loop pops an orphaned PcmBlock via `pop_for_epoch_timeout`:
+        // guard MUST be unlocked BEFORE `ev` is returned/dropped, and `in_flight_ptrs` stays empty!
+        let ev = buf
+            .pop_for_epoch_timeout(ep, Duration::from_millis(50))
+            .expect("expected orphan PcmBlock");
+        assert!(
+            unlocked.lock().unwrap().contains(&ptr_key),
+            "R1: orphan PcmBlock popped via pop_for_epoch_timeout must be unlocked before drop"
+        );
+        {
+            let st = buf.inner.lock().unwrap();
+            assert!(
+                st.in_flight_ptrs.is_empty(),
+                "R1: pop_for_epoch_timeout must never leak keys into in_flight_ptrs"
+            );
+            assert!(
+                st.pinned_guards.is_empty(),
+                "R1: pinned_guards must not retain orphan block guard"
+            );
+        }
+        drop(ev);
+    }
+
+    #[test]
+    fn flush_unlocks_before_free_order_f10() {
+        let buf = BoundedBlockStreamBuffer::with_limits_and_pinning(
+            ULTIMATE_MAX_BUFFERED_FRAMES,
+            Duration::from_secs(ULTIMATE_MAX_BUFFERED_SECONDS),
+            true,
+        );
+        let order = Arc::new(Mutex::new(Vec::<(&'static str, usize)>::new()));
+        let o1 = Arc::clone(&order);
+        *buf.test_on_unlock.lock().unwrap() = Some(Arc::new(move |ptr| {
+            o1.lock().unwrap().push(("unlock", ptr));
+        }));
+        let o2 = Arc::clone(&order);
+        *buf.test_on_free_phase.lock().unwrap() = Some(Arc::new(move || {
+            o2.lock().unwrap().push(("free_phase", 0));
+        }));
+
+        let ep = buf.current_epoch();
+        let mut ptrs = Vec::new();
+        for _ in 0..4 {
+            let b = make_block_at(44_100, 2_048);
+            ptrs.push(b.frames.as_ptr() as usize);
+            assert!(buf.push_for_epoch(ep, StreamEvent::PcmBlock(b)));
+        }
+
+        let _ = buf.reset_and_flush();
+
+        let log = order.lock().unwrap();
+        let free_idx = log
+            .iter()
+            .position(|&(ev, _)| ev == "free_phase")
+            .expect("free_phase marker must fire on flush");
+        assert_eq!(free_idx, 4, "all 4 unlocks must occur strictly BEFORE free_phase: {log:?}");
+        for p in ptrs {
+            assert!(
+                log[..free_idx].iter().any(|&(ev, k)| ev == "unlock" && k == p),
+                "queued block {p:#x} must unlock before buffer free"
+            );
+        }
+    }
+
+    #[test]
+    fn deferred_queues_retain_capacity_after_drain_r6() {
+        let buf = BoundedBlockStreamBuffer::with_limits_and_pinning(
+            ULTIMATE_MAX_BUFFERED_FRAMES,
+            Duration::from_secs(ULTIMATE_MAX_BUFFERED_SECONDS),
+            true,
+        );
+        let ep = buf.current_epoch();
+        for _ in 0..8 {
+            assert!(buf.push_for_epoch(ep, StreamEvent::PcmBlock(make_block_at(44_100, 1_024))));
+        }
+        for _ in 0..4 {
+            if let PopBlockResult::Block(b) = buf.try_pop_track_pcm_block(ep) {
+                buf.recycle_consumed_block(b);
+            }
+        }
+        buf.drain_deferred_drops();
+        {
+            let st = buf.inner.lock().unwrap();
+            assert!(
+                st.deferred_guards.capacity() >= INITIAL_DEFERRED_DROP_CAPACITY,
+                "R6: deferred_guards lost pre-allocated capacity after drain_deferred_drops"
+            );
+            assert!(
+                st.deferred_drops.capacity() >= INITIAL_DEFERRED_DROP_CAPACITY,
+                "R6: deferred_drops lost pre-allocated capacity after drain_deferred_drops"
+            );
+        }
+
+        // Next push drains any recycled blocks and flush drains remaining blocks — capacity MUST stick!
+        for _ in 0..2 {
+            if let PopBlockResult::Block(b) = buf.try_pop_track_pcm_block(ep) {
+                buf.recycle_consumed_block(b);
+            }
+        }
+        assert!(buf.push_for_epoch(ep, StreamEvent::PcmBlock(make_block_at(44_100, 1_024))));
+        let _ = buf.reset_and_flush();
+        {
+            let st = buf.inner.lock().unwrap();
+            assert!(
+                st.deferred_guards.capacity() >= INITIAL_DEFERRED_DROP_CAPACITY,
+                "R6: deferred_guards lost pre-allocated capacity after push/flush"
+            );
+            assert!(
+                st.deferred_drops.capacity() >= INITIAL_DEFERRED_DROP_CAPACITY,
+                "R6: deferred_drops lost pre-allocated capacity after push/flush"
+            );
+        }
     }
 }

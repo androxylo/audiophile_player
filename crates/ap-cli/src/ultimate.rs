@@ -193,7 +193,6 @@ where
     let mut w0_frames: u64 = 0;
     let mut hit_eof_in_w0 = false;
     let mut analyzer = TrackAnalyzer::new(spec.sample_rate_hz, spec.bits_per_sample);
-    let w0_started = Instant::now();
 
     while w0_frames < max_window_frames {
         buf.drain_deferred_drops();
@@ -229,7 +228,6 @@ where
             }
         }
     }
-    let w0_decode_wall_s = w0_started.elapsed().as_secs_f64();
 
     if w0_blocks.is_empty() {
         if !flush_prev_on_incompatible(
@@ -417,7 +415,9 @@ where
                         total_duration_s,
                         w0_audio_s,
                         buffered_opt,
-                        w0_decode_wall_s,
+                        // Review #7 re-review R2: `buffered_before_w2_s` was sampled AFTER W0
+                        // decode finished, so decode time is already reflected in `buffered_opt`!
+                        0.0,
                     );
                     if !probe.passed
                         && probe.fallback_filter.is_some_and(|fb| fb != plan.filter)
@@ -463,7 +463,7 @@ where
             total_duration_s,
             w0_audio_s,
             buffered_opt,
-            w0_decode_wall_s,
+            0.0,
         )
     };
 
@@ -728,6 +728,7 @@ where
     // a warning, sets `had_error = true` (disabling YAML learn-on-play and gapless carryover), and
     // breaks cleanly into EOF flush + `TrackEnd` so single-file sessions and playlists stay intact.
     let mut had_error = false;
+    let mut had_w3_error = false;
     let mut error_warning: Option<String> = None;
     let mut whole_track_m_linear = m30_linear;
     let mut cleared_panic_backup = false;
@@ -756,6 +757,7 @@ where
                 );
                 eprintln!("  [ultimate err] {msg}");
                 had_error = true;
+                had_w3_error = true;
                 error_warning = Some(msg);
                 break;
             }
@@ -966,6 +968,22 @@ where
                 (None, false)
             }
         }
+    } else if had_w3_error {
+        // Review #7 re-review F7 minor: On a W3 error, `session` has already rendered all 30 s of
+        // W0 past the failed W3 block, so flushing `session` would append a discontinuous t=30 s
+        // tail. Drain only any remaining incoming `additive_tail` and emit `TrackEnd` cleanly.
+        if !drain_remaining_additive_tail(
+            &mut session,
+            &mut additive_tail,
+            &mut had_error,
+            &mut error_warning,
+        ) {
+            return UltimateStreamResult::Aborted;
+        }
+        if !buf.push_for_epoch(epoch, StreamEvent::TrackEnd) {
+            return UltimateStreamResult::Aborted;
+        }
+        (None, false)
     } else {
         match session.flush_unity_f64() {
             Ok(ending_unity) => {
@@ -2006,7 +2024,24 @@ mod tests {
         src_q2.streaminfo_md5 = Some([0x12; 16]);
         src_q2.computed_md5_at_eof = Some([0x12; 16]);
         let buf_c3 = Arc::clone(&buf);
-        let h3 = std::thread::spawn(move || drain_track_events(&buf_c3, ep));
+        let h3 = std::thread::spawn(move || {
+            let mut report = None;
+            let mut first_frames: Vec<[i32; 2]> = Vec::new();
+            loop {
+                match buf_c3.pop_for_epoch_timeout(ep, Duration::from_secs(2)) {
+                    Some(StreamEvent::TrackStart { report: r, .. }) => report = Some(r),
+                    Some(StreamEvent::PcmBlock(b)) => {
+                        if first_frames.len() < 1_024 {
+                            let need = 1_024 - first_frames.len();
+                            first_frames.extend_from_slice(&b.frames[..b.frames.len().min(need)]);
+                        }
+                    }
+                    Some(StreamEvent::TrackEnd) => break,
+                    other => panic!("unexpected event in Case 2: {other:?}"),
+                }
+            }
+            (report.expect("missing TrackStart"), first_frames)
+        });
         let _ = stream_track_ultimate(
             &fast_pipeline,
             &ult,
@@ -2026,7 +2061,7 @@ mod tests {
             false,
             16_384,
         );
-        let (rep_q2, _, _) = h3.join().unwrap();
+        let (rep_q2, pcm_q2) = h3.join().unwrap();
         assert!(rep_q2.headroom.total_gain_db().abs() < 1e-9);
         assert_eq!(
             rep_q2.effective_shaper,
@@ -2034,6 +2069,17 @@ mod tests {
             "0 dB Null pass-through must stay bit-perfect Bypass"
         );
         assert_eq!(rep_q2.output_bits, 16);
+        // Verify output PCM matches source 16-bit samples bit-for-bit (F2 zero-gain bit-perfect check).
+        assert_eq!(pcm_q2.len(), 1_024);
+        let mut src_ref = SyntheticSource::sine(44_100, 31.0, 0.25, false);
+        let ref_blk = src_ref.read_next_block(1_024).unwrap().unwrap();
+        let mut ref_q =
+            ap_dsp::quantize::StreamingQuantizer::new(NoiseShaperProfile::Bypass, 16).unwrap();
+        let ref_pcm = ref_q.quantize_block(&ref_blk);
+        assert_eq!(
+            pcm_q2, ref_pcm.frames,
+            "F2: 0 dB Null pass-through PCM must match source 16-bit samples bit-for-bit"
+        );
 
         let _ = fs::remove_dir_all(&db_root);
     }
@@ -2319,6 +2365,179 @@ mod tests {
         assert_eq!(
             blocks_rendered, 11,
             "F9: early probe abort must stop after 1 block (1 + 10 fallback = 11 vs 20 without abort)"
+        );
+
+        let _ = fs::remove_dir_all(&db_root);
+    }
+
+    #[test]
+    fn w4_tail_energy_and_eof_flush_quantize_error_f7_fb2() {
+        let db_root = temp_dir("f7_fb2_tail");
+        let track_path = db_root.join("tail_and_eof.flac");
+        fs::write(&track_path, b"tail_eof").unwrap();
+        let ult = UltimateRuntimeContext {
+            config: UltimateConfig {
+                enabled: true,
+                genre_rules: true,
+                learn_on_play: true,
+            },
+            store: TrackDbStore::new(db_root.clone(), false),
+        };
+        let fast_policy = UpsamplerPolicy {
+            filter_override: Some(FilterArchetype::Null),
+            ..UpsamplerPolicy::default()
+        };
+        let fast_pipeline = AudioPipeline::with_rew_config_full_tail(
+            fast_policy,
+            ConvolutionConfig::disabled(),
+            true,
+        )
+        .unwrap();
+        let buf = BoundedBlockStreamBuffer::with_limits(
+            ULTIMATE_MAX_BUFFERED_FRAMES,
+            Duration::from_secs(ULTIMATE_MAX_BUFFERED_SECONDS),
+        );
+        let ep = buf.current_epoch();
+
+        // 1. F7 tail-energy check: compare first 256 samples of W4-failing track WITH vs WITHOUT
+        //    incoming ConvolutionTail([0.35; 256]) -> carried tail energy MUST appear in PCM!
+        let run_capture_prefix = |with_tail: bool| -> Vec<[i32; 2]> {
+            let mut src = SyntheticSource::sine(44_100, 35.0, 0.1, false);
+            src.fail_at_frame = Some(44_100 * 31);
+            let mut carry = if with_tail {
+                Some(GaplessCarryover {
+                    output_rate_hz: 44_100,
+                    output_bits: 24,
+                    effective_shaper: NoiseShaperProfile::TpdfDither,
+                    upsampler: None,
+                    deemphasis: None,
+                    convolver: Some(ConvolutionTail {
+                        sample_rate_hz: 44_100,
+                        left: vec![0.35; 256],
+                        right: vec![0.35; 256],
+                    }),
+                    quantizer_state: None,
+                })
+            } else {
+                None
+            };
+            let mut backup = None;
+            let mut pend = false;
+            let buf_c = Arc::clone(&buf);
+            let h = std::thread::spawn(move || {
+                let mut prefix = Vec::new();
+                loop {
+                    match buf_c.pop_for_epoch_timeout(ep, Duration::from_secs(2)) {
+                        Some(StreamEvent::TrackStart { .. }) => {}
+                        Some(StreamEvent::PcmBlock(b)) => {
+                            if prefix.len() < 256 {
+                                let need = 256 - prefix.len();
+                                prefix.extend_from_slice(&b.frames[..b.frames.len().min(need)]);
+                            }
+                        }
+                        Some(StreamEvent::TrackEnd) => break,
+                        other => panic!("unexpected event: {other:?}"),
+                    }
+                }
+                prefix
+            });
+            let r = stream_track_ultimate(
+                &fast_pipeline,
+                &ult,
+                &buf,
+                ep,
+                || false,
+                &mut src,
+                &track_path,
+                Some(&track_path),
+                None,
+                None,
+                PlayModeLabel::SingleFile,
+                Some(35.0),
+                &mut carry,
+                &mut backup,
+                &mut pend,
+                false,
+                16_384,
+            );
+            assert!(matches!(r, UltimateStreamResult::Played { wrote_yaml: false, .. }));
+            h.join().unwrap()
+        };
+
+        let no_tail_pcm = run_capture_prefix(false);
+        let with_tail_pcm = run_capture_prefix(true);
+        assert_eq!(no_tail_pcm.len(), 256);
+        assert_eq!(with_tail_pcm.len(), 256);
+        let diff_energy: i128 = with_tail_pcm
+            .iter()
+            .zip(no_tail_pcm.iter())
+            .map(|(a, b)| (i128::from(a[0]) - i128::from(b[0])).abs())
+            .sum();
+        assert!(
+            diff_energy > 256 * 100_000_000_i128,
+            "F7: carried ConvolutionTail energy must appear in quantized output (diff_energy={diff_energy})"
+        );
+
+        // 2. F-B2: Inject quantize error during EOF flush -> MUST log warning, emit TrackEnd,
+        //    and suppress YAML learn-on-play (`wrote_yaml == false`)!
+        //    Use `ShortLp` so `flush_unity_f64()` produces a non-empty filter tail block at EOF.
+        let lp_pipeline = AudioPipeline::with_rew_config_full_tail(
+            UpsamplerPolicy {
+                filter_override: Some(FilterArchetype::ShortLp),
+                ..UpsamplerPolicy::default()
+            },
+            ConvolutionConfig::disabled(),
+            true,
+        )
+        .unwrap();
+        let eof_track = db_root.join("fb2_eof_err.flac");
+        fs::write(&eof_track, b"fb2").unwrap();
+        let mut src_eof = SyntheticSource::sine(176_400, 30.2, 0.5, false);
+        let mut carry = None;
+        let mut backup = None;
+        let mut pend = false;
+        let buf_c2 = Arc::clone(&buf);
+        let h2 = std::thread::spawn(move || drain_track_events(&buf_c2, ep));
+        TEST_FAIL_EOF_FLUSH_QUANTIZE.with(|c| c.set(true));
+        let r_eof = stream_track_ultimate(
+            &lp_pipeline,
+            &ult,
+            &buf,
+            ep,
+            || false,
+            &mut src_eof,
+            &eof_track,
+            Some(&eof_track),
+            None,
+            None,
+            PlayModeLabel::SingleFile,
+            Some(30.2),
+            &mut carry,
+            &mut backup,
+            &mut pend,
+            false,
+            176_400 * 3,
+        );
+        TEST_FAIL_EOF_FLUSH_QUANTIZE.with(|c| c.set(false));
+        let _ = h2.join().unwrap();
+        match r_eof {
+            UltimateStreamResult::Played {
+                wrote_yaml,
+                warning,
+                ..
+            } => {
+                assert!(!wrote_yaml, "F-B2: EOF flush quantize error must suppress YAML write");
+                let w = warning.expect("F-B2: EOF flush quantize error must surface warning");
+                assert!(
+                    w.contains("EOF flush quantize error"),
+                    "unexpected F-B2 warning: {w}"
+                );
+            }
+            other => panic!("F-B2: expected Played with warning, got {other:?}"),
+        }
+        assert!(
+            ult.store.load_for_track(Some(&eof_track), None).is_none(),
+            "F-B2: YAML file must not be persisted after EOF flush quantize error"
         );
 
         let _ = fs::remove_dir_all(&db_root);

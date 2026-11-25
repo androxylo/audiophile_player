@@ -109,6 +109,37 @@ impl CachedWholeTrackEvidence {
         }
         out
     }
+
+    /// Construct current whole-track (`WT`) evidence directly from a fresh full-track
+    /// [`AnalysisResult`] plus optional persisted `user:` overrides (Review #7 re-review R4).
+    ///
+    /// Used by `audiophile-player scan` so scan-time fusion takes the exact same `WT` branches in
+    /// [`fuse_track_evidence`] (Rules A, H, L, HF-noise, effective bits, true peak) as cached
+    /// playback does, guaranteeing identical filter decisions and `--post-chain` keys.
+    pub fn from_whole_track_analysis(
+        analysis: &AnalysisResult,
+        user: Option<&ap_core::track_db::TrackDbUserOverrides>,
+    ) -> Self {
+        Self {
+            results_current: true,
+            user_filter: user.and_then(|u| u.filter.clone()),
+            user_deemphasis: user.and_then(|u| u.deemphasis),
+            user_apodizing: user.and_then(|u| u.apodizing),
+            effective_nyquist_hz: analysis.effective_nyquist_hz,
+            upsampled_from_1x: analysis.upsampled_from_1x,
+            apod_events: analysis.apod_events,
+            apodizing_needed: analysis.apodizing_needed,
+            integrated_lufs: analysis.integrated_lufs,
+            clipped_runs: analysis.clipped_runs,
+            loud_and_clipped: analysis.loud_and_clipped,
+            true_peak_dbtp: analysis
+                .true_peak_dbtp
+                .is_finite()
+                .then_some(analysis.true_peak_dbtp),
+            effective_bits: (analysis.effective_bits > 0).then_some(analysis.effective_bits),
+            ultrasonic_noise_detected: analysis.ultrasonic_noise_detected,
+        }
+    }
 }
 
 /// Build a canonical Schema-1 [`TrackDbEntry`] from whole-track [`AnalysisResult`] + identity.

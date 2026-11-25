@@ -15,11 +15,36 @@
 //! nested tasks, pool exhaustion deadlock is impossible.
 
 use std::any::Any;
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
+
+thread_local! {
+    /// Thread-local re-entrancy guards so nested calls from inside a pool worker execute inline
+    /// rather than risking pool starvation or deadlock (Review #7 re-review F12).
+    static IN_CHANNEL_POOL: Cell<bool> = const { Cell::new(false) };
+    static IN_MAC_POOL: Cell<bool> = const { Cell::new(false) };
+    /// Thread-local sequential execution override used by integration tests to assert exact
+    /// `0 ULPs` (`to_bits()`) bit-identity between parallel pool and single-threaded paths.
+    static FORCE_SEQUENTIAL: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Run `f` with parallel worker-pool fan-out forced to run sequentially on the calling thread
+/// (thread-local; safe for concurrent tests asserting `0 ULPs` bit-identity).
+pub fn with_force_sequential<R>(f: impl FnOnce() -> R) -> R {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FORCE_SEQUENTIAL.with(|c| c.set(self.0));
+        }
+    }
+    let prev = FORCE_SEQUENTIAL.with(|c| c.replace(true));
+    let _reset = Reset(prev);
+    f()
+}
 
 /// Minimum `nonzero_partitions * spec_len` work threshold before fanning out MAC bin slices.
 pub const MAC_PARALLEL_MIN_WORK: usize = 131_072;
@@ -97,7 +122,14 @@ impl PersistentPool {
 
 fn channel_pool() -> &'static PersistentPool {
     static POOL: OnceLock<PersistentPool> = OnceLock::new();
-    POOL.get_or_init(|| PersistentPool::new("ap-dsp-ch", 2))
+    POOL.get_or_init(|| {
+        let cores = thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        // Scale with cores (2..=8) so concurrent background scan/W2 work cannot starve playback
+        // producer stereo joins (Review #7 re-review F12).
+        PersistentPool::new("ap-dsp-ch", cores.clamp(2, 8))
+    })
 }
 
 fn mac_pool() -> &'static PersistentPool {
@@ -176,6 +208,13 @@ where
     FR: FnOnce() -> RR,
     RL: Send,
 {
+    if FORCE_SEQUENTIAL.with(Cell::get)
+        || IN_CHANNEL_POOL.with(Cell::get)
+        || IN_MAC_POOL.with(Cell::get)
+    {
+        return (left_fn(), right_fn());
+    }
+
     let pool = channel_pool();
     let latch = ScopeLatch::new(1);
     let left_slot: Mutex<Option<RL>> = Mutex::new(None);
@@ -187,6 +226,14 @@ where
 
     // Erase the lifetime of `left_fn` strictly inside the `WaitGuard`-protected scope.
     let boxed: Box<dyn FnOnce() + Send + '_> = Box::new(move || {
+        struct FlagGuard;
+        impl Drop for FlagGuard {
+            fn drop(&mut self) {
+                IN_CHANNEL_POOL.with(|c| c.set(false));
+            }
+        }
+        IN_CHANNEL_POOL.with(|c| c.set(true));
+        let _fg = FlagGuard;
         let res = catch_unwind(AssertUnwindSafe(left_fn));
         match res {
             Ok(val) => {
@@ -226,6 +273,11 @@ where
     T: Send,
     F: Fn(usize, usize, &mut [T]) + Sync,
 {
+    if FORCE_SEQUENTIAL.with(Cell::get) || IN_MAC_POOL.with(Cell::get) {
+        f(0, 0, buf);
+        return;
+    }
+
     let slices = max_slices.min(mac_pool().num_workers + 1).max(1);
     if slices <= 1 || buf.len() < 512 {
         f(0, 0, buf);
@@ -263,6 +315,14 @@ where
         // SAFETY: `guard` waits for all `rest.len()` jobs to complete in `Drop` before this
         // function returns or unwinds, so `chunk` and `f_ref` remain valid for the job's lifetime.
         let boxed: Box<dyn FnOnce() + Send + '_> = Box::new(move || {
+            struct FlagGuard;
+            impl Drop for FlagGuard {
+                fn drop(&mut self) {
+                    IN_MAC_POOL.with(|c| c.set(false));
+                }
+            }
+            IN_MAC_POOL.with(|c| c.set(true));
+            let _fg = FlagGuard;
             let res = catch_unwind(AssertUnwindSafe(|| {
                 f_ref(slice_idx, start, chunk);
             }));

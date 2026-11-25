@@ -1342,6 +1342,33 @@ fn producer_loop(
     producer_loop_with_upnp(pipeline, ctrl, buf, shared, None, None);
 }
 
+fn finalize_prev_track(
+    pipeline: &AudioPipeline,
+    buf: &BoundedBlockStreamBuffer,
+    epoch: u64,
+    carried: &mut Option<GaplessCarryover>,
+    pending_end: &mut bool,
+) {
+    if let Some(tail) = carried.take() {
+        if let Ok((pcm, drain_stats)) = pipeline.drain_gapless_carryover_with_stats(tail) {
+            if drain_stats.overs_count > 0 {
+                eprintln!(
+                    "  [clip warn] drained gapless tail: {} pre-quantizer sample overs (max {:.2} dBFS)",
+                    drain_stats.overs_count,
+                    drain_stats.max_pre_quant_peak_dbfs()
+                );
+            }
+            if !pcm.is_empty() {
+                let _ = buf.push_for_epoch(epoch, StreamEvent::PcmBlock(pcm));
+            }
+        }
+    }
+    if *pending_end {
+        *pending_end = false;
+        let _ = buf.push_for_epoch(epoch, StreamEvent::TrackEnd);
+    }
+}
+
 fn producer_loop_with_upnp(
     pipeline: AudioPipeline,
     ctrl: Arc<ProducerControl>,
@@ -1361,31 +1388,6 @@ fn producer_loop_with_upnp(
     let mut consecutive_unsupported: u32 = 0;
     let mut carried_tail: Option<GaplessCarryover> = None;
     let mut pending_track_end = false;
-
-    let finalize_prev_track = |pipeline: &AudioPipeline,
-                               buf: &BoundedBlockStreamBuffer,
-                               epoch: u64,
-                               carried: &mut Option<GaplessCarryover>,
-                               pending_end: &mut bool| {
-        if let Some(tail) = carried.take() {
-            if let Ok((pcm, drain_stats)) = pipeline.drain_gapless_carryover_with_stats(tail) {
-                if drain_stats.overs_count > 0 {
-                    eprintln!(
-                        "  [clip warn] drained gapless tail: {} pre-quantizer sample overs (max {:.2} dBFS)",
-                        drain_stats.overs_count,
-                        drain_stats.max_pre_quant_peak_dbfs()
-                    );
-                }
-                if !pcm.is_empty() {
-                    let _ = buf.push_for_epoch(epoch, StreamEvent::PcmBlock(pcm));
-                }
-            }
-        }
-        if *pending_end {
-            *pending_end = false;
-            let _ = buf.push_for_epoch(epoch, StreamEvent::TrackEnd);
-        }
-    };
 
     while let Some((epoch, directive, cancel_flag)) = ctrl.wait_active_with_cancel() {
         // Guard against the brief window where `buf.reset_and_flush()` bumped the buffer epoch
@@ -4998,6 +5000,179 @@ mod tests {
         assert_ne!(pref_repeat.prefetched_next_gen, Some(gen_b2));
 
         upnp_srv.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ultimate_panic_after_carry_take_finalizes_prev_tail_f8() {
+        // Engine-level F8 recovery test: invoke `stream_track_ultimate` under the same
+        // `catch_unwind` + `panic_backup_carry` -> `finalize_prev_track` recovery flow used by
+        // `engine.rs:1671-1701`, with a panic injected right after `incoming_carryover.take()`.
+        // Assert Track A's nonzero REW carryover tail PCM and `TrackEnd` are both emitted!
+        use crate::ultimate::{
+            TEST_PANIC_AFTER_CARRY_TAKE, UltimateRuntimeContext, stream_track_ultimate,
+        };
+        use ap_core::config::UltimateConfig;
+        use ap_core::format::StreamSpec;
+        use ap_core::headroom::TrackPeakMetadata;
+        use ap_core::metadata::TrackMetadata;
+        use ap_core::track_db::TrackDbStore;
+        use ap_dsp::convolution::ConvolutionTail;
+        use ap_dsp::pipeline::GaplessCarryover;
+        use ap_dsp::selector::{FilterArchetype, NoiseShaperProfile, UpsamplerPolicy};
+        use ap_source::flac::AudioBlockSource;
+
+        struct Dummy31sSource {
+            spec: StreamSpec,
+            cursor: usize,
+            total: usize,
+        }
+        impl AudioBlockSource for Dummy31sSource {
+            fn spec(&self) -> StreamSpec {
+                self.spec
+            }
+            fn peak_meta(&self) -> TrackPeakMetadata {
+                TrackPeakMetadata::default()
+            }
+            fn is_streaming(&self) -> bool {
+                false
+            }
+            fn total_frames(&self) -> Option<u64> {
+                Some(self.total as u64)
+            }
+            fn track_meta(&self) -> TrackMetadata {
+                TrackMetadata::default()
+            }
+            fn streaminfo_md5(&self) -> Option<[u8; 16]> {
+                None
+            }
+            fn computed_md5(&self) -> Option<[u8; 16]> {
+                None
+            }
+            fn read_next_block(
+                &mut self,
+                max_frames: usize,
+            ) -> Result<Option<ap_core::buffer::StereoF64Buffer>, String> {
+                if self.cursor >= self.total {
+                    return Ok(None);
+                }
+                let n = max_frames.min(self.total - self.cursor);
+                self.cursor += n;
+                Ok(Some(ap_core::buffer::StereoF64Buffer {
+                    sample_rate_hz: self.spec.sample_rate_hz,
+                    left: vec![0.1; n],
+                    right: vec![0.1; n],
+                }))
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!("ap_eng_f8_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let track_b = root.join("track_b.flac");
+        std::fs::write(&track_b, b"b").unwrap();
+
+        let pipeline = AudioPipeline::with_rew_config_full_tail(
+            UpsamplerPolicy {
+                filter_override: Some(FilterArchetype::Null),
+                ..UpsamplerPolicy::default()
+            },
+            ConvolutionConfig::disabled(),
+            true,
+        )
+        .unwrap();
+        let ult = UltimateRuntimeContext {
+            config: UltimateConfig {
+                enabled: true,
+                genre_rules: true,
+                learn_on_play: false,
+            },
+            store: TrackDbStore::new(root.clone(), false),
+        };
+        let buf = BoundedBlockStreamBuffer::new(384_000 * 10);
+        let ep = buf.current_epoch();
+
+        let mut carried_tail = Some(GaplessCarryover {
+            output_rate_hz: 44_100,
+            output_bits: 24,
+            effective_shaper: NoiseShaperProfile::TpdfDither,
+            upsampler: None,
+            deemphasis: None,
+            convolver: Some(ConvolutionTail {
+                sample_rate_hz: 44_100,
+                left: vec![0.25; 512],
+                right: vec![-0.25; 512],
+            }),
+            quantizer_state: None,
+        });
+        let mut panic_backup_carry: Option<GaplessCarryover> = None;
+        let mut pending_track_end = true;
+
+        let mut src = Dummy31sSource {
+            spec: StreamSpec {
+                sample_rate_hz: 44_100,
+                bits_per_sample: 16,
+                channels: 2,
+            },
+            cursor: 0,
+            total: 44_100 * 31,
+        };
+
+        TEST_PANIC_AFTER_CARRY_TAKE.with(|c| c.set(true));
+        let res = catch_unwind(AssertUnwindSafe(|| {
+            stream_track_ultimate(
+                &pipeline,
+                &ult,
+                &buf,
+                ep,
+                || false,
+                &mut src,
+                &track_b,
+                Some(&track_b),
+                None,
+                None,
+                PlayModeLabel::SingleFile,
+                Some(31.0),
+                &mut carried_tail,
+                &mut panic_backup_carry,
+                &mut pending_track_end,
+                false,
+                16_384,
+            )
+        }));
+        TEST_PANIC_AFTER_CARRY_TAKE.with(|c| c.set(false));
+
+        assert!(res.is_err(), "expected injected F8 panic");
+        assert!(carried_tail.is_none());
+        assert!(panic_backup_carry.is_some());
+
+        // Exact engine.rs panic recovery path: restore backup carry and finalize Track A cleanly!
+        if carried_tail.is_none() {
+            carried_tail = panic_backup_carry.take();
+        }
+        finalize_prev_track(&pipeline, &buf, ep, &mut carried_tail, &mut pending_track_end);
+        assert!(carried_tail.is_none());
+        assert!(!pending_track_end);
+
+        let mut saw_tail_pcm = false;
+        let mut saw_track_end = false;
+        while let Some(ev) = buf.pop_for_epoch_timeout(ep, Duration::from_millis(50)) {
+            match ev {
+                StreamEvent::PcmBlock(b) => {
+                    assert_eq!(b.frames.len(), 512);
+                    assert!(b.frames.iter().any(|f| f[0] != 0 || f[1] != 0));
+                    saw_tail_pcm = true;
+                }
+                StreamEvent::TrackEnd => {
+                    saw_track_end = true;
+                    break;
+                }
+                other => panic!("unexpected event after F8 panic recovery: {other:?}"),
+            }
+        }
+        assert!(saw_tail_pcm, "F8: Track A's carryover tail PCM must be flushed on panic");
+        assert!(saw_track_end, "F8: Track A's TrackEnd must be emitted on panic");
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }

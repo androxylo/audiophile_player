@@ -247,17 +247,23 @@ pub fn classify_genre_token(token: &str) -> GenreClass {
 
     // 3. Single whole-word head-noun rule: last matching word wins ("symphonic metal" -> metal,
     //    "chamber jazz" -> jazz, "folk rock" -> rock). `"ost"` only matches as a whole word.
+    //    Includes common plurals & compounds (Review #7 re-review R5).
     const CLASSICAL_WORDS: &[&str] = &[
         "classical",
+        "neoclassical",
         "orchestral",
         "symphony",
+        "symphonies",
         "symphonic",
         "chamber",
         "opera",
+        "operas",
         "baroque",
         "choral",
         "concerto",
+        "concertos",
         "sonata",
+        "sonatas",
         "romantic",
         "renaissance",
     ];
@@ -279,18 +285,32 @@ pub fn classify_genre_token(token: &str) -> GenreClass {
     const ROCK_WORDS: &[&str] = &[
         "rock",
         "pop",
+        "britpop",
+        "electropop",
+        "artpop",
+        "krautrock",
         "electronic",
         "electronica",
+        "folktronica",
         "edm",
         "techno",
         "house",
         "trance",
         "dubstep",
         "dnb",
+        "breakbeat",
+        "breakbeats",
         "synth",
         "synthpop",
         "synthwave",
+        "darkwave",
+        "chillwave",
+        "vaporwave",
         "metal",
+        "metalcore",
+        "deathcore",
+        "mathcore",
+        "grindcore",
         "punk",
         "indie",
         "alternative",
@@ -301,6 +321,7 @@ pub fn classify_genre_token(token: &str) -> GenreClass {
         "funk",
         "disco",
         "dance",
+        "dancehall",
         "reggae",
         "grunge",
         "prog",
@@ -312,14 +333,18 @@ pub fn classify_genre_token(token: &str) -> GenreClass {
     const AMBIENT_WORDS: &[&str] = &[
         "ambient",
         "soundtrack",
+        "soundtracks",
         "score",
+        "scores",
+        "soundscape",
+        "soundscapes",
         "ost",
         "drone",
         "downtempo",
         "chillout",
     ];
 
-    let word_class = |w: &str| -> Option<GenreClass> {
+    let lookup_exact = |w: &str| -> Option<GenreClass> {
         if ROCK_WORDS.contains(&w) {
             Some(GenreClass::RockPopElectronic)
         } else if JAZZ_WORDS.contains(&w) {
@@ -331,6 +356,18 @@ pub fn classify_genre_token(token: &str) -> GenreClass {
         } else {
             None
         }
+    };
+
+    let word_class = |w: &str| -> Option<GenreClass> {
+        lookup_exact(w).or_else(|| {
+            // Safe singular fallback for regular English plurals (length >= 5, e.g. "scores",
+            // "soundtracks") while avoiding short tokens like "ost" or "bop".
+            if w.len() >= 5 {
+                w.strip_suffix('s').and_then(lookup_exact)
+            } else {
+                None
+            }
+        })
     };
 
     for &w in words.iter().rev() {
@@ -603,6 +640,17 @@ mod tests {
             ("Film Score", GenreClass::AmbientSoundtrack),
             ("Classical", GenreClass::Classical),
             ("Symphony", GenreClass::Classical),
+            // R5 plurals & compounds:
+            ("Soundtracks", GenreClass::AmbientSoundtrack),
+            ("Scores", GenreClass::AmbientSoundtrack),
+            ("Operas", GenreClass::Classical),
+            ("Concertos", GenreClass::Classical),
+            ("neoclassical", GenreClass::Classical),
+            ("metalcore", GenreClass::RockPopElectronic),
+            ("britpop", GenreClass::RockPopElectronic),
+            ("electropop", GenreClass::RockPopElectronic),
+            ("dancehall", GenreClass::RockPopElectronic),
+            ("folktronica", GenreClass::RockPopElectronic),
             ("ghost", GenreClass::Unknown),
             ("minimalism", GenreClass::Unknown),
         ];
