@@ -1213,32 +1213,69 @@ fn live_wdm_ks_probes_notification_get_and_hardware_position_on_gungnir2() {
     );
     assert_eq!(
         probe.sample_play_offsets.len(),
-        4,
-        "expected 4 live hardware play-offset samples"
+        24,
+        "expected 24 live hardware play-offset samples (~1.25 s, past CLOCK_ANCHOR_BLOCK rollover)"
+    );
+    assert_eq!(
+        probe.sample_wake_elapsed.len(),
+        probe.sample_play_offsets.len(),
+        "expected wall-clock wake elapsed timestamp for every play-offset sample"
     );
 
-    // Feed the real hardware positions into WaveRtLoopController and verify zero false
-    // coalescing: halves must strictly alternate [0, 1, 0, 1] and step by ~1 half per wake.
+    // Feed the real hardware positions AND wall-clock timestamps into WaveRtLoopController and
+    // verify zero false coalescing, zero spurious wakes, and zero wrong-half writes across all
+    // 24 live wakes (strictly past the 16-wake CLOCK_ANCHOR_BLOCK boundary and wake-17 regression).
     let layout = WaveRtRingLayout::new(probe.buffer_bytes, 8).unwrap();
-    let silent = vec![[0_i32, 0_i32]; (probe.buffer_bytes / 8) * 4];
+    let half_frames = layout.half_len() / 8;
+    let half_dur = Duration::from_secs_f64(half_frames as f64 / 384_000.0);
+    let silent = vec![[0_i32, 0_i32]; half_frames * 32];
     let mut pump = WaveRtFramePump::new(&silent, DacWireFormat::Int32);
     let mut ring = vec![0u8; probe.buffer_bytes];
-    let mut ctrl = WaveRtLoopController::new(layout);
+    let mut ctrl = WaveRtLoopController::new(layout)
+        .with_half_duration(half_dur)
+        .with_wrap_mode(if probe.position_register_supported {
+            PositionWrapMode::Modular
+        } else {
+            PositionWrapMode::Auto
+        });
     ctrl.prefill(&mut ring, &mut pump).unwrap();
 
     let mut chosen_halves = Vec::new();
-    for &(pos, _) in &probe.sample_play_offsets {
-        let (h, _) = ctrl
-            .on_notification(&mut ring, &mut pump, false, Some(pos))
+    let mut expected_halves = Vec::new();
+    for (&(pos, safe_hw), &elapsed) in probe
+        .sample_play_offsets
+        .iter()
+        .zip(probe.sample_wake_elapsed.iter())
+    {
+        let (h, out) = ctrl
+            .on_notification_at(&mut ring, &mut pump, false, Some(pos), Some(elapsed))
             .unwrap();
+        assert_eq!(out, WaveRtStepOutcome::Continue);
         chosen_halves.push(h);
+        expected_halves.push(safe_hw);
     }
     assert_eq!(
-        chosen_halves,
-        vec![0, 1, 0, 1],
-        "live Gungnir 2 notifications must alternate cleanly without false coalescing: offsets={:?}",
-        probe.sample_play_offsets
+        chosen_halves, expected_halves,
+        "live Gungnir 2 notifications must stay strictly in phase with hardware DMA: offsets={:?}, elapsed={:?}",
+        probe.sample_play_offsets, probe.sample_wake_elapsed
     );
+    assert_eq!(ctrl.spurious_wakes(), 0);
+    assert_eq!(
+        ctrl.coalesced_wakes(),
+        0,
+        "steady live Gungnir 2 wakes must never trigger false coalescing"
+    );
+    if probe
+        .sample_play_offsets
+        .iter()
+        .all(|&(pos, _)| pos % (probe.half_bytes as u64) == 0)
+    {
+        assert_eq!(
+            ctrl.lag_bytes(),
+            0,
+            "boundary-quantized hardware cursor must never accumulate synthetic wake-latency lag"
+        );
+    }
 }
 
 #[cfg(windows)]
@@ -1658,5 +1695,364 @@ fn review5_unbiased_lag_estimator_and_upper_boundary_guard_survive_randomized_st
             );
             cur_bidx = actual_bidx;
         }
+    }
+}
+
+#[test]
+fn wavert_quantized_usbaudio2_non_nominal_cadence_and_startup_delay_never_invert_phase() {
+    // Regression for live Schiit Gungnir 2 (`usbaudio2.sys`) playback corruption introduced in
+    // Review #5 Step 5:
+    // - `usbaudio2.sys` reports boundary-quantized `KSAUDIO_POSITION` (`[half, 0, half, 0, ...]`)
+    //   with `PositionWrapMode::Auto` (since `POSITIONREGISTER` is unsupported).
+    // - Real hardware wake cadence on Gungnir 2 is ~52.856 ms per nominal 50.000 ms half-buffer
+    //   (`t_1 = 57.5 ms`, `+5.7%` cadence offset).
+    // Previously, `wake_latency_bytes` absorbed cumulative anchor drift as fake cursor lag, hitting
+    // `lag_bytes == half` at wake 17 (~0.9 s) and inverting `write_half` onto the active DMA half
+    // for the rest of the track!
+    let layout = WaveRtRingLayout::new(282_240, 8).unwrap(); // 352.8 kHz, 100 ms ring (50 ms/half)
+    let half_frames = layout.half_len() / 8;
+    let half_dur = Duration::from_secs_f64(half_frames as f64 / 352_800.0);
+    let mut ring = vec![0u8; layout.buf_len()];
+    let mut frames_pool = vec![[77_i32, -77_i32]; half_frames];
+
+    // Part A: 10,000 wakes (~8.8 min) at Gungnir 2's observed 52.856 ms cadence + periodic
+    // coalesced stalls (1 skipped boundary and 2 skipped boundaries).
+    let mut ctrl = WaveRtLoopController::new(layout)
+        .with_half_duration(half_dur)
+        .with_wrap_mode(PositionWrapMode::Auto);
+    {
+        let mut pump = WaveRtFramePump::new(&frames_pool, DacWireFormat::Int32);
+        ctrl.prefill(&mut ring, &mut pump).unwrap();
+    }
+
+    let mut bidx: u64 = 0;
+    for step in 0..10_000usize {
+        let advance: u64 = if step == 500 {
+            2 // 1 missed boundary (coalesced)
+        } else if step == 2500 {
+            3 // full ring + 1 half coalesced
+        } else {
+            1
+        };
+        bidx += advance;
+        let pos = if bidx % 2 == 1 {
+            layout.half_len() as u64
+        } else {
+            0u64
+        };
+        let safe_hw = ((bidx as usize) & 1) ^ 1;
+        let t_ns = ((57.5 + (bidx - 1) as f64 * 52.856) * 1_000_000.0).round() as u64;
+        frames_pool[0][0] = (step & 0x7FFF) as i32;
+        let mut pump = WaveRtFramePump::new(&frames_pool, DacWireFormat::Int32);
+        let (h, out) = ctrl
+            .on_notification_at(
+                &mut ring,
+                &mut pump,
+                false,
+                Some(pos),
+                Some(Duration::from_nanos(t_ns)),
+            )
+            .unwrap();
+        assert_eq!(
+            out,
+            WaveRtStepOutcome::Continue,
+            "step={step} bidx={bidx}: unexpected outcome {out:?}"
+        );
+        assert_eq!(
+            h, safe_hw,
+            "step={step} bidx={bidx} pos={pos}: wrote active DMA half {h} instead of safe half {safe_hw}"
+        );
+    }
+    assert_eq!(ctrl.spurious_wakes(), 0);
+
+    // Part B: Constant KSSTATE_RUN startup delays (0..80 ms) on quantized cursor must stay
+    // strictly in phase across all wakes with 0 wrong-half writes.
+    for startup_ms in [0u64, 5, 10, 20, 30, 45, 50, 55, 80] {
+        let mut ctrl = WaveRtLoopController::new(layout)
+            .with_half_duration(half_dur)
+            .with_wrap_mode(PositionWrapMode::Auto);
+        {
+            let mut pump = WaveRtFramePump::new(&frames_pool, DacWireFormat::Int32);
+            ctrl.prefill(&mut ring, &mut pump).unwrap();
+        }
+        for k in 1u64..=100 {
+            let pos = if k % 2 == 1 {
+                layout.half_len() as u64
+            } else {
+                0u64
+            };
+            let safe_hw = ((k as usize) & 1) ^ 1;
+            let now = Duration::from_millis(startup_ms) + half_dur.mul_f64(k as f64);
+            let mut pump = WaveRtFramePump::new(&frames_pool, DacWireFormat::Int32);
+            let (h, out) = ctrl
+                .on_notification_at(&mut ring, &mut pump, false, Some(pos), Some(now))
+                .unwrap();
+            assert_eq!(
+                out,
+                WaveRtStepOutcome::Continue,
+                "startup_ms={startup_ms} wake={k}"
+            );
+            assert_eq!(
+                h, safe_hw,
+                "startup_ms={startup_ms} wake={k}: wrote active DMA half {h} instead of {safe_hw}"
+            );
+        }
+        assert_eq!(ctrl.spurious_wakes(), 0, "startup_ms={startup_ms}");
+    }
+}
+
+/// Simulated hardware DMA readback harness for end-to-end WaveRT cyclic buffer verification.
+///
+/// Stamps every stereo Int32 PCM frame with its unique monotonic frame index `[idx, -idx]`.
+/// After `prefill`, DMA streams half 0 (`[0..H)`). On every subsequent hardware wake `k`,
+/// `on_notification_at` writes the safe half while DMA actively reads `ring[active_half]`.
+/// Auditing `ring[active_half]` *after* `on_notification_at` guarantees bit-exact sequential
+/// PCM delivery and immediately catches any active-half overwrite, phase inversion, or drop.
+struct SimulatedDmaVerifier {
+    layout: WaveRtRingLayout,
+    half_frames: usize,
+    ring: Vec<u8>,
+    next_dma_frame: i32,
+}
+
+impl SimulatedDmaVerifier {
+    fn new_prefilled(
+        layout: WaveRtRingLayout,
+        total_wakes: usize,
+        ctrl: &mut WaveRtLoopController,
+    ) -> (Self, Vec<[i32; 2]>) {
+        let half_frames = layout.half_len() / layout.bytes_per_frame();
+        let total_frames = half_frames * (total_wakes + 4);
+        let frames: Vec<[i32; 2]> = (1..=(total_frames as i32)).map(|i| [i, -i]).collect();
+        let mut ring = vec![0u8; layout.buf_len()];
+        let mut pump = WaveRtFramePump::new(&frames, DacWireFormat::Int32);
+        ctrl.prefill(&mut ring, &mut pump).unwrap();
+
+        let mut verifier = Self {
+            layout,
+            half_frames,
+            ring,
+            next_dma_frame: 1,
+        };
+        // Half 0 streams to the DAC between KSSTATE_RUN and wake #1.
+        verifier.assert_active_half_intact(0, "prefill half 0");
+        (verifier, frames)
+    }
+
+    fn assert_active_half_intact(&mut self, active_half: usize, context: &str) {
+        let range = self.layout.half_range(active_half);
+        let slice = &self.ring[range];
+        for i in 0..self.half_frames {
+            let off = i * 8;
+            let got_l = i32::from_le_bytes(slice[off..off + 4].try_into().unwrap());
+            let got_r = i32::from_le_bytes(slice[off + 4..off + 8].try_into().unwrap());
+            let expected = self.next_dma_frame;
+            assert_eq!(
+                (got_l, got_r),
+                (expected, -expected),
+                "{context}: active DMA half {active_half} corrupted at frame {i} (expected [{expected}, -{expected}], got [{got_l}, {got_r}])"
+            );
+            self.next_dma_frame += 1;
+        }
+    }
+}
+
+#[test]
+fn wavert_dma_integrity_quantized_driver_across_cadences_and_wrap_modes() {
+    // Hardened matrix covering real boundary-quantized drivers (`pos % half == 0`, e.g.
+    // `usbaudio2.sys`) across BOTH slower and faster non-nominal cadences (-8% to +8%) and
+    // all 3 PositionWrapModes, audited by bit-exact sequential DMA frame readback.
+    let layout = WaveRtRingLayout::new(6400, 8).unwrap(); // 400 frames/half
+    let half_dur = Duration::from_millis(50);
+
+    for wrap_mode in [
+        PositionWrapMode::Auto,
+        PositionWrapMode::Modular,
+        PositionWrapMode::Monotonic,
+    ] {
+        for cadence_ms in [46.0_f64, 47.5, 50.0, 52.856, 54.0] {
+            let mut ctrl = WaveRtLoopController::new(layout)
+                .with_half_duration(half_dur)
+                .with_wrap_mode(wrap_mode);
+            let total_wakes = 200usize;
+            let (mut dma, frames) =
+                SimulatedDmaVerifier::new_prefilled(layout, total_wakes, &mut ctrl);
+            // Advance pump past the 2 prefilled halves so subsequent wakes write frames [2H..].
+            let mut pump = WaveRtFramePump::new(&frames[dma.half_frames * 2..], DacWireFormat::Int32);
+
+            for k in 1u64..=(total_wakes as u64) {
+                let raw_pos = match wrap_mode {
+                    PositionWrapMode::Monotonic => k * (layout.half_len() as u64),
+                    PositionWrapMode::Auto | PositionWrapMode::Modular => {
+                        if k % 2 == 1 {
+                            layout.half_len() as u64
+                        } else {
+                            0u64
+                        }
+                    }
+                };
+                let t_ns = ((7.5 + (k as f64) * cadence_ms) * 1_000_000.0).round() as u64;
+                let (written_half, outcome) = ctrl
+                    .on_notification_at(
+                        &mut dma.ring,
+                        &mut pump,
+                        false,
+                        Some(raw_pos),
+                        Some(Duration::from_nanos(t_ns)),
+                    )
+                    .unwrap();
+                let active_dma_half = (k as usize) & 1;
+                let safe_half = active_dma_half ^ 1;
+                assert_eq!(
+                    outcome,
+                    WaveRtStepOutcome::Continue,
+                    "mode={wrap_mode:?} cadence={cadence_ms}ms wake={k}"
+                );
+                assert_eq!(
+                    written_half, safe_half,
+                    "mode={wrap_mode:?} cadence={cadence_ms}ms wake={k}: wrote active half!"
+                );
+                dma.assert_active_half_intact(
+                    active_dma_half,
+                    &format!("mode={wrap_mode:?} cadence={cadence_ms}ms wake={k}"),
+                );
+            }
+
+            assert_eq!(ctrl.spurious_wakes(), 0, "mode={wrap_mode:?} cadence={cadence_ms}ms");
+            assert_eq!(
+                ctrl.coalesced_wakes(),
+                0,
+                "mode={wrap_mode:?} cadence={cadence_ms}ms: unexpected false coalesce"
+            );
+            assert_eq!(
+                ctrl.lag_bytes(),
+                0,
+                "mode={wrap_mode:?} cadence={cadence_ms}ms: quantized cursor must keep lag_bytes=0"
+            );
+            let tracked_ms = ctrl.effective_half_duration().unwrap().as_secs_f64() * 1000.0;
+            assert!(
+                (tracked_ms - cadence_ms).abs() <= cadence_ms * 0.005,
+                "mode={wrap_mode:?} cadence={cadence_ms}ms: tracked period {tracked_ms:.3}ms did not converge"
+            );
+        }
+    }
+}
+
+#[test]
+fn wavert_dma_integrity_continuous_lagging_cursor_with_non_nominal_cadence_and_jitter_bursts() {
+    // Hardened stress test: continuous lagging DMA cursors (10%, 40%, 65% of half) combined with
+    // non-nominal driver cadences (47.5 ms and 52.856 ms), a 15 ms startup offset, AND a
+    // mid-stream burst of 8 consecutive late wakes (+18..28 ms) followed by return to 0.8 ms.
+    let layout = WaveRtRingLayout::new(6400, 8).unwrap(); // half = 3200 B = 400 frames
+    let half_dur = Duration::from_millis(50);
+
+    for cadence_ms in [47.5_f64, 52.856] {
+        for true_lag in [320u64, 1280, 2080] {
+            for wrap_mode in [PositionWrapMode::Modular, PositionWrapMode::Monotonic] {
+                let mut ctrl = WaveRtLoopController::new(layout)
+                    .with_half_duration(half_dur)
+                    .with_wrap_mode(wrap_mode);
+                let total_wakes = 180usize;
+                let (mut dma, frames) =
+                    SimulatedDmaVerifier::new_prefilled(layout, total_wakes, &mut ctrl);
+                let mut pump =
+                    WaveRtFramePump::new(&frames[dma.half_frames * 2..], DacWireFormat::Int32);
+
+                let startup_ms = 15.0_f64;
+                for k in 1u64..=(total_wakes as u64) {
+                    // Inject a burst of 8 consecutive heavy-jitter wakes (18..28 ms late) at k=60..67.
+                    let wake_lat_ms = if (60..=67).contains(&k) {
+                        18.0 + ((k - 60) as f64) * 1.4
+                    } else {
+                        0.8
+                    };
+                    let t_ms = startup_ms + (k as f64) * cadence_ms + wake_lat_ms;
+                    let dma_extra_bytes =
+                        ((wake_lat_ms / cadence_ms) * (layout.half_len() as f64)).round() as u64;
+                    let real_dma = k * (layout.half_len() as u64) + dma_extra_bytes;
+                    let rep = real_dma.saturating_sub(true_lag);
+                    let pos = if wrap_mode == PositionWrapMode::Modular {
+                        rep % (layout.buf_len() as u64)
+                    } else {
+                        rep
+                    };
+                    let (written_half, outcome) = ctrl
+                        .on_notification_at(
+                            &mut dma.ring,
+                            &mut pump,
+                            false,
+                            Some(pos),
+                            Some(Duration::from_nanos((t_ms * 1_000_000.0).round() as u64)),
+                        )
+                        .unwrap();
+                    let active_dma_half = (k as usize) & 1;
+                    let safe_half = active_dma_half ^ 1;
+                    assert_eq!(
+                        outcome,
+                        WaveRtStepOutcome::Continue,
+                        "cadence={cadence_ms}ms lag={true_lag} mode={wrap_mode:?} wake={k}"
+                    );
+                    assert_eq!(
+                        written_half, safe_half,
+                        "cadence={cadence_ms}ms lag={true_lag} mode={wrap_mode:?} wake={k}: wrote active half!"
+                    );
+                    dma.assert_active_half_intact(
+                        active_dma_half,
+                        &format!("cadence={cadence_ms}ms lag={true_lag} mode={wrap_mode:?} wake={k}"),
+                    );
+                }
+
+                assert_eq!(ctrl.spurious_wakes(), 0);
+                assert_eq!(
+                    ctrl.coalesced_wakes(),
+                    0,
+                    "cadence={cadence_ms}ms lag={true_lag} mode={wrap_mode:?}: false coalescing during jitter burst"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn wavert_unavailable_fallback_adapts_to_non_nominal_cadence_and_preserves_dma_integrity() {
+    // Hardened wall-clock fallback (`play_offset = None`) test under non-nominal hardware
+    // cadences (47.5 ms and 52.856 ms) across 2,000 wakes (~1.7 min) with steady 1.5 ms wake
+    // latency, verifying zero wrong-half writes and bit-exact sequential DMA frame delivery.
+    let layout = WaveRtRingLayout::new(6400, 8).unwrap();
+    let half_dur = Duration::from_millis(50);
+
+    for cadence_ms in [47.5_f64, 52.856] {
+        let mut ctrl = WaveRtLoopController::new(layout).with_half_duration(half_dur);
+        let total_wakes = 2_000usize;
+        let (mut dma, frames) =
+            SimulatedDmaVerifier::new_prefilled(layout, total_wakes, &mut ctrl);
+        let mut pump = WaveRtFramePump::new(&frames[dma.half_frames * 2..], DacWireFormat::Int32);
+
+        for k in 1u64..=(total_wakes as u64) {
+            let t_ns = (((k as f64) * cadence_ms + 1.5) * 1_000_000.0).round() as u64;
+            let (written_half, outcome) = ctrl
+                .on_notification_at(
+                    &mut dma.ring,
+                    &mut pump,
+                    false,
+                    None,
+                    Some(Duration::from_nanos(t_ns)),
+                )
+                .unwrap();
+            let active_dma_half = (k as usize) & 1;
+            let safe_half = active_dma_half ^ 1;
+            assert_eq!(outcome, WaveRtStepOutcome::Continue, "cadence={cadence_ms}ms wake={k}");
+            assert_eq!(
+                written_half, safe_half,
+                "cadence={cadence_ms}ms wake={k}: wrote active half!"
+            );
+            dma.assert_active_half_intact(
+                active_dma_half,
+                &format!("unavailable cadence={cadence_ms}ms wake={k}"),
+            );
+        }
+
+        assert_eq!(ctrl.spurious_wakes(), 0, "cadence={cadence_ms}ms");
+        assert_eq!(ctrl.coalesced_wakes(), 0, "cadence={cadence_ms}ms");
     }
 }

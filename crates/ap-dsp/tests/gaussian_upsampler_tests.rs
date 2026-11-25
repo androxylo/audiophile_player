@@ -844,3 +844,42 @@ fn test_8_default_selection_and_length_below_sinc_steep_4m() {
         assert_eq!(p.tap_budget, 0);
     }
 }
+
+/// Release-only real-time throughput regression guard: ensures default Gaussian polyphase
+/// upsamplers sustain a comfortable margin (`>= 2.0x` real-time) on production builds so an
+/// accidental inner-loop regression cannot starve the WaveRT audio thread.
+#[cfg(not(debug_assertions))]
+#[test]
+fn test_9_release_realtime_throughput_margin_exceeds_2x() {
+    use std::time::Instant;
+
+    for (archetype, src_rate, dst_rate) in [
+        (FilterArchetype::GaussLongLp, 44_100_u32, 352_800_u32),
+        (FilterArchetype::GaussHiresLp, 88_200_u32, 352_800_u32),
+    ] {
+        let spec = GaussianFilterSpec::for_default_archetype(archetype, src_rate, dst_rate).unwrap();
+        let mut up = PolyphaseFirUpsampler::from_gaussian(design_gaussian_filter(spec));
+        let audio_secs = 2.0_f64;
+        let total_in = (src_rate as usize) * 2;
+        let block_in = 16_384_usize;
+        let mut done = 0usize;
+        let t0 = Instant::now();
+        while done < total_in {
+            let n = (total_in - done).min(block_in);
+            let buf = StereoF64Buffer {
+                sample_rate_hz: src_rate,
+                left: vec![0.125; n],
+                right: vec![-0.125; n],
+            };
+            let out = up.process_block(buf).unwrap();
+            assert!(!out.is_empty() || done == 0);
+            done += n;
+        }
+        let elapsed_s = t0.elapsed().as_secs_f64().max(1e-6);
+        let rt_factor = audio_secs / elapsed_s;
+        assert!(
+            rt_factor >= 2.0,
+            "{archetype} ({src_rate} -> {dst_rate} Hz) fell below 2.0x real-time in release mode: {rt_factor:.2}x ({elapsed_s:.3}s for {audio_secs}s audio)"
+        );
+    }
+}
