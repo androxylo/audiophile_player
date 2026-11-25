@@ -265,28 +265,36 @@ fn incoming_gapless_rew_tail_demotes_active_convolver_only_and_preserves_null_co
         ..TrackPeakMetadata::default()
     };
 
-    // Small incoming tail (0.10): 0.60 + 0.10 = 0.70 <= 1.0 -> stays 0 dB.
+    // Small incoming tail (0.10): 0.60 + 0.10 = 0.70 <= 1.0 -> stays 0 dB, S_B = 0 dB.
     let s_small = rew_pipeline
         .start_track_with_tail_hint(spec_352, &quiet_tp, false, Some((352_800, 0.10)))
         .unwrap();
     assert_eq!(s_small.report().headroom.mode, HeadroomMode::ZeroDb);
+    assert_eq!(s_small.report().headroom.convolution_scale_db, 0.0);
 
-    // Loud incoming tail (0.50): 0.60 + 0.50 = 1.10 > 1.0 -> forces -3 dB!
+    // Loud incoming tail (0.50): HEADROOM_DESIGN.md §4 (Review #5 #3) keeps G_up = 0 dB and
+    // applies exact excess scaling S_B = 20*log10(0.50) - (-4.437) = -1.584 dB!
     let s_hot = rew_pipeline
         .start_track_with_tail_hint(spec_352, &quiet_tp, false, Some((352_800, 0.50)))
         .unwrap();
-    assert_eq!(s_hot.report().headroom.mode, HeadroomMode::Minus3Db);
-    assert!(s_hot.report().headroom.reason.contains("incoming gapless REW tail"));
+    assert_eq!(s_hot.report().headroom.mode, HeadroomMode::ZeroDb);
+    assert!(
+        (s_hot.report().headroom.convolution_scale_db - (-1.5836)).abs() < 0.02,
+        "expected S_B ~= -1.584 dB, got {:.4}",
+        s_hot.report().headroom.convolution_scale_db
+    );
+    assert!(s_hot.report().headroom.reason.contains("incoming gapless tail"));
 
-    // Different-rate incoming tail (384k vs 352.8k) -> stays 0 dB.
+    // Different-rate incoming tail (384k vs 352.8k) -> stays 0 dB, S_B = 0 dB.
     let s_other_rate = rew_pipeline
         .start_track_with_tail_hint(spec_384, &quiet_tp, false, Some((352_800, 0.50)))
         .unwrap();
     assert_eq!(s_other_rate.report().headroom.mode, HeadroomMode::ZeroDb);
+    assert_eq!(s_other_rate.report().headroom.convolution_scale_db, 0.0);
 
-    // Exercise `start_track_for_carryover` with `up_hist_peak` term (Finding #13):
-    // Track A (44.1k) ends loud so carry has conv_peak (~0.25, alone 0.60+0.25=0.85 <= 1.0) PLUS
-    // up_hist_peak (~0.55), pushing 0.60 + conv_peak + up_hist_peak > 1.0 -> MUST demote to -3 dB!
+    // Exercise `start_track_for_carryover` with `up_hist_peak` term:
+    // Track A (44.1k) ends loud so carry has conv_peak (~0.25) PLUS up_hist_peak (~0.55),
+    // pushing 0.60 + T > 1.0 -> MUST keep G_up = 0 dB and apply negative S_B!
     let mut sess_a = rew_pipeline
         .start_track(spec_44, &TrackPeakMetadata::default(), false)
         .unwrap();
@@ -313,10 +321,11 @@ fn incoming_gapless_rew_tail_demotes_active_convolver_only_and_preserves_null_co
     let s_b_rew = rew_pipeline
         .start_track_for_carryover(spec_44, &quiet_tp, false, Some(&carry_a))
         .unwrap();
-    assert_eq!(
-        s_b_rew.report().headroom.mode,
-        HeadroomMode::Minus3Db,
-        "same-rate active-convolver carry where conv_peak + up_hist_peak pushes over 1.0 must demote to -3 dB"
+    assert_eq!(s_b_rew.report().headroom.mode, HeadroomMode::ZeroDb);
+    assert!(
+        s_b_rew.report().headroom.convolution_scale_db < -1.0,
+        "same-rate active-convolver carry where conv_peak + up_hist_peak pushes over 1.0 must apply negative S_B, got {:.3}",
+        s_b_rew.report().headroom.convolution_scale_db
     );
 
     // Null-convolver pipeline (e.g. REW filter removed before native 352.8k Track B starts):
@@ -646,5 +655,229 @@ fn same_output_rate_different_upsampler_ratio_hands_off_rew_tail_without_gap() {
     assert!(
         peak_near_echo > 0.10,
         "Track A's REW echo must decay seamlessly into Track B around index 2904, got peak {peak_near_echo:.5}"
+    );
+}
+
+#[test]
+fn review5_carryover_preserves_convolution_scale_and_null_convolver_applies_s() {
+    // Finding #4: Track A with a +6 dB REW IR (delay tap = 2.0 at index 2000) receives S = -6 dB
+    // (total_gain_db = G_up + S). Draining carryover OR doing ConvolverOnlyHandoff MUST preserve
+    // Track A's exact scaled level with NO +6 dB jump or clipping!
+    let mut ir_l = vec![0.0_f64; 2500];
+    ir_l[0] = 0.0;
+    ir_l[2000] = 2.0; // +6.02 dB gain across all frequencies
+    let ir = Arc::new(PreparedStereoIr::from_stereo_ir("boost-6db", 352_800, &ir_l, &ir_l).unwrap());
+    assert!(
+        (ir.max_boost_db - 6.0206).abs() < 0.05,
+        "expected ~+6.02 dB boost, got {:.3}",
+        ir.max_boost_db
+    );
+
+    struct FixedIrFactory(Arc<PreparedStereoIr>);
+    impl StereoConvolverFactory for FixedIrFactory {
+        fn create_for_rate(&self, rate_hz: u32) -> Result<Box<dyn StereoConvolver>, String> {
+            if rate_hz == self.0.sample_rate_hz {
+                Ok(Box::new(PartitionedStereoConvolver::new(Arc::clone(&self.0))))
+            } else {
+                NullConvolverFactory.create_for_rate(rate_hz)
+            }
+        }
+    }
+
+    let policy = UpsamplerPolicy {
+        filter_override: Some(FilterArchetype::SimpleTest),
+        shaper_override: Some(NoiseShaperProfile::TpdfDither),
+        ..UpsamplerPolicy::default()
+    };
+    let pipeline = AudioPipeline::with_factories(
+        policy.clone(),
+        Box::new(FixedIrFactory(ir)),
+        Box::new(NullChannelDelayerFactory),
+    )
+    .unwrap();
+    let spec_44 = StreamSpec {
+        sample_rate_hz: 44_100,
+        bits_per_sample: 24,
+        channels: 2,
+    };
+    let spec_88 = StreamSpec {
+        sample_rate_hz: 88_200,
+        bits_per_sample: 24,
+        channels: 2,
+    };
+    // Review #5 Finding #4 exact scenario: untagged 44.1k Track A -> G_up = -3 dB, G_c = +6.02 dB,
+    // predicted = 0 + 3 - 3 + 6.02 = +6.02 dB -> S = -6.02 dB!
+    let untagged = TrackPeakMetadata::default();
+
+    // Case 1: drain_gapless_carryover after Track A impulse near end.
+    let n_a = 512usize;
+    let mut sig = vec![0.0_f64; n_a];
+    sig[450] = 0.90;
+    let mut sess_a = pipeline.start_track(spec_44, &untagged, false).unwrap();
+    assert_eq!(sess_a.report().headroom.mode, HeadroomMode::Minus3Db);
+    assert!(
+        (sess_a.report().headroom.convolution_scale_db - (-6.0206)).abs() < 0.05,
+        "expected S ~= -6.02 dB, got {:.3}",
+        sess_a.report().headroom.convolution_scale_db
+    );
+    let mut full_a = sess_a
+        .process_block(StereoF64Buffer {
+            sample_rate_hz: 44_100,
+            left: sig.clone(),
+            right: sig.clone(),
+        })
+        .unwrap()
+        .frames;
+    let (flush_a, carry_a) = sess_a.flush_for_gapless().unwrap();
+    full_a.extend(flush_a.frames);
+    let carry_a = carry_a.expect("expected carryover");
+    let drained = pipeline.drain_gapless_carryover(carry_a).unwrap();
+    let max_drained = drained
+        .frames
+        .iter()
+        .map(|&[l, r]| (l as f64).abs().max((r as f64).abs()) / 2_147_483_648.0)
+        .fold(0.0_f64, f64::max);
+    // Without the fix, S was undone on drain and 0.90 * 0.707 * 2.0 = 1.27 clipped to 1.0!
+    // With S folded into Stage 1, 0.90 * 0.7071 * 0.5 * 2.0 ~= 0.636 (zero step, zero clipping!).
+    assert!(
+        max_drained > 0.50 && max_drained < 0.72,
+        "drained +6 dB IR tail must preserve exact S=-6 dB scaling without +6 dB jump/clip, got peak {max_drained:.5}"
+    );
+
+    // Case 2: ConvolverOnlyHandoff (44.1k -> 88.2k) preserves exact S scaling too.
+    let mut sess_a2 = pipeline.start_track(spec_44, &untagged, false).unwrap();
+    let _ = sess_a2
+        .process_block(StereoF64Buffer {
+            sample_rate_hz: 44_100,
+            left: sig.clone(),
+            right: sig,
+        })
+        .unwrap();
+    let (_, carry_a2) = sess_a2.flush_for_gapless().unwrap();
+    let carry_a2 = carry_a2.unwrap();
+    let mut sess_b = pipeline
+        .start_track_for_carryover(spec_88, &untagged, false, Some(&carry_a2))
+        .unwrap();
+    let outcome = pipeline.attach_gapless_carryover(&mut sess_b, carry_a2).unwrap();
+    assert!(matches!(outcome, GaplessAttachOutcome::ConvolverOnlyHandoff { .. }));
+    let mut b_frames = sess_b
+        .process_block(StereoF64Buffer {
+            sample_rate_hz: 88_200,
+            left: vec![0.0; 1024],
+            right: vec![0.0; 1024],
+        })
+        .unwrap()
+        .frames;
+    b_frames.extend(sess_b.flush().unwrap().frames);
+    let max_b = b_frames
+        .iter()
+        .map(|&[l, r]| (l as f64).abs().max((r as f64).abs()) / 2_147_483_648.0)
+        .fold(0.0_f64, f64::max);
+    assert!(
+        max_b > 0.50 && max_b < 0.72,
+        "ConvolverOnlyHandoff +6 dB IR tail must stay scaled cleanly without clipping, got {max_b:.5}"
+    );
+
+    // Finding #14: NullConvolver (G_c = 0 dB) with +4 dBTP hot master MUST still apply
+    // G_up = -3 dB AND S = -1 dB (total -4 dB) in Stage 1!
+    let null_pipe = AudioPipeline::new(policy).unwrap();
+    let hot_tp = TrackPeakMetadata {
+        true_peak_linear: Some(10.0_f64.powf(4.0 / 20.0)),
+        ..TrackPeakMetadata::default()
+    };
+    let mut sess_hot = null_pipe.start_track(spec_44, &hot_tp, false).unwrap();
+    assert_eq!(sess_hot.report().headroom.mode, HeadroomMode::Minus3Db);
+    assert!((sess_hot.report().headroom.convolution_scale_db - (-1.0)).abs() < 1e-6);
+    // Feed constant 0.5 DC: output steady-state amplitude must be 0.5 * 10^(-4/20) ~= 0.3155 (not 0.354!).
+    let mut out_hot = sess_hot
+        .process_block(StereoF64Buffer {
+            sample_rate_hz: 44_100,
+            left: vec![0.5; 256],
+            right: vec![0.5; 256],
+        })
+        .unwrap()
+        .frames;
+    out_hot.extend(sess_hot.flush().unwrap().frames);
+    let mid_amp = (out_hot[out_hot.len() / 2][0] as f64) / 2_147_483_648.0;
+    let expected_amp = 0.5 * 10.0_f64.powf(-4.0 / 20.0);
+    assert!(
+        (mid_amp - expected_amp).abs() < 0.005,
+        "NullConvolver +4 dBTP track must apply full -4 dB (G_up=-3, S=-1): expected {expected_amp:.4}, got {mid_amp:.4}"
+    );
+}
+
+#[test]
+fn review5_quantizer_counts_overs_and_auto_selector_degrades_for_max_taps() {
+    // Finding #15: StreamingQuantizer counts clipped samples and tracks max pre-quant peak.
+    let spec_352 = StreamSpec {
+        sample_rate_hz: 352_800,
+        bits_per_sample: 24,
+        channels: 2,
+    };
+    let pipe = AudioPipeline::new(UpsamplerPolicy {
+        filter_override: Some(FilterArchetype::SimpleTest),
+        shaper_override: Some(NoiseShaperProfile::TpdfDither),
+        ..UpsamplerPolicy::default()
+    })
+    .unwrap();
+    // Claim quiet true peak (-6 dBTP -> G_up = 0 dB) then feed an out-of-range +1.25 transient.
+    let lied_meta = TrackPeakMetadata {
+        true_peak_linear: Some(0.5),
+        ..TrackPeakMetadata::default()
+    };
+    let mut sess = pipe.start_track(spec_352, &lied_meta, false).unwrap();
+    let _ = sess
+        .process_block(StereoF64Buffer {
+            sample_rate_hz: 352_800,
+            left: vec![0.2, 1.25, -1.30, 0.2],
+            right: vec![0.1, 0.1, 0.1, 0.1],
+        })
+        .unwrap();
+    let _ = sess.flush().unwrap();
+    let stats = sess.quantizer_stats();
+    assert!(
+        stats.overs_count >= 2,
+        "expected >= 2 clipped samples, got {}",
+        stats.overs_count
+    );
+    assert!(
+        stats.max_pre_quant_peak > 1.29,
+        "expected max_pre_quant_peak ~= 1.30, got {:.4}",
+        stats.max_pre_quant_peak
+    );
+    assert!(stats.max_pre_quant_peak_dbfs() > 2.2);
+
+    // Finding #18: --max-taps 4096 in default auto mode must gracefully degrade to SimpleTest
+    // instead of failing every 44.1 kHz track, while explicit Gaussian override fails cleanly
+    // with the true shape-derived tap count.
+    let low_cap_auto = AudioPipeline::new(UpsamplerPolicy {
+        max_taps: 4_096,
+        ..UpsamplerPolicy::default()
+    })
+    .unwrap();
+    let spec_44 = StreamSpec {
+        sample_rate_hz: 44_100,
+        bits_per_sample: 16,
+        channels: 2,
+    };
+    let auto_sess = low_cap_auto
+        .start_track(spec_44, &TrackPeakMetadata::default(), false)
+        .expect("auto mode with --max-taps 4096 must degrade to SimpleTest instead of failing");
+    assert_eq!(auto_sess.report().dsp_plan.filter, FilterArchetype::SimpleTest);
+    assert!(auto_sess.report().dsp_plan.tap_budget <= 4_096);
+
+    let low_cap_explicit = AudioPipeline::new(UpsamplerPolicy {
+        filter_override: Some(FilterArchetype::GaussLongLp),
+        max_taps: 4_096,
+        ..UpsamplerPolicy::default()
+    })
+    .unwrap();
+    let err = low_cap_explicit
+        .start_track(spec_44, &TrackPeakMetadata::default(), false)
+        .err()
+        .expect("explicit Gaussian override exceeding --max-taps must return a clear error");
+    assert!(
+        err.contains("exceeds --max-taps") && err.contains("5063"),
+        "unexpected error message: {err}"
     );
 }

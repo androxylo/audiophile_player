@@ -31,12 +31,33 @@ pub fn apply_safe_gain_f64(audio: &mut StereoF64Buffer, gain_db: f64) -> Result<
     Ok(())
 }
 
+/// Per-track pre-quantizer peak and clipping backstop statistics (`HEADROOM_DESIGN.md` §6,
+/// Review #5 Finding #15).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct QuantizerStats {
+    /// Number of individual channel samples clamped against `[min_int, max_int]`.
+    pub overs_count: u64,
+    /// Maximum pre-quantizer linear amplitude observed across both channels.
+    pub max_pre_quant_peak: f64,
+}
+
+impl QuantizerStats {
+    pub fn max_pre_quant_peak_dbfs(&self) -> f64 {
+        if self.max_pre_quant_peak > 0.0 {
+            20.0 * self.max_pre_quant_peak.log10()
+        } else {
+            f64::NEG_INFINITY
+        }
+    }
+}
+
 /// Stateful streaming `f64 -> i32` quantizer preserving continuous dither/shaper state across blocks.
 #[derive(Debug, Clone)]
 pub struct StreamingQuantizer {
     shaper: NoiseShaperProfile,
     dac_bits: u8,
     rng_state: u64,
+    stats: QuantizerStats,
 }
 
 impl StreamingQuantizer {
@@ -51,7 +72,13 @@ impl StreamingQuantizer {
             shaper,
             dac_bits: dac_bits.clamp(16, 32),
             rng_state: 0x2026_0401_9E37_79B9,
+            stats: QuantizerStats::default(),
         })
+    }
+
+    /// Return cumulative pre-quantizer peak and over-clip count for this track session.
+    pub fn stats(&self) -> QuantizerStats {
+        self.stats
     }
 
     #[inline]
@@ -92,8 +119,24 @@ impl StreamingQuantizer {
                 (0.0, 0.0)
             };
 
-            let ql = (audio.left[i] * levels + dl).round().clamp(min_int, max_int) as i32;
-            let qr = (audio.right[i] * levels + dr).round().clamp(min_int, max_int) as i32;
+            let sl = audio.left[i];
+            let sr = audio.right[i];
+            let peak = sl.abs().max(sr.abs());
+            if peak > self.stats.max_pre_quant_peak {
+                self.stats.max_pre_quant_peak = peak;
+            }
+
+            let raw_l = (sl * levels + dl).round();
+            if raw_l > max_int || raw_l < min_int {
+                self.stats.overs_count += 1;
+            }
+            let raw_r = (sr * levels + dr).round();
+            if raw_r > max_int || raw_r < min_int {
+                self.stats.overs_count += 1;
+            }
+
+            let ql = raw_l.clamp(min_int, max_int) as i32;
+            let qr = raw_r.clamp(min_int, max_int) as i32;
             frames.push([ql.wrapping_shl(shift), qr.wrapping_shl(shift)]);
         }
 

@@ -193,3 +193,77 @@ fn convolution_is_scaled_only_by_excess_over_0_dbfs_and_never_cuts_when_under_0_
     assert_eq!(d_scan_ok.mode, HeadroomMode::ZeroDb);
     assert_eq!(d_scan_ok.convolution_scale_db, 0.0);
 }
+
+#[test]
+fn review5_headroom_design_rows_null_convolver_16bit_boundary_14bit_and_tail_s_b() {
+    use ap_core::headroom::{apply_gapless_tail_headroom, select_headroom_for_bits};
+
+    // 1. Finding #14 (HEADROOM_DESIGN.md §4 null-convolver row):
+    // +4 dBTP true peak with NullConvolver (G_c = 0 / None) -> G_up = -3 dB, S = -1.0 dB!
+    let tp_plus_4 = TrackPeakMetadata {
+        true_peak_linear: Some(10.0_f64.powf(4.0 / 20.0)),
+        ..TrackPeakMetadata::default()
+    };
+    let d_null = select_headroom_for_bits(&tp_plus_4, 24, false, None, None);
+    assert_eq!(d_null.mode, HeadroomMode::Minus3Db);
+    assert!((d_null.convolution_scale_db - (-1.0)).abs() < 1e-9);
+
+    // 2. Finding #16: 16-bit scanner normalizing by 32767 produces 32768/32767 ~= 1.00003052.
+    // Must stay SamplePeak (keeping 3 dB A_isp reserve), so with G_c=+3 dB -> S=-3 dB!
+    let full_16bit_sp = TrackPeakMetadata {
+        replaygain_track_peak: Some(32768.0 / 32767.0),
+        ..TrackPeakMetadata::default()
+    };
+    assert_eq!(
+        full_16bit_sp.classified_peak_for_bits(16).unwrap().kind,
+        PeakKind::SamplePeak
+    );
+    let d_16 = select_headroom_for_bits(&full_16bit_sp, 16, false, Some(3.0), None);
+    assert_eq!(d_16.mode, HeadroomMode::Minus3Db);
+    assert!((d_16.convolution_scale_db - (-3.0)).abs() < 1e-3);
+
+    // 1-LSB realism floor for 16-bit (-90.3 dBFS): value below 1 LSB (~ -100 dBFS) is rejected.
+    let sub_lsb_16 = TrackPeakMetadata {
+        replaygain_track_peak: Some(10.0_f64.powf(-100.0 / 20.0)),
+        ..TrackPeakMetadata::default()
+    };
+    assert_eq!(sub_lsb_16.classified_peak_for_bits(16), None);
+
+    // 3. HEADROOM_DESIGN.md §8 Test 4: 14-bit content (~ -12 dBFS sample peak) + +6 dB filter
+    // -> G_up = 0 dB, predicted = -12 + 3 + 0 + 6 = -3 <= 0 -> S = 0 dB, total gain exactly 0 dB!
+    let content_14bit = TrackPeakMetadata {
+        replaygain_track_peak: Some(0.25), // -12.04 dBFS
+        ..TrackPeakMetadata::default()
+    };
+    let d_14 = select_headroom_for_bits(&content_14bit, 16, false, Some(6.0), None);
+    assert_eq!(d_14.mode, HeadroomMode::ZeroDb);
+    assert_eq!(d_14.convolution_scale_db, 0.0);
+    assert_eq!(d_14.total_gain_db(), 0.0);
+
+    // 4. Finding #3 (all 3 S_B tail-overlap scenarios from Review #5):
+    // (a) Untagged B (-3 dB), G_c=+2 dB, T=0.25 -> S_B = -4.50 dB (G_up stays -3 dB).
+    let mut d_a = select_headroom_for_bits(&TrackPeakMetadata::default(), 24, false, Some(2.0), None);
+    apply_gapless_tail_headroom(&mut d_a, &TrackPeakMetadata::default(), 24, false, 2.0, 0.25, 0.0);
+    assert_eq!(d_a.mode, HeadroomMode::Minus3Db);
+    assert!((d_a.convolution_scale_db - (-4.4988)).abs() < 0.01);
+
+    // (b) REPLAYGAIN_TRACK_PEAK=0.5 (sample, A_isp=3), G_c=0, T=0.4 -> G_up=0, S_B = -1.42 dB.
+    let sp_half = TrackPeakMetadata {
+        replaygain_track_peak: Some(0.5),
+        ..TrackPeakMetadata::default()
+    };
+    let mut d_b = select_headroom_for_bits(&sp_half, 24, false, Some(0.0), None);
+    apply_gapless_tail_headroom(&mut d_b, &sp_half, 24, false, 0.0, 0.4, 0.0);
+    assert_eq!(d_b.mode, HeadroomMode::ZeroDb);
+    assert!((d_b.convolution_scale_db - (-1.4164)).abs() < 0.01);
+
+    // (c) True peak -3.5 dBTP, G_c=0, T=0.6 -> G_up stays 0 dB, S_B = -4.46 dB!
+    let tp_35 = TrackPeakMetadata {
+        true_peak_linear: Some(10.0_f64.powf(-3.5 / 20.0)),
+        ..TrackPeakMetadata::default()
+    };
+    let mut d_c = select_headroom_for_bits(&tp_35, 24, false, Some(0.0), None);
+    apply_gapless_tail_headroom(&mut d_c, &tp_35, 24, false, 0.0, 0.6, 0.0);
+    assert_eq!(d_c.mode, HeadroomMode::ZeroDb);
+    assert!((d_c.convolution_scale_db - (-4.4588)).abs() < 0.01);
+}

@@ -1308,7 +1308,7 @@ impl StereoConvolver for PartitionedStereoConvolver {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CachedIrKey {
     path: PathBuf,
     modified: Option<SystemTime>,
@@ -1328,6 +1328,9 @@ struct CachedIrEntry {
 pub struct RewConvolverFactory {
     config: ConvolutionConfig,
     cache: Mutex<HashMap<u32, CachedIrEntry>>,
+    /// Negative cache of invalid `(path, modified, len)` WAVs so broken newest files in `dir`
+    /// are not re-read from disk on every track start until modified (Review #5 Finding #17).
+    failed_cache: Mutex<HashMap<(u32, CachedIrKey), String>>,
     warned_keys: Mutex<HashSet<String>>,
     warnings: Mutex<Vec<String>>,
 }
@@ -1337,6 +1340,7 @@ impl RewConvolverFactory {
         Self {
             config,
             cache: Mutex::new(HashMap::new()),
+            failed_cache: Mutex::new(HashMap::new()),
             warned_keys: Mutex::new(HashSet::new()),
             warnings: Mutex::new(Vec::new()),
         }
@@ -1401,17 +1405,36 @@ impl RewConvolverFactory {
                 }
             }
         }
-
-        let wav = load_stereo_wav(path)?;
-        if wav.sample_rate_hz != rate_hz {
-            return Err(format!(
-                "REW WAV '{}' is {} Hz, expected {} Hz",
-                path.display(),
-                wav.sample_rate_hz,
-                rate_hz
-            ));
+        {
+            let failed = self.failed_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(reason) = failed.get(&(rate_hz, key.clone())) {
+                return Err(reason.clone());
+            }
         }
-        let prepared = Arc::new(PreparedStereoIr::from_wav(&wav)?);
+
+        let load_res = (|| -> Result<Arc<PreparedStereoIr>, String> {
+            let wav = load_stereo_wav(path)?;
+            if wav.sample_rate_hz != rate_hz {
+                return Err(format!(
+                    "REW WAV '{}' is {} Hz, expected {} Hz",
+                    path.display(),
+                    wav.sample_rate_hz,
+                    rate_hz
+                ));
+            }
+            Ok(Arc::new(PreparedStereoIr::from_wav(&wav)?))
+        })();
+
+        let prepared = match load_res {
+            Ok(ir) => ir,
+            Err(err) => {
+                let mut failed = self.failed_cache.lock().unwrap_or_else(|e| e.into_inner());
+                if failed.len() < 128 {
+                    failed.insert((rate_hz, key), err.clone());
+                }
+                return Err(err);
+            }
+        };
 
         if prepared.max_boost_db > 0.0 || prepared.l1_norm_db > 3.0 {
             let notice = format!(

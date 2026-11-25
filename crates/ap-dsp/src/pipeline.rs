@@ -14,14 +14,17 @@
 use ap_core::buffer::{InterleavedInt32Buffer, StereoF64Buffer};
 use ap_core::config::ConvolutionConfig;
 use ap_core::format::StreamSpec;
-use ap_core::headroom::{HeadroomDecision, HeadroomMode, TrackPeakMetadata, select_headroom};
+use ap_core::headroom::{
+    HeadroomDecision, HeadroomMode, TrackPeakMetadata, apply_gapless_tail_headroom,
+    select_headroom_for_bits,
+};
 
 use crate::convolution::{
     ConvolutionTail, NullConvolverFactory, RewConvolverFactory, StereoConvolver,
     StereoConvolverFactory,
 };
 use crate::delay::{ChannelDelayer, ChannelDelayerFactory, NullChannelDelayerFactory};
-use crate::quantize::{StreamingQuantizer, apply_safe_gain_f64};
+use crate::quantize::{QuantizerStats, StreamingQuantizer, apply_safe_gain_f64};
 use crate::selector::{
     FilterArchetype, FilterDesignMetrics, MAX_SUPPORTED_SOURCE_RATE_HZ,
     MIN_SUPPORTED_SOURCE_RATE_HZ, NoiseShaperProfile, SelectedDspPlan, TrackSourceInfo,
@@ -166,6 +169,11 @@ impl StreamingPipelineSession {
         self.convolver.accepts_tail()
     }
 
+    /// Return cumulative pre-quantizer peak and clipping backstop counts (`HEADROOM_DESIGN.md` §6).
+    pub fn quantizer_stats(&self) -> QuantizerStats {
+        self.quantizer.stats()
+    }
+
     /// Process one bounded source `f64` block through all 5 stages -> ready `i32` PCM block.
     pub fn process_block(
         &mut self,
@@ -175,8 +183,11 @@ impl StreamingPipelineSession {
             return Ok(InterleavedInt32Buffer::empty(self.report.output_rate_hz));
         }
 
-        // Stage 1: Hardcoded -3 dB / 0 dB headroom in f64.
-        apply_safe_gain_f64(&mut block, self.report.headroom.mode.gain_db())?;
+        // Stage 1: Hardcoded -3 dB / 0 dB headroom (`G_up`) + excess-only scaling (`S` / `S_B`)
+        // folded in pure `f64` before the linear upsampler and convolver (Review #5 Findings #4 &
+        // #14: guarantees Track A's carried upsampler history and REW tail carry A's exact gain
+        // across FullHandoff / ConvolverOnlyHandoff / drain AND applies `S` for NullConvolver).
+        apply_safe_gain_f64(&mut block, self.report.headroom.total_gain_db())?;
 
         // Stage 2: Dynamic per-track stateful f64 upsampler (or zero-copy NullUpsampler).
         let block = self.upsampler.process_block(block)?;
@@ -455,62 +466,44 @@ impl AudioPipeline {
             .delayer_factory
             .create_for_rate(dsp_plan.target_rate_hz)?;
 
-        let active_conv_gain_db = if convolver.accepts_tail() {
-            Some(convolver.max_boost_db())
+        let conv_boost_db = if convolver.accepts_tail() {
+            convolver.max_boost_db()
         } else {
-            None
+            0.0
         };
-        let mut headroom =
-            select_headroom(peak_meta, is_streaming_source, active_conv_gain_db, None);
+        // Review #5 Findings #14 & #16: pass source `bits_per_sample` AND `Some(conv_boost_db)`
+        // (0.0 for NullConvolver) so realistic true peaks > +3 dBTP still receive `S`.
+        let mut headroom = select_headroom_for_bits(
+            peak_meta,
+            spec.bits_per_sample,
+            is_streaming_source,
+            Some(conv_boost_db),
+            None,
+        );
 
-        // If an equal-rate decaying REW tail from the previous track will overlap-add onto this
-        // track's opening (ONLY when Track B's convolver actively accepts tails!), ensure
-        // `next_track_peak * effective_conv_gain + total_tail_peak <= 1.0` without using L1.
-        // If `0 dB` would risk exceeding full scale, safely fall back to hardcoded `-3 dB` and
-        // recompute any excess-only convolution scaling for `-3 dB`.
-        if headroom.mode == HeadroomMode::ZeroDb && convolver.accepts_tail() {
+        // Review #5 Finding #3: exact `HEADROOM_DESIGN.md` §4 gapless tail-overlap scaling (`S_B`)
+        // across ALL modes (`0 dB` and `-3 dB`), preserving Stage-1 `G_up` strictly from `P`.
+        if convolver.accepts_tail() {
             if let Some((tail_rate_hz, conv_tail_peak, up_hist_peak, _has_conv_tail)) =
                 incoming_tail_hint
             {
                 if tail_rate_hz == dsp_plan.target_rate_hz {
-                    let effective_conv_lin = 10.0_f64
-                        .powf((convolver.max_boost_db() + headroom.convolution_scale_db) / 20.0);
-                    let extra_up_reverb = up_hist_peak * effective_conv_lin;
-                    let total_tail_peak = conv_tail_peak + extra_up_reverb;
-                    if total_tail_peak.is_finite() && total_tail_peak > 1e-6 {
-                        let track_peak_lin = peak_meta
-                            .effective_peak_linear()
-                            .map_or(1.0, |(p, _)| p);
-                        let b_own_peak = track_peak_lin * effective_conv_lin;
-                        let combined_peak = b_own_peak + total_tail_peak;
-                        if combined_peak > 1.0 {
-                            // Recompute convolution excess for G_up = -3 dB so we don't double-cut.
-                            let conv_scale_db = if let Some(cp) = peak_meta.classified_peak() {
-                                let predicted = cp.dbfs
-                                    + cp.isp_allowance_db()
-                                    + HeadroomMode::Minus3Db.gain_db()
-                                    + convolver.max_boost_db().max(0.0);
-                                if predicted > 1e-9 { -predicted } else { 0.0 }
-                            } else {
-                                headroom.convolution_scale_db
-                            };
-                            headroom = HeadroomDecision {
-                                mode: HeadroomMode::Minus3Db,
-                                peak_dbfs: headroom.peak_dbfs,
-                                peak_kind: headroom.peak_kind,
-                                convolution_scale_db: conv_scale_db,
-                                reason: format!(
-                                    "incoming gapless REW tail ({:.3}) + track peak ({:.3}) = {:.3} > 1.0 -> -3 dB",
-                                    total_tail_peak, b_own_peak, combined_peak
-                                ),
-                            };
-                        }
-                    }
+                    apply_gapless_tail_headroom(
+                        &mut headroom,
+                        peak_meta,
+                        spec.bits_per_sample,
+                        is_streaming_source,
+                        conv_boost_db,
+                        conv_tail_peak,
+                        up_hist_peak,
+                    );
                 }
             }
         }
 
-        convolver.set_output_scale(headroom.convolution_scale_linear());
+        // Scale `S` / `S_B` is folded into Stage 1's linear f64 gain (Finding #4 & #14), so
+        // the convolver itself runs at unity scale (1.0) and carried tails always match Track A.
+        convolver.set_output_scale(1.0);
 
         let untouched_native = dsp_plan.filter == FilterArchetype::Null
             && headroom.mode == HeadroomMode::ZeroDb
@@ -537,6 +530,15 @@ impl AudioPipeline {
         };
 
         let quantizer = StreamingQuantizer::new(effective_shaper, output_bits)?;
+        let conv_desc = if headroom.convolution_scale_db < -1e-6 {
+            format!(
+                "{} [scale {:.2} dB]",
+                convolver.description(),
+                headroom.convolution_scale_db
+            )
+        } else {
+            convolver.description()
+        };
 
         let report = PipelineReport {
             source_spec: spec,
@@ -546,7 +548,7 @@ impl AudioPipeline {
             dsp_plan,
             filter_metrics: upsampler.design_metrics(),
             convolver_name: convolver.name(),
-            convolver_description: convolver.description(),
+            convolver_description: conv_desc,
             delayer_name: delayer.name(),
             effective_shaper,
         };

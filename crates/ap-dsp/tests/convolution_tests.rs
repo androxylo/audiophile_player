@@ -1388,6 +1388,80 @@ fn discovery_warns_on_zero_frame_and_falls_back_when_newest_wav_fails_prepare() 
 }
 
 #[test]
+fn review5_loaded_wav_ir_matches_file_samples_bit_exact_and_negative_cache_skips_broken_wav() {
+    // HEADROOM_DESIGN.md §8 Test 3: loaded IR coefficients are never pre-normalized and match
+    // the WAV samples bit-for-bit (boost > 0 dB is preserved in `PreparedStereoIr.max_boost_db`).
+    let tmp = std::env::temp_dir().join(format!(
+        "ap_review5_ir_negcache_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&tmp).unwrap();
+
+    let good_path = tmp.join("a_good_boost_384k.wav");
+    let raw_l: [f32; 8] = [2.0, -0.5, 0.25, -0.125, 0.0, 0.0625, -0.03125, 0.015625];
+    let raw_r: [f32; 8] = [1.5, 0.25, -0.5, 0.125, -0.0625, 0.0, 0.03125, -0.015625];
+    let mut interleaved = Vec::with_capacity(16);
+    for i in 0..8 {
+        interleaved.push(raw_l[i]);
+        interleaved.push(raw_r[i]);
+    }
+    write_wav_f32(&good_path, 384_000, 2, &interleaved, false);
+
+    let loaded = load_stereo_wav(&good_path).unwrap();
+    for i in 0..8 {
+        assert_eq!(loaded.left[i], f64::from(raw_l[i]), "left tap {i} must match WAV bit-for-bit");
+        assert_eq!(loaded.right[i], f64::from(raw_r[i]), "right tap {i} must match WAV bit-for-bit");
+    }
+    let prepared = PreparedStereoIr::from_wav(&loaded).unwrap();
+    assert!(
+        prepared.max_boost_db > 5.0,
+        "IR with +6 dB tap must NOT be pre-normalized; got max_boost_db={:.3}",
+        prepared.max_boost_db
+    );
+
+    // Finding #17: Place a newer broken (all-zero) WAV in the same folder.
+    // First create_for_rate tries the broken newest WAV, records it in the negative cache, and
+    // falls back to `a_good_boost_384k.wav`. Second create_for_rate MUST skip the broken WAV
+    // directly from negative cache without appending a duplicate failure warning!
+    thread::sleep(Duration::from_millis(30));
+    let broken_path = tmp.join("z_broken_all_zeros_384k.wav");
+    write_wav_f32(&broken_path, 384_000, 2, &[0.0_f32; 64], false);
+
+    let factory = RewConvolverFactory::new(ConvolutionConfig::auto_dir(tmp.clone()));
+    let c1 = factory.create_for_rate(384_000).unwrap();
+    assert!(c1.description().contains("a_good_boost_384k.wav"));
+    let warn_count_after_first = factory
+        .warnings()
+        .iter()
+        .filter(|w| w.contains("z_broken_all_zeros_384k.wav"))
+        .count();
+    assert_eq!(
+        warn_count_after_first, 1,
+        "expected exactly 1 failure warning on first discovery, got: {:?}",
+        factory.warnings()
+    );
+
+    let c2 = factory.create_for_rate(384_000).unwrap();
+    assert!(c2.description().contains("a_good_boost_384k.wav"));
+    let warn_count_after_second = factory
+        .warnings()
+        .iter()
+        .filter(|w| w.contains("z_broken_all_zeros_384k.wav"))
+        .count();
+    assert_eq!(
+        warn_count_after_second, 1,
+        "negative cache must skip unchanged broken WAV on subsequent calls without re-loading/re-warning, got: {:?}",
+        factory.warnings()
+    );
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
 #[ignore = "requires local C:\\Program Files\\EqualizerAPO\\config REW WAVs"]
 fn real_equalizer_apo_rew_filters_load_and_stream_4m_taps_if_present() {
     let dir = Path::new(r"C:\Program Files\EqualizerAPO\config");

@@ -112,12 +112,28 @@ pub struct TrackPeakMetadata {
     pub true_peak_linear: Option<f64>,
 }
 
-fn realistic_dbfs(linear: f64) -> Option<f64> {
+/// Valid sample-peak upper limit for `bits_per_sample` (`2^(b-1) / (2^(b-1) - 1)`), accounting
+/// for ReplayGain scanners that normalize by `2^(b-1) - 1` (Review #5 Finding #16).
+pub fn max_sample_peak_linear_for_bits(bits_per_sample: u16) -> f64 {
+    let b = bits_per_sample.clamp(8, 32);
+    let half = (1_u64 << (b - 1)) as f64;
+    half / (half - 1.0)
+}
+
+/// 1-LSB realism floor in dBFS for `bits_per_sample` (clamped at `-120 dBFS`, Review #5 #16).
+pub fn min_realistic_peak_dbfs_for_bits(bits_per_sample: u16) -> f64 {
+    let b = bits_per_sample.clamp(8, 32);
+    let lsb_db = -20.0 * ((1_u64 << (b - 1)) as f64).log10();
+    lsb_db.max(MIN_REALISTIC_PEAK_DB)
+}
+
+fn realistic_dbfs_for_bits(linear: f64, bits_per_sample: u16) -> Option<f64> {
     if !linear.is_finite() || linear <= 0.0 {
         return None;
     }
     let dbfs = 20.0 * linear.log10();
-    if dbfs >= MIN_REALISTIC_PEAK_DB - 1e-9 && dbfs <= MAX_REALISTIC_TRUE_PEAK_DB + 1e-9 {
+    let min_db = min_realistic_peak_dbfs_for_bits(bits_per_sample);
+    if dbfs >= min_db - 1e-9 && dbfs <= MAX_REALISTIC_TRUE_PEAK_DB + 1e-9 {
         Some(dbfs)
     } else {
         None
@@ -125,20 +141,30 @@ fn realistic_dbfs(linear: f64) -> Option<f64> {
 }
 
 impl TrackPeakMetadata {
-    /// Classify the best realistic peak amplitude per the decided headroom rules:
+    /// Classify the best realistic peak amplitude using default 24-bit bounds.
+    pub fn classified_peak(&self) -> Option<ClassifiedPeak> {
+        self.classified_peak_for_bits(24)
+    }
+
+    /// Classify the best realistic peak amplitude per `HEADROOM_DESIGN.md` for `bits_per_sample`:
     /// - True peak tags take priority over ReplayGain track peak, which takes priority over album peak.
-    /// - Sample-peak tags `> 1.0` (`> 0 dBFS`) count as [`PeakKind::TruePeak`].
-    /// - Any peak `> +6.0 dBTP` (or `< -120.0 dBFS`, `<= 0`, non-finite) counts as unknown (`None`).
+    /// - Sample-peak tags `> 2^(b-1)/(2^(b-1)-1)` (strictly above 1-sample full scale for `b` bits)
+    ///   count as [`PeakKind::TruePeak`]; values up to that limit stay [`PeakKind::SamplePeak`]
+    ///   so 32767-normalizing 16-bit scanners keep the `3 dB` `A_isp` reserve (Review #5 #16).
+    /// - Any peak `> +6.0 dBTP` or `< 1 LSB` (or `<= 0`, non-finite) counts as unknown (`None`).
     /// - If a `true_peak_linear` tag is present and exceeds `+6.0 dBTP`, returns `None` immediately
     ///   (unknown) instead of falling back to a potentially quieter sample-peak tag.
-    pub fn classified_peak(&self) -> Option<ClassifiedPeak> {
+    pub fn classified_peak_for_bits(&self, bits_per_sample: u16) -> Option<ClassifiedPeak> {
+        let min_db = min_realistic_peak_dbfs_for_bits(bits_per_sample);
+        let sp_upper = max_sample_peak_linear_for_bits(bits_per_sample);
+
         if let Some(p) = self.true_peak_linear {
             if p.is_finite() && p > 0.0 {
                 let dbfs = 20.0 * p.log10();
                 if dbfs > MAX_REALISTIC_TRUE_PEAK_DB + 1e-9 {
                     return None;
                 }
-                if dbfs >= MIN_REALISTIC_PEAK_DB - 1e-9 {
+                if dbfs >= min_db - 1e-9 {
                     return Some(ClassifiedPeak {
                         linear: p,
                         dbfs,
@@ -154,8 +180,8 @@ impl TrackPeakMetadata {
                 if dbfs > MAX_REALISTIC_TRUE_PEAK_DB + 1e-9 {
                     return None;
                 }
-                if let Some(dbfs) = realistic_dbfs(p) {
-                    let kind = if p > 1.0 {
+                if let Some(dbfs) = realistic_dbfs_for_bits(p, bits_per_sample) {
+                    let kind = if p > sp_upper + 1e-9 {
                         PeakKind::TruePeak
                     } else {
                         PeakKind::SamplePeak
@@ -175,8 +201,8 @@ impl TrackPeakMetadata {
                 if dbfs > MAX_REALISTIC_TRUE_PEAK_DB + 1e-9 {
                     return None;
                 }
-                if let Some(dbfs) = realistic_dbfs(p) {
-                    let kind = if p > 1.0 {
+                if let Some(dbfs) = realistic_dbfs_for_bits(p, bits_per_sample) {
+                    let kind = if p > sp_upper + 1e-9 {
                         PeakKind::TruePeak
                     } else {
                         PeakKind::SamplePeak
@@ -232,6 +258,16 @@ impl HeadroomDecision {
         }
     }
 
+    /// Combined non-boosting linear-stage gain in dB (`G_up + S`, strictly `<= 0.0 dB`).
+    pub fn total_gain_db(&self) -> f64 {
+        let s = if self.convolution_scale_db.is_finite() && self.convolution_scale_db < 0.0 {
+            self.convolution_scale_db
+        } else {
+            0.0
+        };
+        self.mode.gain_db() + s
+    }
+
     pub fn summary(&self) -> String {
         if self.convolution_scale_db < -1e-6 {
             format!(
@@ -244,15 +280,32 @@ impl HeadroomDecision {
     }
 }
 
-/// Choose strictly `-3 dB` or `0 dB` upsampler gain `G_up` and excess-only convolution scaling.
-///
-/// - `is_streaming_source`: live streams have unknown peak (`P = 0 dBFS`, `A_isp = 3 dB`, `G_up = -3 dB`).
-/// - `active_conv_max_gain_db`: `Some(G_c)` (`max |H(f)|` in dB, uncapped) when REW convolution is
-///   active; `None` when convolution is bypassed (`NullConvolver`).
-/// - `full_scan_post_chain_peak_db`: optional current full-scan post-chain peak `M` (dBFS); when
-///   present and finite, convolution excess is computed from `M + G_up` over `0 dBFS`.
+/// Choose strictly `-3 dB` or `0 dB` upsampler gain `G_up` and excess-only scaling `S`
+/// using default 24-bit sample-peak bounds.
 pub fn select_headroom(
     meta: &TrackPeakMetadata,
+    is_streaming_source: bool,
+    active_conv_max_gain_db: Option<f64>,
+    full_scan_post_chain_peak_db: Option<f64>,
+) -> HeadroomDecision {
+    select_headroom_for_bits(
+        meta,
+        24,
+        is_streaming_source,
+        active_conv_max_gain_db,
+        full_scan_post_chain_peak_db,
+    )
+}
+
+/// Choose strictly `-3 dB` or `0 dB` upsampler gain `G_up` and excess-only scaling `S`
+/// per `HEADROOM_DESIGN.md` §3–§4, accounting for source `bits_per_sample`.
+///
+/// Even when convolution is bypassed (`active_conv_max_gain_db` is `None` or `Some(0.0)`),
+/// `G_c = 0.0` so realistic true peaks above `+3 dBTP` (e.g. `+4 dBTP`) still receive
+/// `S = -1 dB` (Review #5 Finding #14).
+pub fn select_headroom_for_bits(
+    meta: &TrackPeakMetadata,
+    bits_per_sample: u16,
     is_streaming_source: bool,
     active_conv_max_gain_db: Option<f64>,
     full_scan_post_chain_peak_db: Option<f64>,
@@ -260,7 +313,7 @@ pub fn select_headroom(
     let classified = if is_streaming_source {
         None
     } else {
-        meta.classified_peak()
+        meta.classified_peak_for_bits(bits_per_sample)
     };
 
     // 1. Upsampler gain G_up is strictly 0 dB when realistic peak <= -3.0 dBFS, else -3 dB.
@@ -303,28 +356,25 @@ pub fn select_headroom(
         }
     };
 
-    // 2. Active convolution is scaled ONLY by the excess over 0 dBFS.
-    let convolution_scale_db = if let Some(g_c_db) = active_conv_max_gain_db {
-        let g_up_db = mode.gain_db();
-        let predicted_db = match full_scan_post_chain_peak_db {
-            Some(m_db) if m_db.is_finite() => m_db + g_up_db,
-            _ => {
-                let g_c_pos = if g_c_db.is_finite() && g_c_db > 0.0 {
-                    g_c_db
-                } else {
-                    0.0
-                };
-                p_db + a_isp_db + g_up_db + g_c_pos
-            }
-        };
-        if predicted_db > 1e-9 {
-            reason.push_str(&format!(
-                "; conv excess +{predicted_db:.2} dB -> conv scale -{predicted_db:.2} dB"
-            ));
-            -predicted_db
-        } else {
-            0.0
+    // 2. Excess-only scaling S over 0 dBFS (`G_c = 0.0` when NullConvolver, Review #5 #14).
+    let g_c_db = active_conv_max_gain_db.unwrap_or(0.0);
+    let g_up_db = mode.gain_db();
+    let predicted_db = match full_scan_post_chain_peak_db {
+        Some(m_db) if m_db.is_finite() => m_db + g_up_db,
+        _ => {
+            let g_c_pos = if g_c_db.is_finite() && g_c_db > 0.0 {
+                g_c_db
+            } else {
+                0.0
+            };
+            p_db + a_isp_db + g_up_db + g_c_pos
         }
+    };
+    let convolution_scale_db = if predicted_db > 1e-9 {
+        reason.push_str(&format!(
+            "; conv excess +{predicted_db:.2} dB -> conv scale -{predicted_db:.2} dB"
+        ));
+        -predicted_db
     } else {
         0.0
     };
@@ -335,5 +385,51 @@ pub fn select_headroom(
         peak_kind,
         convolution_scale_db,
         reason,
+    }
+}
+
+/// Apply `HEADROOM_DESIGN.md` §4 gapless tail-overlap scaling (`S_B`) for Track B without ever
+/// altering Stage-1 `G_up` (Review #5 Finding #3).
+///
+/// Computes `B_out = P + A_isp + G_up + max(G_c, 0)`,
+/// `T = conv_tail_peak + up_hist_peak * 10^(max(G_c, 0)/20)`,
+/// and `S_B = min(0, -B_out, 20*log10(max(1 - T, 1e-3)) - B_out)`.
+pub fn apply_gapless_tail_headroom(
+    base: &mut HeadroomDecision,
+    meta: &TrackPeakMetadata,
+    bits_per_sample: u16,
+    is_streaming_source: bool,
+    conv_max_boost_db: f64,
+    conv_tail_peak: f64,
+    up_hist_peak: f64,
+) {
+    let g_c_pos = if conv_max_boost_db.is_finite() && conv_max_boost_db > 0.0 {
+        conv_max_boost_db
+    } else {
+        0.0
+    };
+    let g_c_lin = 10.0_f64.powf(g_c_pos / 20.0);
+    let total_tail = conv_tail_peak.max(0.0) + up_hist_peak.max(0.0) * g_c_lin;
+    if !total_tail.is_finite() || total_tail <= 1e-6 {
+        return;
+    }
+
+    let (p_db, a_isp_db) = if is_streaming_source {
+        (0.0, SAMPLE_PEAK_ISP_ALLOWANCE_DB)
+    } else if let Some(cp) = meta.classified_peak_for_bits(bits_per_sample) {
+        (cp.dbfs, cp.isp_allowance_db())
+    } else {
+        (0.0, SAMPLE_PEAK_ISP_ALLOWANCE_DB)
+    };
+
+    let b_out_db = p_db + a_isp_db + base.mode.gain_db() + g_c_pos;
+    let room_db = 20.0 * (1.0 - total_tail).max(1e-3).log10();
+    let s_b_db = 0.0_f64.min(-b_out_db).min(room_db - b_out_db);
+
+    if s_b_db < base.convolution_scale_db - 1e-9 {
+        base.convolution_scale_db = s_b_db;
+        base.reason.push_str(&format!(
+            "; incoming gapless tail T={total_tail:.3} (B_out={b_out_db:+.2} dB) -> S_B={s_b_db:.2} dB"
+        ));
     }
 }

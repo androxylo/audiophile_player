@@ -1954,6 +1954,18 @@ fn stream_single_track(
         );
     }
 
+    let qstats = session.quantizer_stats();
+    if qstats.overs_count > 0 {
+        let warn_msg = format!(
+            "Quantizer clipped {} sample(s) on '{}' (pre-quant peak {:+.2} dBFS)",
+            qstats.overs_count,
+            chosen.display(),
+            qstats.max_pre_quant_peak_dbfs()
+        );
+        eprintln!("  [clip warn] {warn_msg}");
+        shared.record_action(warn_msg);
+    }
+
     if next_carryover.is_some() {
         // Keep TrackEnd open until we know whether the next track accepts the gapless carryover;
         // if not (EndOfQueue, rate change, or error), we drain the tail right before TrackEnd.
@@ -2385,6 +2397,18 @@ fn stream_open_audio_source<S: AudioBlockSource>(
             None,
             false,
         );
+    }
+
+    let qstats = session.quantizer_stats();
+    if qstats.overs_count > 0 {
+        let warn_msg = format!(
+            "Quantizer clipped {} sample(s) on '{}' (pre-quant peak {:+.2} dBFS)",
+            qstats.overs_count,
+            label_path.display(),
+            qstats.max_pre_quant_peak_dbfs()
+        );
+        eprintln!("  [clip warn] {warn_msg}");
+        shared.record_action(warn_msg);
     }
 
     if next_carryover.is_some() {

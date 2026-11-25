@@ -278,8 +278,9 @@ impl FilterArchetype {
             Self::SimpleTest => simple_test_taps_per_phase(mult, cap)
                 .map_or(0, |m| m.saturating_mul(mult)),
             Self::GaussLongLp | Self::GaussHiresLp => {
-                default_gaussian_num_taps(self, source_rate_hz, target_rate_hz)
-                    .map_or(0, |n| n.min(cap))
+                // Review #5 Finding #18: report the true shape-derived N rather than silently
+                // clamping to `cap` so budget mismatches are explicit and honest.
+                default_gaussian_num_taps(self, source_rate_hz, target_rate_hz).unwrap_or(0)
             }
             // Future Phase 2/3 researched constant-time lengths (`UPSAMPLING_RESEARCH.md` §4.4, §7).
             Self::GaussApod4M => (65_536_usize.saturating_mul(mult)).min(cap),
@@ -640,7 +641,32 @@ impl UpsamplerPicker {
                     (forced, raw_ratio, true, format!("cli --filter {forced}"))
                 }
             }
-            None => (selected_auto, raw_ratio, false, selected_reason),
+            None => {
+                // Review #5 Finding #18: when auto-mode selects a Gaussian filter whose shape-
+                // derived tap count exceeds `--max-taps`, degrade cleanly to `SimpleTest` sized
+                // to the user's cap instead of failing every Redbook track.
+                let needs_fallback = matches!(
+                    selected_auto,
+                    FilterArchetype::GaussLongLp | FilterArchetype::GaussHiresLp
+                ) && default_gaussian_num_taps(selected_auto, source.sample_rate_hz, t_hz)
+                    .is_some_and(|n| n > self.policy.max_taps);
+                if needs_fallback {
+                    let req_n =
+                        default_gaussian_num_taps(selected_auto, source.sample_rate_hz, t_hz)
+                            .unwrap_or(0);
+                    (
+                        FilterArchetype::SimpleTest,
+                        raw_ratio,
+                        false,
+                        format!(
+                            "auto fallback to simple-test ({selected_auto} requires {req_n} taps > --max-taps {})",
+                            self.policy.max_taps
+                        ),
+                    )
+                } else {
+                    (selected_auto, raw_ratio, false, selected_reason)
+                }
+            }
         };
 
         let (shaper, shaper_overridden) = match self.policy.shaper_override {
