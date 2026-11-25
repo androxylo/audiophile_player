@@ -27,6 +27,10 @@ pub struct UpnpPlayRequest {
     pub duration_s: Option<f64>,
     /// Optional start offset in seconds (used for `AVTransport::Seek` and Pause/Resume).
     pub seek_offset_s: Option<f64>,
+    /// Monotonic generation token set ONLY when this request originated from a gapless
+    /// `SetNextAVTransportURI` prefetch (`None` for explicit `Play`/`Seek`/`SetAVTransportURI`
+    /// restarts of `CurrentURI`, Review #6 Findings #8 & #17).
+    pub prefetched_next_gen: Option<u64>,
 }
 
 impl Eq for UpnpPlayRequest {}

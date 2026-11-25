@@ -395,8 +395,12 @@ impl<'a> EngineState<'a> {
                             PlayDirective::UpnpStream { request: next_req },
                             true,
                         );
+                        return DispatchOutcome::Applied;
                     }
-                    return DispatchOutcome::Applied;
+                    // Review #6 Finding #7: when no NextURI is queued during UPnP playback,
+                    // return Rejected so the consumer's resume loop clears `stop_handle` and
+                    // continues playing the active stream instead of discarding remaining PCM.
+                    return DispatchOutcome::Rejected;
                 }
                 println!("  [next] Skipping to next track...");
                 let _ = io::stdout().flush();
@@ -826,6 +830,7 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
         StreamEvent::TrackStart {
             path,
             upnp_uri,
+            upnp_next_gen,
             mode_label,
             report,
             total_duration_s,
@@ -884,6 +889,7 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
                     StreamEvent::TrackStart {
                         path,
                         upnp_uri,
+                        upnp_next_gen,
                         mode_label,
                         report,
                         total_duration_s,
@@ -911,6 +917,7 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
                     StreamEvent::TrackStart {
                         path,
                         upnp_uri,
+                        upnp_next_gen,
                         mode_label,
                         report,
                         total_duration_s,
@@ -934,10 +941,11 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
             shared.set_playing(mode_label, track_str, fmt_str);
             if mode_label == PlayModeLabel::UpnpRenderer {
                 if let Some(ref upnp) = state.upnp_state {
-                    // Review #5 Finding #5: promote prefetched NextURI -> CurrentURI and start
-                    // RelTime clock strictly here when audio becomes audible on the DAC!
+                    // Review #5 #5 & Review #6 #8/#17: promote prefetched NextURI -> CurrentURI
+                    // strictly by generation token when audio becomes audible on the DAC; explicit
+                    // Play/Seek restarts pass `upnp_next_gen = None` and never consume `st.next`.
                     if let Some(ref uri) = upnp_uri {
-                        upnp.engine_mark_playing(uri, total_duration_s);
+                        upnp.engine_mark_playing_with_gen(uri, total_duration_s, upnp_next_gen);
                     } else {
                         upnp.engine_mark_playing_current(total_duration_s);
                     }
@@ -1136,7 +1144,14 @@ fn producer_loop_with_upnp(
                                carried: &mut Option<GaplessCarryover>,
                                pending_end: &mut bool| {
         if let Some(tail) = carried.take() {
-            if let Ok(pcm) = pipeline.drain_gapless_carryover(tail) {
+            if let Ok((pcm, drain_stats)) = pipeline.drain_gapless_carryover_with_stats(tail) {
+                if drain_stats.overs_count > 0 {
+                    eprintln!(
+                        "  [clip warn] drained gapless tail: {} pre-quantizer sample overs (max {:.2} dBFS)",
+                        drain_stats.overs_count,
+                        drain_stats.max_pre_quant_peak_dbfs()
+                    );
+                }
                 if !pcm.is_empty() {
                     let _ = buf.push_for_epoch(epoch, StreamEvent::PcmBlock(pcm));
                 }
@@ -1186,7 +1201,7 @@ fn producer_loop_with_upnp(
             }
 
             let mut cur_req = request;
-            let mut last_prefetched_uri: Option<String> = None;
+            let mut last_prefetched_gen: Option<u64> = cur_req.prefetched_next_gen;
             let mut aborted = false;
             loop {
                 if ctrl.epoch() != epoch || buf.current_epoch() != epoch {
@@ -1235,13 +1250,13 @@ fn producer_loop_with_upnp(
                     TrackStreamOutcome::Played => {
                         carried_tail = next_carry;
                         pending_track_end = next_pend;
-                        // Review #5 Finding #5: peek NextURI for producer prefetch WITHOUT
-                        // mutating CurrentURI or resetting RelTime; consumer promotes it when
-                        // TrackStart actually becomes audible on the DAC!
+                        // Review #5 #5 & Review #6 #8: peek NextURI by generation token WITHOUT
+                        // mutating CurrentURI or resetting RelTime; consumer promotes it strictly
+                        // when TrackStart becomes audible on the DAC (and repeat-one prefetches!).
                         if let Some(next_req) = upnp_state.as_deref().and_then(|u| {
-                            u.engine_peek_next_for_prefetch(last_prefetched_uri.as_deref())
+                            u.engine_peek_next_for_prefetch(last_prefetched_gen)
                         }) {
-                            last_prefetched_uri = Some(next_req.uri.clone());
+                            last_prefetched_gen = next_req.prefetched_next_gen;
                             cur_req = next_req;
                             continue;
                         }
@@ -1792,6 +1807,7 @@ fn stream_single_track(
     let mut pending_start = Some(StreamEvent::TrackStart {
         path: chosen.to_path_buf(),
         upnp_uri: None,
+        upnp_next_gen: None,
         mode_label,
         report: session.report().clone(),
         total_duration_s,
@@ -2062,6 +2078,11 @@ fn stream_upnp_request(
             &mut cur_source,
             &PathBuf::from(&seg_label),
             Some(&req.uri),
+            if seg_idx == 0 {
+                req.prefetched_next_gen
+            } else {
+                None
+            },
             PlayModeLabel::UpnpRenderer,
             seg_duration,
             UPNP_SOURCE_BLOCK_FRAMES,
@@ -2105,6 +2126,7 @@ fn stream_open_audio_source<S: AudioBlockSource>(
     source: &mut S,
     label_path: &Path,
     upnp_uri: Option<&str>,
+    upnp_next_gen: Option<u64>,
     mode_label: PlayModeLabel,
     total_duration_s: Option<f64>,
     block_frames: usize,
@@ -2267,6 +2289,7 @@ fn stream_open_audio_source<S: AudioBlockSource>(
     let mut pending_start = Some(StreamEvent::TrackStart {
         path: label_path.to_path_buf(),
         upnp_uri: upnp_uri.map(str::to_string),
+        upnp_next_gen,
         mode_label,
         report: session.report().clone(),
         total_duration_s,
@@ -3041,14 +3064,17 @@ mod tests {
         handle.join().unwrap();
         let _ = fs::remove_dir_all(&root);
 
+        // Review #6 #13: full zero-input FIR decay adds `m_half * ratio = 317 * 8 = 2536` samples
+        // for `gauss-long-lp` at 8x when draining unconsumed carryover across rate changes / EOF.
+        let expected_full = n_frames * 8 + 317 * 8 + (ir_taps - 1);
         assert!(saw_end_of_queue, "expected EndOfQueue after 2 sequential tracks");
         assert_eq!(
             track_counts,
             vec![
-                (352_800, n_frames * 8 + (ir_taps - 1)),
-                (384_000, n_frames * 8 + (ir_taps - 1)),
+                (352_800, expected_full),
+                (384_000, expected_full),
             ],
-            "both rate-change track and final end-of-queue track must preserve full N*8 + flush_tail"
+            "both rate-change track and final end-of-queue track must preserve full N*8 + FIR decay + flush_tail"
         );
     }
 
@@ -3237,14 +3263,15 @@ mod tests {
         handle.join().unwrap();
         let _ = fs::remove_dir_all(&root);
 
+        let expected_full = n_frames * 8 + 317 * 8 + (ir_taps - 1);
         assert!(saw_end_of_queue);
         assert_eq!(
             track_counts,
             vec![
-                (f01, n_frames * 8 + (ir_taps - 1), false),
-                (f04, n_frames * 8 + (ir_taps - 1), false),
+                (f01, expected_full, false),
+                (f04, expected_full, false),
             ],
-            "Track 1 MUST keep its full N*8 + REW flush_tail when same-rate Track 2 fails on block 1"
+            "Track 1 MUST keep its full N*8 + FIR decay + REW flush_tail when same-rate Track 2 fails on block 1"
         );
     }
 
@@ -3303,6 +3330,7 @@ mod tests {
             StreamEvent::TrackStart {
                 path: f01.clone(),
                 upnp_uri: None,
+        upnp_next_gen: None,
                 mode_label: PlayModeLabel::Sequential,
                 report: dummy_report.clone(),
                 total_duration_s: Some(1.0),
@@ -3315,6 +3343,7 @@ mod tests {
             StreamEvent::TrackStart {
                 path: f02.clone(),
                 upnp_uri: None,
+        upnp_next_gen: None,
                 mode_label: PlayModeLabel::Sequential,
                 report: dummy_report,
                 total_duration_s: Some(1.0),
@@ -3376,6 +3405,7 @@ mod tests {
             StreamEvent::TrackStart {
                 path: f02.clone(),
                 upnp_uri: None,
+        upnp_next_gen: None,
                 mode_label: PlayModeLabel::Sequential,
                 report: dummy_report.clone(),
                 total_duration_s: Some(1.0),
@@ -3409,6 +3439,7 @@ mod tests {
             StreamEvent::TrackStart {
                 path: f02,
                 upnp_uri: None,
+        upnp_next_gen: None,
                 mode_label: PlayModeLabel::Sequential,
                 report: dummy_report,
                 total_duration_s: Some(1.0),
@@ -3923,6 +3954,7 @@ mod tests {
             StreamEvent::TrackStart {
                 path: f02.clone(),
                 upnp_uri: None,
+        upnp_next_gen: None,
                 mode_label: PlayModeLabel::Sequential,
                 report: dummy_report.clone(),
                 total_duration_s: Some(5.0),
@@ -3998,6 +4030,7 @@ mod tests {
             StreamEvent::TrackStart {
                 path: f01.clone(),
                 upnp_uri: None,
+        upnp_next_gen: None,
                 mode_label: PlayModeLabel::Sequential,
                 report: dummy_report.clone(),
                 total_duration_s: Some(1.0),
@@ -4024,6 +4057,7 @@ mod tests {
             StreamEvent::TrackStart {
                 path: f02.clone(),
                 upnp_uri: None,
+        upnp_next_gen: None,
                 mode_label: PlayModeLabel::Sequential,
                 report: dummy_report,
                 total_duration_s: Some(1.0),
@@ -4431,6 +4465,209 @@ mod tests {
             }
             other => panic!("expected UpnpStream for late NextURI, got {other:?}"),
         }
+
+        upnp_srv.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn review6_web_next_during_upnp_without_nexturi_rejects_and_resumes_stream_and_gen_prefetch() {
+        use ap_upnp::{TransportState, UpnpRendererConfig, UpnpRendererServer};
+        use std::net::Ipv4Addr;
+
+        let root = std::env::temp_dir().join(format!(
+            "ap_cli_r6_upnp_next_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&root);
+        let shared = SharedControl::new(root.clone(), "Mock DAC");
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        shared.attach_sink_stop_flag(Arc::clone(&stop_flag));
+
+        let mut upnp_srv = UpnpRendererServer::start(
+            shared.clone(),
+            UpnpRendererConfig {
+                friendly_name: "R6 UPnP Test".to_string(),
+                port: None,
+                bind_ip: Some(Ipv4Addr::LOCALHOST),
+                enable_ssdp: false,
+            },
+        )
+        .unwrap();
+        let upnp_state = Arc::clone(upnp_srv.state());
+
+        let buf = BoundedBlockStreamBuffer::new(DEFAULT_MAX_BUFFERED_FRAMES);
+        let ep0 = buf.current_epoch();
+        let prod_ctrl = ProducerControl::new(ep0, ProducerDirective::Paused);
+        let controller = ShutdownController::new();
+
+        upnp_state.set_av_transport_uri("http://127.0.0.1:59999/a.flac".into(), String::new());
+        upnp_state.play().unwrap();
+        let play_cmd = shared.take_pending_command().unwrap();
+
+        let mut state = EngineState::with_upnp(
+            ep0,
+            PlayDirective::Random { root: root.clone() },
+            &buf,
+            &prod_ctrl,
+            &shared,
+            Some(Arc::clone(&upnp_state)),
+        );
+        assert_eq!(state.dispatch(play_cmd), DispatchOutcome::Applied);
+
+        // Finding #7: Web/CLI Next during UPnP with NO NextURI queued MUST return Rejected
+        // (and when submitted mid-track, consumer must resume playing remaining blocks!).
+        assert_eq!(
+            state.dispatch(ControlCommand::Next),
+            DispatchOutcome::Rejected,
+            "Next during UPnP without NextURI must return Rejected so active stream resumes"
+        );
+
+        let ep = state.active_epoch;
+        let report = AudioPipeline::new(UpsamplerPolicy::default())
+            .unwrap()
+            .start_track(
+                ap_core::format::StreamSpec {
+                    sample_rate_hz: 44_100,
+                    bits_per_sample: 16,
+                    channels: 2,
+                },
+                &ap_core::headroom::TrackPeakMetadata::default(),
+                true,
+            )
+            .unwrap()
+            .report()
+            .clone();
+        assert!(buf.push_for_epoch(
+            ep,
+            StreamEvent::TrackStart {
+                path: PathBuf::from("a.flac [UPnP FLAC]"),
+                upnp_uri: Some("http://127.0.0.1:59999/a.flac".into()),
+                upnp_next_gen: None,
+                mode_label: PlayModeLabel::UpnpRenderer,
+                report,
+                total_duration_s: Some(10.0),
+                had_gapless_carryover: false,
+            }
+        ));
+        for _ in 0..4 {
+            assert!(buf.push_for_epoch(
+                ep,
+                StreamEvent::PcmBlock(ap_core::buffer::InterleavedInt32Buffer {
+                    sample_rate_hz: 44_100,
+                    frames: vec![[100, -100]; 4096],
+                })
+            ));
+        }
+        assert!(buf.push_for_epoch(ep, StreamEvent::TrackEnd));
+
+        struct InterruptOnceSink {
+            shared: Arc<SharedControl>,
+            stop_flag: Arc<AtomicBool>,
+            interrupted: bool,
+            frames_played: usize,
+        }
+        impl BlockStreamAudioSink for InterruptOnceSink {
+            fn play_block_stream<F>(
+                &mut self,
+                rate: u32,
+                _fmt: DacWireFormat,
+                mut next: F,
+            ) -> Result<PlaybackStats, OutputError>
+            where
+                F: FnMut() -> ap_output_win::wdm_ks::StreamBlock,
+            {
+                loop {
+                    if self.stop_flag.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    match next() {
+                        ap_output_win::wdm_ks::StreamBlock::Ready(b) => {
+                            self.frames_played += b.frames.len();
+                            if !self.interrupted {
+                                self.interrupted = true;
+                                // Simulate Web UI Next click mid-UPnP-track with no NextURI!
+                                self.shared.submit_command(ControlCommand::Next);
+                                break;
+                            }
+                        }
+                        ap_output_win::wdm_ks::StreamBlock::EndOfTrack => break,
+                        ap_output_win::wdm_ks::StreamBlock::Underrun => break,
+                    }
+                }
+                Ok(PlaybackStats {
+                    device_name: "Mock DAC".to_string(),
+                    sample_rate_hz: rate,
+                    wire_format: DacWireFormat::Int32,
+                    frames_played: self.frames_played,
+                    wavert_buffer_bytes: 0,
+                    notifications: 1,
+                    mmcss_pro_audio: false,
+                })
+            }
+        }
+
+        let mut sink = InterruptOnceSink {
+            shared: shared.clone(),
+            stop_flag: Arc::clone(&stop_flag),
+            interrupted: false,
+            frames_played: 0,
+        };
+        assert_eq!(
+            step_consumer_once(
+                &mut state,
+                &buf,
+                &shared,
+                &controller,
+                &stop_flag,
+                &mut sink,
+                || false,
+            ),
+            ConsumerStepResult::Continue
+        );
+        assert_eq!(
+            sink.frames_played,
+            4 * 4096,
+            "consumer must resume after rejected Next and play all 4 blocks instead of discarding them"
+        );
+        assert_eq!(upnp_state.snapshot().transport_state, TransportState::Playing);
+
+        // Finding #8: Replaced NextURI (B -> B2) after prefetching B promotes B accurately while
+        // keeping B2 queued as NextURI, AND repeat-one (SetNext(B2) while playing B2) prefetches!
+        upnp_state.set_next_av_transport_uri("http://127.0.0.1:59999/b.flac".into(), String::new());
+        let pref_b = upnp_state
+            .engine_peek_next_for_prefetch(None)
+            .expect("must peek B");
+        let gen_b = pref_b.prefetched_next_gen.expect("must carry generation token");
+        assert_eq!(pref_b.uri, "http://127.0.0.1:59999/b.flac");
+
+        // Control point replaces NextURI with B2 before B becomes audible.
+        upnp_state.set_next_av_transport_uri("http://127.0.0.1:59999/b2.flac".into(), String::new());
+        // B becomes audible on DAC -> must promote B to current AND keep B2 in next!
+        upnp_state.engine_mark_playing_with_gen(&pref_b.uri, Some(20.0), Some(gen_b));
+        let snap_b = upnp_state.snapshot();
+        assert_eq!(
+            snap_b.current.as_ref().map(|c| c.uri.as_str()),
+            Some("http://127.0.0.1:59999/b.flac")
+        );
+        assert_eq!(
+            snap_b.next.as_ref().map(|n| n.uri.as_str()),
+            Some("http://127.0.0.1:59999/b2.flac")
+        );
+
+        // Producer now peeks B2 cleanly (new gen != gen_b), promotes B2, then queues repeat-one B2!
+        let pref_b2 = upnp_state
+            .engine_peek_next_for_prefetch(Some(gen_b))
+            .expect("must peek B2");
+        let gen_b2 = pref_b2.prefetched_next_gen.unwrap();
+        assert_ne!(gen_b2, gen_b);
+        upnp_state.engine_mark_playing_with_gen(&pref_b2.uri, Some(25.0), Some(gen_b2));
+        upnp_state.set_next_av_transport_uri("http://127.0.0.1:59999/b2.flac".into(), String::new());
+        let pref_repeat = upnp_state
+            .engine_peek_next_for_prefetch(Some(gen_b2))
+            .expect("repeat-one SetNext(B2) must prefetch gaplessly with fresh generation!");
+        assert_eq!(pref_repeat.uri, "http://127.0.0.1:59999/b2.flac");
+        assert_ne!(pref_repeat.prefetched_next_gen, Some(gen_b2));
 
         upnp_srv.shutdown();
         let _ = std::fs::remove_dir_all(&root);

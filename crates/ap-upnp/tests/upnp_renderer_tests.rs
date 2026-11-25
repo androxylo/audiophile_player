@@ -430,3 +430,59 @@ fn seek_and_pause_resume_preserve_position_and_per_peer_cap_prevents_starvation(
 
     srv.shutdown();
 }
+
+#[test]
+fn review6_repeat_one_seek_preserves_reltime_and_next_uri() {
+    // Review #6 Finding #17: CurrentURI == NextURI (repeat-one). A Seek(REL_TIME, 00:01:00)
+    // followed by engine_mark_playing (restart of current, next_gen = None) MUST preserve
+    // RelTime >= 60 s and MUST NOT consume st.next!
+    let shared = SharedControl::new(PathBuf::from(r"C:\Music"), "Gungnir 2");
+    let mut srv = UpnpRendererServer::start(
+        shared.clone(),
+        UpnpRendererConfig {
+            friendly_name: "Repeat-One Seek Test".to_string(),
+            port: None,
+            bind_ip: Some(Ipv4Addr::LOCALHOST),
+            enable_ssdp: false,
+        },
+    )
+    .unwrap();
+    let st = srv.state();
+    let uri = "http://127.0.0.1:50000/repeat.flac";
+    st.set_av_transport_uri(
+        uri.into(),
+        r#"<DIDL-Lite><item><res duration="0:03:00"></res></item></DIDL-Lite>"#.into(),
+    );
+    st.play().unwrap();
+    let _ = shared.take_pending_command();
+    st.engine_mark_playing_with_gen(uri, Some(180.0), None);
+    st.set_next_av_transport_uri(uri.into(), String::new());
+
+    // Seek to 1:00 on current track.
+    st.seek("REL_TIME", "00:01:00").unwrap();
+    let seek_req = match shared.take_pending_command() {
+        Some(ControlCommand::PlayUpnp(r)) => r,
+        other => panic!("expected PlayUpnp from Seek, got {other:?}"),
+    };
+    assert_eq!(seek_req.seek_offset_s, Some(60.0));
+    assert_eq!(
+        seek_req.prefetched_next_gen, None,
+        "Seek must carry prefetched_next_gen = None"
+    );
+
+    // TrackStart arrives for the seeked stream -> must NOT consume next or reset RelTime!
+    st.engine_mark_playing_with_gen(&seek_req.uri, Some(180.0), seek_req.prefetched_next_gen);
+    let snap = st.snapshot();
+    assert!(
+        snap.elapsed_s >= 59.9,
+        "Seek on repeat-one must preserve RelTime ~= 60s, got {:.2}",
+        snap.elapsed_s
+    );
+    assert_eq!(
+        snap.next.as_ref().map(|n| n.uri.as_str()),
+        Some(uri),
+        "Seek on repeat-one must keep NextURI queued!"
+    );
+
+    srv.shutdown();
+}

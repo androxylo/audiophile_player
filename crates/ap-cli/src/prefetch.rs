@@ -37,6 +37,9 @@ pub enum StreamEvent {
         /// Originating UPnP URI (set for `PlayModeLabel::UpnpRenderer` so the consumer promotes
         /// `CurrentURI` and starts `RelTime` only when this track becomes audible, Review #5 #5).
         upnp_uri: Option<String>,
+        /// Generation token when this UPnP track came from a gapless `SetNextAVTransportURI`
+        /// prefetch (`None` for explicit `Play`/`Seek` restarts of `CurrentURI`, Review #6 #8/#17).
+        upnp_next_gen: Option<u64>,
         mode_label: PlayModeLabel,
         report: PipelineReport,
         total_duration_s: Option<f64>,

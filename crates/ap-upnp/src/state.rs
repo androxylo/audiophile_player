@@ -1,6 +1,7 @@
 //! Shared UPnP MediaRenderer transport state synchronized between `ap-upnp` SOAP/GENA and
 //! the `ap-cli` audio engine.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -85,6 +86,21 @@ impl UpnpTrackDescriptor {
             bits_per_sample: self.bits_per_sample,
             duration_s: self.duration_s,
             seek_offset_s,
+            prefetched_next_gen: None,
+        }
+    }
+
+    pub fn to_play_request_prefetched(&self, next_gen: u64) -> UpnpPlayRequest {
+        UpnpPlayRequest {
+            uri: self.uri.clone(),
+            display_name: self.display_name(),
+            protocol_info: self.protocol_info.clone(),
+            sample_rate_hz: self.sample_rate_hz,
+            channels: self.channels,
+            bits_per_sample: self.bits_per_sample,
+            duration_s: self.duration_s,
+            seek_offset_s: None,
+            prefetched_next_gen: Some(next_gen),
         }
     }
 }
@@ -105,7 +121,13 @@ struct InnerUpnpState {
     transport_state: TransportState,
     transport_status: String,
     current: Option<UpnpTrackDescriptor>,
-    next: Option<UpnpTrackDescriptor>,
+    /// Queued `NextURI` paired with its monotonic `SetNextAVTransportURI` generation token.
+    next: Option<(u64, UpnpTrackDescriptor)>,
+    next_gen_seq: u64,
+    /// Bounded cache of recently prefetched `(gen, descriptor)` pairs so replacing `NextURI`
+    /// (`B -> B2`) after the producer already prefetched `B` still promotes `B` accurately when
+    /// `B` becomes audible while keeping `B2` queued in `next` (Review #6 Finding #8).
+    prefetched_nexts: VecDeque<(u64, UpnpTrackDescriptor)>,
     playing_started_at: Option<Instant>,
     accumulated_elapsed_s: f64,
     active_duration_s: Option<f64>,
@@ -134,6 +156,8 @@ impl UpnpRendererState {
                 transport_status: "OK".to_string(),
                 current: None,
                 next: None,
+                next_gen_seq: 0,
+                prefetched_nexts: VecDeque::new(),
                 playing_started_at: None,
                 accumulated_elapsed_s: 0.0,
                 active_duration_s: None,
@@ -183,7 +207,7 @@ impl UpnpRendererState {
             transport_state: st.transport_state,
             transport_status: st.transport_status.clone(),
             current: st.current.clone(),
-            next: st.next.clone(),
+            next: st.next.as_ref().map(|(_, d)| d.clone()),
             elapsed_s,
             duration_s,
         }
@@ -202,6 +226,7 @@ impl UpnpRendererState {
             st.accumulated_elapsed_s = 0.0;
             st.active_duration_s = None;
             st.next = None;
+            st.prefetched_nexts.clear();
 
             if trimmed_uri.is_empty() {
                 st.current = None;
@@ -247,8 +272,11 @@ impl UpnpRendererState {
             if trimmed.is_empty() {
                 st.next = None;
             } else {
-                st.next = Some(UpnpTrackDescriptor::from_uri_and_metadata(
-                    trimmed, metadata,
+                st.next_gen_seq = st.next_gen_seq.wrapping_add(1).max(1);
+                let next_gen = st.next_gen_seq;
+                st.next = Some((
+                    next_gen,
+                    UpnpTrackDescriptor::from_uri_and_metadata(trimmed, metadata),
                 ));
             }
         }
@@ -350,6 +378,7 @@ impl UpnpRendererState {
         {
             let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             st.next = None;
+            st.prefetched_nexts.clear();
             st.playing_started_at = None;
             st.accumulated_elapsed_s = 0.0;
             st.active_duration_s = None;
@@ -386,9 +415,10 @@ impl UpnpRendererState {
     pub fn next_track(&self) -> Result<(), (u16, &'static str)> {
         let promoted = {
             let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(next) = st.next.take() else {
+            let Some((_, next)) = st.next.take() else {
                 return Err((701, "Transition not available"));
             };
+            st.prefetched_nexts.clear();
             let req = next.to_play_request();
             st.current = Some(next);
             st.transport_state = TransportState::Transitioning;
@@ -427,23 +457,65 @@ impl UpnpRendererState {
 
     /// Called by the engine consumer when a UPnP stream actually begins playing on the WDM-KS DAC.
     ///
-    /// If `uri` matches a prefetched `NextURI` (Review #5 Finding #5), atomically promotes
-    /// `NextURI -> CurrentURI` right when audio becomes audible instead of 12 s early during
-    /// producer decode-ahead.
+    /// Compatibility wrapper for explicit starts/restarts of `CurrentURI` (`prefetched_next_gen =
+    /// None`); never consumes `st.next` (Review #6 Finding #17).
     pub fn engine_mark_playing(&self, uri: &str, decoded_duration_s: Option<f64>) {
+        self.engine_mark_playing_with_gen(uri, decoded_duration_s, None);
+    }
+
+    /// Generation-aware promotion when a UPnP track becomes audible on the WDM-KS DAC
+    /// (Review #5 Finding #5 + Review #6 Findings #8 & #17):
+    /// - `prefetched_next_gen = Some(gen)`: promotes the prefetched track into `current` and resets
+    ///   `RelTime = 0`, matching either active `st.next` (consuming it) or the cached prefetched
+    ///   descriptor if `SetNextAVTransportURI` was replaced (`B -> B2`) after `B` was already
+    ///   prefetched (leaving `B2` intact in `st.next`).
+    /// - `prefetched_next_gen = None`: explicit `Play`/`Seek`/`SetAVTransportURI` start/restart of
+    ///   `current`; NEVER consumes `st.next` (even when `NextURI == CurrentURI` on repeat-one) and
+    ///   preserves `accumulated_elapsed_s`!
+    pub fn engine_mark_playing_with_gen(
+        &self,
+        uri: &str,
+        decoded_duration_s: Option<f64>,
+        prefetched_next_gen: Option<u64>,
+    ) {
         let mut changed = false;
         {
             let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            let matches_next = st.next.as_ref().is_some_and(|n| n.uri == uri);
-            if matches_next {
-                if let Some(next) = st.next.take() {
-                    st.current = Some(next);
+            if let Some(next_gen) = prefetched_next_gen {
+                let promoted_desc = if st.next.as_ref().is_some_and(|(g, _)| *g == next_gen) {
+                    st.prefetched_nexts.retain(|(g, _)| *g != next_gen);
+                    st.next.take().map(|(_, d)| d)
+                } else if let Some(pos) = st
+                    .prefetched_nexts
+                    .iter()
+                    .position(|(g, _)| *g == next_gen)
+                {
+                    st.prefetched_nexts.remove(pos).map(|(_, d)| d)
+                } else {
+                    None
+                };
+
+                if let Some(desc) = promoted_desc {
+                    st.current = Some(desc);
                     st.accumulated_elapsed_s = 0.0;
                     st.active_duration_s = decoded_duration_s;
                     st.transport_state = TransportState::Playing;
                     st.transport_status = "OK".to_string();
                     st.playing_started_at = Some(Instant::now());
                     changed = true;
+                } else if st.current.as_ref().is_some_and(|c| c.uri == uri) {
+                    if st.transport_state != TransportState::Playing {
+                        changed = true;
+                    }
+                    st.transport_state = TransportState::Playing;
+                    st.transport_status = "OK".to_string();
+                    st.playing_started_at = Some(Instant::now());
+                    if let Some(dur) = decoded_duration_s {
+                        if st.active_duration_s != Some(dur) {
+                            st.active_duration_s = Some(dur);
+                            changed = true;
+                        }
+                    }
                 }
             } else if st.current.as_ref().is_some_and(|c| c.uri == uri) {
                 if st.transport_state != TransportState::Playing {
@@ -472,33 +544,42 @@ impl UpnpRendererState {
             st.current.as_ref().map(|c| c.uri.clone())
         };
         if let Some(u) = uri {
-            self.engine_mark_playing(&u, decoded_duration_s);
+            self.engine_mark_playing_with_gen(&u, decoded_duration_s, None);
         }
     }
 
     /// Peek `NextURI` for producer-side gapless prefetch WITHOUT prematurely promoting
-    /// `CurrentURI` or resetting `RelTime` (Review #5 Finding #5).
+    /// `CurrentURI` or resetting `RelTime` (Review #5 #5 + Review #6 #8).
     ///
-    /// Returns `Some(req)` only when `st.next` is set and differs from `already_prefetched_uri`
-    /// so the producer never loops on the same queued next URI.
+    /// Keyed by monotonic `SetNextAVTransportURI` generation token (`already_prefetched_gen`)
+    /// rather than URI string so repeat-one (`NextURI == CurrentURI`) prefetches gaplessly and
+    /// replacing `NextURI` (`B -> B2`) after prefetching `B` preserves `B`'s descriptor for
+    /// accurate metadata/RelTime promotion when `B` becomes audible.
     pub fn engine_peek_next_for_prefetch(
         &self,
-        already_prefetched_uri: Option<&str>,
+        already_prefetched_gen: Option<u64>,
     ) -> Option<UpnpPlayRequest> {
-        let st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let next = st.next.as_ref()?;
-        if already_prefetched_uri == Some(next.uri.as_str()) {
+        let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let (next_gen, next) = st.next.as_ref()?.clone();
+        if already_prefetched_gen == Some(next_gen) {
             return None;
         }
-        Some(next.to_play_request())
+        if !st.prefetched_nexts.iter().any(|(g, _)| *g == next_gen) {
+            if st.prefetched_nexts.len() >= 8 {
+                st.prefetched_nexts.pop_front();
+            }
+            st.prefetched_nexts.push_back((next_gen, next.clone()));
+        }
+        Some(next.to_play_request_prefetched(next_gen))
     }
 
-    /// Called by the DSP producer when the current UPnP stream reaches clean EOF:
-    /// atomically promotes `NextURI` -> `CurrentURI` for gapless handoff!
+    /// Called by the DSP producer or consumer when advancing immediately to queued `NextURI`:
+    /// atomically promotes `NextURI` -> `CurrentURI`.
     pub fn engine_take_next_for_gapless(&self) -> Option<UpnpPlayRequest> {
         let promoted = {
             let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            let next = st.next.take()?;
+            let (next_gen, next) = st.next.take()?;
+            st.prefetched_nexts.retain(|(g, _)| *g != next_gen);
             let req = next.to_play_request();
             st.current = Some(next);
             st.playing_started_at = Some(Instant::now());
@@ -515,6 +596,7 @@ impl UpnpRendererState {
         let mut changed = false;
         {
             let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            st.prefetched_nexts.clear();
             if matches!(
                 st.transport_state,
                 TransportState::Playing | TransportState::Transitioning
@@ -571,6 +653,7 @@ impl UpnpRendererState {
                     TransportState::NoMediaPresent
                 };
                 st.next = None;
+                st.prefetched_nexts.clear();
                 st.playing_started_at = None;
                 st.accumulated_elapsed_s = 0.0;
                 changed = true;
