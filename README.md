@@ -49,6 +49,7 @@ audiophile_player/
 - [docs/research/00-landscape-and-sources.md](docs/research/00-landscape-and-sources.md) — Landscape survey of existing audiophile players, best practices, and curated reference sources.
 - [docs/research/02-audiophile-filter-survey.md](docs/research/02-audiophile-filter-survey.md) — Upsampling & noise-shaping algorithm sources, audiophile consensus, and list of inaccessible sources for user snippets.
 - [docs/research/03-filter-knowledge-base.md](docs/research/03-filter-knowledge-base.md) — Comprehensive filter, noise-shaping & community experience knowledge base synthesized from primary manuals (HQPlayer 5, PGGB V9), community listening threads, technical guides, and DSP literature.
+- [docs/research/04-noise-shapers.md](docs/research/04-noise-shapers.md) — INV-04 final quantization, TPDF dither, clean-room 8fS Levinson–Durbin error-feedback noise shapers (`ns-gentle-2`, `ns5-class`, `lns15-class`, `wide40-9`), NOS R-2R code-activity analysis, and `dac_bits` hardware probes.
 - [docs/research/05-rew-convolution-and-delay.md](docs/research/05-rew-convolution-and-delay.md) — REW stereo convolution and channel delay design.
 - [docs/research/06-windows-kernel-streaming.md](docs/research/06-windows-kernel-streaming.md) — WASAPI Exclusive vs. Audirvana-style WDM-KS (`usbaudio2.sys` / WaveRT), bit-perfect verification, and minimal-effort zero-mixer POC design.
 - [poc/README.md](poc/README.md) — Prototype setup, hardware probe, and test-tone/FLAC verification commands.
