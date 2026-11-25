@@ -10,6 +10,7 @@ pub mod delay;
 pub mod pipeline;
 pub mod quantize;
 pub mod selector;
+pub mod shaper_design;
 pub mod upsampler;
 
 /// Strict upper bound on filter length (4,000,000 taps).

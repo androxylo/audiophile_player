@@ -109,7 +109,8 @@ impl StreamingQuantizer {
         let use_tpdf = match self.shaper {
             NoiseShaperProfile::Bypass => false,
             NoiseShaperProfile::TpdfDither => true,
-            NoiseShaperProfile::Ns5Multibit
+            NoiseShaperProfile::NsGentle2
+            | NoiseShaperProfile::Ns5Multibit
             | NoiseShaperProfile::Lns15Smooth
             | NoiseShaperProfile::PggbOptimal => {
                 unreachable!("unimplemented noise shapers are rejected in StreamingQuantizer::new")

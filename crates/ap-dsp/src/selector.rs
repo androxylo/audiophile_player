@@ -407,18 +407,25 @@ impl FilterSelector for DefaultFilterSelector {
     }
 }
 
-/// Curated `8fS` (`352.8 / 384 kHz`) noise shapers & dithers (from `INV-02` / `INV-04`).
+/// Curated `8fS` (`352.8 / 384 kHz`) noise shapers & dithers (`docs/research/04-noise-shapers.md`).
+///
+/// Note on naming (§3): `Ns5Multibit` (`ns5` / `ns5-class`), `Lns15Smooth` (`lns15` / `lns15-class`),
+/// and `PggbOptimal` (`pggb-optimal` / `wide40-9`) are independent clean-room Levinson–Durbin
+/// minimum-phase designs matching those order/passband/envelope classes — never reverse-engineered
+/// or claimed bit-identical to proprietary shapers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoiseShaperProfile {
     /// Pass-through (no re-quantization when source is already untouched 32-bit at 8fS).
     Bypass,
-    /// Flat triangular PDF dither (initial implemented quantizer; zero ultrasonic noise shaping).
+    /// Flat triangular PDF dither (zero ultrasonic noise shaping; default at 24-bit).
     TpdfDither,
-    /// Future (`INV-04`): 5th-order multibit-optimized (`NS5` class).
+    /// Clean-room 2nd-order gentle shaper (`ns-gentle-2`, 20 kHz, `+6 dB` ceiling; auto default at `<= 20` bits).
+    NsGentle2,
+    /// Clean-room 5th-order multibit-class shaper (`ns5` / `ns5-class`, 20 kHz, `+20 dB` ceiling).
     Ns5Multibit,
-    /// Future (`INV-04`): 15th-order smooth linear (`LNS15` class).
+    /// Clean-room 15th-order tapered-ultrasonic shaper (`lns15` / `lns15-class`, 20->60 kHz, `+15 dB` ceiling).
     Lns15Smooth,
-    /// Future (`INV-04`): PGGB-class 8fS noise shaper (low noise floor >= 40 kHz).
+    /// Clean-room 9th-order 40 kHz-wideband shaper (`pggb-optimal` / `wide40-9`, 40 kHz, `+18 dB` ceiling).
     PggbOptimal,
 }
 
@@ -427,6 +434,7 @@ impl NoiseShaperProfile {
         match self {
             Self::Bypass => "bypass",
             Self::TpdfDither => "tpdf",
+            Self::NsGentle2 => "ns-gentle-2",
             Self::Ns5Multibit => "ns5",
             Self::Lns15Smooth => "lns15",
             Self::PggbOptimal => "pggb-optimal",
@@ -452,11 +460,13 @@ impl FromStr for NoiseShaperProfile {
         match s.trim().to_ascii_lowercase().as_str() {
             "bypass" => Ok(Self::Bypass),
             "tpdf" => Ok(Self::TpdfDither),
-            "ns5" => Ok(Self::Ns5Multibit),
-            "lns15" => Ok(Self::Lns15Smooth),
-            "pggb-optimal" => Ok(Self::PggbOptimal),
+            "ns-gentle-2" => Ok(Self::NsGentle2),
+            "ns5" | "ns5-class" => Ok(Self::Ns5Multibit),
+            "lns15" | "lns15-class" => Ok(Self::Lns15Smooth),
+            "pggb-optimal" | "wide40-9" => Ok(Self::PggbOptimal),
             other => Err(format!(
-                "unknown shaper '{other}'; expected auto, bypass, tpdf, ns5, lns15, or pggb-optimal"
+                "unknown shaper '{other}'; expected auto, bypass, tpdf, ns-gentle-2, ns5 \
+                 (alias ns5-class), lns15 (alias lns15-class), or pggb-optimal (alias wide40-9)"
             )),
         }
     }

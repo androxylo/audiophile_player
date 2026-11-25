@@ -95,7 +95,11 @@ def design_shaper(
     def solve_for_log_eps(log10_eps: float) -> tuple[np.ndarray, float]:
         eps = 10.0 ** log10_eps
         W = weight_curve(w, fs_hz, spec.f_band_hz, spec.f_taper_hz, eps)
-        r = (cos_kw @ W) / grid_n
+        # Exploit exact midpoint orthogonality (1/N) sum cos(k*w) = delta_{k,0} to avoid
+        # floating-point loss when adding tiny stopband eps (~1e-9) onto O(1000) passband sums.
+        W_excess = np.where(W > eps, W - eps, 0.0)
+        r = (cos_kw @ W_excess) / grid_n
+        r[0] += eps
         c = levinson_durbin(r, spec.order)
         ntf = 1.0 + (c[:, None] * exp_mjw).sum(axis=0)
         peak = float(np.max(np.abs(ntf)))

@@ -319,11 +319,24 @@ fn cli_names_and_compatibility_aliases_parse_roundtrip_for_all_filters_and_shape
     for s in [
         NoiseShaperProfile::Bypass,
         NoiseShaperProfile::TpdfDither,
+        NoiseShaperProfile::NsGentle2,
         NoiseShaperProfile::Ns5Multibit,
         NoiseShaperProfile::Lns15Smooth,
         NoiseShaperProfile::PggbOptimal,
     ] {
         assert_eq!(NoiseShaperProfile::from_str(s.cli_name()).unwrap(), s);
     }
+    assert_eq!(
+        NoiseShaperProfile::from_str("ns5-class").unwrap(),
+        NoiseShaperProfile::Ns5Multibit
+    );
+    assert_eq!(
+        NoiseShaperProfile::from_str("lns15-class").unwrap(),
+        NoiseShaperProfile::Lns15Smooth
+    );
+    assert_eq!(
+        NoiseShaperProfile::from_str("wide40-9").unwrap(),
+        NoiseShaperProfile::PggbOptimal
+    );
     assert!(NoiseShaperProfile::from_str("nonexistent").is_err());
 }
