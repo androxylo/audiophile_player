@@ -583,9 +583,18 @@ fn rew_boost_is_unnormalized_at_load_scaled_only_by_excess_and_runs_before_noise
     assert_eq!(
         factory_b.warnings().len(),
         1,
-        "first load of boosting IR must emit exactly one diagnostic warning"
+        "first load of boosting IR must emit exactly one diagnostic notice"
     );
-    assert!(factory_b.warnings()[0].contains("WARNING"));
+    assert!(
+        factory_b.warnings()[0].contains("unnormalized")
+            && !factory_b.warnings()[0].contains("strongly dispersive"),
+        "non-dispersive boosted IR (L1 - G_c = 0 dB) should log unnormalized load notice without dispersive warning: {:?}",
+        factory_b.warnings()
+    );
+    assert!(
+        conv_b.content_hash().is_some_and(|h| h.starts_with("fnv1a128:") && h.len() == 9 + 32),
+        "active REW convolver must expose deterministic content hash"
+    );
     // Second creation uses cached IR and must not spam duplicate notices.
     let _ = factory_b.create_for_rate(384_000).unwrap();
     assert_eq!(factory_b.warnings().len(), 1);
@@ -1200,10 +1209,19 @@ fn all_pass_ir_treats_l1_as_diagnostic_only_under_decided_headroom_policy() {
         factory
             .warnings()
             .iter()
-            .any(|w| w.contains("WARNING") && w.contains("diagnostic L1")),
-        "expected diagnostic L1 WARNING in factory.warnings(): {:?}",
+            .any(|w| w.contains("WARNING") && w.contains("strongly dispersive") && w.contains("diagnostic L1")),
+        "expected strongly dispersive L1 - G_c > 6 dB WARNING in factory.warnings(): {:?}",
         factory.warnings()
     );
+
+    // Verify IR content hash changes when even a single tap changes, and stays deterministic.
+    let mut h_mod = h.clone();
+    h_mod[1] += 1e-6;
+    let ir_a1 = PreparedStereoIr::from_stereo_ir("ap-a", 384_000, &h, &h).unwrap();
+    let ir_a2 = PreparedStereoIr::from_stereo_ir("ap-a-copy", 384_000, &h, &h).unwrap();
+    let ir_b = PreparedStereoIr::from_stereo_ir("ap-b", 384_000, &h_mod, &h_mod).unwrap();
+    assert_eq!(ir_a1.content_hash, ir_a2.content_hash);
+    assert_ne!(ir_a1.content_hash, ir_b.content_hash);
 
     let pipeline = AudioPipeline::with_rew_config(
         UpsamplerPolicy {

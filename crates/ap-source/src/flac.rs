@@ -11,7 +11,10 @@ use std::path::Path;
 
 use ap_core::buffer::{InterleavedInt32Buffer, StereoF64Buffer};
 use ap_core::format::StreamSpec;
-use ap_core::headroom::TrackPeakMetadata;
+use ap_core::headroom::{
+    MAX_REALISTIC_TRUE_PEAK_DB, MAX_REALISTIC_TRUE_PEAK_LINEAR, MIN_REALISTIC_PEAK_DB,
+    PEAK_TAG_ROUNDING_TOLERANCE, TrackPeakMetadata,
+};
 use flac_codec::decode::{FlacSampleReader, Metadata};
 use flac_codec::metadata::VorbisComment;
 
@@ -21,6 +24,13 @@ pub trait AudioBlockSource: Send {
     fn peak_meta(&self) -> TrackPeakMetadata;
     fn is_streaming(&self) -> bool;
     fn total_frames(&self) -> Option<u64>;
+
+    /// Optional 16-byte `STREAMINFO` MD5 signature for exact track-identity verification
+    /// (`HEADROOM_DESIGN.md` §2 full-scan YAML lookup). Returns `None` for live streams or
+    /// FLAC files with an all-zero/unset MD5 field.
+    fn streaminfo_md5(&self) -> Option<[u8; 16]> {
+        None
+    }
 
     /// Decode up to `max_frames` stereo frames into a pure IEEE 754 `f64` block.
     /// Returns `Ok(None)` cleanly at end-of-stream.
@@ -51,6 +61,7 @@ struct ValidatedFlac {
     spec: StreamSpec,
     peak_meta: TrackPeakMetadata,
     total_frames: Option<u64>,
+    streaminfo_md5: Option<[u8; 16]>,
     shift: u32,
 }
 
@@ -106,6 +117,7 @@ fn open_validated(path: &Path) -> Result<ValidatedFlac, String> {
     let spec = validate_flac_stream_params(source_channels, sample_rate_hz, bits_per_sample, path)?;
     let peak_meta = parse_peak_metadata(reader.metadata().get::<VorbisComment>());
     let total_frames = reader.total_samples();
+    let streaminfo_md5 = reader.md5().copied();
     let shift = 32 - bits_per_sample;
 
     Ok(ValidatedFlac {
@@ -114,6 +126,7 @@ fn open_validated(path: &Path) -> Result<ValidatedFlac, String> {
         spec,
         peak_meta,
         total_frames,
+        streaminfo_md5,
         shift,
     })
 }
@@ -129,6 +142,7 @@ pub struct FlacBlockReader {
     spec: StreamSpec,
     peak_meta: TrackPeakMetadata,
     total_frames: Option<u64>,
+    streaminfo_md5: Option<[u8; 16]>,
     shift: u32,
     scratch: Vec<i32>,
     eof: bool,
@@ -144,6 +158,7 @@ impl FlacBlockReader {
             spec: validated.spec,
             peak_meta: validated.peak_meta,
             total_frames: validated.total_frames,
+            streaminfo_md5: validated.streaminfo_md5,
             shift: validated.shift,
             scratch: Vec::new(),
             eof: false,
@@ -172,6 +187,10 @@ impl AudioBlockSource for FlacBlockReader {
 
     fn total_frames(&self) -> Option<u64> {
         self.total_frames
+    }
+
+    fn streaminfo_md5(&self) -> Option<[u8; 16]> {
+        self.streaminfo_md5
     }
 
     fn read_next_block(&mut self, max_frames: usize) -> Result<Option<StereoF64Buffer>, String> {
@@ -280,15 +299,19 @@ enum TruePeakTagUnit {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ParsedTruePeak {
-    /// Unambiguous value (from explicit `dB`/`dBTP` suffix or bare negative dBTP).
+    /// Unambiguous value (from explicit `dB`/`dBTP` suffix or bare negative dBTP) within `(0, 2.0]`.
     Unambiguous(f64),
-    /// Bare positive ReplayGain linear candidate requiring companion sample-peak cross-check.
+    /// Bare positive ReplayGain linear candidate in `(0, 2.0]` requiring companion sample-peak cross-check.
     BarePositiveLinearCandidate(f64),
+    /// Explicitly implausible true-peak value (`> 2.0` linear / `> +6.0206 dBTP`): marks track peak
+    /// as unknown (`P = 0`) without falling back to a quieter sample-peak tag (`HEADROOM_DESIGN.md` §2).
+    OutOfRange,
 }
 
-/// Parse a True Peak Vorbis comment value with strict unit disambiguation so a hot master
-/// tagged as unitless positive dBTP (`+0.3` / `0.3` / `0.5`) or an R128 Q7.8 integer (`-768`)
-/// can NEVER be misinterpreted as a quiet linear peak.
+/// Parse a True Peak Vorbis comment value with strict unit disambiguation and §2 plausibility
+/// bounds `(0, 2.0]` linear / `<= +6.0206 dBTP` so a hot master tagged as unitless positive dBTP
+/// (`+0.3` / `0.3` / `0.5`), an implausible unit error (`+15 dBTP` / `5.0`), or an R128 Q7.8
+/// integer (`-768`) can NEVER be misinterpreted as a quiet linear peak.
 fn parse_true_peak_value(raw: &str, unit: TruePeakTagUnit) -> Option<ParsedTruePeak> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -311,7 +334,9 @@ fn parse_true_peak_value(raw: &str, unit: TruePeakTagUnit) -> Option<ParsedTrueP
     }
 
     if has_db_suffix {
-        if (-120.0..=24.0).contains(&val) {
+        if val > MAX_REALISTIC_TRUE_PEAK_DB + 1e-9 {
+            Some(ParsedTruePeak::OutOfRange)
+        } else if val >= MIN_REALISTIC_PEAK_DB - 1e-9 {
             Some(ParsedTruePeak::Unambiguous(10.0_f64.powf(val / 20.0)))
         } else {
             None
@@ -319,13 +344,17 @@ fn parse_true_peak_value(raw: &str, unit: TruePeakTagUnit) -> Option<ParsedTrueP
     } else {
         match unit {
             TruePeakTagUnit::ReplayGainLinearOrExplicitDb => {
-                if num_str.starts_with('-') && (-120.0..=0.0).contains(&val) {
+                if num_str.starts_with('-') && (MIN_REALISTIC_PEAK_DB..=0.0).contains(&val) {
                     // Negative values cannot be linear amplitudes -> unambiguous dBTP.
                     Some(ParsedTruePeak::Unambiguous(10.0_f64.powf(val / 20.0)))
-                } else if !num_str.starts_with('+') && val > 0.0 && val <= 16.0 {
-                    // Bare positive linear candidate: requires companion sample-peak tag to
-                    // rule out unitless hot dBTP like `REPLAYGAIN_TRACK_TRUE_PEAK=0.5`.
-                    Some(ParsedTruePeak::BarePositiveLinearCandidate(val))
+                } else if !num_str.starts_with('+') && val > 0.0 {
+                    if val > MAX_REALISTIC_TRUE_PEAK_LINEAR + 1e-9 {
+                        Some(ParsedTruePeak::OutOfRange)
+                    } else {
+                        // Bare positive linear candidate in (0, 2.0]: requires companion sample-peak
+                        // tag to rule out unitless hot dBTP like `REPLAYGAIN_TRACK_TRUE_PEAK=0.5`.
+                        Some(ParsedTruePeak::BarePositiveLinearCandidate(val))
+                    }
                 } else {
                     None
                 }
@@ -333,7 +362,7 @@ fn parse_true_peak_value(raw: &str, unit: TruePeakTagUnit) -> Option<ParsedTrueP
             TruePeakTagUnit::TruePeakDbOnly => {
                 // Only unambiguous bare negative dBTP (e.g. `-4.2`); reject bare positive (`0.3`,
                 // `+0.3`, `0.0`) and Q7.8-like `< -120.0`.
-                if num_str.starts_with('-') && (-120.0..=0.0).contains(&val) {
+                if num_str.starts_with('-') && (MIN_REALISTIC_PEAK_DB..=0.0).contains(&val) {
                     Some(ParsedTruePeak::Unambiguous(10.0_f64.powf(val / 20.0)))
                 } else {
                     None
@@ -345,9 +374,13 @@ fn parse_true_peak_value(raw: &str, unit: TruePeakTagUnit) -> Option<ParsedTrueP
 }
 
 /// Update a true-peak candidate slot without letting a lower-confidence bare-positive linear
-/// candidate overwrite an already-parsed unambiguous true-peak tag (Review #5 Finding #24).
+/// candidate overwrite an already-parsed unambiguous true-peak tag (Review #5 Finding #24),
+/// while letting an explicit `OutOfRange` (> +6.02 dBTP) stay sticky as invalid.
 fn update_tp_candidate(slot: &mut Option<ParsedTruePeak>, parsed: ParsedTruePeak) {
     match (&*slot, parsed) {
+        (Some(ParsedTruePeak::OutOfRange), _) | (_, ParsedTruePeak::OutOfRange) => {
+            *slot = Some(ParsedTruePeak::OutOfRange);
+        }
         (_, ParsedTruePeak::Unambiguous(lin)) => {
             *slot = Some(ParsedTruePeak::Unambiguous(lin));
         }
@@ -418,14 +451,22 @@ pub fn parse_peak_metadata_fields(fields: &[String]) -> TrackPeakMetadata {
         }
     }
 
+    if matches!(track_tp_candidate, Some(ParsedTruePeak::OutOfRange))
+        || matches!(album_tp_candidate, Some(ParsedTruePeak::OutOfRange))
+    {
+        meta.true_peak_invalid = true;
+        return meta;
+    }
+
     let resolve_candidate = |cand: Option<ParsedTruePeak>, companion_sp: Option<f64>| -> Option<f64> {
         match cand? {
+            ParsedTruePeak::OutOfRange => None,
             ParsedTruePeak::Unambiguous(lin) => Some(lin),
             ParsedTruePeak::BarePositiveLinearCandidate(lin) => {
                 // Only accept a bare positive ReplayGain true-peak value when a realistic
                 // companion sample-peak tag confirms linear scaling (`tp >= sp * 0.995`).
                 let sp = companion_sp?;
-                if sp.is_finite() && sp > 0.0 && lin >= sp * 0.995 {
+                if sp.is_finite() && sp > 0.0 && lin >= sp * (1.0 - PEAK_TAG_ROUNDING_TOLERANCE) {
                     Some(lin)
                 } else {
                     None
@@ -434,19 +475,34 @@ pub fn parse_peak_metadata_fields(fields: &[String]) -> TrackPeakMetadata {
         }
     };
 
-    meta.true_peak_linear = resolve_candidate(track_tp_candidate, meta.replaygain_track_peak)
-        .or_else(|| {
-            resolve_candidate(
-                album_tp_candidate,
-                meta.replaygain_album_peak.or(meta.replaygain_track_peak),
-            )
-        });
+    let resolved_track_tp = resolve_candidate(track_tp_candidate, meta.replaygain_track_peak);
+    let resolved_album_tp = resolve_candidate(
+        album_tp_candidate,
+        meta.replaygain_album_peak.or(meta.replaygain_track_peak),
+    );
+
+    // §2 tag sanity: when both track and album true-peak tags exist, track <= album (within 0.5%).
+    if let (Some(t_tp), Some(a_tp)) = (resolved_track_tp, resolved_album_tp) {
+        if t_tp > a_tp * (1.0 + PEAK_TAG_ROUNDING_TOLERANCE) {
+            meta.true_peak_invalid = true;
+            return meta;
+        }
+    }
+
+    // Also verify album true peak against album sample peak when album true peak stands in.
+    let valid_album_tp = resolved_album_tp.filter(|&a_tp| {
+        !meta.replaygain_album_peak.is_some_and(|a_sp| {
+            a_sp.is_finite() && a_sp > 0.0 && a_tp < a_sp * (1.0 - PEAK_TAG_ROUNDING_TOLERANCE)
+        })
+    });
+
+    meta.true_peak_linear = resolved_track_tp.or(valid_album_tp);
 
     // Mathematical sanity cross-check: True Peak can never be lower than discrete sample peak.
     // If a mis-tagged or mis-unit-ed True Peak falls below the track's sample peak (beyond 0.5%
     // tag-rounding tolerance), discard `true_peak_linear` so headroom falls back safely.
     if let (Some(tp), Some(sp)) = (meta.true_peak_linear, meta.replaygain_track_peak) {
-        if sp.is_finite() && sp > 0.0 && tp < sp * 0.995 {
+        if sp.is_finite() && sp > 0.0 && tp < sp * (1.0 - PEAK_TAG_ROUNDING_TOLERANCE) {
             meta.true_peak_linear = None;
         }
     }

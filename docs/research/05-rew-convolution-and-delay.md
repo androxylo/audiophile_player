@@ -11,10 +11,9 @@ Across reference audiophile DSP engines (**HQPlayer**, **PGGB**, **Roon DSP**, *
 2. **Convolution warps the Noise Transfer Function (NTF):**
    - An `8fS` noise shaper carefully pushes quantization noise out of the audible band (`0–20 kHz`) into ultrasonic frequencies (`50–192 kHz`).
    - Any FIR room filter applied *after* noise shaping multiplies that shaped ultrasonic noise spectrum by $|H_{\text{REW}}(e^{j\omega})|$, altering the NTF, increasing out-of-band energy where the filter boosts, and potentially causing numerical overload on the ultrasonic noise floor.
-3. **Zero internal truncation in `f64` + auto-normalized headroom safety:**
+3. **Zero internal truncation in `f64` + excess-only headroom safety:**
    - Executing all linear time-invariant (LTI) stages in IEEE 754 `f64` before the single final quantizer keeps internal rounding noise at `~-319 dB`—orders of magnitude below both 24-bit PCM (`-144 dB`) and any physical DAC.
-   - At IR load time, `PreparedStereoIr` measures `max |H(f)|` across both channels with a `>= 2x` zero-padded real FFT. Any IR whose peak frequency gain exceeds `0 dB` is **auto-normalized down to `0 dB`** (scaling left and right equally to preserve L/R balance) and logged once on first load, so the hardcoded `-3 dB` fail-safe always retains a full `3 dB` steady-state margin.
-   - Per the decided headroom design (`HEADROOM_DESIGN.md`), REW IRs are **never normalized at load** so positive EQ boosts fill hardware/room dips on purpose. `PreparedStereoIr` measures exact `max |H(f)|` (`max_boost_db`) and computes `l1_norm_db` for diagnostics only; active convolution output is scaled per track only by the excess of `P + A_isp + G_up + max(G_c, 0)` over `0 dBFS`.
+   - Per the decided headroom design (`HEADROOM_DESIGN.md`, Issue #7), REW IRs are **never normalized at load** so positive EQ boosts fill hardware/room dips on purpose. `PreparedStereoIr` measures exact `max |H(f)|` (`max_boost_db`, uncapped) via a `>= 2x` zero-padded real FFT, computes `l1_norm_db` for diagnostics only (emitting a dispersive-filter warning when `L1 - G_c > 6 dB`), and records a deterministic content hash; per-track convolution output is scaled only by the excess of `P + A_isp + G_up + max(G_c, 0)` (or `M + G_up`) over `0 dBFS`.
 
 ### Locked Pipeline Order (`ap-dsp`)
 ```text

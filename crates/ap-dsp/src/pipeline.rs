@@ -102,6 +102,9 @@ pub struct PipelineReport {
     pub filter_metrics: Option<FilterDesignMetrics>,
     pub convolver_name: &'static str,
     pub convolver_description: String,
+    /// Deterministic content hash of the active REW IR (`None` for `NullConvolver`), used for
+    /// `HEADROOM_DESIGN.md` §4 `post_chain_peaks` keying & invalidation.
+    pub convolver_content_hash: Option<String>,
     pub delayer_name: &'static str,
     pub effective_shaper: NoiseShaperProfile,
 }
@@ -494,6 +497,7 @@ impl AudioPipeline {
                         spec.bits_per_sample,
                         is_streaming_source,
                         conv_boost_db,
+                        None,
                         conv_tail_peak,
                         up_hist_peak,
                     );
@@ -549,6 +553,7 @@ impl AudioPipeline {
             filter_metrics: upsampler.design_metrics(),
             convolver_name: convolver.name(),
             convolver_description: conv_desc,
+            convolver_content_hash: convolver.content_hash().map(str::to_string),
             delayer_name: delayer.name(),
             effective_shaper,
         };

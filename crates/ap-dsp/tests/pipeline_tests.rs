@@ -881,3 +881,182 @@ fn review5_quantizer_counts_overs_and_auto_selector_degrades_for_max_taps() {
         "unexpected error message: {err}"
     );
 }
+
+#[test]
+fn headroom_design_issue7_14bit_zero_db_and_per_track_gapless_scale_continuity() {
+    struct StaticIrFactory(Arc<PreparedStereoIr>);
+    impl StereoConvolverFactory for StaticIrFactory {
+        fn create_for_rate(&self, rate_hz: u32) -> Result<Box<dyn StereoConvolver>, String> {
+            if rate_hz == self.0.sample_rate_hz {
+                Ok(Box::new(PartitionedStereoConvolver::new(Arc::clone(&self.0))))
+            } else {
+                NullConvolverFactory.create_for_rate(rate_hz)
+            }
+        }
+    }
+
+    let spec_44_16 = StreamSpec {
+        sample_rate_hz: 44_100,
+        bits_per_sample: 16,
+        channels: 2,
+    };
+
+    // HEADROOM_DESIGN.md §8 Test 4: 14-bit content in a 16-bit file (-12.04 dBFS sample peak)
+    // passes with total gain strictly 0 dB through BOTH an unboosted filter AND a +5 dB filter!
+    let meta_14bit = TrackPeakMetadata {
+        replaygain_track_peak: Some(0.25), // -12.04 dBFS
+        ..TrackPeakMetadata::default()
+    };
+    let amp_14bit = 0.25_f64;
+
+    // 4a. Unboosted filter (unity impulse).
+    let ir_unity = Arc::new(
+        PreparedStereoIr::from_stereo_ir("unity-352k", 352_800, &[1.0], &[1.0]).unwrap(),
+    );
+    let pipe_unity = AudioPipeline::with_factories(
+        UpsamplerPolicy {
+            filter_override: Some(FilterArchetype::SimpleTest),
+            ..UpsamplerPolicy::default()
+        },
+        Box::new(StaticIrFactory(Arc::clone(&ir_unity))),
+        Box::new(NullChannelDelayerFactory),
+    )
+    .unwrap();
+    let res_unity = pipe_unity
+        .process(
+            StereoF64Buffer {
+                sample_rate_hz: 44_100,
+                left: vec![amp_14bit; 512],
+                right: vec![amp_14bit; 512],
+            },
+            spec_44_16,
+            &meta_14bit,
+            false,
+        )
+        .unwrap();
+    assert_eq!(res_unity.report.headroom.mode, HeadroomMode::ZeroDb);
+    assert_eq!(res_unity.report.headroom.convolution_scale_db, 0.0);
+    assert_eq!(res_unity.report.headroom.total_gain_db(), 0.0);
+    assert_eq!(
+        res_unity.report.convolver_content_hash.as_deref(),
+        Some(ir_unity.content_hash.as_str())
+    );
+    let mid_unity = (res_unity.pcm.frames[2048][0] as f64) / 2_147_483_648.0;
+    assert!(
+        (mid_unity - amp_14bit).abs() < 1e-4,
+        "14-bit content through unboosted filter must pass at 0 dB: got {mid_unity:.5}, expected {amp_14bit:.5}"
+    );
+
+    // 4b. +5 dB boosted filter (-12.04 + 3 + 0 + 5 = -4.04 dBFS <= 0 -> G_up=0, S=0, total=0 dB!).
+    let boost_5db = 10.0_f64.powf(5.0 / 20.0);
+    let ir_boost5 = Arc::new(
+        PreparedStereoIr::from_stereo_ir("boost5-352k", 352_800, &[boost_5db], &[boost_5db])
+            .unwrap(),
+    );
+    let pipe_boost5 = AudioPipeline::with_factories(
+        UpsamplerPolicy {
+            filter_override: Some(FilterArchetype::SimpleTest),
+            ..UpsamplerPolicy::default()
+        },
+        Box::new(StaticIrFactory(ir_boost5)),
+        Box::new(NullChannelDelayerFactory),
+    )
+    .unwrap();
+    let res_boost5 = pipe_boost5
+        .process(
+            StereoF64Buffer {
+                sample_rate_hz: 44_100,
+                left: vec![amp_14bit; 512],
+                right: vec![amp_14bit; 512],
+            },
+            spec_44_16,
+            &meta_14bit,
+            false,
+        )
+        .unwrap();
+    assert_eq!(res_boost5.report.headroom.mode, HeadroomMode::ZeroDb);
+    assert_eq!(res_boost5.report.headroom.convolution_scale_db, 0.0);
+    assert_eq!(res_boost5.report.headroom.total_gain_db(), 0.0);
+    let mid_boost5 = (res_boost5.pcm.frames[2048][0] as f64) / 2_147_483_648.0;
+    let expected_boost5 = amp_14bit * boost_5db;
+    assert!(
+        (mid_boost5 - expected_boost5).abs() < 1e-4,
+        "14-bit content through +5 dB filter must pass at 0 dB: got {mid_boost5:.5}, expected {expected_boost5:.5}"
+    );
+
+    // HEADROOM_DESIGN.md §8 Test 5: Two consecutive tracks with different peaks get their own
+    // independent G_up & S, while Track A's carried REW tail keeps Track A's exact scale!
+    let mut h_echo = vec![0.0_f64; 3000];
+    h_echo[0] = 1.0;
+    h_echo[2000] = 0.5; // max |H| = 1.5 (+3.52 dB)
+    let ir_echo = Arc::new(
+        PreparedStereoIr::from_stereo_ir("echo-boost-352k", 352_800, &h_echo, &h_echo).unwrap(),
+    );
+    let pipe_echo = AudioPipeline::with_factories(
+        UpsamplerPolicy {
+            filter_override: Some(FilterArchetype::SimpleTest),
+            ..UpsamplerPolicy::default()
+        },
+        Box::new(StaticIrFactory(ir_echo)),
+        Box::new(NullChannelDelayerFactory),
+    )
+    .unwrap();
+
+    // Track A: quiet true peak -6 dBTP -> G_up = 0 dB, B_out = -6 + 0 + 0 + 3.52 = -2.48 <= 0 -> S = 0 dB!
+    let meta_a = TrackPeakMetadata {
+        true_peak_linear: Some(10.0_f64.powf(-6.0 / 20.0)),
+        ..TrackPeakMetadata::default()
+    };
+    let mut sig_a = vec![0.0_f64; 512];
+    // Place impulse at index 350 (output index 2800, well before the upsampler carryover window):
+    // main impulse (h[0]=1.0) emits inside Track A, while the +2000-sample echo lands at output
+    // index 4800 (index 704 inside Track B!).
+    sig_a[350] = 0.5;
+    let mut sess_a = pipe_echo.start_track(spec_44_16, &meta_a, false).unwrap();
+    assert_eq!(sess_a.report().headroom.mode, HeadroomMode::ZeroDb);
+    assert_eq!(sess_a.report().headroom.convolution_scale_db, 0.0);
+    let _ = sess_a
+        .process_block(StereoF64Buffer {
+            sample_rate_hz: 44_100,
+            left: sig_a.clone(),
+            right: sig_a,
+        })
+        .unwrap();
+    let (_flush_a, carry_a) = sess_a.flush_for_gapless().unwrap();
+    let carry_a = carry_a.expect("expected gapless carryover from Track A");
+
+    // Track B: untagged (unknown peak) -> G_up = -3 dB, S <= -3.52 dB (strictly independent of Track A!).
+    let mut sess_b = pipe_echo
+        .start_track_for_carryover(spec_44_16, &TrackPeakMetadata::default(), false, Some(&carry_a))
+        .unwrap();
+    assert_eq!(sess_b.report().headroom.mode, HeadroomMode::Minus3Db);
+    assert!(
+        sess_b.report().headroom.convolution_scale_db <= -3.50,
+        "Track B must compute its own S <= -3.52 dB independently of Track A, got {:.3}",
+        sess_b.report().headroom.convolution_scale_db
+    );
+    let outcome = pipe_echo
+        .attach_gapless_carryover(&mut sess_b, carry_a)
+        .unwrap();
+    assert!(matches!(outcome, GaplessAttachOutcome::FullHandoff));
+
+    // Feed silence into Track B: Track A's +2000-sample echo must arrive at Track A's exact
+    // unattenuated scale (0.5 * 0.5 = 0.25, NOT scaled down by Track B's -6.5+ dB total cut!).
+    let mut b_frames = sess_b
+        .process_block(StereoF64Buffer {
+            sample_rate_hz: 44_100,
+            left: vec![0.0; 512],
+            right: vec![0.0; 512],
+        })
+        .unwrap()
+        .frames;
+    b_frames.extend(sess_b.flush().unwrap().frames);
+    let peak_b_echo = b_frames
+        .iter()
+        .map(|&[l, _]| (l as f64).abs() / 2_147_483_648.0)
+        .fold(0.0_f64, f64::max);
+    assert!(
+        (peak_b_echo - 0.25).abs() < 0.03,
+        "Track A's carried REW echo inside Track B must preserve Track A's 0 dB scale (~0.25), got {peak_b_echo:.4}"
+    );
+}

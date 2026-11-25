@@ -52,6 +52,35 @@ pub const MAX_IR_TAPS: usize = 1 << 22;
 /// Hard cap on WAV `data` payload bytes (`MAX_IR_TAPS` stereo `f64` frames = 64 MiB).
 pub const MAX_IR_DATA_BYTES: u64 = (MAX_IR_TAPS as u64) * 16;
 
+/// Dispersive-filter warning threshold (`HEADROOM_DESIGN.md` §6): warn when `L1 - G_c > 6.0 dB`
+/// so the user knows an excess-phase filter may exceed the `max |H(f)|` peak prediction.
+pub const DISPERSIVE_FILTER_WARNING_THRESHOLD_DB: f64 = 6.0;
+
+/// Compute a deterministic 128-bit FNV-1a content fingerprint (`fnv1a128:<32-hex>`) over the
+/// exact loaded stereo `f64` IR taps and sample rate for `HEADROOM_DESIGN.md` §4 `post_chain_peaks`
+/// invalidation whenever an IR changes.
+fn compute_ir_content_hash(sample_rate_hz: u32, left: &[f64], right: &[f64]) -> String {
+    const FNV_OFFSET: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    const FNV_PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
+    let mut h = FNV_OFFSET;
+    let mut feed = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= u128::from(b);
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+    };
+    feed(&sample_rate_hz.to_le_bytes());
+    feed(&(left.len() as u64).to_le_bytes());
+    for (&l, &r) in left.iter().zip(right.iter()) {
+        // Canonicalize -0.0 -> +0.0 so semantically identical zero taps hash identically.
+        let lb = if l == 0.0 { 0.0_f64.to_bits() } else { l.to_bits() };
+        let rb = if r == 0.0 { 0.0_f64.to_bits() } else { r.to_bits() };
+        feed(&lb.to_le_bytes());
+        feed(&rb.to_le_bytes());
+    }
+    format!("fnv1a128:{h:032x}")
+}
+
 /// Flush-tail threshold (`-200 dB`, 56 dB below 24-bit PCM) applied only when an IR exceeds
 /// `MAX_PARTITION_BLOCK` taps, preventing multi-second sub-`-250 dB` float noise gaps between
 /// tracks while convolving 100% of all non-zero taps during active playback.
@@ -117,6 +146,12 @@ pub trait StereoConvolver: Send {
     /// (`false` for [`NullConvolver`], `true` for [`PartitionedStereoConvolver`].)
     fn accepts_tail(&self) -> bool {
         false
+    }
+
+    /// Deterministic content hash of the active REW IR (`None` for [`NullConvolver`]), used to
+    /// key and invalidate measured `post_chain_peaks` entries (`HEADROOM_DESIGN.md` §4).
+    fn content_hash(&self) -> Option<&str> {
+        None
     }
 
     /// Apply per-track excess-only linear attenuation (`<= 1.0`, never boosts) to this track's
@@ -643,6 +678,8 @@ pub struct PreparedStereoIr {
     pub l1_norm: f64,
     /// Diagnostic L1 norm in dB (`max(0.0, 20 * log10(l1_norm))`; never used as a gain criterion).
     pub l1_norm_db: f64,
+    /// Deterministic content hash (`fnv1a128:<32-hex>`) over exact loaded stereo taps and rate.
+    pub content_hash: String,
     r2c: Arc<dyn RealToComplex<f64>>,
     c2r: Arc<dyn ComplexToReal<f64>>,
     ir_spectra_left: Vec<Vec<Complex<f64>>>,
@@ -664,14 +701,15 @@ impl std::fmt::Debug for PreparedStereoIr {
             .field("max_boost_db", &self.max_boost_db)
             .field("l1_norm", &self.l1_norm)
             .field("l1_norm_db", &self.l1_norm_db)
+            .field("content_hash", &self.content_hash)
             .finish()
     }
 }
 
 impl PreparedStereoIr {
-    /// Prepare UPOLS FFT partitions, measure peak frequency gain with `>= 2x` zero-padding,
-    /// auto-normalize any `> 0 dB` IR down to `0 dB` (preserving L/R balance), and compute the
-    /// post-normalization L1 norm bound in pure `f64`.
+    /// Prepare UPOLS FFT partitions in pure `f64` keeping IR coefficients verbatim (never
+    /// normalized at load per `HEADROOM_DESIGN.md`), measuring peak frequency boost `max(G_c, 0)`
+    /// via `>= 2x` zero-padded FFT, diagnostic `L1`, and deterministic content hash.
     pub fn from_stereo_ir(
         label: impl Into<String>,
         sample_rate_hz: u32,
@@ -801,6 +839,8 @@ impl PreparedStereoIr {
             ir_spectra_right.push(spec_r);
         }
 
+        let content_hash = compute_ir_content_hash(sample_rate_hz, left, right);
+
         Ok(Self {
             label,
             sample_rate_hz,
@@ -812,6 +852,7 @@ impl PreparedStereoIr {
             max_boost_db,
             l1_norm,
             l1_norm_db,
+            content_hash,
             r2c,
             c2r,
             ir_spectra_left,
@@ -1189,6 +1230,10 @@ impl StereoConvolver for PartitionedStereoConvolver {
         true
     }
 
+    fn content_hash(&self) -> Option<&str> {
+        Some(&self.ir.content_hash)
+    }
+
     fn set_output_scale(&mut self, scale_linear: f64) {
         if scale_linear.is_finite() {
             self.output_scale = scale_linear.clamp(0.0, 1.0);
@@ -1436,9 +1481,23 @@ impl RewConvolverFactory {
             }
         };
 
-        if prepared.max_boost_db > 0.0 || prepared.l1_norm_db > 3.0 {
+        let dispersion_db = prepared.l1_norm_db - prepared.max_boost_db;
+        if dispersion_db > DISPERSIVE_FILTER_WARNING_THRESHOLD_DB {
             let notice = format!(
-                "  [rew] WARNING: '{}' loaded unnormalized (max |H(f)| +{:.2} dB, diagnostic L1 +{:.2} dB); per-track convolution output will scale only by any excess over 0 dBFS.",
+                "  [rew] WARNING: '{}' is strongly dispersive (diagnostic L1 +{:.2} dB vs max |H(f)| +{:.2} dB; L1 - G_c = +{:.2} dB > {:.1} dB): max |H(f)| prediction may undershoot; over-counter backstop is active.",
+                prepared.label,
+                prepared.l1_norm_db,
+                prepared.max_boost_db,
+                dispersion_db,
+                DISPERSIVE_FILTER_WARNING_THRESHOLD_DB,
+            );
+            self.emit_notice_once(
+                format!("ir-dispersive:{}:{:?}:{}", path.display(), modified, file_len),
+                notice,
+            );
+        } else if prepared.max_boost_db > 0.0 {
+            let notice = format!(
+                "  [rew] Loaded '{}' unnormalized (max |H(f)| +{:.2} dB, diagnostic L1 +{:.2} dB); per-track convolution output will scale only by any excess over 0 dBFS.",
                 prepared.label,
                 prepared.max_boost_db,
                 prepared.l1_norm_db,

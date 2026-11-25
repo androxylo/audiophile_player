@@ -32,8 +32,16 @@ pub const MINUS_3_DB_LINEAR_THRESHOLD: f64 = 0.707_945_784_384_137_9;
 /// Inter-sample peak allowance (`A_isp`) added for discrete sample-peak or unknown tracks.
 pub const SAMPLE_PEAK_ISP_ALLOWANCE_DB: f64 = 3.0;
 
-/// Maximum realistic True Peak (`+6.0 dBTP`); peaks above this are treated as unknown.
-pub const MAX_REALISTIC_TRUE_PEAK_DB: f64 = 6.0;
+/// Maximum realistic True Peak linear amplitude (`2.0`, i.e., `+6.0206 dBTP`).
+/// Peaks above this are treated as unit errors / unknown (`HEADROOM_DESIGN.md` §2).
+pub const MAX_REALISTIC_TRUE_PEAK_LINEAR: f64 = 2.0;
+
+/// Maximum realistic True Peak in dBTP (`20 * log10(2.0) ~= +6.0206 dBTP`).
+pub const MAX_REALISTIC_TRUE_PEAK_DB: f64 = 6.020_599_913_279_624;
+
+/// Relative rounding tolerance (0.5%) applied to cross-tag consistency checks
+/// (`track_peak <= album_peak` and `true_peak >= sample_peak`).
+pub const PEAK_TAG_ROUNDING_TOLERANCE: f64 = 0.005;
 
 /// Minimum realistic peak (`-120.0 dBFS`); values below this are treated as corrupted/unknown.
 pub const MIN_REALISTIC_PEAK_DB: f64 = -120.0;
@@ -100,7 +108,8 @@ impl ClassifiedPeak {
     }
 }
 
-/// Optional loudness & peak annotations parsed from FLAC Vorbis comments.
+/// Optional loudness & peak annotations parsed from FLAC Vorbis comments (plus optional
+/// Priority #1 full-scan YAML `true_peak_dbtp` override when track identity matches).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct TrackPeakMetadata {
     pub replaygain_track_gain_db: Option<f64>,
@@ -110,6 +119,12 @@ pub struct TrackPeakMetadata {
     /// Measured True Peak amplitude (linear relative to full scale `1.0`), parsed from
     /// `TRUE_PEAK`, `REPLAYGAIN_TRACK_TRUE_PEAK`, or `R128_TRACK_TRUE_PEAK`.
     pub true_peak_linear: Option<f64>,
+    /// Set by the Vorbis tag parser when a true-peak tag was present with an implausible value
+    /// (`> 2.0` linear / `> +6.02 dBTP`), preventing unsafe fallback to a quieter sample-peak tag.
+    pub true_peak_invalid: bool,
+    /// Priority #1 full-scan YAML `results.true_peak_dbtp` (converted to linear `10^(db/20)`),
+    /// populated ONLY when YAML identity (`streaminfo_md5`, sample rate, bit depth) matches.
+    pub full_scan_true_peak_linear: Option<f64>,
 }
 
 /// Valid sample-peak upper limit for `bits_per_sample` (`2^(b-1) / (2^(b-1) - 1)`), accounting
@@ -141,43 +156,98 @@ fn realistic_dbfs_for_bits(linear: f64, bits_per_sample: u16) -> Option<f64> {
 }
 
 impl TrackPeakMetadata {
+    /// Return a copy with Priority #1 full-scan YAML `results.true_peak_dbtp` applied.
+    pub fn with_full_scan_true_peak_dbtp(mut self, true_peak_dbtp: f64) -> Self {
+        if true_peak_dbtp.is_finite() {
+            self.full_scan_true_peak_linear = Some(10.0_f64.powf(true_peak_dbtp / 20.0));
+        }
+        self
+    }
+
     /// Classify the best realistic peak amplitude using default 24-bit bounds.
     pub fn classified_peak(&self) -> Option<ClassifiedPeak> {
         self.classified_peak_for_bits(24)
     }
 
-    /// Classify the best realistic peak amplitude per `HEADROOM_DESIGN.md` for `bits_per_sample`:
-    /// - True peak tags take priority over ReplayGain track peak, which takes priority over album peak.
-    /// - Sample-peak tags `> 2^(b-1)/(2^(b-1)-1)` (strictly above 1-sample full scale for `b` bits)
-    ///   count as [`PeakKind::TruePeak`]; values up to that limit stay [`PeakKind::SamplePeak`]
-    ///   so 32767-normalizing 16-bit scanners keep the `3 dB` `A_isp` reserve (Review #5 #16).
-    /// - Any peak `> +6.0 dBTP` or `< 1 LSB` (or `<= 0`, non-finite) counts as unknown (`None`).
-    /// - If a `true_peak_linear` tag is present and exceeds `+6.0 dBTP`, returns `None` immediately
-    ///   (unknown) instead of falling back to a potentially quieter sample-peak tag.
+    /// Classify the best realistic peak amplitude per `HEADROOM_DESIGN.md` §2 for `bits_per_sample`:
+    /// 1. Full-scan YAML `results.true_peak_dbtp` (Priority #1; overrides every tag when present).
+    /// 2. Track/album true-peak Vorbis comment tags.
+    /// 3. `REPLAYGAIN_TRACK_PEAK` (sample peak, or `TruePeak` if `> 2^(b-1)/(2^(b-1)-1)`).
+    /// 4. `REPLAYGAIN_ALBUM_PEAK`.
+    /// 5. Unknown (`None` -> `P = 0 dBFS`, `A_isp = 3 dB`, `G_up = -3 dB`).
+    ///
+    /// Realism checks enforced here:
+    /// - True peak must lie in `[1 LSB, 2.0]` linear (`<= +6.0206 dBTP`); values `> 2.0` count as
+    ///   unknown immediately instead of falling back to a quieter sample-peak tag.
+    /// - When both `true_peak_linear` and `replaygain_track_peak` exist, `true_peak < sample_peak`
+    ///   (beyond 0.5% rounding) discards the true-peak tag and falls back to the sample peak.
+    /// - When both `replaygain_track_peak` and `replaygain_album_peak` exist, `track_peak > album_peak`
+    ///   (beyond 0.5% rounding) rejects contradictory sample-peak tags as unknown (`None`).
     pub fn classified_peak_for_bits(&self, bits_per_sample: u16) -> Option<ClassifiedPeak> {
         let min_db = min_realistic_peak_dbfs_for_bits(bits_per_sample);
         let sp_upper = max_sample_peak_linear_for_bits(bits_per_sample);
 
+        // Priority 1: Full-scan YAML `results.true_peak_dbtp` (overrides all Vorbis tags).
+        if let Some(p) = self.full_scan_true_peak_linear {
+            if !p.is_finite() || p <= 0.0 || p > MAX_REALISTIC_TRUE_PEAK_LINEAR + 1e-9 {
+                return None;
+            }
+            let dbfs = 20.0 * p.log10();
+            if dbfs >= min_db - 1e-9 {
+                return Some(ClassifiedPeak {
+                    linear: p,
+                    dbfs,
+                    kind: PeakKind::TruePeak,
+                    source_tag: "FULL_SCAN_TRUE_PEAK",
+                });
+            }
+            return None;
+        }
+
+        // Priority 2: Vorbis true-peak tag. An explicitly implausible true-peak tag (> 2.0 linear)
+        // must immediately resolve to unknown rather than falling back to a quieter sample peak.
+        if self.true_peak_invalid {
+            return None;
+        }
         if let Some(p) = self.true_peak_linear {
             if p.is_finite() && p > 0.0 {
-                let dbfs = 20.0 * p.log10();
-                if dbfs > MAX_REALISTIC_TRUE_PEAK_DB + 1e-9 {
+                if p > MAX_REALISTIC_TRUE_PEAK_LINEAR + 1e-9 {
                     return None;
                 }
-                if dbfs >= min_db - 1e-9 {
-                    return Some(ClassifiedPeak {
-                        linear: p,
-                        dbfs,
-                        kind: PeakKind::TruePeak,
-                        source_tag: "TRUE_PEAK",
-                    });
+                let below_sample_peak = self
+                    .replaygain_track_peak
+                    .is_some_and(|sp| sp.is_finite() && sp > 0.0 && p < sp * (1.0 - PEAK_TAG_ROUNDING_TOLERANCE));
+                if !below_sample_peak {
+                    let dbfs = 20.0 * p.log10();
+                    if dbfs >= min_db - 1e-9 {
+                        return Some(ClassifiedPeak {
+                            linear: p,
+                            dbfs,
+                            kind: PeakKind::TruePeak,
+                            source_tag: "TRUE_PEAK",
+                        });
+                    }
                 }
             }
         }
+
+        // §2 tag sanity: track sample peak must be <= album sample peak (within 0.5% rounding)
+        // whenever both positive finite tags exist.
+        if let (Some(tp), Some(ap)) = (self.replaygain_track_peak, self.replaygain_album_peak) {
+            if tp.is_finite()
+                && ap.is_finite()
+                && tp > 0.0
+                && ap > 0.0
+                && tp > ap * (1.0 + PEAK_TAG_ROUNDING_TOLERANCE)
+            {
+                return None;
+            }
+        }
+
+        // Priority 3: REPLAYGAIN_TRACK_PEAK.
         if let Some(p) = self.replaygain_track_peak {
             if p.is_finite() && p > 0.0 {
-                let dbfs = 20.0 * p.log10();
-                if dbfs > MAX_REALISTIC_TRUE_PEAK_DB + 1e-9 {
+                if p > MAX_REALISTIC_TRUE_PEAK_LINEAR + 1e-9 {
                     return None;
                 }
                 if let Some(dbfs) = realistic_dbfs_for_bits(p, bits_per_sample) {
@@ -195,10 +265,11 @@ impl TrackPeakMetadata {
                 }
             }
         }
+
+        // Priority 4: REPLAYGAIN_ALBUM_PEAK.
         if let Some(p) = self.replaygain_album_peak {
             if p.is_finite() && p > 0.0 {
-                let dbfs = 20.0 * p.log10();
-                if dbfs > MAX_REALISTIC_TRUE_PEAK_DB + 1e-9 {
+                if p > MAX_REALISTIC_TRUE_PEAK_LINEAR + 1e-9 {
                     return None;
                 }
                 if let Some(dbfs) = realistic_dbfs_for_bits(p, bits_per_sample) {
@@ -216,6 +287,7 @@ impl TrackPeakMetadata {
                 }
             }
         }
+
         None
     }
 
@@ -391,15 +463,18 @@ pub fn select_headroom_for_bits(
 /// Apply `HEADROOM_DESIGN.md` §4 gapless tail-overlap scaling (`S_B`) for Track B without ever
 /// altering Stage-1 `G_up` (Review #5 Finding #3).
 ///
-/// Computes `B_out = P + A_isp + G_up + max(G_c, 0)`,
+/// Computes `B_out = M + G_up` (when `full_scan_post_chain_peak_db` is present) or
+/// `B_out = P + A_isp + G_up + max(G_c, 0)`,
 /// `T = conv_tail_peak + up_hist_peak * 10^(max(G_c, 0)/20)`,
 /// and `S_B = min(0, -B_out, 20*log10(max(1 - T, 1e-3)) - B_out)`.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_gapless_tail_headroom(
     base: &mut HeadroomDecision,
     meta: &TrackPeakMetadata,
     bits_per_sample: u16,
     is_streaming_source: bool,
     conv_max_boost_db: f64,
+    full_scan_post_chain_peak_db: Option<f64>,
     conv_tail_peak: f64,
     up_hist_peak: f64,
 ) {
@@ -414,15 +489,19 @@ pub fn apply_gapless_tail_headroom(
         return;
     }
 
-    let (p_db, a_isp_db) = if is_streaming_source {
-        (0.0, SAMPLE_PEAK_ISP_ALLOWANCE_DB)
-    } else if let Some(cp) = meta.classified_peak_for_bits(bits_per_sample) {
-        (cp.dbfs, cp.isp_allowance_db())
-    } else {
-        (0.0, SAMPLE_PEAK_ISP_ALLOWANCE_DB)
+    let b_out_db = match full_scan_post_chain_peak_db {
+        Some(m_db) if m_db.is_finite() => m_db + base.mode.gain_db(),
+        _ => {
+            let (p_db, a_isp_db) = if is_streaming_source {
+                (0.0, SAMPLE_PEAK_ISP_ALLOWANCE_DB)
+            } else if let Some(cp) = meta.classified_peak_for_bits(bits_per_sample) {
+                (cp.dbfs, cp.isp_allowance_db())
+            } else {
+                (0.0, SAMPLE_PEAK_ISP_ALLOWANCE_DB)
+            };
+            p_db + a_isp_db + base.mode.gain_db() + g_c_pos
+        }
     };
-
-    let b_out_db = p_db + a_isp_db + base.mode.gain_db() + g_c_pos;
     let room_db = 20.0 * (1.0 - total_tail).max(1e-3).log10();
     let s_b_db = 0.0_f64.min(-b_out_db).min(room_db - b_out_db);
 

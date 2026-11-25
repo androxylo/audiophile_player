@@ -471,3 +471,76 @@ fn review5_bare_positive_replaygain_true_peak_does_not_overwrite_unambiguous_tru
         "expected {expected_album:.6}, got {got_album:.6}"
     );
 }
+
+#[test]
+fn headroom_design_issue7_tag_bounds_track_vs_album_and_streaminfo_md5() {
+    // 1. Tightened §2 upper bound: (0, 2.0] linear / <= +6.0206 dBTP accepted; > 2.0 rejected to
+    // unknown without falling back to a quiet sample-peak tag!
+    let at_limit_db = parse_peak_metadata_fields(&["TRUE_PEAK=+6.02 dBTP".to_string()]);
+    assert!(at_limit_db.true_peak_linear.is_some());
+    assert!(!at_limit_db.true_peak_invalid);
+
+    let at_limit_lin = parse_peak_metadata_fields(&[
+        "REPLAYGAIN_TRACK_PEAK=0.99".to_string(),
+        "REPLAYGAIN_TRACK_TRUE_PEAK=2.0".to_string(),
+    ]);
+    assert_eq!(at_limit_lin.true_peak_linear, Some(2.0));
+    assert!(!at_limit_lin.true_peak_invalid);
+
+    let over_limit_lin = parse_peak_metadata_fields(&[
+        "REPLAYGAIN_TRACK_PEAK=0.5".to_string(),
+        "REPLAYGAIN_TRACK_TRUE_PEAK=2.5".to_string(),
+    ]);
+    assert!(over_limit_lin.true_peak_invalid);
+    assert_eq!(over_limit_lin.true_peak_linear, None);
+    assert_eq!(over_limit_lin.classified_peak(), None);
+
+    let over_limit_db = parse_peak_metadata_fields(&[
+        "REPLAYGAIN_TRACK_PEAK=0.5".to_string(),
+        "TRUE_PEAK=+30.0 dBTP".to_string(),
+    ]);
+    assert!(over_limit_db.true_peak_invalid);
+    assert_eq!(over_limit_db.classified_peak(), None);
+
+    // 2. Track true peak > album true peak (beyond 0.5% rounding) -> contradictory -> unknown.
+    let bad_tp_pair = parse_peak_metadata_fields(&[
+        "REPLAYGAIN_TRACK_TRUE_PEAK=-2.0 dBTP".to_string(),
+        "REPLAYGAIN_ALBUM_TRUE_PEAK=-5.0 dBTP".to_string(),
+    ]);
+    assert!(bad_tp_pair.true_peak_invalid);
+    assert_eq!(bad_tp_pair.classified_peak(), None);
+
+    // 3. Album true peak < album sample peak -> discarded cleanly.
+    let bad_album_tp = parse_peak_metadata_fields(&[
+        "REPLAYGAIN_ALBUM_PEAK=0.95".to_string(),
+        "REPLAYGAIN_ALBUM_TRUE_PEAK=-6.0 dBTP".to_string(),
+    ]);
+    assert_eq!(bad_album_tp.true_peak_linear, None);
+    assert_eq!(
+        bad_album_tp.effective_peak_linear(),
+        Some((0.95, "REPLAYGAIN_ALBUM_PEAK"))
+    );
+
+    // 4. FlacBlockReader exposes STREAMINFO MD5 signature for YAML identity verification.
+    let path = make_temp_flac_path("streaminfo_md5");
+    let samples: Vec<i32> = (0..256).map(|i| (i * 123) % 10_000).collect();
+    let mut enc = FlacSampleWriter::create(
+        &path,
+        Options::default(),
+        44_100,
+        16,
+        2,
+        Some(samples.len() as u64),
+    )
+    .unwrap();
+    enc.write(&samples).unwrap();
+    enc.finalize().unwrap();
+
+    let reader = FlacBlockReader::open(&path).unwrap();
+    let md5 = reader
+        .streaminfo_md5()
+        .expect("encoded FLAC must expose non-empty STREAMINFO MD5");
+    assert_ne!(md5, [0u8; 16]);
+
+    let _ = fs::remove_file(&path);
+}

@@ -26,10 +26,8 @@ fn unknown_or_unrealistic_peak_always_defaults_to_minus_3_db() {
     // Gain tag present without a peak tag does NOT bound instantaneous peak -> must stay -3 dB
     let gain_only = TrackPeakMetadata {
         replaygain_track_gain_db: Some(6.0),
-        replaygain_track_peak: None,
         replaygain_album_gain_db: Some(5.0),
-        replaygain_album_peak: None,
-        true_peak_linear: None,
+        ..TrackPeakMetadata::default()
     };
     assert_eq!(
         select_headroom(&gain_only, false, None, None).mode,
@@ -243,7 +241,16 @@ fn review5_headroom_design_rows_null_convolver_16bit_boundary_14bit_and_tail_s_b
     // 4. Finding #3 (all 3 S_B tail-overlap scenarios from Review #5):
     // (a) Untagged B (-3 dB), G_c=+2 dB, T=0.25 -> S_B = -4.50 dB (G_up stays -3 dB).
     let mut d_a = select_headroom_for_bits(&TrackPeakMetadata::default(), 24, false, Some(2.0), None);
-    apply_gapless_tail_headroom(&mut d_a, &TrackPeakMetadata::default(), 24, false, 2.0, 0.25, 0.0);
+    apply_gapless_tail_headroom(
+        &mut d_a,
+        &TrackPeakMetadata::default(),
+        24,
+        false,
+        2.0,
+        None,
+        0.25,
+        0.0,
+    );
     assert_eq!(d_a.mode, HeadroomMode::Minus3Db);
     assert!((d_a.convolution_scale_db - (-4.4988)).abs() < 0.01);
 
@@ -253,7 +260,7 @@ fn review5_headroom_design_rows_null_convolver_16bit_boundary_14bit_and_tail_s_b
         ..TrackPeakMetadata::default()
     };
     let mut d_b = select_headroom_for_bits(&sp_half, 24, false, Some(0.0), None);
-    apply_gapless_tail_headroom(&mut d_b, &sp_half, 24, false, 0.0, 0.4, 0.0);
+    apply_gapless_tail_headroom(&mut d_b, &sp_half, 24, false, 0.0, None, 0.4, 0.0);
     assert_eq!(d_b.mode, HeadroomMode::ZeroDb);
     assert!((d_b.convolution_scale_db - (-1.4164)).abs() < 0.01);
 
@@ -263,7 +270,286 @@ fn review5_headroom_design_rows_null_convolver_16bit_boundary_14bit_and_tail_s_b
         ..TrackPeakMetadata::default()
     };
     let mut d_c = select_headroom_for_bits(&tp_35, 24, false, Some(0.0), None);
-    apply_gapless_tail_headroom(&mut d_c, &tp_35, 24, false, 0.0, 0.6, 0.0);
+    apply_gapless_tail_headroom(&mut d_c, &tp_35, 24, false, 0.0, None, 0.6, 0.0);
     assert_eq!(d_c.mode, HeadroomMode::ZeroDb);
     assert!((d_c.convolution_scale_db - (-4.4588)).abs() < 0.01);
+}
+
+#[test]
+fn headroom_design_issue7_complete_stage1_stage2_truth_tables_and_tag_realism() {
+    use ap_core::headroom::{
+        MAX_REALISTIC_TRUE_PEAK_LINEAR, apply_gapless_tail_headroom, select_headroom_for_bits,
+    };
+
+    let db = |x: f64| 10.0_f64.powf(x / 20.0);
+
+    // --- HEADROOM_DESIGN.md §3 Stage-1 complete truth table ---
+    let stage1_cases: &[(&str, TrackPeakMetadata, u16, bool, HeadroomMode)] = &[
+        (
+            "14-bit content (-12.04 dBFS)",
+            TrackPeakMetadata {
+                replaygain_track_peak: Some(0.25),
+                ..TrackPeakMetadata::default()
+            },
+            16,
+            false,
+            HeadroomMode::ZeroDb,
+        ),
+        (
+            "15-bit content (-6.02 dBFS)",
+            TrackPeakMetadata {
+                replaygain_track_peak: Some(0.5),
+                ..TrackPeakMetadata::default()
+            },
+            16,
+            false,
+            HeadroomMode::ZeroDb,
+        ),
+        (
+            "quiet master (-3.5 dBFS)",
+            TrackPeakMetadata {
+                replaygain_track_peak: Some(db(-3.5)),
+                ..TrackPeakMetadata::default()
+            },
+            24,
+            false,
+            HeadroomMode::ZeroDb,
+        ),
+        (
+            "exact boundary (-3.00 dBFS)",
+            TrackPeakMetadata {
+                replaygain_track_peak: Some(db(-3.0)),
+                ..TrackPeakMetadata::default()
+            },
+            24,
+            false,
+            HeadroomMode::ZeroDb,
+        ),
+        (
+            "hot master (-0.3 dBFS)",
+            TrackPeakMetadata {
+                replaygain_track_peak: Some(db(-0.3)),
+                ..TrackPeakMetadata::default()
+            },
+            24,
+            false,
+            HeadroomMode::Minus3Db,
+        ),
+        (
+            "untagged local",
+            TrackPeakMetadata::default(),
+            24,
+            false,
+            HeadroomMode::Minus3Db,
+        ),
+        (
+            "live stream with quiet tag ignored",
+            TrackPeakMetadata {
+                true_peak_linear: Some(db(-12.0)),
+                ..TrackPeakMetadata::default()
+            },
+            24,
+            true,
+            HeadroomMode::Minus3Db,
+        ),
+    ];
+    for (name, meta, bits, streaming, expected_mode) in stage1_cases {
+        let d = select_headroom_for_bits(meta, *bits, *streaming, Some(0.0), None);
+        assert_eq!(d.mode, *expected_mode, "Stage-1 row failed: {name}");
+    }
+
+    // --- HEADROOM_DESIGN.md §4 Stage-2 complete 9-row truth table ---
+    struct Stage2Row {
+        name: &'static str,
+        meta: TrackPeakMetadata,
+        g_c_db: f64,
+        expected_g_up: f64,
+        expected_s: f64,
+        expected_total: f64,
+    }
+    let rows = [
+        Stage2Row {
+            name: "Owner example: -6 true, +1 fill -> 0 dB total",
+            meta: TrackPeakMetadata {
+                true_peak_linear: Some(db(-6.0)),
+                ..TrackPeakMetadata::default()
+            },
+            g_c_db: 1.0,
+            expected_g_up: 0.0,
+            expected_s: 0.0,
+            expected_total: 0.0,
+        },
+        Stage2Row {
+            name: "14-bit sample (-12.04), +5 fill -> 0 dB total",
+            meta: TrackPeakMetadata {
+                replaygain_track_peak: Some(db(-12.04)),
+                ..TrackPeakMetadata::default()
+            },
+            g_c_db: 5.0,
+            expected_g_up: 0.0,
+            expected_s: 0.0,
+            expected_total: 0.0,
+        },
+        Stage2Row {
+            name: "15-bit sample (-6.02), +2 fill -> 0 dB total",
+            meta: TrackPeakMetadata {
+                replaygain_track_peak: Some(db(-6.02)),
+                ..TrackPeakMetadata::default()
+            },
+            g_c_db: 2.0,
+            expected_g_up: 0.0,
+            expected_s: 0.0,
+            expected_total: 0.0,
+        },
+        Stage2Row {
+            name: "15-bit sample (-6.02), +5 fill -> S=-1.98, total=-1.98",
+            meta: TrackPeakMetadata {
+                replaygain_track_peak: Some(db(-6.02)),
+                ..TrackPeakMetadata::default()
+            },
+            g_c_db: 5.0,
+            expected_g_up: 0.0,
+            expected_s: -1.98,
+            expected_total: -1.98,
+        },
+        Stage2Row {
+            name: "Quiet master (-4 sample), cut-only (-1) -> 0 dB total",
+            meta: TrackPeakMetadata {
+                replaygain_track_peak: Some(db(-4.0)),
+                ..TrackPeakMetadata::default()
+            },
+            g_c_db: -1.0,
+            expected_g_up: 0.0,
+            expected_s: 0.0,
+            expected_total: 0.0,
+        },
+        Stage2Row {
+            name: "Hot master (+1 true), +2 fill -> G_up=-3, S=0, total=-3",
+            meta: TrackPeakMetadata {
+                true_peak_linear: Some(db(1.0)),
+                ..TrackPeakMetadata::default()
+            },
+            g_c_db: 2.0,
+            expected_g_up: -3.0,
+            expected_s: 0.0,
+            expected_total: -3.0,
+        },
+        Stage2Row {
+            name: "Untagged, +2 fill -> G_up=-3, S=-2, total=-5",
+            meta: TrackPeakMetadata::default(),
+            g_c_db: 2.0,
+            expected_g_up: -3.0,
+            expected_s: -2.0,
+            expected_total: -5.0,
+        },
+        Stage2Row {
+            name: "Untagged, +5 fill -> G_up=-3, S=-5, total=-8",
+            meta: TrackPeakMetadata::default(),
+            g_c_db: 5.0,
+            expected_g_up: -3.0,
+            expected_s: -5.0,
+            expected_total: -8.0,
+        },
+        Stage2Row {
+            name: "Hot sample (-0.3), +6 fill -> G_up=-3, S=-5.7, total=-8.7",
+            meta: TrackPeakMetadata {
+                replaygain_track_peak: Some(db(-0.3)),
+                ..TrackPeakMetadata::default()
+            },
+            g_c_db: 6.0,
+            expected_g_up: -3.0,
+            expected_s: -5.7,
+            expected_total: -8.7,
+        },
+    ];
+    for row in &rows {
+        let d = select_headroom_for_bits(&row.meta, 16, false, Some(row.g_c_db), None);
+        assert!(
+            (d.mode.gain_db() - row.expected_g_up).abs() < 1e-6,
+            "Stage-2 G_up mismatch for '{}': got {}, expected {}",
+            row.name,
+            d.mode.gain_db(),
+            row.expected_g_up
+        );
+        assert!(
+            (d.convolution_scale_db - row.expected_s).abs() < 1e-3,
+            "Stage-2 S mismatch for '{}': got {}, expected {}",
+            row.name,
+            d.convolution_scale_db,
+            row.expected_s
+        );
+        assert!(
+            (d.total_gain_db() - row.expected_total).abs() < 1e-3,
+            "Stage-2 total mismatch for '{}': got {}, expected {}",
+            row.name,
+            d.total_gain_db(),
+            row.expected_total
+        );
+        assert!(d.convolution_scale_db <= 0.0, "S must never be positive");
+    }
+
+    // --- §2 Tag realism checks ---
+    // 1. Exact linear 2.0 (+6.0206 dBTP) is valid per §2 table `(0, 2.0]`; 2.01 is unknown.
+    let tp_exact_2 = TrackPeakMetadata {
+        true_peak_linear: Some(MAX_REALISTIC_TRUE_PEAK_LINEAR),
+        ..TrackPeakMetadata::default()
+    };
+    let cp2 = tp_exact_2
+        .classified_peak_for_bits(24)
+        .expect("linear 2.0 (+6.0206 dBTP) must be accepted");
+    assert_eq!(cp2.kind, PeakKind::TruePeak);
+    let tp_over_2 = TrackPeakMetadata {
+        true_peak_linear: Some(2.01),
+        replaygain_track_peak: Some(0.5),
+        ..TrackPeakMetadata::default()
+    };
+    assert_eq!(
+        tp_over_2.classified_peak_for_bits(24),
+        None,
+        "linear > 2.0 must resolve to unknown without falling back to quiet sample peak"
+    );
+
+    // 2. Track sample peak > album sample peak (beyond 0.5% rounding) -> contradictory -> unknown.
+    let bad_track_vs_album = TrackPeakMetadata {
+        replaygain_track_peak: Some(0.55),
+        replaygain_album_peak: Some(0.45),
+        ..TrackPeakMetadata::default()
+    };
+    assert_eq!(bad_track_vs_album.classified_peak_for_bits(24), None);
+    assert_eq!(
+        select_headroom_for_bits(&bad_track_vs_album, 24, false, None, None).mode,
+        HeadroomMode::Minus3Db
+    );
+
+    // Within 0.5% rounding tolerance (e.g. 0.501 vs 0.500) stays valid.
+    let rounding_ok = TrackPeakMetadata {
+        replaygain_track_peak: Some(0.501),
+        replaygain_album_peak: Some(0.500),
+        ..TrackPeakMetadata::default()
+    };
+    assert_eq!(
+        select_headroom_for_bits(&rounding_ok, 24, false, None, None).mode,
+        HeadroomMode::ZeroDb
+    );
+
+    // 3. Priority #1 full-scan true_peak_dbtp overrides tags (even contradictory or invalid tags).
+    let with_full_scan = TrackPeakMetadata {
+        replaygain_track_peak: Some(0.95),
+        true_peak_invalid: true,
+        ..TrackPeakMetadata::default()
+    }
+    .with_full_scan_true_peak_dbtp(-6.0);
+    let d_fs = select_headroom_for_bits(&with_full_scan, 24, false, Some(2.0), None);
+    assert_eq!(d_fs.mode, HeadroomMode::ZeroDb);
+    assert_eq!(d_fs.peak_kind, Some(PeakKind::TruePeak));
+    assert_eq!(d_fs.convolution_scale_db, 0.0);
+
+    // 4. Gapless S_B respects measured post-chain peak M when present (B_out = M + G_up).
+    let mut d_m = select_headroom_for_bits(&with_full_scan, 24, false, Some(10.0), Some(-2.0));
+    assert_eq!(d_m.mode, HeadroomMode::ZeroDb);
+    assert_eq!(d_m.convolution_scale_db, 0.0);
+    // Incoming tail T = 0.5 -> room = -6.0206 dB; B_out = M + G_up = -2.0 dB -> S_B = -4.0206 dB.
+    apply_gapless_tail_headroom(&mut d_m, &with_full_scan, 24, false, 10.0, Some(-2.0), 0.5, 0.0);
+    assert_eq!(d_m.mode, HeadroomMode::ZeroDb);
+    assert!((d_m.convolution_scale_db - (-4.0206)).abs() < 0.01);
 }
