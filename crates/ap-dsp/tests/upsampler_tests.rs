@@ -733,20 +733,46 @@ fn null_upsampler_moves_native_384khz_f64_buffer_zero_copy_and_bit_exact() {
 }
 
 #[test]
-fn future_unimplemented_filter_archetypes_report_clear_error_until_inv03() {
-    let picker = UpsamplerPicker::new(UpsamplerPolicy {
-        filter_override: Some(FilterArchetype::GaussApod4M),
+fn all_curated_filter_archetypes_are_implemented_and_construct_cleanly() {
+    for arch in [
+        FilterArchetype::GaussLongLp,
+        FilterArchetype::GaussApod4M,
+        FilterArchetype::SincSteep4M,
+        FilterArchetype::ExtSharpLp,
+        FilterArchetype::MinphaseLong,
+        FilterArchetype::IntermediateLong,
+        FilterArchetype::ShortLp,
+        FilterArchetype::ShortMp,
+    ] {
+        assert!(arch.is_implemented(), "{arch} must be implemented");
+        let picker = UpsamplerPicker::new(UpsamplerPolicy {
+            filter_override: Some(arch),
+            max_taps: 1_500_000,
+            ..UpsamplerPolicy::default()
+        })
+        .unwrap();
+        let plan = picker.select(&TrackSourceInfo::from_stream_spec(StreamSpec {
+            sample_rate_hz: 44_100,
+            bits_per_sample: 16,
+            channels: 2,
+        }));
+        let up = build_upsampler(&plan).unwrap_or_else(|e| panic!("{arch} build failed: {e}"));
+        assert_eq!(up.name(), arch.cli_name());
+        assert_eq!(up.total_taps(), plan.tap_budget);
+    }
+
+    // Hi-res gauss-hires-lp at 96 kHz
+    assert!(FilterArchetype::GaussHiresLp.is_implemented());
+    let picker_hr = UpsamplerPicker::new(UpsamplerPolicy {
+        filter_override: Some(FilterArchetype::GaussHiresLp),
         ..UpsamplerPolicy::default()
     })
     .unwrap();
-    let plan = picker.select(&TrackSourceInfo::from_stream_spec(StreamSpec {
-        sample_rate_hz: 44_100,
-        bits_per_sample: 16,
+    let plan_hr = picker_hr.select(&TrackSourceInfo::from_stream_spec(StreamSpec {
+        sample_rate_hz: 96_000,
+        bits_per_sample: 24,
         channels: 2,
     }));
-    let err = match build_upsampler(&plan) {
-        Ok(_) => panic!("expected unimplemented error for GaussApod4M before INV-03"),
-        Err(e) => e,
-    };
-    assert!(err.contains("not implemented yet"));
+    let up_hr = build_upsampler(&plan_hr).expect("gauss-hires-lp 96k");
+    assert_eq!(up_hr.name(), "gauss-hires-lp");
 }

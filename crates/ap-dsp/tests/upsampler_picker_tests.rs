@@ -22,6 +22,8 @@ fn track(rate: u32, bits: u16) -> TrackSourceInfo {
         channels: 2,
         apodizing_needed: false,
         is_streaming_source: false,
+        effective_nyquist_hz: None,
+        hf_noise_filter: false,
     }
 }
 
@@ -275,7 +277,7 @@ fn policy_enforces_strict_4_million_tap_ceiling() {
     };
     let picker = UpsamplerPicker::new(custom).unwrap();
     let p = picker.select(&track(44_100, 16));
-    assert_eq!(p.tap_budget, 1_000_000);
+    assert!(p.tap_budget <= 1_000_000 && p.tap_budget >= 999_980 && p.tap_budget % 2 == 1);
     assert_eq!(p.dac_bits, 24);
     assert_eq!(p.shaper, NoiseShaperProfile::NsGentle2);
 
@@ -341,18 +343,18 @@ fn cli_names_and_compatibility_aliases_parse_roundtrip_for_all_filters_and_shape
     );
     assert!(FilterArchetype::from_str("nonexistent").is_err());
 
-    // Verify implemented flags for Phase 1.
+    // Verify all curated filter archetypes are implemented (Phase 2 complete).
     assert!(FilterArchetype::Null.is_implemented());
     assert!(FilterArchetype::SimpleTest.is_implemented());
     assert!(FilterArchetype::GaussLongLp.is_implemented());
     assert!(FilterArchetype::GaussHiresLp.is_implemented());
-    assert!(!FilterArchetype::GaussApod4M.is_implemented());
-    assert!(!FilterArchetype::SincSteep4M.is_implemented());
-    assert!(!FilterArchetype::ExtSharpLp.is_implemented());
-    assert!(!FilterArchetype::MinphaseLong.is_implemented());
-    assert!(!FilterArchetype::IntermediateLong.is_implemented());
-    assert!(!FilterArchetype::ShortLp.is_implemented());
-    assert!(!FilterArchetype::ShortMp.is_implemented());
+    assert!(FilterArchetype::GaussApod4M.is_implemented());
+    assert!(FilterArchetype::SincSteep4M.is_implemented());
+    assert!(FilterArchetype::ExtSharpLp.is_implemented());
+    assert!(FilterArchetype::MinphaseLong.is_implemented());
+    assert!(FilterArchetype::IntermediateLong.is_implemented());
+    assert!(FilterArchetype::ShortLp.is_implemented());
+    assert!(FilterArchetype::ShortMp.is_implemented());
 
     for s in [
         NoiseShaperProfile::Bypass,

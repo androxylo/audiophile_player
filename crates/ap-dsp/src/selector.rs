@@ -23,7 +23,7 @@ use ap_core::config::{DEFAULT_DAC_BITS, is_valid_dac_bits};
 use ap_core::format::{StreamSpec, TargetDspRate};
 
 use crate::MAX_FILTER_TAPS;
-use crate::upsampler::default_gaussian_num_taps;
+use crate::upsampler::planned_taps_for_archetype;
 
 /// Minimum sane source sample rate accepted by the DSP pipeline (protects against corrupt
 /// ultra-low-rate headers causing extreme upsampling ratios and OOM allocations).
@@ -73,10 +73,14 @@ pub struct TrackSourceInfo {
     pub bits_per_sample: u16,
     pub channels: u16,
     /// True when pre-analysis detects mastering/ADC pre-ringing errors needing an apodizing filter
-    /// (used by future smart selectors in Phase 5+; ignored by [`DefaultFilterSelector`]).
+    /// (used by smart/ultimate selectors; ignored by [`DefaultFilterSelector`]).
     pub apodizing_needed: bool,
-    /// True for live streaming sources (Milestone 2 Tidal); false for local FLAC files.
+    /// True for live streaming sources (UPnP / HTTP / Tidal); false for local FLAC files.
     pub is_streaming_source: bool,
+    /// Optional content-derived effective Nyquist in Hz (Detector H fake hi-res, e.g. `22_050` Hz).
+    pub effective_nyquist_hz: Option<u32>,
+    /// True when Detector H detects 4fS ultrasonic ADC/DSD noise above 40 kHz (`OQ-37`).
+    pub hf_noise_filter: bool,
 }
 
 impl TrackSourceInfo {
@@ -87,6 +91,8 @@ impl TrackSourceInfo {
             channels: spec.channels,
             apodizing_needed: false,
             is_streaming_source: false,
+            effective_nyquist_hz: None,
+            hf_noise_filter: false,
         }
     }
 }
@@ -186,7 +192,7 @@ impl FilterDesignMetrics {
 /// Checked inside `Upsampler::set_incoming_carryover` so two different filters (or the same
 /// archetype with different parameters/effective Nyquist) NEVER splice their FIR histories even
 /// when their tap lengths happen to match — forcing a clean `ConvolverOnlyHandoff` instead.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FilterIdentity {
     pub archetype: FilterArchetype,
     pub source_rate_hz: u32,
@@ -196,15 +202,15 @@ pub struct FilterIdentity {
     pub taps_per_phase: usize,
     /// IEEE 754 `f64::to_bits()` of filter cutoff `fc` in Hz (`0` for non-parametric/bypass).
     pub fc_hz_bits: u64,
-    /// IEEE 754 `f64::to_bits()` of Gaussian `sigma_f` in Hz (`0` for non-Gaussian).
+    /// IEEE 754 `f64::to_bits()` of Gaussian `sigma_f` in Hz (`0` for non-Gaussian) or Kaiser beta.
     pub sigma_f_hz_bits: u64,
-    /// Optional content-derived effective Nyquist (reserved for Phase 6 Detector H).
+    /// Optional content-derived effective Nyquist (Detector H / `OQ-37` HF noise filter stop edge).
     pub effective_nyquist_hz: Option<u32>,
 }
 
 /// Curated audiophile PCM filter archetypes (`UPSAMPLING_RESEARCH.md` §1 & §7), plus `Null`
 /// (native 8fS 1:1 `f64` pass-through) and test-only `SimpleTest`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FilterArchetype {
     /// Null 1:1 floating-point upsampler (`StereoF64Buffer -> StereoF64Buffer`, zero copy).
     /// Used for native `352.8 / 384 kHz` sources so they enter the `f64` DSP domain without resampling.
@@ -253,10 +259,7 @@ impl FilterArchetype {
 
     /// True if this filter kernel is currently implemented and runnable in `ap-dsp`.
     pub fn is_implemented(self) -> bool {
-        matches!(
-            self,
-            Self::Null | Self::SimpleTest | Self::GaussLongLp | Self::GaussHiresLp
-        )
+        true
     }
 
     /// Shape-derived (for Gaussian archetypes) or researched constant-time tap count, bounded by
@@ -278,25 +281,7 @@ impl FilterArchetype {
             Self::Null => 0,
             Self::SimpleTest => simple_test_taps_per_phase(mult, cap)
                 .map_or(0, |m| m.saturating_mul(mult)),
-            Self::GaussLongLp | Self::GaussHiresLp => {
-                // Review #5 Finding #18: report the true shape-derived N rather than silently
-                // clamping to `cap` so budget mismatches are explicit and honest.
-                default_gaussian_num_taps(self, source_rate_hz, target_rate_hz).unwrap_or(0)
-            }
-            // Future Phase 2/3 researched constant-time lengths (`UPSAMPLING_RESEARCH.md` §4.4, §7).
-            Self::GaussApod4M => (65_536_usize.saturating_mul(mult)).min(cap),
-            Self::SincSteep4M => (131_070_usize.saturating_mul(mult)).min(cap),
-            Self::ExtSharpLp => (65_536_usize.saturating_mul(mult)).min(cap),
-            Self::MinphaseLong | Self::IntermediateLong => {
-                let ref_arch = if source_rate_hz <= 48_000 {
-                    Self::GaussLongLp
-                } else {
-                    Self::GaussHiresLp
-                };
-                default_gaussian_num_taps(ref_arch, source_rate_hz, target_rate_hz)
-                    .map_or((8_192_usize.saturating_mul(mult)).min(cap), |n| n.min(cap))
-            }
-            Self::ShortLp | Self::ShortMp => (256_usize.saturating_mul(mult)).min(cap),
+            _ => planned_taps_for_archetype(self, source_rate_hz, target_rate_hz, cap).unwrap_or(0),
         }
     }
 
@@ -539,6 +524,10 @@ pub struct SelectedDspPlan {
     pub tap_budget: usize,
     /// User/policy `--max-taps` ceiling (preserved so `build_upsampler` enforces the hard cap).
     pub max_taps: usize,
+    /// Optional content-derived effective Nyquist in Hz (Detector H fake hi-res).
+    pub effective_nyquist_hz: Option<u32>,
+    /// True when 4fS ultrasonic HF noise filtering above 40 kHz is requested (`OQ-37`).
+    pub hf_noise_filter: bool,
     pub filter_overridden: bool,
     pub shaper_overridden: bool,
     pub reason: String,
@@ -678,12 +667,21 @@ impl UpsamplerPicker {
                 let needs_fallback = matches!(
                     selected_auto,
                     FilterArchetype::GaussLongLp | FilterArchetype::GaussHiresLp
-                ) && default_gaussian_num_taps(selected_auto, source.sample_rate_hz, t_hz)
-                    .is_some_and(|n| n > self.policy.max_taps);
+                ) && planned_taps_for_archetype(
+                    selected_auto,
+                    source.sample_rate_hz,
+                    t_hz,
+                    MAX_FILTER_TAPS,
+                )
+                .is_some_and(|n| n > self.policy.max_taps);
                 if needs_fallback {
-                    let req_n =
-                        default_gaussian_num_taps(selected_auto, source.sample_rate_hz, t_hz)
-                            .unwrap_or(0);
+                    let req_n = planned_taps_for_archetype(
+                        selected_auto,
+                        source.sample_rate_hz,
+                        t_hz,
+                        MAX_FILTER_TAPS,
+                    )
+                    .unwrap_or(0);
                     (
                         FilterArchetype::SimpleTest,
                         raw_ratio,
@@ -759,6 +757,8 @@ impl UpsamplerPicker {
             dac_bits: self.policy.dac_bits,
             tap_budget,
             max_taps: self.policy.max_taps,
+            effective_nyquist_hz: source.effective_nyquist_hz,
+            hf_noise_filter: source.hf_noise_filter,
             filter_overridden,
             shaper_overridden,
             reason,

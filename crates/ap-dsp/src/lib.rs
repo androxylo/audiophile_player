@@ -6,7 +6,9 @@
 //! - Core first-class REW stereo convolution + optional integer-sample channel delay only.
 
 pub mod convolution;
+pub mod dd;
 pub mod delay;
+pub mod phase;
 pub mod pipeline;
 pub mod quantize;
 pub mod selector;
