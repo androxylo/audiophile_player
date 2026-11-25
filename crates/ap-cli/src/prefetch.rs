@@ -19,14 +19,20 @@ use ap_control::state::PlayModeLabel;
 use ap_core::buffer::InterleavedInt32Buffer;
 use ap_dsp::pipeline::PipelineReport;
 
-/// Default buffered lead time held in RAM ahead of the DAC (`12 s` at any output rate).
-pub const DEFAULT_MAX_BUFFERED_SECONDS: u64 = 12;
+/// Default buffered lead time held in RAM ahead of the DAC (`24 s` at any output rate).
+/// Absorbs multi-second mid-stream DSP/convolution/disk/rate-switch spikes with zero underruns
+/// while capping worst-case RAM to ~73.7 MB at 384 kHz stereo Int32.
+pub const DEFAULT_MAX_BUFFERED_SECONDS: u64 = 24;
 
-/// Hard maximum buffered PCM frames held in RAM ahead of the DAC (~12 s @ 384 kHz ≈ 36 MB).
+/// Hard maximum buffered PCM frames held in RAM ahead of the DAC (~24 s @ 384 kHz ≈ 73.7 MB).
 pub const DEFAULT_MAX_BUFFERED_FRAMES: usize = 384_000 * (DEFAULT_MAX_BUFFERED_SECONDS as usize);
 
-/// Minimum cushion buffered before starting a new WDM-KS stream (~2 s at output rate).
-pub const PREBUFFER_SECONDS: u32 = 2;
+/// Minimum cushion buffered before starting a new local WDM-KS stream (`4 s` at output rate).
+pub const PREBUFFER_SECONDS: u32 = 4;
+
+/// Maximum consumed PCM blocks held in the deferred-drop queue so the real-time MMCSS WaveRT
+/// thread never invokes `HeapFree` / `VirtualFree` on large PCM allocations.
+const MAX_DEFERRED_DROP_BLOCKS: usize = 16;
 
 /// Ordered stream events flowing from the DSP Producer into the WDM-KS Consumer.
 #[derive(Debug)]
@@ -105,17 +111,25 @@ struct BufferInner {
     terminal_markers: usize,
     max_buffered_frames: usize,
     max_buffered_duration_ns: u128,
+    /// Lowest remaining buffered duration observed while actively popping PCM blocks for the
+    /// current track (resets on track start / flush; diagnostic headroom metric).
+    track_min_buffered_ns: Option<u128>,
+    /// Consumed PCM blocks handed off by the real-time WaveRT thread so large `Vec<[i32; 2]>`
+    /// buffers are deallocated exclusively on the non-RT producer/control thread.
+    deferred_drops: Vec<InterleavedInt32Buffer>,
     closed: bool,
 }
 
 impl BufferInner {
-    fn flush_locked(&mut self) -> u64 {
+    fn flush_locked(&mut self) -> (u64, Vec<InterleavedInt32Buffer>) {
         self.epoch = self.epoch.wrapping_add(1);
         self.events.clear();
         self.buffered_frames = 0;
         self.buffered_duration_ns = 0;
         self.terminal_markers = 0;
-        self.epoch
+        self.track_min_buffered_ns = None;
+        let drops = std::mem::take(&mut self.deferred_drops);
+        (self.epoch, drops)
     }
 
     fn push_back_event(&mut self, ev: StreamEvent) {
@@ -175,6 +189,8 @@ impl BoundedBlockStreamBuffer {
                 terminal_markers: 0,
                 max_buffered_frames: max_buffered_frames.max(65_536),
                 max_buffered_duration_ns: max_buffered_duration.as_nanos().max(1),
+                track_min_buffered_ns: None,
+                deferred_drops: Vec::with_capacity(MAX_DEFERRED_DROP_BLOCKS),
                 closed: false,
             }),
             cv: Condvar::new(),
@@ -185,6 +201,46 @@ impl BoundedBlockStreamBuffer {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).epoch
     }
 
+    /// Reset per-track buffer low-water telemetry right before starting hardware DMA.
+    pub fn reset_track_low_water(&self) {
+        let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        st.track_min_buffered_ns = Some(st.buffered_duration_ns);
+    }
+
+    /// Lowest remaining buffered duration (ms) observed during the current track's RT pops.
+    #[allow(dead_code)]
+    pub fn track_min_buffered_ms(&self) -> Option<u64> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .track_min_buffered_ns
+            .map(|ns| (ns / 1_000_000) as u64)
+    }
+
+    /// Hand a consumed PCM block off the real-time MMCSS WaveRT thread for deferred deallocation
+    /// on the producer thread (avoids `HeapFree` / `VirtualFree` kernel locks on the RT thread).
+    pub fn recycle_consumed_block(&self, buf: InterleavedInt32Buffer) {
+        let overflow = {
+            let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if st.deferred_drops.len() < MAX_DEFERRED_DROP_BLOCKS {
+                st.deferred_drops.push(buf);
+                None
+            } else {
+                Some(buf)
+            }
+        };
+        drop(overflow);
+    }
+
+    /// Explicitly drop any deferred consumed PCM blocks on a non-RT thread.
+    pub fn drain_deferred_drops(&self) {
+        let drops = {
+            let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut st.deferred_drops)
+        };
+        drop(drops);
+    }
+
     #[cfg(test)]
     pub fn buffered_frames(&self) -> usize {
         self.inner
@@ -193,11 +249,24 @@ impl BoundedBlockStreamBuffer {
             .buffered_frames
     }
 
+    #[cfg(test)]
+    pub fn deferred_drop_count(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .deferred_drops
+            .len()
+    }
+
     /// Increment epoch and immediately drop all queued PCM blocks (frees RAM on Pause / switch).
     pub fn reset_and_flush(&self) -> u64 {
-        let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let ep = st.flush_locked();
-        self.cv.notify_all();
+        let (ep, drops) = {
+            let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let res = st.flush_locked();
+            self.cv.notify_all();
+            res
+        };
+        drop(drops);
         ep
     }
 
@@ -280,29 +349,41 @@ impl BoundedBlockStreamBuffer {
                 }
             }
         }
-        let ep = st.flush_locked();
+        let (ep, drops) = st.flush_locked();
         self.cv.notify_all();
+        drop(st);
+        drop(drops);
         (false, ep, skipped_front_path)
     }
 
     /// Permanently close the buffer for graceful shutdown, waking all blocked threads.
     pub fn close(&self) {
-        let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        st.closed = true;
-        st.events.clear();
-        st.buffered_frames = 0;
-        st.buffered_duration_ns = 0;
-        st.terminal_markers = 0;
-        self.cv.notify_all();
+        let drops = {
+            let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            st.closed = true;
+            st.events.clear();
+            st.buffered_frames = 0;
+            st.buffered_duration_ns = 0;
+            st.terminal_markers = 0;
+            st.track_min_buffered_ns = None;
+            let d = std::mem::take(&mut st.deferred_drops);
+            self.cv.notify_all();
+            d
+        };
+        drop(drops);
     }
 
     /// Producer side: push a stream event, applying backpressure whenever buffered PCM reaches
-    /// either the duration cap (`12 s` at the output rate) or `max_buffered_frames`.
+    /// either the duration cap (`24 s` at the output rate) or `max_buffered_frames`.
+    /// Also drains any RT-recycled PCM blocks so `HeapFree` / `VirtualFree` runs here off-RT.
     pub fn push_for_epoch(&self, epoch: u64, event: StreamEvent) -> bool {
         let (frames_in_event, dur_ns_in_event, _) = event_metrics(&event);
         let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut drops = std::mem::take(&mut st.deferred_drops);
         loop {
             if st.closed || st.epoch != epoch {
+                drop(st);
+                drop(drops);
                 return false;
             }
             // Control markers pass immediately; PCM blocks respect both duration and RAM caps
@@ -314,10 +395,27 @@ impl BoundedBlockStreamBuffer {
                         <= st.max_buffered_duration_ns)
             {
                 st.push_back_event(event);
+                if !st.deferred_drops.is_empty() {
+                    drops.append(&mut st.deferred_drops);
+                }
                 self.cv.notify_all();
+                drop(st);
+                drop(drops);
                 return true;
             }
+            if !drops.is_empty() {
+                drop(st);
+                drops.clear();
+                st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                if !st.deferred_drops.is_empty() {
+                    drops.append(&mut st.deferred_drops);
+                }
+                continue;
+            }
             st = self.cv.wait(st).unwrap_or_else(|e| e.into_inner());
+            if !st.deferred_drops.is_empty() {
+                drops.append(&mut st.deferred_drops);
+            }
         }
     }
 
@@ -417,6 +515,13 @@ impl BoundedBlockStreamBuffer {
         match st.events.front() {
             Some(StreamEvent::PcmBlock(_)) => {
                 if let Some(StreamEvent::PcmBlock(b)) = st.pop_front_event() {
+                    if st.terminal_markers == 0 {
+                        let rem = st.buffered_duration_ns;
+                        st.track_min_buffered_ns = Some(match st.track_min_buffered_ns {
+                            Some(prev) => prev.min(rem),
+                            None => rem,
+                        });
+                    }
                     self.cv.notify_all();
                     PopBlockResult::Block(b)
                 } else {
@@ -430,7 +535,10 @@ impl BoundedBlockStreamBuffer {
             }
             // Leave next TrackStart / EndOfQueue / FatalError at the front for outer loop!
             Some(_) => PopBlockResult::TrackEnd,
-            None => PopBlockResult::Underrun,
+            None => {
+                st.track_min_buffered_ns = Some(0);
+                PopBlockResult::Underrun
+            }
         }
     }
 }
@@ -487,15 +595,17 @@ mod tests {
     }
 
     #[test]
-    fn time_based_cap_limits_low_rate_lead_to_twelve_seconds() {
-        // At 44.1 kHz, 12 s is 529,200 frames — far less than DEFAULT_MAX_BUFFERED_FRAMES (4.6M).
+    fn time_based_cap_limits_low_rate_lead_to_default_seconds() {
+        // At 44.1 kHz, DEFAULT_MAX_BUFFERED_SECONDS (24 s) is 1,058,400 frames — far less than
+        // DEFAULT_MAX_BUFFERED_FRAMES (9.2M @ 384 kHz).
+        let cap_secs = DEFAULT_MAX_BUFFERED_SECONDS as usize;
         let buf = BoundedBlockStreamBuffer::new(DEFAULT_MAX_BUFFERED_FRAMES);
         let ep = buf.current_epoch();
         let b_prod = Arc::clone(&buf);
 
-        // Producer tries to push 20 seconds of 44.1 kHz audio (20 blocks of 44,100 frames).
+        // Producer tries to push (cap_secs + 8) seconds of 44.1 kHz audio.
         let producer = thread::spawn(move || {
-            for _ in 0..20 {
+            for _ in 0..(cap_secs + 8) {
                 if !b_prod.push_for_epoch(ep, StreamEvent::PcmBlock(make_block_at(44_100, 44_100)))
                 {
                     break;
@@ -503,25 +613,22 @@ mod tests {
             }
         });
 
-        // Poll deterministically until the producer reaches the 12 s backpressure cap
-        // (up to 2 s deadline — never flaky on loaded CI hosts) and confirm it stays blocked.
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while std::time::Instant::now() < deadline {
-            if buf.buffered_frames() >= 44_100 * 12 {
+            if buf.buffered_frames() >= 44_100 * cap_secs {
                 break;
             }
             thread::sleep(Duration::from_millis(5));
         }
-        // Brief settle to verify the producer is genuinely blocked at the cap and not pushing more.
         thread::sleep(Duration::from_millis(20));
         let buffered = buf.buffered_frames();
         assert!(
-            buffered <= 44_100 * 12,
-            "44.1 kHz buffer should cap at <= 12 s (529,200 frames), got {buffered}"
+            buffered <= 44_100 * cap_secs,
+            "44.1 kHz buffer should cap at <= {cap_secs} s, got {buffered}"
         );
         assert!(
-            buffered >= 44_100 * 11,
-            "producer should have filled up to the 12 s cap, got {buffered}"
+            buffered >= 44_100 * (cap_secs - 1),
+            "producer should have filled up to the {cap_secs} s cap, got {buffered}"
         );
         assert!(
             !producer.is_finished(),
@@ -530,6 +637,33 @@ mod tests {
 
         buf.close();
         producer.join().unwrap();
+    }
+
+    #[test]
+    fn deferred_block_recycling_and_low_water_telemetry_work_off_rt_thread() {
+        let buf = BoundedBlockStreamBuffer::new(DEFAULT_MAX_BUFFERED_FRAMES);
+        let ep = buf.current_epoch();
+
+        // Push 4 blocks of 0.5 s @ 384 kHz (2.0 s total).
+        for _ in 0..4 {
+            assert!(buf.push_for_epoch(ep, StreamEvent::PcmBlock(make_block(192_000))));
+        }
+        buf.reset_track_low_water();
+        assert_eq!(buf.track_min_buffered_ms(), Some(2_000));
+
+        // Pop 2 blocks and recycle them as the RT thread would; drops stay deferred until producer runs.
+        for _ in 0..2 {
+            match buf.try_pop_track_pcm_block(ep) {
+                PopBlockResult::Block(b) => buf.recycle_consumed_block(b),
+                other => panic!("expected Block, got {other:?}"),
+            }
+        }
+        assert_eq!(buf.deferred_drop_count(), 2);
+        assert_eq!(buf.track_min_buffered_ms(), Some(1_000));
+
+        // Next producer push automatically drains the deferred-drop queue off the RT thread.
+        assert!(buf.push_for_epoch(ep, StreamEvent::PcmBlock(make_block(192_000))));
+        assert_eq!(buf.deferred_drop_count(), 0);
     }
 
     #[test]

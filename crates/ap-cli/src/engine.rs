@@ -43,12 +43,27 @@ use crate::prefetch::{
 };
 use crate::signals::{ShutdownController, ShutdownSignal};
 
-/// Responsive chunk size for live HTTP/UPnP streams (~185 ms at 44.1 kHz, ~42 ms at 192 kHz)
-/// so playback starts rapidly and Stop/Pause/Seek aborts promptly while remaining bit-identical.
-const UPNP_SOURCE_BLOCK_FRAMES: usize = 8_192;
+/// Prebuffer cushion for live HTTP/UPnP streams (`2 s` at output rate — absorbs LAN/WAN jitter
+/// and heavy 4M-tap REW/upsampler bursts while starting playback rapidly).
+const UPNP_PREBUFFER_SECONDS: u32 = 2;
 
-/// Prebuffer cushion for live HTTP/UPnP streams (`1 s` at output rate).
-const UPNP_PREBUFFER_SECONDS: u32 = 1;
+/// Target output frames per streaming DSP chunk (`65,536` = exact 1 UPOLS FFT partition,
+/// `~171 ms` @ 384 kHz / `~186 ms` @ 352.8 kHz). Eliminates multi-second monolithic DSP gulps
+/// at `8x–48x` upsampling ratios and keeps end-of-pipeline buffer fill `> 99%` across all rates.
+const TARGET_OUTPUT_BLOCK_FRAMES: usize = 65_536;
+
+/// Compute source read chunk size so each `session.process_block()` produces ~1 UPOLS partition
+/// (`~65,536` output frames) at upsampled rates, or `~0.25 s` on non-8fS `--filter null`.
+fn source_block_frames_for_rates(source_rate_hz: u32, output_rate_hz: u32) -> usize {
+    let src = u64::from(source_rate_hz.max(1));
+    let dst = u64::from(output_rate_hz.max(1));
+    if dst <= src {
+        ((src / 4) as usize).clamp(4_096, DEFAULT_SOURCE_BLOCK_FRAMES)
+    } else {
+        let scaled = ((TARGET_OUTPUT_BLOCK_FRAMES as u64) * src).div_ceil(dst);
+        (scaled as usize).clamp(1_024, DEFAULT_SOURCE_BLOCK_FRAMES)
+    }
+}
 
 /// Run idle mode (`--idle`): print start, park at 0% CPU until signal, print graceful stop.
 pub fn run_idle(controller: &ShutdownController) {
@@ -576,6 +591,22 @@ mod quantizer_policy_tests {
         assert_eq!(p_cli.dac_bits, 20);
         assert_eq!(p_cli.shaper_override, None);
     }
+
+    #[test]
+    fn output_aligned_source_chunk_keeps_every_rate_near_one_upols_partition() {
+        // 8fS upsampled rates align cleanly to ~65,536 output frames (exact 1 UPOLS FFT partition).
+        assert_eq!(source_block_frames_for_rates(384_000, 384_000), 65_536);
+        assert_eq!(source_block_frames_for_rates(192_000, 384_000), 32_768);
+        assert_eq!(source_block_frames_for_rates(96_000, 384_000), 16_384);
+        assert_eq!(source_block_frames_for_rates(44_100, 352_800), 8_192);
+        assert_eq!(source_block_frames_for_rates(22_050, 352_800), 4_096);
+        // 48x (8 kHz -> 384 kHz): ~1,366 source -> ~65,568 output (~171 ms, NOT 8.19 s!).
+        let chunk_8k = source_block_frames_for_rates(8_000, 384_000);
+        assert_eq!(chunk_8k, 1_366);
+        assert!((chunk_8k * 48) <= 66_000);
+        // Non-8fS --filter null pass-through stays responsive (~0.25 s).
+        assert_eq!(source_block_frames_for_rates(44_100, 44_100), 11_025);
+    }
 }
 
 /// Run default zero-config random FLAC playback via bounded-memory block streaming,
@@ -774,6 +805,20 @@ trait BlockStreamAudioSink {
     ) -> Result<PlaybackStats, OutputError>
     where
         F: FnMut() -> ap_output_win::wdm_ks::StreamBlock;
+
+    fn play_block_stream_with_recycler<F, R>(
+        &mut self,
+        sample_rate_hz: u32,
+        wire_format: DacWireFormat,
+        next_block: F,
+        _recycle_block: R,
+    ) -> Result<PlaybackStats, OutputError>
+    where
+        F: FnMut() -> ap_output_win::wdm_ks::StreamBlock,
+        R: FnMut(ap_core::buffer::InterleavedInt32Buffer) + 'static,
+    {
+        self.play_block_stream(sample_rate_hz, wire_format, next_block)
+    }
 }
 
 impl BlockStreamAudioSink for WdmKsSink {
@@ -787,6 +832,26 @@ impl BlockStreamAudioSink for WdmKsSink {
         F: FnMut() -> ap_output_win::wdm_ks::StreamBlock,
     {
         WdmKsSink::play_block_stream(self, sample_rate_hz, wire_format, next_block)
+    }
+
+    fn play_block_stream_with_recycler<F, R>(
+        &mut self,
+        sample_rate_hz: u32,
+        wire_format: DacWireFormat,
+        next_block: F,
+        recycle_block: R,
+    ) -> Result<PlaybackStats, OutputError>
+    where
+        F: FnMut() -> ap_output_win::wdm_ks::StreamBlock,
+        R: FnMut(ap_core::buffer::InterleavedInt32Buffer) + 'static,
+    {
+        WdmKsSink::play_block_stream_with_recycler(
+            self,
+            sample_rate_hz,
+            wire_format,
+            next_block,
+            recycle_block,
+        )
     }
 }
 
@@ -1017,22 +1082,39 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
             // rejected command (e.g. TOCTOU-invalidated PlayFile), drain any remaining queued
             // commands (e.g. a trailing Next or Pause) before clearing stop_handle, and re-check
             // immediately after clearing stop_handle so no command ever loses its stop signal.
+            stream_buf.reset_track_low_water();
             loop {
                 let ep_for_stream = state.active_epoch;
                 let buf_for_stream = Arc::clone(stream_buf);
+                let buf_for_recycle = Arc::clone(stream_buf);
                 let hit_track_end = Arc::new(AtomicBool::new(false));
                 let hit_end_cb = Arc::clone(&hit_track_end);
-                match sink.play_block_stream(out_rate, DacWireFormat::Int32, move || {
-                    match buf_for_stream.try_pop_track_pcm_block(ep_for_stream) {
+                let play_res = sink.play_block_stream_with_recycler(
+                    out_rate,
+                    DacWireFormat::Int32,
+                    move || match buf_for_stream.try_pop_track_pcm_block(ep_for_stream) {
                         PopBlockResult::Block(b) => ap_output_win::wdm_ks::StreamBlock::Ready(b),
                         PopBlockResult::Underrun => ap_output_win::wdm_ks::StreamBlock::Underrun,
                         PopBlockResult::TrackEnd | PopBlockResult::StaleOrClosed => {
                             hit_end_cb.store(true, Ordering::SeqCst);
                             ap_output_win::wdm_ks::StreamBlock::EndOfTrack
                         }
-                    }
-                }) {
-                    Ok(_stats) => {
+                    },
+                    move |consumed| buf_for_recycle.recycle_consumed_block(consumed),
+                );
+                stream_buf.drain_deferred_drops();
+                match play_res {
+                    Ok(stats) => {
+                        if stats.underrun_halves > 0 {
+                            let warn_msg = format!(
+                                "Buffer underrun on '{}' ({} Hz): {} DMA half-buffer(s) padded with silence",
+                                path.display(),
+                                out_rate,
+                                stats.underrun_halves
+                            );
+                            eprintln!("  [underrun warn] {warn_msg}");
+                            shared.record_action(warn_msg);
+                        }
                         if !hit_track_end.load(Ordering::SeqCst)
                             && controller.current_signal().is_none()
                         {
@@ -1746,6 +1828,9 @@ fn stream_single_track(
         }
     };
 
+    let src_block_frames =
+        source_block_frames_for_rates(spec.sample_rate_hz, session.report().output_rate_hz);
+
     // Review #3 Finding #3: decode and validate the first non-empty block BEFORE touching
     // `incoming_carryover` or closing `TrackEnd(prev)`. If this track is 0-frame or corrupt on
     // its first block, `incoming_carryover` is drained intact onto the previous track!
@@ -1753,7 +1838,7 @@ fn stream_single_track(
         if ctrl.epoch() != epoch {
             return (TrackStreamOutcome::Aborted, None, false);
         }
-        match source.read_next_block(DEFAULT_SOURCE_BLOCK_FRAMES) {
+        match source.read_next_block(src_block_frames) {
             Ok(Some(b)) if b.is_empty() => continue,
             Ok(Some(b)) => break b,
             Ok(None) => {
@@ -1931,7 +2016,7 @@ fn stream_single_track(
         let next_src = if let Some(b) = pending_first_block.take() {
             b
         } else {
-            match source.read_next_block(DEFAULT_SOURCE_BLOCK_FRAMES) {
+            match source.read_next_block(src_block_frames) {
                 Ok(Some(b)) => b,
                 Ok(None) => break, // clean EOF
                 Err(err) => {
@@ -2146,7 +2231,7 @@ fn stream_upnp_request(
             },
             PlayModeLabel::UpnpRenderer,
             seg_duration,
-            UPNP_SOURCE_BLOCK_FRAMES,
+            None,
             incoming_carryover,
             panic_backup_carry,
             had_pending_prev_end,
@@ -2190,7 +2275,7 @@ fn stream_open_audio_source<S: AudioBlockSource>(
     upnp_next_gen: Option<u64>,
     mode_label: PlayModeLabel,
     total_duration_s: Option<f64>,
-    block_frames: usize,
+    block_frames_override: Option<usize>,
     incoming_carryover: &mut Option<GaplessCarryover>,
     panic_backup_carry: &mut Option<GaplessCarryover>,
     had_pending_prev_end: &mut bool,
@@ -2250,6 +2335,10 @@ fn stream_open_audio_source<S: AudioBlockSource>(
             );
         }
     };
+
+    let block_frames = block_frames_override.unwrap_or_else(|| {
+        source_block_frames_for_rates(spec.sample_rate_hz, session.report().output_rate_hz)
+    });
 
     let first_src = loop {
         if ctrl.epoch() != epoch {
@@ -3985,6 +4074,7 @@ mod tests {
                     wavert_buffer_bytes: 0,
                     notifications: 1,
                     mmcss_pro_audio: false,
+                    underrun_halves: 0,
                 })
             }
         }
@@ -4367,6 +4457,7 @@ mod tests {
                     wavert_buffer_bytes: 0,
                     notifications: 0,
                     mmcss_pro_audio: false,
+                    underrun_halves: 0,
                 })
             }
         }
@@ -4664,6 +4755,7 @@ mod tests {
                     wavert_buffer_bytes: 0,
                     notifications: 1,
                     mmcss_pro_audio: false,
+                    underrun_halves: 0,
                 })
             }
         }

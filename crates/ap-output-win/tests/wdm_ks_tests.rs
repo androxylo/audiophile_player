@@ -516,13 +516,19 @@ fn wavert_loop_controller_recovers_from_nonblocking_underrun_without_truncating_
     ]
     .into_iter();
 
+    let recycled_blocks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let recycled_cb = std::sync::Arc::clone(&recycled_blocks);
     let mut pump = StreamingWaveRtPump::new(384_000, DacWireFormat::Int32, move || {
         sequence.next().unwrap_or(StreamBlock::EndOfTrack)
+    })
+    .with_recycler(move |_old| {
+        recycled_cb.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     });
     let mut ring = vec![0xFF_u8; 64];
     let mut ctrl = WaveRtLoopController::new(layout);
 
     ctrl.prefill(&mut ring, &mut pump).unwrap();
+    assert_eq!(ctrl.underrun_halves(), 0);
 
     // Wake 1 (half 0): underrun -> fills half 0 with silence, MUST Continue!
     let (h1, out1) = ctrl
@@ -532,6 +538,7 @@ fn wavert_loop_controller_recovers_from_nonblocking_underrun_without_truncating_
     assert_eq!(out1, WaveRtStepOutcome::Continue);
     assert_eq!(&ring[0..32], &[0u8; 32]);
     assert_eq!(ctrl.frames_played(), 4);
+    assert_eq!(ctrl.underrun_halves(), 1);
 
     // Wake 2 (half 1): second underrun -> fills half 1 with silence, MUST still Continue!
     let (h2, out2) = ctrl
@@ -541,6 +548,8 @@ fn wavert_loop_controller_recovers_from_nonblocking_underrun_without_truncating_
     assert_eq!(out2, WaveRtStepOutcome::Continue);
     assert_eq!(&ring[32..64], &[0u8; 32]);
     assert_eq!(ctrl.frames_played(), 8);
+    assert_eq!(ctrl.underrun_halves(), 2);
+    assert_eq!(pump.underrun_events(), 2);
 
     // Wake 3 (half 0): producer recovers with 4 frames of [2, -2]!
     let (h3, out3) = ctrl
@@ -555,6 +564,12 @@ fn wavert_loop_controller_recovers_from_nonblocking_underrun_without_truncating_
         .on_notification(&mut ring, &mut pump, false, Some(128))
         .unwrap();
     assert_eq!(out4, WaveRtStepOutcome::Continue);
+    assert_eq!(ctrl.underrun_halves(), 2);
+    assert_eq!(
+        recycled_blocks.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "both consumed Ready blocks must be handed to the off-RT recycler"
+    );
 
     // Wake 5 (half 0): recovered half 0 finished DMA -> trailing_silent_halves = 2 -> Finished!
     let (_, out5) = ctrl

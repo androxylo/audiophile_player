@@ -15,6 +15,8 @@ pub struct PlaybackStats {
     pub wavert_buffer_bytes: u32,
     pub notifications: usize,
     pub mmcss_pro_audio: bool,
+    /// Number of DMA half-buffer fills that encountered a producer underrun (silence padded).
+    pub underrun_halves: usize,
 }
 
 /// Errors returned by zero-mixer Windows audio output backends.

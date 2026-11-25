@@ -533,6 +533,11 @@ pub trait WaveRtPumpSource {
     fn take_error(&mut self) -> Option<OutputError> {
         None
     }
+
+    /// Number of non-blocking producer underrun events encountered during streaming.
+    fn underrun_events(&self) -> usize {
+        0
+    }
 }
 
 impl WaveRtPumpSource for WaveRtFramePump<'_> {
@@ -558,20 +563,22 @@ impl WaveRtPumpSource for WaveRtFramePump<'_> {
 }
 
 /// Streaming WaveRT ring-buffer pump that pulls bounded `InterleavedInt32Buffer` blocks
-/// lazily across block boundaries with zero gaps, non-blocking underrun silence, and
-/// click-free fade-out on stop.
+/// lazily across block boundaries with zero gaps, non-blocking underrun silence, deferred
+/// off-RT-thread block recycling, and click-free fade-out on stop.
 pub struct StreamingWaveRtPump<F, B = StreamBlock>
 where
     F: FnMut() -> B,
     B: Into<StreamBlock>,
 {
     next_block: F,
+    recycler: Option<Box<dyn FnMut(InterleavedInt32Buffer)>>,
     current: Option<InterleavedInt32Buffer>,
     cursor: usize,
     expected_sample_rate_hz: u32,
     wire_format: DacWireFormat,
     dither: WireDitherState,
     total_frames_written: usize,
+    underrun_events: usize,
     eof: bool,
     pending_error: Option<OutputError>,
     _marker: PhantomData<fn() -> B>,
@@ -585,16 +592,37 @@ where
     pub fn new(expected_sample_rate_hz: u32, wire_format: DacWireFormat, next_block: F) -> Self {
         Self {
             next_block,
+            recycler: None,
             current: None,
             cursor: 0,
             expected_sample_rate_hz,
             wire_format,
             dither: WireDitherState::default(),
             total_frames_written: 0,
+            underrun_events: 0,
             eof: false,
             pending_error: None,
             _marker: PhantomData,
         }
+    }
+
+    /// Attach a callback that receives consumed `InterleavedInt32Buffer` blocks so the real-time
+    /// MMCSS WaveRT thread never invokes `HeapFree` / `VirtualFree` on large PCM buffers.
+    pub fn with_recycler<R>(mut self, recycler: R) -> Self
+    where
+        R: FnMut(InterleavedInt32Buffer) + 'static,
+    {
+        self.recycler = Some(Box::new(recycler));
+        self
+    }
+
+    fn release_current(&mut self) {
+        if let Some(old) = self.current.take() {
+            if let Some(ref mut recycle) = self.recycler {
+                recycle(old);
+            }
+        }
+        self.cursor = 0;
     }
 
     fn ensure_current(&mut self) -> bool {
@@ -604,15 +632,18 @@ where
                     return true;
                 }
             }
+            self.release_current();
             match (self.next_block)().into() {
                 StreamBlock::Ready(buf) if !buf.frames.is_empty() => {
                     if buf.sample_rate_hz != self.expected_sample_rate_hz {
-                        self.current = None;
-                        self.cursor = 0;
+                        let bad_rate = buf.sample_rate_hz;
+                        if let Some(ref mut recycle) = self.recycler {
+                            recycle(buf);
+                        }
                         self.eof = true;
                         self.pending_error = Some(OutputError::InvalidBuffer(format!(
                             "stream block sample rate mismatch: pin is {} Hz, block is {} Hz",
-                            self.expected_sample_rate_hz, buf.sample_rate_hz
+                            self.expected_sample_rate_hz, bad_rate
                         )));
                         return false;
                     }
@@ -620,23 +651,35 @@ where
                     self.cursor = 0;
                     return true;
                 }
-                StreamBlock::Ready(_) => continue, // skip empty block
+                StreamBlock::Ready(empty) => {
+                    if let Some(ref mut recycle) = self.recycler {
+                        recycle(empty);
+                    }
+                    continue; // skip empty block
+                }
                 StreamBlock::Underrun => {
                     // Temporary non-blocking underrun: emit silence for this half without
                     // marking EOF so playback recovers seamlessly once the producer catches up.
-                    self.current = None;
-                    self.cursor = 0;
+                    self.underrun_events = self.underrun_events.saturating_add(1);
                     return false;
                 }
                 StreamBlock::EndOfTrack => {
-                    self.current = None;
-                    self.cursor = 0;
                     self.eof = true;
                     return false;
                 }
             }
         }
         false
+    }
+}
+
+impl<F, B> Drop for StreamingWaveRtPump<F, B>
+where
+    F: FnMut() -> B,
+    B: Into<StreamBlock>,
+{
+    fn drop(&mut self) {
+        self.release_current();
     }
 }
 
@@ -720,6 +763,10 @@ where
 
     fn take_error(&mut self) -> Option<OutputError> {
         self.pending_error.take()
+    }
+
+    fn underrun_events(&self) -> usize {
+        self.underrun_events
     }
 }
 
@@ -951,6 +998,7 @@ pub struct WaveRtLoopController {
     completed_audio_frames: usize,
     spurious_wakes: usize,
     coalesced_wakes: usize,
+    underrun_halves: usize,
     trailing_silent_halves: usize,
     stopping_fade_done: bool,
 }
@@ -989,6 +1037,7 @@ impl WaveRtLoopController {
             completed_audio_frames: 0,
             spurious_wakes: 0,
             coalesced_wakes: 0,
+            underrun_halves: 0,
             trailing_silent_halves: 0,
             stopping_fade_done: false,
         }
@@ -1027,6 +1076,11 @@ impl WaveRtLoopController {
     /// Number of coalesced notifications (`>= 2` half-boundaries crossed between wakes).
     pub fn coalesced_wakes(&self) -> usize {
         self.coalesced_wakes
+    }
+
+    /// Number of DMA half-buffer refills that received zero frames from a non-EOF producer.
+    pub fn underrun_halves(&self) -> usize {
+        self.underrun_halves
     }
 
     /// Current estimated hardware play-cursor lag in bytes (strictly `0` for boundary-quantized
@@ -1937,6 +1991,7 @@ impl WaveRtLoopController {
             } else {
                 // Non-blocking producer underrun: digital silence was written into this half;
                 // stay alive until audio resumes or stop_requested becomes true.
+                self.underrun_halves = self.underrun_halves.saturating_add(1);
                 self.trailing_silent_halves = 0;
             }
         } else {
@@ -2218,6 +2273,27 @@ impl WdmKsSink {
         self.run_wavert_pump(sample_rate_hz, wire_format, &mut pump)
     }
 
+    /// Stream bounded `InterleavedInt32Buffer` blocks like [`Self::play_block_stream`], handing
+    /// consumed blocks to `recycle_block` so the real-time MMCSS WaveRT thread never frees large
+    /// PCM buffers directly.
+    #[cfg(windows)]
+    pub fn play_block_stream_with_recycler<F, B, R>(
+        &mut self,
+        sample_rate_hz: u32,
+        wire_format: DacWireFormat,
+        next_block: F,
+        recycle_block: R,
+    ) -> Result<PlaybackStats, OutputError>
+    where
+        F: FnMut() -> B,
+        B: Into<StreamBlock>,
+        R: FnMut(InterleavedInt32Buffer) + 'static,
+    {
+        let mut pump = StreamingWaveRtPump::new(sample_rate_hz, wire_format, next_block)
+            .with_recycler(recycle_block);
+        self.run_wavert_pump(sample_rate_hz, wire_format, &mut pump)
+    }
+
     /// Empirically probe live WaveRT notification (`GET` vs `SET`) and hardware position
     /// properties (`POSITIONREGISTER` and `KSPROPERTY_AUDIO_POSITION`) on the opened DAC.
     #[cfg(windows)]
@@ -2343,6 +2419,7 @@ impl WdmKsSink {
                 wavert_buffer_bytes: 0,
                 notifications: 0,
                 mmcss_pro_audio: false,
+                underrun_halves: 0,
             });
         }
 
@@ -2464,6 +2541,7 @@ impl WdmKsSink {
             wavert_buffer_bytes: rt_buf.ActualBufferSize,
             notifications,
             mmcss_pro_audio: mmcss.is_active(),
+            underrun_halves: controller.underrun_halves().max(pump.underrun_events()),
         })
     }
 }
