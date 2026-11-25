@@ -277,3 +277,38 @@ fn parses_and_validates_quantizer_section_with_strict_dac_bits_and_shaper() {
     assert!(PlayerConfig::from_toml_str("[quantizer]\ndac_bits = 24\n[quantizer]\n").is_err());
     assert!(PlayerConfig::from_toml_str("[quantizer]\nunknown_key = 1\n").is_err());
 }
+
+#[test]
+fn parses_and_validates_ultimate_and_trackdb_sections_with_locked_defaults() {
+    let default_cfg = PlayerConfig::default();
+    assert!(!default_cfg.ultimate.enabled);
+    assert!(default_cfg.ultimate.genre_rules);
+    assert!(default_cfg.ultimate.learn_on_play);
+    assert_eq!(default_cfg.trackdb.dir, None);
+    assert!(!default_cfg.trackdb.sidecar);
+
+    let toml = r#"
+[ultimate]
+enabled = true
+genre_rules = false
+learn_on_play = false
+
+[trackdb]
+dir = 'D:\AudioCache\trackdb'
+sidecar = true
+"#;
+    let cfg = PlayerConfig::from_toml_str(toml).unwrap();
+    assert!(cfg.ultimate.enabled);
+    assert!(!cfg.ultimate.genre_rules);
+    assert!(!cfg.ultimate.learn_on_play);
+    assert_eq!(cfg.trackdb.dir, Some(PathBuf::from(r"D:\AudioCache\trackdb")));
+    assert!(cfg.trackdb.sidecar);
+
+    // Reject duplicate sections, duplicate keys, and unknown keys (including removed OQ-36/OQ-40 keys).
+    assert!(PlayerConfig::from_toml_str("[ultimate]\nenabled = true\n[ultimate]\n").is_err());
+    assert!(PlayerConfig::from_toml_str("[ultimate]\nenabled = true\nenabled = false\n").is_err());
+    assert!(PlayerConfig::from_toml_str("[ultimate]\nalbum_context = true\n").is_err());
+    assert!(PlayerConfig::from_toml_str("[trackdb]\nsidecar = true\n[trackdb]\n").is_err());
+    assert!(PlayerConfig::from_toml_str("[trackdb]\nsidecar = true\nsidecar = false\n").is_err());
+    assert!(PlayerConfig::from_toml_str("[trackdb]\nunknown = 1\n").is_err());
+}

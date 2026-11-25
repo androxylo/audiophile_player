@@ -22,7 +22,9 @@ use ap_control::state::{ControlCommand, PlayModeLabel, SharedControl, UpnpPlayRe
 use ap_core::buffer::DEFAULT_SOURCE_BLOCK_FRAMES;
 use std::str::FromStr;
 
-use ap_core::config::{ConvolutionConfig, PlayerConfig, QuantizerConfig};
+use ap_core::config::{
+    ConvolutionConfig, PlayerConfig, QuantizerConfig, TrackDbConfig, UltimateConfig,
+};
 use ap_core::format::DacWireFormat;
 use ap_dsp::pipeline::{AudioPipeline, GaplessAttachOutcome, GaplessCarryover};
 use ap_dsp::selector::{NoiseShaperProfile, UNSUPPORTED_SAMPLE_RATE_PREFIX, UpsamplerPolicy};
@@ -36,7 +38,7 @@ use ap_source::http_stream::{HttpAudioSource, HttpStreamHints};
 use ap_source::library::{SequentialFlacCursor, default_user_music_dir, pick_random_flac_walk};
 use ap_upnp::{UpnpRendererConfig, UpnpRendererServer, UpnpRendererState};
 
-use crate::cli_args::{QuantizerCliOverride, UpnpCliOverride};
+use crate::cli_args::{QuantizerCliOverride, UltimateCliOverride, UpnpCliOverride};
 use crate::prefetch::{
     BoundedBlockStreamBuffer, DEFAULT_MAX_BUFFERED_FRAMES, PREBUFFER_SECONDS, PopBlockResult,
     StreamEvent,
@@ -618,11 +620,13 @@ pub fn run_random_music_player(
     music_dir_override: Option<PathBuf>,
     device_filter: Option<String>,
     optimization: OptimizationLevel,
+    optimization_explicit: bool,
     http_port: Option<u16>,
     upsampler_policy: UpsamplerPolicy,
     quantizer_override: QuantizerCliOverride,
     rew_override: Option<ConvolutionConfig>,
     upnp_override: UpnpCliOverride,
+    ultimate_override: UltimateCliOverride,
     controller: &ShutdownController,
 ) -> Result<(), String> {
     let loaded_cfg = PlayerConfig::discover_and_load(config_path.as_deref())?;
@@ -633,6 +637,32 @@ pub fn run_random_music_player(
         quantizer_override,
         &loaded_cfg.config.quantizer,
     )?;
+
+    let effective_ultimate = UltimateConfig {
+        enabled: ultimate_override
+            .enabled
+            .unwrap_or(loaded_cfg.config.ultimate.enabled),
+        genre_rules: ultimate_override
+            .genre_rules
+            .unwrap_or(loaded_cfg.config.ultimate.genre_rules),
+        learn_on_play: ultimate_override
+            .learn_on_play
+            .unwrap_or(loaded_cfg.config.ultimate.learn_on_play),
+    };
+    let effective_trackdb = TrackDbConfig {
+        dir: ultimate_override
+            .trackdb_dir
+            .or(loaded_cfg.config.trackdb.dir),
+        sidecar: ultimate_override
+            .trackdb_sidecar
+            .unwrap_or(loaded_cfg.config.trackdb.sidecar),
+    };
+    let optimization = if effective_ultimate.enabled && !optimization_explicit {
+        OptimizationLevel::Extreme
+    } else {
+        optimization
+    };
+    let _ = (&effective_ultimate, &effective_trackdb);
 
     let upnp_explicit = upnp_override.port.is_some()
         || upnp_override.bind_ip.is_some()

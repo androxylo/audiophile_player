@@ -36,6 +36,16 @@ pub struct UpnpCliOverride {
     pub bind_ip: Option<Ipv4Addr>,
 }
 
+/// Explicit CLI overrides for `[ultimate]` and `[trackdb]` (`--ultimate`, `--no-ultimate`, etc.).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UltimateCliOverride {
+    pub enabled: Option<bool>,
+    pub genre_rules: Option<bool>,
+    pub learn_on_play: Option<bool>,
+    pub trackdb_dir: Option<PathBuf>,
+    pub trackdb_sidecar: Option<bool>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunMode {
     /// Default zero-option mode: play random FLACs from `music_dir` via WDM-KS + local HTTP UI + UPnP MediaRenderer.
@@ -44,6 +54,7 @@ pub enum RunMode {
         music_dir: Option<PathBuf>,
         device_filter: Option<String>,
         optimization: OptimizationLevel,
+        optimization_explicit: bool,
         http_port: Option<u16>,
         upsampler_policy: UpsamplerPolicy,
         /// Explicit CLI overrides for `[quantizer]` in `config.toml`.
@@ -52,6 +63,8 @@ pub enum RunMode {
         rew_override: Option<ConvolutionConfig>,
         /// Explicit CLI overrides for `[upnp]` in `config.toml`.
         upnp_override: UpnpCliOverride,
+        /// Explicit CLI overrides for `[ultimate]` and `[trackdb]` in `config.toml`.
+        ultimate_override: UltimateCliOverride,
     },
     /// Offline parallel resumable library scanner (`audiophile-player scan <folder> [OPTIONS]`).
     Scan {
@@ -94,11 +107,13 @@ where
     let mut music_dir: Option<PathBuf> = None;
     let mut device_filter: Option<String> = None;
     let mut optimization = OptimizationLevel::High;
+    let mut optimization_explicit = false;
     let mut http_port: Option<u16> = None;
     let mut upsampler_policy = UpsamplerPolicy::default();
     let mut quantizer_override = QuantizerCliOverride::default();
     let mut rew_override: Option<ConvolutionConfig> = None;
     let mut upnp_override = UpnpCliOverride::default();
+    let mut ultimate_override = UltimateCliOverride::default();
     let mut idle = false;
 
     while let Some(arg_raw) = iter.next() {
@@ -250,6 +265,27 @@ where
                     .map_err(|_| format!("invalid --upnp-bind IPv4 address '{val_str}'"))?;
                 upnp_override.bind_ip = Some(ip);
             }
+            "--ultimate" => {
+                ultimate_override.enabled = Some(true);
+            }
+            "--no-ultimate" => {
+                ultimate_override.enabled = Some(false);
+            }
+            "--no-genre-rules" => {
+                ultimate_override.genre_rules = Some(false);
+            }
+            "--no-learn-on-play" => {
+                ultimate_override.learn_on_play = Some(false);
+            }
+            "--trackdb-dir" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| "--trackdb-dir requires a directory path".to_string())?;
+                ultimate_override.trackdb_dir = Some(PathBuf::from(val));
+            }
+            "--trackdb-sidecar" => {
+                ultimate_override.trackdb_sidecar = Some(true);
+            }
             "--opt" => {
                 let val = iter
                     .next()
@@ -265,6 +301,7 @@ where
                         ));
                     }
                 };
+                optimization_explicit = true;
             }
             unknown => {
                 return Err(format!(
@@ -285,11 +322,13 @@ where
         music_dir,
         device_filter,
         optimization,
+        optimization_explicit,
         http_port,
         upsampler_policy,
         quantizer_override,
         rew_override,
         upnp_override,
+        ultimate_override,
     })
 }
 
@@ -434,6 +473,13 @@ pub fn help_text() -> String {
                                 2-ch WAV matching 352.8 / 384 kHz)\n\
            --conv-file <PATH>   Override config: explicit 2-ch REW WAV file\n\
            --no-conv            Override config: disable REW stereo convolution\n\
+           --ultimate           Enable Ultimate Mode (30 s look-ahead, per-track H/A/L/B analysis,\n\
+                                full-tail REW, exact-M fixed gain, learn-on-play YAML DB)\n\
+           --no-ultimate        Force-disable Ultimate Mode even if enabled in config.toml\n\
+           --no-genre-rules     Disable Rule G genre-aware filter defaults in Ultimate Mode\n\
+           --no-learn-on-play   Disable YAML trackdb write-back at clean EOF in Ultimate Mode\n\
+           --trackdb-dir <PATH> Override central Schema-1 YAML trackdb folder\n\
+           --trackdb-sidecar    Persist `<track.flac>.ap.yaml` sidecars next to local files\n\
            --opt <LEVEL>        KS priority tier: normal | high | extreme (default: high)\n\
            --idle               Start idle without opening audio hardware (signal test mode)\n\
            -h, --help           Show this help message\n",
@@ -455,11 +501,13 @@ mod tests {
                 music_dir: None,
                 device_filter: None,
                 optimization: OptimizationLevel::High,
+                optimization_explicit: false,
                 http_port: None,
                 upsampler_policy: UpsamplerPolicy::default(),
                 quantizer_override: QuantizerCliOverride::default(),
                 rew_override: None,
                 upnp_override: UpnpCliOverride::default(),
+                ultimate_override: UltimateCliOverride::default(),
             }
         );
     }
@@ -492,6 +540,11 @@ mod tests {
             "2000000",
             "--conv-file",
             r"C:\Filters\room-384k.wav",
+            "--ultimate",
+            "--no-genre-rules",
+            "--trackdb-dir",
+            r"C:\TrackDb",
+            "--trackdb-sidecar",
             "--opt",
             "extreme",
         ])
@@ -503,6 +556,7 @@ mod tests {
                 music_dir: Some(PathBuf::from(r"D:\Audio")),
                 device_filter: Some("Gungnir 2".to_string()),
                 optimization: OptimizationLevel::Extreme,
+                optimization_explicit: true,
                 http_port: Some(8090),
                 upsampler_policy: UpsamplerPolicy {
                     filter_override: Some(FilterArchetype::SincSteep4M),
@@ -522,6 +576,13 @@ mod tests {
                     friendly_name: Some("Living Room DAC".to_string()),
                     port: Some(49170),
                     bind_ip: Some(Ipv4Addr::new(192, 168, 0, 187)),
+                },
+                ultimate_override: UltimateCliOverride {
+                    enabled: Some(true),
+                    genre_rules: Some(false),
+                    learn_on_play: None,
+                    trackdb_dir: Some(PathBuf::from(r"C:\TrackDb")),
+                    trackdb_sidecar: Some(true),
                 },
             }
         );

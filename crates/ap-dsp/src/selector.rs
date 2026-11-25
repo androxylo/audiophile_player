@@ -21,9 +21,14 @@ use std::sync::Arc;
 
 use ap_core::config::{DEFAULT_DAC_BITS, is_valid_dac_bits};
 use ap_core::format::{StreamSpec, TargetDspRate};
+use ap_core::metadata::{GenreClass, PhaseTagOverride};
 
 use crate::MAX_FILTER_TAPS;
+use crate::fusion::{EvidenceSource, FusedTrackEvidence};
 use crate::upsampler::planned_taps_for_archetype;
+
+/// Hard look-ahead ceiling in seconds for Ultimate Mode (Mandates M1–M4; non-configurable).
+pub const ULTIMATE_LOOKAHEAD_SECONDS: u32 = 30;
 
 /// Minimum sane source sample rate accepted by the DSP pipeline (protects against corrupt
 /// ultra-low-rate headers causing extreme upsampling ratios and OOM allocations).
@@ -797,5 +802,497 @@ fn auto_select_shaper(
         NoiseShaperProfile::NsGentle2
     } else {
         NoiseShaperProfile::TpdfDither
+    }
+}
+
+impl FilterArchetype {
+    /// Returns `true` when this filter archetype is permitted on live/HTTP/Tidal streaming sources.
+    ///
+    /// Mandate M4: mega-tap `#3 gauss-apod-4m` (and 4M-class long-FFT archetypes) are **local files
+    /// only** because streaming sources cannot buffer beyond 30 s and must start with low latency.
+    pub const fn is_streaming_safe(self) -> bool {
+        !matches!(
+            self,
+            Self::GaussApod4M | Self::SincSteep4M | Self::ExtSharpLp
+        )
+    }
+}
+
+/// Structured audit trail of how [`select_ultimate_plan`] resolved a single track (`U13`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UltimateSelection {
+    pub plan: SelectedDspPlan,
+    /// Display mode label: `"ultimate: cached"`, `"ultimate: live"`, or `"normal (<30 s)"`.
+    pub mode_label: String,
+    /// Winning rule identifier (e.g. `"rule_A_apodizing"`, `"rule_G_classical"`, `"short_track_bypass"`).
+    pub winning_rule: String,
+    /// Ordered list of all rules/signals that fired for this track.
+    pub fired_rules: Vec<String>,
+    /// True when M3 bypassed ultimate analysis because the track is `< 30 s`.
+    pub short_track_bypass: bool,
+    /// Optional non-fatal warnings (e.g. streaming guard overriding `gauss-apod-4m`, MQA, stale tags).
+    pub warnings: Vec<String>,
+}
+
+/// Pluggable [`FilterSelector`] implementing the Ultimate Mode §3 decision table
+/// (`docs/research/07-ultimate-mode.md` §3 + resolved `OQ-34`, `OQ-35`, `OQ-37`, `OQ-40`).
+///
+/// Strictly per-track: depends solely on this track's own [`TrackSourceInfo`] and fused evidence.
+#[derive(Debug, Clone)]
+pub struct UltimateSelector {
+    pub fused: FusedTrackEvidence,
+    pub genre_rules: bool,
+}
+
+impl FilterSelector for UltimateSelector {
+    fn name(&self) -> &'static str {
+        "ultimate-selector"
+    }
+
+    fn select_filter(
+        &self,
+        source: &TrackSourceInfo,
+        ratio: UpsampleRatio,
+    ) -> (FilterArchetype, String) {
+        let (filter, _rule, detail, _warnings) = resolve_ultimate_filter_choice(
+            source.sample_rate_hz,
+            source.is_streaming_source,
+            ratio,
+            &self.fused,
+            self.genre_rules,
+        );
+        (filter, detail)
+    }
+}
+
+fn streaming_safe_fallback(is_effective_1x: bool) -> FilterArchetype {
+    if is_effective_1x {
+        FilterArchetype::GaussLongLp
+    } else {
+        FilterArchetype::GaussHiresLp
+    }
+}
+
+fn resolve_ultimate_filter_choice(
+    sample_rate_hz: u32,
+    is_streaming: bool,
+    ratio: UpsampleRatio,
+    fused: &FusedTrackEvidence,
+    genre_rules: bool,
+) -> (FilterArchetype, String, String, Vec<String>) {
+    let mut warnings = Vec::new();
+
+    if ratio == UpsampleRatio::Bypass1x || sample_rate_hz >= 352_800 {
+        return (
+            FilterArchetype::Null,
+            "native_8fs".to_string(),
+            format!("ultimate: native 8fS ({sample_rate_hz} Hz) -> null"),
+            warnings,
+        );
+    }
+
+    let is_fake_hires = fused.effective_nyquist_hz.value.is_some();
+    let is_effective_1x = sample_rate_hz <= 48_000 || is_fake_hires;
+
+    // Priority 1: Explicit user override (YAML `user.filter` > Vorbis `AP_FILTER`).
+    if let Some(ref uf) = fused.user_filter {
+        match FilterArchetype::from_str(&uf.value) {
+            Ok(arch) => {
+                if is_streaming && !arch.is_streaming_safe() {
+                    let fb = streaming_safe_fallback(is_effective_1x);
+                    warnings.push(format!(
+                        "M4 streaming guard: user override '{}' is local-only; using '{}'",
+                        arch, fb
+                    ));
+                    return (
+                        fb,
+                        "streaming_guard_user".to_string(),
+                        format!(
+                            "ultimate: streaming guard substituted {fb} for local-only {arch} ({})",
+                            uf.source.as_str()
+                        ),
+                        warnings,
+                    );
+                }
+                return (
+                    arch,
+                    format!("user_filter({})", uf.source.as_str()),
+                    format!("ultimate: user override {} ({})", arch, uf.detail),
+                    warnings,
+                );
+            }
+            Err(err) => {
+                warnings.push(format!(
+                    "ignoring unrecognized user filter override '{}': {err}",
+                    uf.value
+                ));
+            }
+        }
+    }
+
+    // Priority 2: Explicit user `AP_PHASE` Vorbis tag (`min` -> #6, `ip` -> #7).
+    if let Some(ref phase_ev) = fused.phase_override {
+        match phase_ev.value {
+            PhaseTagOverride::Minimum => {
+                return (
+                    FilterArchetype::MinphaseLong,
+                    "user_phase_min".to_string(),
+                    format!("ultimate: {} -> minphase-long", phase_ev.detail),
+                    warnings,
+                );
+            }
+            PhaseTagOverride::Intermediate => {
+                return (
+                    FilterArchetype::IntermediateLong,
+                    "user_phase_ip".to_string(),
+                    format!("ultimate: {} -> intermediate-long", phase_ev.detail),
+                    warnings,
+                );
+            }
+            PhaseTagOverride::Linear => {}
+        }
+    }
+
+    // Priority 3: Rule A — Apodizing needed (highest automatic priority: A > L > G > R).
+    if fused.apodizing.value {
+        if is_streaming {
+            let fb = streaming_safe_fallback(is_effective_1x);
+            return (
+                fb,
+                "rule_A_streaming".to_string(),
+                format!(
+                    "ultimate: Rule A ({}) on stream (M4 local-only gauss-apod-4m) -> {fb}",
+                    fused.apodizing.detail
+                ),
+                warnings,
+            );
+        }
+        return (
+            FilterArchetype::GaussApod4M,
+            "rule_A_apodizing".to_string(),
+            format!(
+                "ultimate: Rule A ({}, {}) -> gauss-apod-4m",
+                fused.apodizing.source.as_str(),
+                fused.apodizing.detail
+            ),
+            warnings,
+        );
+    }
+
+    // Priority 4: Rule L — Loud & clipped (`OQ-34`: local -> #3 gauss-apod-4m, stream -> #1/#2).
+    if fused.loud_and_clipped.value {
+        if is_streaming {
+            let fb = streaming_safe_fallback(is_effective_1x);
+            return (
+                fb,
+                "rule_L_streaming".to_string(),
+                format!(
+                    "ultimate: Rule L ({}) on stream -> {fb}",
+                    fused.loud_and_clipped.detail
+                ),
+                warnings,
+            );
+        }
+        return (
+            FilterArchetype::GaussApod4M,
+            "rule_L_loud_clipped".to_string(),
+            format!(
+                "ultimate: Rule L ({}, {}) -> gauss-apod-4m",
+                fused.loud_and_clipped.source.as_str(),
+                fused.loud_and_clipped.detail
+            ),
+            warnings,
+        );
+    }
+
+    // Priority 5: Rule G — Genre-aware defaults (`OQ-35`, enabled by default, lowest priority A > L > G > R).
+    if genre_rules && is_effective_1x {
+        match fused.genre_class.value {
+            GenreClass::Classical => {
+                let arch = if is_streaming {
+                    FilterArchetype::GaussLongLp
+                } else {
+                    FilterArchetype::SincSteep4M
+                };
+                return (
+                    arch,
+                    "rule_G_classical".to_string(),
+                    format!("ultimate: Rule G (Classical) -> {arch}"),
+                    warnings,
+                );
+            }
+            GenreClass::JazzAcoustic => {
+                return (
+                    FilterArchetype::GaussLongLp,
+                    "rule_G_jazz_acoustic".to_string(),
+                    "ultimate: Rule G (Jazz/Acoustic) -> gauss-long-lp".to_string(),
+                    warnings,
+                );
+            }
+            GenreClass::RockPopElectronic => {
+                let arch = if is_streaming {
+                    FilterArchetype::GaussLongLp
+                } else {
+                    FilterArchetype::ExtSharpLp
+                };
+                return (
+                    arch,
+                    "rule_G_rock_pop_electronic".to_string(),
+                    format!("ultimate: Rule G (Rock/Pop/Electronic) -> {arch}"),
+                    warnings,
+                );
+            }
+            GenreClass::AmbientSoundtrack => {
+                return (
+                    FilterArchetype::GaussLongLp,
+                    "rule_G_ambient_soundtrack".to_string(),
+                    "ultimate: Rule G (Ambient/Soundtrack) -> gauss-long-lp".to_string(),
+                    warnings,
+                );
+            }
+            GenreClass::Ambiguous | GenreClass::Unknown => {}
+        }
+    }
+
+    // Priority 6: Rule R — Rate defaults (with Rule H fake hi-res treated as 1x, OQ-37 HF noise).
+    if is_effective_1x {
+        let arch = if is_streaming {
+            FilterArchetype::GaussLongLp
+        } else {
+            FilterArchetype::SincSteep4M
+        };
+        let rule = if is_fake_hires {
+            "rule_H_fake_hires"
+        } else if is_streaming {
+            "rule_R_1x_stream"
+        } else {
+            "rule_R_1x_clean"
+        };
+        let detail = if let Some(feff) = fused.effective_nyquist_hz.value {
+            format!("ultimate: Rule H (fake hi-res f_eff={feff} Hz) -> {arch}")
+        } else if is_streaming {
+            format!("ultimate: 1x stream ({sample_rate_hz} Hz) -> {arch}")
+        } else {
+            format!("ultimate: clean 1x ({sample_rate_hz} Hz) -> {arch}")
+        };
+        return (arch, rule.to_string(), detail, warnings);
+    }
+
+    // Clean hi-res (`88.2..=192 kHz`): `#2 gauss-hires-lp` (+ OQ-37 HF noise filter when flagged).
+    let (rule, detail) = if fused.hf_noise_filter.value {
+        (
+            "rule_R_hires_hf_noise".to_string(),
+            format!(
+                "ultimate: hi-res ({sample_rate_hz} Hz) + OQ-37 HF ultrasonic noise filter -> gauss-hires-lp"
+            ),
+        )
+    } else {
+        (
+            "rule_R_hires_clean".to_string(),
+            format!("ultimate: clean hi-res ({sample_rate_hz} Hz) -> gauss-hires-lp"),
+        )
+    };
+    (FilterArchetype::GaussHiresLp, rule, detail, warnings)
+}
+
+/// Select the complete Ultimate Mode [`SelectedDspPlan`] and structured [`UltimateSelection`]
+/// audit trail for one track.
+///
+/// Honors:
+/// - **M3 (`< 30 s` bypass):** short tracks return normal-mode defaults with `"normal (<30 s)"`.
+/// - **Explicit CLI overrides:** `--filter` / `--shaper` / `--dac-bits` always win (with M4
+///   streaming guard protecting streams from `gauss-apod-4m`).
+/// - **Strict per-track independence (`OQ-40`):** zero cross-track state.
+#[allow(clippy::too_many_arguments)]
+pub fn select_ultimate_plan(
+    spec: StreamSpec,
+    is_streaming_source: bool,
+    duration_s_hint: Option<f64>,
+    fused: &FusedTrackEvidence,
+    policy: &UpsamplerPolicy,
+    genre_rules: bool,
+    used_cached_wt: bool,
+) -> Result<UltimateSelection, String> {
+    let mut warnings = fused.notices.clone();
+
+    // Mandate M3: tracks shorter than 30 s take the normal-mode path cleanly.
+    if duration_s_hint.is_some_and(|d| d.is_finite() && d < f64::from(ULTIMATE_LOOKAHEAD_SECONDS)) {
+        let mut src = TrackSourceInfo::from_stream_spec(spec);
+        src.is_streaming_source = is_streaming_source;
+        src.deemphasis = fused.deemphasis.value;
+        let picker = UpsamplerPicker::new(*policy)?;
+        let plan = picker.select(&src);
+        return Ok(UltimateSelection {
+            plan,
+            mode_label: "normal (<30 s)".to_string(),
+            winning_rule: "short_track_bypass".to_string(),
+            fired_rules: vec!["M3(<30 s)".to_string()],
+            short_track_bypass: true,
+            warnings,
+        });
+    }
+
+    let mut fired_rules = Vec::new();
+    if fused.deemphasis.value {
+        fired_rules.push(format!("P(deemphasis:{})", fused.deemphasis.source.as_str()));
+    }
+    if fused.apodizing.value {
+        fired_rules.push(format!("A(apod:{})", fused.apodizing.source.as_str()));
+    }
+    if let Some(feff) = fused.effective_nyquist_hz.value {
+        fired_rules.push(format!(
+            "H(fake_hires:f_eff={}Hz:{})",
+            feff,
+            fused.effective_nyquist_hz.source.as_str()
+        ));
+    }
+    if fused.hf_noise_filter.value {
+        fired_rules.push(format!(
+            "H(hf_noise>40kHz:{})",
+            fused.hf_noise_filter.source.as_str()
+        ));
+    }
+    if fused.loud_and_clipped.value {
+        fired_rules.push(format!(
+            "L(loud_clipped:{})",
+            fused.loud_and_clipped.source.as_str()
+        ));
+    }
+    if genre_rules
+        && !matches!(
+            fused.genre_class.value,
+            GenreClass::Unknown | GenreClass::Ambiguous
+        )
+    {
+        fired_rules.push(format!("G({:?})", fused.genre_class.value));
+    }
+
+    let (_, raw_ratio) = select_target_rate(spec.sample_rate_hz);
+    let (_, mut winning_rule, _, mut choice_warnings) = resolve_ultimate_filter_choice(
+        spec.sample_rate_hz,
+        is_streaming_source,
+        raw_ratio,
+        fused,
+        genre_rules,
+    );
+    warnings.append(&mut choice_warnings);
+
+    // Protect streaming sources even if CLI explicitly passed `--filter gauss-apod-4m` (Mandate M4).
+    let mut effective_policy = *policy;
+    if let Some(cli_f) = policy.filter_override {
+        if is_streaming_source && !cli_f.is_streaming_safe() {
+            let is_1x = spec.sample_rate_hz <= 48_000 || fused.effective_nyquist_hz.value.is_some();
+            let fb = streaming_safe_fallback(is_1x);
+            warnings.push(format!(
+                "M4 streaming guard: CLI --filter {cli_f} is local-only; substituting {fb} on stream"
+            ));
+            effective_policy.filter_override = Some(fb);
+            winning_rule = "cli_streaming_guard".to_string();
+        } else {
+            winning_rule = "cli_override".to_string();
+        }
+    }
+
+    let mut src = TrackSourceInfo::from_stream_spec(spec);
+    src.is_streaming_source = is_streaming_source;
+    src.apodizing_needed = fused.apodizing.value;
+    src.effective_nyquist_hz = fused.effective_nyquist_hz.value;
+    src.hf_noise_filter = fused.hf_noise_filter.value && fused.effective_nyquist_hz.value.is_none();
+    src.deemphasis = fused.deemphasis.value;
+
+    let selector = Arc::new(UltimateSelector {
+        fused: fused.clone(),
+        genre_rules,
+    });
+    let picker = UpsamplerPicker::with_selector(effective_policy, selector)?;
+    let plan = picker.select(&src);
+
+    let mode_label = if used_cached_wt
+        || fused.apodizing.source == EvidenceSource::Cache
+        || fused.effective_nyquist_hz.source == EvidenceSource::Cache
+    {
+        "ultimate: cached".to_string()
+    } else {
+        "ultimate: live".to_string()
+    };
+
+    Ok(UltimateSelection {
+        plan,
+        mode_label,
+        winning_rule,
+        fired_rules,
+        short_track_bypass: false,
+        warnings,
+    })
+}
+
+/// Outcome of the Ultimate Mode §4.3 throughput self-check.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThroughputCheckResult {
+    /// Measured processing speed in multiples of real time (`rendered_audio_s / wall_s`).
+    pub measured_x_rt: f64,
+    /// Minimum required speed (`>= 1.05x RT` safety floor, or `T / (T + 30)` with headroom).
+    pub required_x_rt: f64,
+    /// True when the active lossless configuration comfortably outruns real-time playback.
+    pub passed: bool,
+    /// Loud diagnostic message explaining pass margin or exact lossless fallback when refused.
+    pub detail: String,
+    /// Recommended lossless fallback filter when `passed == false` (`#1 gauss-long-lp` or `#2 gauss-hires-lp`).
+    pub fallback_filter: Option<FilterArchetype>,
+}
+
+/// Evaluate measured first-window processing throughput against Ultimate Mode §4.3's real-time
+/// requirement. Never silently truncates tails or drops to `f32`: if too slow, returns
+/// `passed = false` with a loud diagnostic and clean lossless fallback (`#1` / `#2`).
+pub fn check_ultimate_throughput(
+    active_filter: FilterArchetype,
+    source_rate_hz: u32,
+    rendered_audio_s: f64,
+    wall_seconds: f64,
+    track_duration_s: Option<f64>,
+) -> ThroughputCheckResult {
+    let wall = wall_seconds.max(1e-9);
+    let measured_x_rt = if rendered_audio_s.is_finite() && rendered_audio_s > 0.0 {
+        rendered_audio_s / wall
+    } else {
+        0.0
+    };
+
+    // §4.3 requirement: with a full 30 s look-ahead cushion, a finite track of length T needs
+    // at least `T / (T + 30 s)` (strictly < 1.0x for short tracks, approaching 1.0x for long
+    // tracks), multiplied by a 1.15x safety margin so transient OS jitter can never cause underruns.
+    // For unknown-duration streams, require >= 1.15x RT unconditionally.
+    let base_req = match track_duration_s {
+        Some(t) if t.is_finite() && t > 0.0 => t / (t + f64::from(ULTIMATE_LOOKAHEAD_SECONDS)),
+        _ => 1.0,
+    };
+    let required_x_rt = (base_req * 1.15).max(1.0);
+    let passed = measured_x_rt >= required_x_rt;
+
+    if passed {
+        ThroughputCheckResult {
+            measured_x_rt,
+            required_x_rt,
+            passed: true,
+            detail: format!(
+                "{active_filter} throughput {measured_x_rt:.2}x RT >= {required_x_rt:.2}x RT required (OK)"
+            ),
+            fallback_filter: None,
+        }
+    } else {
+        let fallback = if source_rate_hz <= 48_000 {
+            FilterArchetype::GaussLongLp
+        } else {
+            FilterArchetype::GaussHiresLp
+        };
+        ThroughputCheckResult {
+            measured_x_rt,
+            required_x_rt,
+            passed: false,
+            detail: format!(
+                "REFUSED {active_filter}: measured {measured_x_rt:.2}x RT < {required_x_rt:.2}x RT required; falling back to lossless {fallback}"
+            ),
+            fallback_filter: Some(fallback),
+        }
     }
 }

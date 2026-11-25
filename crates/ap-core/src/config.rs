@@ -1,7 +1,8 @@
 //! Engine configuration schema & zero-dependency TOML config file loader.
 //!
 //! Configures **REW stereo convolution** (`[convolution]`), **quantizer / noise shaping**
-//! (`[quantizer]`), and the built-in **UPnP AV MediaRenderer** (`[upnp]`).
+//! (`[quantizer]`), the built-in **UPnP AV MediaRenderer** (`[upnp]`), **Ultimate Mode**
+//! (`[ultimate]`), and the Schema-1 YAML **Track Database** (`[trackdb]`).
 //!
 //! ## Config Discovery Order
 //! 1. Explicit `--config <PATH>` (must exist and parse cleanly).
@@ -228,12 +229,50 @@ impl QuantizerConfig {
     }
 }
 
+/// Ultimate Mode configuration loaded from `[ultimate]` in `config.toml` or CLI `--ultimate`
+/// (`docs/research/07-ultimate-mode.md` §6, `OQ-35`, `OQ-36`, `OQ-40`).
+///
+/// Notes:
+/// - The 30 s look-ahead window (`ULTIMATE_LOOKAHEAD_SECONDS = 30`) is a hard constant, not a setting.
+/// - Runtime execution is pure `f64` (`OQ-36`; U8 one-time double-double kernel synthesis is always on).
+/// - Strict per-track independence (`OQ-40`): zero album/folder context or sibling priors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UltimateConfig {
+    /// Master switch (`false` by default — normal mode stays 100% unchanged).
+    pub enabled: bool,
+    /// Rule G genre-aware filter defaults (`true` by default in ultimate mode, `OQ-35`).
+    pub genre_rules: bool,
+    /// Persist verified whole-track analysis + exact post-chain peak `M` to YAML on clean EOF (`U5b`).
+    pub learn_on_play: bool,
+}
+
+impl Default for UltimateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            genre_rules: true,
+            learn_on_play: true,
+        }
+    }
+}
+
+/// Persistent Schema-1 YAML Track Database configuration loaded from `[trackdb]` in `config.toml`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrackDbConfig {
+    /// Central trackdb directory (`None` -> default `%APPDATA%\audiophile-player\trackdb`).
+    pub dir: Option<PathBuf>,
+    /// Opt-in sidecar persistence (`<track.flac>.ap.yaml` next to local music files; default `false`).
+    pub sidecar: bool,
+}
+
 /// Top-level user configuration file (`config.toml` / `audiophile-player.toml`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlayerConfig {
     pub convolution: ConvolutionConfig,
     pub quantizer: QuantizerConfig,
     pub upnp: UpnpConfig,
+    pub ultimate: UltimateConfig,
+    pub trackdb: TrackDbConfig,
 }
 
 /// Result of config file discovery + loading.
@@ -271,7 +310,8 @@ impl PlayerConfig {
         None
     }
 
-    /// Parse a strict TOML config string (`[convolution]`, `[quantizer]`, and `[upnp]` sections).
+    /// Parse a strict TOML config string (`[convolution]`, `[quantizer]`, `[upnp]`, `[ultimate]`,
+    /// and `[trackdb]` sections).
     pub fn from_toml_str(input: &str) -> Result<Self, String> {
         // Strip optional UTF-8 BOM (Windows editors such as Notepad may emit it).
         let text = input.strip_prefix('\u{feff}').unwrap_or(input);
@@ -282,19 +322,27 @@ impl PlayerConfig {
             Convolution,
             Quantizer,
             Upnp,
+            Ultimate,
+            TrackDb,
         }
 
         let mut active_section = Section::None;
         let mut seen_convolution_section = false;
         let mut seen_quantizer_section = false;
         let mut seen_upnp_section = false;
+        let mut seen_ultimate_section = false;
+        let mut seen_trackdb_section = false;
         let mut seen_conv_keys: HashSet<&str> = HashSet::new();
         let mut seen_quant_keys: HashSet<&str> = HashSet::new();
         let mut seen_upnp_keys: HashSet<&str> = HashSet::new();
+        let mut seen_ultimate_keys: HashSet<&str> = HashSet::new();
+        let mut seen_trackdb_keys: HashSet<&str> = HashSet::new();
         let mut explicit_conv_enabled: Option<bool> = None;
         let mut conv = ConvolutionConfig::default();
         let mut quantizer = QuantizerConfig::default();
         let mut upnp = UpnpConfig::default();
+        let mut ultimate = UltimateConfig::default();
+        let mut trackdb = TrackDbConfig::default();
 
         for (idx, raw_line) in text.lines().enumerate() {
             let line_no = idx + 1;
@@ -338,9 +386,27 @@ impl PlayerConfig {
                         seen_upnp_section = true;
                         active_section = Section::Upnp;
                     }
+                    "ultimate" => {
+                        if seen_ultimate_section {
+                            return Err(format!(
+                                "config line {line_no}: duplicate section '[ultimate]'"
+                            ));
+                        }
+                        seen_ultimate_section = true;
+                        active_section = Section::Ultimate;
+                    }
+                    "trackdb" => {
+                        if seen_trackdb_section {
+                            return Err(format!(
+                                "config line {line_no}: duplicate section '[trackdb]'"
+                            ));
+                        }
+                        seen_trackdb_section = true;
+                        active_section = Section::TrackDb;
+                    }
                     other => {
                         return Err(format!(
-                            "config line {line_no}: unknown section '[{other}]' (supported: [convolution], [quantizer], [upnp])"
+                            "config line {line_no}: unknown section '[{other}]' (supported: [convolution], [quantizer], [upnp], [ultimate], [trackdb])"
                         ));
                     }
                 }
@@ -349,7 +415,7 @@ impl PlayerConfig {
 
             if active_section == Section::None {
                 return Err(format!(
-                    "config line {line_no}: key-value entry outside a section (expected [convolution], [quantizer], or [upnp])"
+                    "config line {line_no}: key-value entry outside a section (expected [convolution], [quantizer], [upnp], [ultimate], or [trackdb])"
                 ));
             }
 
@@ -490,6 +556,51 @@ impl PlayerConfig {
                         }
                     }
                 }
+                Section::Ultimate => {
+                    if !seen_ultimate_keys.insert(key) {
+                        return Err(format!(
+                            "config line {line_no}: duplicate key '{key}' in [ultimate]"
+                        ));
+                    }
+                    match key {
+                        "enabled" => {
+                            ultimate.enabled = parse_toml_bool(val, line_no, "enabled")?;
+                        }
+                        "genre_rules" => {
+                            ultimate.genre_rules = parse_toml_bool(val, line_no, "genre_rules")?;
+                        }
+                        "learn_on_play" => {
+                            ultimate.learn_on_play =
+                                parse_toml_bool(val, line_no, "learn_on_play")?;
+                        }
+                        other => {
+                            return Err(format!(
+                                "config line {line_no}: unknown key '{other}' in [ultimate] (allowed: enabled, genre_rules, learn_on_play)"
+                            ));
+                        }
+                    }
+                }
+                Section::TrackDb => {
+                    if !seen_trackdb_keys.insert(key) {
+                        return Err(format!(
+                            "config line {line_no}: duplicate key '{key}' in [trackdb]"
+                        ));
+                    }
+                    match key {
+                        "dir" => {
+                            let s = parse_toml_string(val, line_no, "dir")?;
+                            trackdb.dir = non_empty_path(s);
+                        }
+                        "sidecar" => {
+                            trackdb.sidecar = parse_toml_bool(val, line_no, "sidecar")?;
+                        }
+                        other => {
+                            return Err(format!(
+                                "config line {line_no}: unknown key '{other}' in [trackdb] (allowed: dir, sidecar)"
+                            ));
+                        }
+                    }
+                }
             }
         }
 
@@ -502,6 +613,8 @@ impl PlayerConfig {
             convolution: conv,
             quantizer,
             upnp,
+            ultimate,
+            trackdb,
         })
     }
 

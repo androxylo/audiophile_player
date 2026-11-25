@@ -48,3 +48,21 @@
 # friendly_name = 'Audiophile Player'
 # port = 49152
 # bind_ip = '192.168.0.187'
+
+[ultimate]
+# Showcase "best possible quality" playback mode (30 s bounded look-ahead, per-track
+# content analysis H/A/L/B, full-tail REW convolution, exact-M fixed whole-track gain,
+# mega-tap local filters, and learn-on-play YAML caching).
+# Default is false (normal mode stays unchanged); can also be enabled via `--ultimate`.
+# Note: streaming sources (UPnP/Tidal) never buffer beyond 30 s, never use mega-tap
+# gauss-apod-4m, and always enforce -3 dB upsampling safety.
+# enabled = false
+# genre_rules = true
+# learn_on_play = true
+
+[trackdb]
+# Persistent Schema-1 YAML Track Database (read-only on your music files).
+# Default central location: %APPDATA%\audiophile-player\trackdb
+# dir = 'C:\Users\you\AppData\Roaming\audiophile-player\trackdb'
+# Set `sidecar = true` to write `<track.flac>.ap.yaml` next to local FLAC files instead.
+# sidecar = false
