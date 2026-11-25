@@ -11,6 +11,17 @@ use crate::GITHUB_MANUAL_URL;
 use crate::browser::{FolderListing, encode_path_token, html_escape, json_escape, url_encode};
 use crate::state::ControlSnapshot;
 
+/// Strip a trailing `.flac` extension (ASCII case-insensitive) for cleaner HTTP browser display,
+/// keeping any other extension intact to differentiate rarer formats (and never returning empty
+/// for a literal `.flac` filename).
+fn display_track_name(file_name: &str) -> &str {
+    if file_name.len() > 5 && file_name[file_name.len() - 5..].eq_ignore_ascii_case(".flac") {
+        &file_name[..file_name.len() - 5]
+    } else {
+        file_name
+    }
+}
+
 /// Render the minimal control page for the currently browsed folder and player state.
 pub fn render_control_page(snapshot: &ControlSnapshot, listing: &FolderListing) -> String {
     let dir_token = encode_path_token(&listing.current_dir);
@@ -65,6 +76,7 @@ pub fn render_control_page(snapshot: &ControlSnapshot, listing: &FolderListing) 
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| file.to_string_lossy().into_owned());
+        let display_name = display_track_name(&name);
         let f_html = html_escape(&encode_path_token(file));
         items_html.push_str(&format!(
             "<div class=\"row file\">\
@@ -73,7 +85,7 @@ pub fn render_control_page(snapshot: &ControlSnapshot, listing: &FolderListing) 
              <input type=\"hidden\" name=\"dir\" value=\"{dir_token_html}\">\
              <button type=\"submit\" class=\"link-btn\">&#9835; {}</button>\
              </form></div>",
-            html_escape(&name)
+            html_escape(display_name)
         ));
     }
     if listing.subdirs.is_empty() && listing.flac_files.is_empty() && listing.error.is_none() {
@@ -206,4 +218,20 @@ pub fn render_status_json(snapshot: &ControlSnapshot) -> String {
         decision_json,
         log_items.join(",")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::display_track_name;
+
+    #[test]
+    fn display_track_name_trims_only_flac_case_insensitively() {
+        assert_eq!(display_track_name("01 Track.flac"), "01 Track");
+        assert_eq!(display_track_name("02 Track.FLAC"), "02 Track");
+        assert_eq!(display_track_name("03 Track.Flac"), "03 Track");
+        assert_eq!(display_track_name("04 Master.wav"), "04 Master.wav");
+        assert_eq!(display_track_name("05 Live.dsf"), "05 Live.dsf");
+        assert_eq!(display_track_name("06 Tape.aiff"), "06 Tape.aiff");
+        assert_eq!(display_track_name(".flac"), ".flac");
+    }
 }

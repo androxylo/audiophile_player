@@ -112,7 +112,9 @@ fn http_server_serves_scrollable_no_volume_ui_and_routes_play_pause_commands() {
     assert!(page.contains("Pause (Release DAC)"));
     assert!(page.contains("overflow-y:auto")); // scrollable folder & action log
     assert!(page.contains("AlbumOne"));
-    assert!(page.contains("sample.flac"));
+    assert!(page.contains("&#9835; sample</button>"));
+    assert!(!page.contains("&#9835; sample.flac</button>"));
+    assert!(page.contains("sample.flac")); // hidden path input retains exact filename
     assert!(
         !page.contains(".. (Parent Folder)"),
         "root folder view must not show parent link above allowed root"
