@@ -31,6 +31,14 @@ impl DetectorVerdict {
             Self::Inconclusive => "inconclusive",
         }
     }
+
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "positive" | "true" | "yes" => Self::Positive,
+            "negative" | "false" | "no" => Self::Negative,
+            _ => Self::Inconclusive,
+        }
+    }
 }
 
 /// Immutable snapshot of all content-analyser measurements (produced from either `W30` or `WT`).

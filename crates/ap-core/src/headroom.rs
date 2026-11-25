@@ -465,6 +465,126 @@ pub fn select_headroom_for_bits(
     }
 }
 
+/// Compute the quantizer margin `m_q` in dB (`docs/research/07-ultimate-mode.md` §4.2):
+/// worst-case shaped-dither excursion `(1.5 * sum(|c_k|) + 1.5)` LSB below digital full scale.
+///
+/// For `ns-gentle-2` (`sum(|c_k|) = 2.0`), this is `4.5 LSB`.
+pub fn quantizer_margin_db(dac_bits: u8, shaper_l1_sum: f64) -> f64 {
+    let b = dac_bits.clamp(16, 24);
+    let l1 = if shaper_l1_sum.is_finite() && shaper_l1_sum >= 0.0 {
+        shaper_l1_sum
+    } else {
+        0.0
+    };
+    let margin_lsb = 1.5 * l1 + 1.5;
+    let half_scale = (1_u64 << (b - 1)) as f64;
+    let max_linear = (1.0 - margin_lsb / half_scale).clamp(0.5, 1.0);
+    -20.0 * max_linear.log10()
+}
+
+/// Choose a **mandatory fixed whole-track gain** for Ultimate Mode (`OQ-33`, `07-ultimate-mode.md` §4.2):
+/// - **Streaming sources (`is_streaming_source == true`):** track peak is never known, so ALWAYS
+///   enforce `-3 dB` upsampling safety (+ REW excess `S`), tightened further only if `M30` requires.
+/// - **Local file with cached whole-track exact `M`:** `G = min(0, -M - m_q)` (zero overs, zero
+///   wasted headroom; `G < -3 dB` only when REW boost / `M > +3 dBFS` requires it).
+/// - **Local file without cached `M` (first play):** `G = min(G_HR, -M30 - m_q)` (`M30` can only
+///   add attenuation and never relaxes normal HR safety).
+#[allow(clippy::too_many_arguments)]
+pub fn select_ultimate_headroom(
+    meta: &TrackPeakMetadata,
+    bits_per_sample: u16,
+    is_streaming_source: bool,
+    active_conv_max_gain_db: Option<f64>,
+    cached_exact_m_db: Option<f64>,
+    window_m30_db: Option<f64>,
+    margin_m_q_db: f64,
+) -> HeadroomDecision {
+    let m_q = if margin_m_q_db.is_finite() && margin_m_q_db >= 0.0 {
+        margin_m_q_db
+    } else {
+        0.0
+    };
+
+    // Pack any constant total gain `g_db <= 0.0` into `(HeadroomMode, convolution_scale_db)` so
+    // `HeadroomDecision::total_gain_db()` equals `g_db` exactly.
+    let pack_gain = |g_db: f64,
+                     peak_dbfs: Option<f64>,
+                     peak_kind: Option<PeakKind>,
+                     reason: String|
+     -> HeadroomDecision {
+        let g = g_db.min(0.0);
+        if g <= UNKNOWN_PEAK_HEADROOM_DB + 1e-9 {
+            HeadroomDecision {
+                mode: HeadroomMode::Minus3Db,
+                peak_dbfs,
+                peak_kind,
+                convolution_scale_db: (g - UNKNOWN_PEAK_HEADROOM_DB).min(0.0),
+                reason,
+            }
+        } else {
+            HeadroomDecision {
+                mode: HeadroomMode::ZeroDb,
+                peak_dbfs,
+                peak_kind,
+                convolution_scale_db: g,
+                reason,
+            }
+        }
+    };
+
+    // Streaming: OQ-33 mandates ALWAYS -3 dB safety (never relaxed by cached M or tags).
+    if is_streaming_source {
+        let mut hr = select_headroom_for_bits(
+            meta,
+            bits_per_sample,
+            true,
+            active_conv_max_gain_db,
+            None,
+        );
+        if let Some(m30) = window_m30_db.filter(|v| v.is_finite()) {
+            let g_m30 = (-(m30 + m_q)).min(0.0);
+            if g_m30 < hr.total_gain_db() - 1e-9 {
+                let reason = format!(
+                    "{}; W30 exact peak M30={m30:+.2} dBFS -> tightened to {g_m30:.2} dB",
+                    hr.reason
+                );
+                hr = pack_gain(g_m30, hr.peak_dbfs, hr.peak_kind, reason);
+            }
+        }
+        return hr;
+    }
+
+    // Local file with cached whole-track exact post-chain peak M: G = min(0, -M - m_q).
+    if let Some(m_db) = cached_exact_m_db.filter(|v| v.is_finite()) {
+        let g_exact = (-(m_db + m_q)).min(0.0);
+        let reason = format!(
+            "ultimate cached exact M={m_db:+.2} dBFS (m_q={m_q:.5} dB) -> fixed gain {g_exact:+.2} dB"
+        );
+        return pack_gain(g_exact, Some(m_db), Some(PeakKind::TruePeak), reason);
+    }
+
+    // Local file without cached M: G = min(G_HR, -M30 - m_q) (M30 only adds safety, never relaxes).
+    let hr = select_headroom_for_bits(
+        meta,
+        bits_per_sample,
+        false,
+        active_conv_max_gain_db,
+        None,
+    );
+    let g_hr = hr.total_gain_db();
+    if let Some(m30) = window_m30_db.filter(|v| v.is_finite()) {
+        let g_m30 = (-(m30 + m_q)).min(0.0);
+        if g_m30 < g_hr - 1e-9 {
+            let reason = format!(
+                "{}; W30 exact peak M30={m30:+.2} dBFS -> fixed gain {g_m30:+.2} dB",
+                hr.reason
+            );
+            return pack_gain(g_m30, hr.peak_dbfs, hr.peak_kind, reason);
+        }
+    }
+    hr
+}
+
 /// Apply `HEADROOM_DESIGN.md` §4 gapless tail-overlap scaling (`S_B`) for Track B without ever
 /// altering Stage-1 `G_up`.
 ///

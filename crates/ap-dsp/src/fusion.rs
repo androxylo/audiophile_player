@@ -8,8 +8,12 @@
 
 use ap_core::headroom::{PEAK_TAG_ROUNDING_TOLERANCE, PeakKind, TrackPeakMetadata};
 use ap_core::metadata::{GenreClass, PhaseTagOverride, TrackMetadata};
+use ap_core::track_db::{
+    TRACK_DB_SCHEMA_VERSION, TrackDbDecision, TrackDbEntry, TrackDbFileInfo, TrackDbResults,
+    TrackDbScanInfo, TrackDbUserOverrides, now_unix_secs,
+};
 
-use crate::analysis::{AnalysisResult, DetectorVerdict};
+use crate::analysis::{AnalysisResult, DETECTOR_VERSION, DetectorVerdict};
 
 /// Tolerance in dB for disproving a stale true-peak Vorbis tag against `W30` (`07-ultimate-mode.md` §5.3 row 3).
 pub const STALE_TRUE_PEAK_TOLERANCE_DB: f64 = 0.1;
@@ -72,6 +76,86 @@ pub struct CachedWholeTrackEvidence {
     pub true_peak_dbtp: Option<f64>,
     pub effective_bits: Option<u16>,
     pub ultrasonic_noise_detected: DetectorVerdict,
+}
+
+impl CachedWholeTrackEvidence {
+    /// Convert a validated Schema-1 [`TrackDbEntry`] into [`CachedWholeTrackEvidence`].
+    /// When `results_current == false`, only `user:` overrides are preserved while stale
+    /// detector results are left `Inconclusive` / `None`.
+    pub fn from_track_db_entry(entry: &TrackDbEntry, results_current: bool) -> Self {
+        let mut out = Self {
+            user_filter: entry.user.filter.clone(),
+            user_deemphasis: entry.user.deemphasis,
+            user_apodizing: entry.user.apodizing,
+            ..Self::default()
+        };
+        if results_current {
+            out.effective_nyquist_hz = entry.results.effective_nyquist_hz;
+            out.upsampled_from_1x = DetectorVerdict::from_str_lossy(&entry.results.upsampled_from_1x);
+            out.apod_events = entry.results.apod_events;
+            out.apodizing_needed = DetectorVerdict::from_str_lossy(&entry.results.apodizing_needed);
+            out.integrated_lufs = entry.results.integrated_lufs;
+            out.clipped_runs = entry.results.clipped_runs;
+            out.loud_and_clipped = DetectorVerdict::from_str_lossy(&entry.results.loud_and_clipped);
+            out.true_peak_dbtp = entry.results.true_peak_dbtp;
+            out.effective_bits = (entry.results.effective_bits > 0).then_some(entry.results.effective_bits);
+            out.ultrasonic_noise_detected =
+                DetectorVerdict::from_str_lossy(&entry.results.ultrasonic_noise_detected);
+        }
+        out
+    }
+}
+
+/// Build a canonical Schema-1 [`TrackDbEntry`] from whole-track [`AnalysisResult`] + identity.
+#[allow(clippy::too_many_arguments)]
+pub fn build_track_db_entry(
+    file_path: String,
+    file_size: u64,
+    mtime_unix_s: u64,
+    streaminfo_md5_hex: Option<String>,
+    analysis: &AnalysisResult,
+    deemphasis_flag: bool,
+    decision_filter: String,
+    decision_rule: String,
+) -> TrackDbEntry {
+    TrackDbEntry {
+        schema: TRACK_DB_SCHEMA_VERSION,
+        file: TrackDbFileInfo {
+            path: file_path,
+            size: file_size,
+            mtime_unix_s,
+            streaminfo_md5: streaminfo_md5_hex,
+            sample_rate: analysis.sample_rate_hz,
+            bits: analysis.container_bits,
+        },
+        scan: TrackDbScanInfo {
+            detector_version: DETECTOR_VERSION,
+            scanned_at_unix_s: now_unix_secs(),
+            duration_s: analysis.duration_s,
+        },
+        results: TrackDbResults {
+            effective_bandwidth_hz: analysis.effective_bandwidth_hz,
+            upsampled_from_1x: analysis.upsampled_from_1x.as_str().to_string(),
+            effective_nyquist_hz: analysis.effective_nyquist_hz,
+            ultrasonic_noise_detected: analysis.ultrasonic_noise_detected.as_str().to_string(),
+            lossy_origin_suspected: analysis.lossy_origin_suspected,
+            apod_events: analysis.apod_events,
+            apodizing_needed: analysis.apodizing_needed.as_str().to_string(),
+            integrated_lufs: analysis.integrated_lufs,
+            sample_peak: analysis.sample_peak_linear,
+            true_peak_dbtp: analysis.true_peak_dbtp.is_finite().then_some(analysis.true_peak_dbtp),
+            clipped_runs: analysis.clipped_runs,
+            loud_and_clipped: analysis.loud_and_clipped.as_str().to_string(),
+            effective_bits: analysis.effective_bits,
+            deemphasis_flag,
+            post_chain_peaks: Vec::new(),
+        },
+        decision: TrackDbDecision {
+            filter: decision_filter,
+            rule: decision_rule,
+        },
+        user: TrackDbUserOverrides::default(),
+    }
 }
 
 /// Complete per-track fused evidence ready for `UltimateSelector` and `U13` decision reporting.

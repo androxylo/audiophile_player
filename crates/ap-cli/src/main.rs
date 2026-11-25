@@ -7,6 +7,7 @@
 mod cli_args;
 mod engine;
 mod prefetch;
+mod scanner;
 mod signals;
 
 use std::process::ExitCode;
@@ -60,6 +61,30 @@ fn main() -> ExitCode {
             quantizer_override,
             rew_override,
             upnp_override,
+            controller,
+        ),
+        RunMode::Scan {
+            folder,
+            report,
+            sidecar,
+            post_chain,
+            force,
+            trackdb_dir,
+            config_path,
+            rew_override,
+            upsampler_policy,
+        } => scanner::run_scan_cli(
+            scanner::ScanOptions {
+                folder,
+                report,
+                sidecar,
+                post_chain,
+                force,
+                trackdb_dir,
+                config_path,
+                rew_override,
+                upsampler_policy,
+            },
             controller,
         ),
         RunMode::Help => unreachable!(),

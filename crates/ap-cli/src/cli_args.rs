@@ -53,6 +53,18 @@ pub enum RunMode {
         /// Explicit CLI overrides for `[upnp]` in `config.toml`.
         upnp_override: UpnpCliOverride,
     },
+    /// Offline parallel resumable library scanner (`audiophile-player scan <folder> [OPTIONS]`).
+    Scan {
+        folder: PathBuf,
+        report: bool,
+        sidecar: bool,
+        post_chain: bool,
+        force: bool,
+        trackdb_dir: Option<PathBuf>,
+        config_path: Option<PathBuf>,
+        rew_override: Option<ConvolutionConfig>,
+        upsampler_policy: UpsamplerPolicy,
+    },
     /// Explicit `--idle` mode: keep running without touching audio hardware (for signal tests).
     Idle,
     /// Print concise help text and exit `0`.
@@ -69,8 +81,14 @@ where
     I: IntoIterator<Item = S>,
     S: Into<OsString>,
 {
-    let mut iter = args.into_iter().map(Into::into);
+    let mut iter = args.into_iter().map(Into::into).peekable();
     let _program = iter.next(); // skip argv[0]
+
+    // Subcommand: `audiophile-player scan <folder> [--report] [--sidecar] [--post-chain] [--force] ...`
+    if iter.peek().and_then(|s| s.to_str()) == Some("scan") {
+        iter.next();
+        return parse_scan_args(iter);
+    }
 
     let mut config_path: Option<PathBuf> = None;
     let mut music_dir: Option<PathBuf> = None;
@@ -275,6 +293,109 @@ where
     })
 }
 
+fn parse_scan_args<I>(mut iter: I) -> Result<RunMode, String>
+where
+    I: Iterator<Item = OsString>,
+{
+    let mut folder: Option<PathBuf> = None;
+    let mut report = false;
+    let mut sidecar = false;
+    let mut post_chain = false;
+    let mut force = false;
+    let mut trackdb_dir: Option<PathBuf> = None;
+    let mut config_path: Option<PathBuf> = None;
+    let mut rew_override: Option<ConvolutionConfig> = None;
+    let mut upsampler_policy = UpsamplerPolicy::default();
+
+    while let Some(arg_raw) = iter.next() {
+        let Some(arg) = arg_raw.to_str() else {
+            if folder.is_none() {
+                folder = Some(PathBuf::from(arg_raw));
+                continue;
+            }
+            return Err(format!(
+                "unknown non-UTF-8 option '{}' for 'scan'",
+                arg_raw.to_string_lossy()
+            ));
+        };
+        match arg {
+            "-h" | "--help" => return Ok(RunMode::Help),
+            "--report" => report = true,
+            "--sidecar" => sidecar = true,
+            "--post-chain" => post_chain = true,
+            "--force" => force = true,
+            "--trackdb-dir" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| "--trackdb-dir requires a directory path".to_string())?;
+                trackdb_dir = Some(PathBuf::from(val));
+            }
+            "--config" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| "--config requires a TOML config file path".to_string())?;
+                config_path = Some(PathBuf::from(val));
+            }
+            "--filter" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| "--filter requires a filter name or 'auto'".to_string())?;
+                let val_str = require_utf8_arg("--filter", val)?;
+                if val_str.eq_ignore_ascii_case("auto") {
+                    upsampler_policy.filter_override = None;
+                } else {
+                    upsampler_policy.filter_override = Some(FilterArchetype::from_str(&val_str)?);
+                }
+            }
+            "--conv-dir" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| "--conv-dir requires a REW WAV directory path".to_string())?;
+                rew_override = Some(ConvolutionConfig::auto_dir(PathBuf::from(val)));
+            }
+            "--conv-file" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| "--conv-file requires a stereo REW WAV file path".to_string())?;
+                rew_override = Some(ConvolutionConfig::explicit_file(PathBuf::from(val)));
+            }
+            "--no-conv" => {
+                rew_override = Some(ConvolutionConfig::disabled());
+            }
+            other if other.starts_with('-') => {
+                return Err(format!(
+                    "unknown scan option '{other}' (run with --help for usage)"
+                ));
+            }
+            _ => {
+                if folder.is_none() {
+                    folder = Some(PathBuf::from(arg_raw));
+                } else {
+                    return Err(format!("unexpected extra scan argument '{arg}'"));
+                }
+            }
+        }
+    }
+
+    let folder = folder.ok_or_else(|| {
+        "scan requires a folder path (usage: audiophile-player scan <folder> [--report] [--sidecar] [--post-chain])"
+            .to_string()
+    })?;
+    upsampler_policy.validate()?;
+
+    Ok(RunMode::Scan {
+        folder,
+        report,
+        sidecar,
+        post_chain,
+        force,
+        trackdb_dir,
+        config_path,
+        rew_override,
+        upsampler_policy,
+    })
+}
+
 pub fn help_text() -> String {
     format!(
         "audiophile-player v{} — Headless Windows Kernel Streaming (WDM-KS) Player\n\
@@ -283,7 +404,10 @@ pub fn help_text() -> String {
            audiophile-player                  Start immediately in highest-quality WDM-KS mode,\n\
                                               playing random FLACs from ~/Music + local HTTP UI\n\
                                               + UPnP AV MediaRenderer (for foobar2000 / BubbleUPnP).\n\
-           audiophile-player [OPTIONS]\n\n\
+           audiophile-player [OPTIONS]\n\
+           audiophile-player scan <FOLDER> [--report] [--sidecar] [--post-chain] [--force]\n\
+                                              Offline whole-track library scanner (writes Schema-1\n\
+                                              YAML trackdb entries; never modifies FLAC files).\n\n\
          CONFIG FILE:\n\
            Auto-loads .\\audiophile-player.toml or %APPDATA%\\audiophile-player\\config.toml\n\
            (or pass --config <PATH>). Configures [convolution], [quantizer], and [upnp].\n\n\
@@ -460,5 +584,38 @@ mod tests {
         // Non-UTF-8 flag name returns Err instead of panicking.
         let bad_flag = parse_args(vec![OsString::from("audiophile-player"), weird_path]);
         assert!(bad_flag.is_err());
+    }
+
+    #[test]
+    fn scan_subcommand_parses_all_flags_and_rejects_missing_folder() {
+        let mode = parse_args([
+            "audiophile-player",
+            "scan",
+            r"D:\Music",
+            "--report",
+            "--sidecar",
+            "--post-chain",
+            "--force",
+            "--trackdb-dir",
+            r"C:\DB",
+            "--no-conv",
+        ])
+        .unwrap();
+        assert_eq!(
+            mode,
+            RunMode::Scan {
+                folder: PathBuf::from(r"D:\Music"),
+                report: true,
+                sidecar: true,
+                post_chain: true,
+                force: true,
+                trackdb_dir: Some(PathBuf::from(r"C:\DB")),
+                config_path: None,
+                rew_override: Some(ConvolutionConfig::disabled()),
+                upsampler_policy: UpsamplerPolicy::default(),
+            }
+        );
+        assert!(parse_args(["audiophile-player", "scan"]).is_err());
+        assert!(parse_args(["audiophile-player", "scan", r"D:\Music", "--bogus"]).is_err());
     }
 }
