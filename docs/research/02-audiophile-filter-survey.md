@@ -1,6 +1,6 @@
 # Research 02 — Upsampling & Noise Shaping: Algorithm Sources & Audiophile Consensus
 
-**Status:** In Progress (Initial Web & Forum Synthesis Complete; awaiting optional user snippets/PDFs for inaccessible sources in §4)  
+**Status:** Core Survey Complete — Expanded into the comprehensive [03-filter-knowledge-base.md](03-filter-knowledge-base.md)  
 **Scope:** Survey of upsampling/reconstruction filter families, dithering & noise-shaping algorithms, open-source/academic algorithm sources, and what audiophiles report on reviews and message boards—specifically focused on **PCM upsampling to NOS / Multibit / R2R DACs** (Schiit Gungnir 2 at 352.8 / 384 kHz) within our **4,000,000-tap cap** and **floating-point-only** pipeline.
 
 ---
@@ -116,8 +116,7 @@ Per our **Browser PDF Handoff Protocol**, the following high-value sources are p
    - `http://archimago.blogspot.com/2021/07/mega-taps-upsampling-remasteros-pan.html`
    - Any Archimago posts measuring HQPlayer PCM filters (`sinc-M`, `poly-sinc-gauss`, `LNS15`, `NS9`).
    - *What we need:* Key measurement takeaways or screenshots/PDFs of impulse responses, stopband attenuation, and noise-shaper ultrasonic noise plots.
-6. **Roon Community — "Which HQPlayer Filter Are You Using?" / Favorite PCM Filters Threads** (`https://community.roonlabs.com/`):
-   - *What we need:* Snippets of recent community polls or consensus summaries on favorite PCM filters (especially distinguishing 1x 44.1/48 kHz vs Nx 96+ kHz preferences).
+6. ~~**Roon Community / Head-Fi / Audiophile Style / Northern Audio / ASR Filter Threads**~~ — **RECEIVED & INTEGRATED** into [03-filter-knowledge-base.md](03-filter-knowledge-base.md) (synthesizing 1x vs. Nx community consensus, PCM `sinc-long` / `sinc-L` / `sinc-MGa` / `gauss-*` / `ext2/3` impressions, compute/RAM profiles, Jussi Laako's 5-point NOS critique, R2R `DAC Bits` linearization, and DSP implementation references).
 
 ### Priority 3 — Paywalled Foundational AES Papers (For Exact Mathematical Derivation in `INV-03` & `INV-04`)
 *(Only needed if you have access or find public author-hosted preprints; we can also derive equivalent math from open DSP textbooks if unavailable.)*
