@@ -210,13 +210,13 @@ fn max_working_set_growth_bytes() -> usize {
     static MAX_GROWTH: OnceLock<usize> = OnceLock::new();
     *MAX_GROWTH.get_or_init(|| {
         const MIN_CAP_BYTES: usize = 512 * 1024 * 1024;
-        const MAX_CAP_BYTES: usize = 4 * 1024 * 1024 * 1024;
+        let max_cap_bytes: usize = (4u64 << 30).min(usize::MAX as u64) as usize;
         use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
         let mut status: MEMORYSTATUSEX = unsafe { core::mem::zeroed() };
         status.dwLength = core::mem::size_of::<MEMORYSTATUSEX>() as u32;
         if unsafe { GlobalMemoryStatusEx(&mut status) } != 0 && status.ullTotalPhys > 0 {
             let quarter_phys = (status.ullTotalPhys / 4).min(usize::MAX as u64) as usize;
-            quarter_phys.clamp(MIN_CAP_BYTES, MAX_CAP_BYTES)
+            quarter_phys.clamp(MIN_CAP_BYTES, max_cap_bytes)
         } else {
             MIN_CAP_BYTES
         }

@@ -816,6 +816,9 @@ impl WaveRtRingLayout {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaveRtStepOutcome {
     Continue,
+    /// Spurious or duplicate wake before the next half-buffer boundary; no half was overwritten
+    /// and no frames were credited.
+    Spurious,
     Finished,
 }
 
@@ -885,14 +888,23 @@ impl AudioPositionCursorSelector {
     }
 }
 
+const LAG_HISTORY_WINDOW: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaveRtWakeDecision {
+    Write { write_half: usize, coalesced: bool },
+    Spurious,
+}
+
 /// Pure, hardware-independent WaveRT cyclic half-buffer state machine.
 ///
 /// Manages:
-/// - Position-authoritative, lag-compensated half-boundary tracking with a 1/4-half pre-boundary
-///   guard band and wall-clock (`Instant`) sanity checks. Late-but-not-coalesced wakes never
-///   trigger false coalescing or invert half phase, genuine coalesced wakes resynchronize on
-///   every wake (self-healing), and `Unavailable` position sources fall back to wall-clock
-///   boundary tracking when timing is provided.
+/// - Position-authoritative, continuously lag-tracked half-boundary detection with a 1/4-half
+///   pre-boundary guard band, unified wall-clock multi-ring unwrapping, and spurious-wake
+///   rejection. Late-but-not-coalesced wakes never trigger false coalescing or invert half phase,
+///   late/stale first wakes converge to true driver lag instead of locking in a bad estimate,
+///   genuine coalesced wakes resynchronize on every wake, and `Unavailable` position sources use
+///   an anchored `run_start + n * half_duration` clock that never absorbs steady wake latency.
 /// - Stop fade-out that waits for the fade half to finish playing (`trailing_silent_halves >= 2`).
 /// - Non-blocking underrun handling (emits digital silence without ending playback).
 /// - Accurate `frames_played` counting only real audio frames whose half completed DMA playback.
@@ -904,12 +916,19 @@ pub struct WaveRtLoopController {
     last_unwrapped_pos: Option<u64>,
     last_boundary_idx: u64,
     lag_bytes: u64,
+    lag_history: [u64; LAG_HISTORY_WINDOW],
+    lag_history_len: usize,
+    lag_history_cursor: usize,
     wrap_mode: PositionWrapMode,
     observed_wrap: bool,
     half_duration: Option<Duration>,
-    last_boundary_instant: Option<Duration>,
+    /// Offset (ns) of boundary 0 relative to `run_start`. Trimmed only on early wakes so steady
+    /// thread wake latency is never absorbed into the boundary reference.
+    clock_anchor_offset_ns: i128,
+    last_wake_instant: Option<Duration>,
     half_audio_frames: [usize; 2],
     completed_audio_frames: usize,
+    spurious_wakes: usize,
     trailing_silent_halves: usize,
     stopping_fade_done: bool,
 }
@@ -924,12 +943,17 @@ impl WaveRtLoopController {
             last_unwrapped_pos: None,
             last_boundary_idx: 0,
             lag_bytes: 0,
+            lag_history: [0; LAG_HISTORY_WINDOW],
+            lag_history_len: 0,
+            lag_history_cursor: 0,
             wrap_mode: PositionWrapMode::Auto,
             observed_wrap: false,
             half_duration: None,
-            last_boundary_instant: None,
+            clock_anchor_offset_ns: 0,
+            last_wake_instant: None,
             half_audio_frames: [0, 0],
             completed_audio_frames: 0,
+            spurious_wakes: 0,
             trailing_silent_halves: 0,
             stopping_fade_done: false,
         }
@@ -959,6 +983,11 @@ impl WaveRtLoopController {
         self.completed_audio_frames
     }
 
+    /// Number of spurious/early notifications ignored without writing or crediting frames.
+    pub fn spurious_wakes(&self) -> usize {
+        self.spurious_wakes
+    }
+
     /// Pre-fill both cyclic halves before transitioning the KS pin to `KSSTATE_RUN`.
     pub fn prefill(
         &mut self,
@@ -981,8 +1010,13 @@ impl WaveRtLoopController {
         self.last_unwrapped_pos = None;
         self.last_boundary_idx = 0;
         self.lag_bytes = 0;
+        self.lag_history = [0; LAG_HISTORY_WINDOW];
+        self.lag_history_len = 0;
+        self.lag_history_cursor = 0;
         self.observed_wrap = false;
-        self.last_boundary_instant = Some(Duration::ZERO);
+        self.clock_anchor_offset_ns = 0;
+        self.last_wake_instant = Some(Duration::ZERO);
+        self.spurious_wakes = 0;
         Ok(())
     }
 
@@ -1004,66 +1038,118 @@ impl WaveRtLoopController {
             .saturating_add((boundary_idx % 2) * half)
     }
 
-    fn advance_boundary_clock(
+    /// Ideal monotonic time (ns since `KSSTATE_RUN`) for half-boundary `boundary_idx`.
+    fn ideal_boundary_ns(&self, boundary_idx: u64, half_dur: Duration) -> i128 {
+        let half_ns = half_dur.as_nanos() as i128;
+        (boundary_idx as i128)
+            .saturating_mul(half_ns)
+            .saturating_add(self.clock_anchor_offset_ns)
+            .max(0)
+    }
+
+    /// Record a non-coalesced lag sample and recompute `self.lag_bytes` robustly.
+    ///
+    /// Uses the 2nd-largest sample in the sliding window (once >= 3 samples exist; max before
+    /// that). This converges immediately upward when wake #1 was late (underestimated lag) AND
+    /// rejects an isolated stale/coarse outlier sample (overestimated lag) within 2 on-time wakes.
+    fn record_lag_sample(&mut self, sample: u64) {
+        let half = self.layout.half_len() as u64;
+        let clamped = sample.min(half);
+        self.lag_history[self.lag_history_cursor] = clamped;
+        self.lag_history_cursor = (self.lag_history_cursor + 1) % LAG_HISTORY_WINDOW;
+        if self.lag_history_len < LAG_HISTORY_WINDOW {
+            self.lag_history_len += 1;
+        }
+        if self.lag_history_len == 0 {
+            self.lag_bytes = 0;
+            return;
+        }
+        let mut sorted = [0u64; LAG_HISTORY_WINDOW];
+        sorted[..self.lag_history_len].copy_from_slice(&self.lag_history[..self.lag_history_len]);
+        sorted[..self.lag_history_len].sort_unstable();
+        self.lag_bytes = if self.lag_history_len >= 3 {
+            sorted[self.lag_history_len - 2]
+        } else {
+            sorted[self.lag_history_len - 1]
+        };
+    }
+
+    /// Trim the wall-clock boundary anchor ONLY when a wake arrives slightly *early* (audio
+    /// crystal faster than QPC). Never pulls the anchor forward on late wakes, so steady wake
+    /// latency is never absorbed into the boundary reference.
+    fn trim_clock_anchor_if_early(
         &mut self,
         now_since_run: Option<Duration>,
-        halves_advanced: u64,
+        boundary_idx: u64,
     ) {
         let (Some(now), Some(half_dur)) = (now_since_run, self.half_duration) else {
             return;
         };
-        let prev_t = self.last_boundary_instant.unwrap_or(Duration::ZERO);
-        let step = half_dur.saturating_mul(halves_advanced.min(u32::MAX as u64) as u32);
-        let ideal = prev_t.saturating_add(step);
-        let new_t = if now < ideal {
-            // Wake arrived slightly before estimated boundary (crystal faster than QPC or jitter).
-            now
-        } else {
-            let overshoot = now.saturating_sub(ideal);
-            if overshoot <= half_dur / 4 {
-                // On-time wake: gently PLL-track crystal drift without reacting to late spikes.
-                ideal.saturating_add(overshoot / 8)
-            } else {
-                // Late wake: keep the nominal boundary reference intact so the next on-time wake
-                // sees the true inter-boundary elapsed interval.
-                ideal
-            }
-        };
-        self.last_boundary_instant = Some(new_t);
+        let now_ns = now.as_nanos() as i128;
+        let ideal_ns = self.ideal_boundary_ns(boundary_idx, half_dur);
+        if now_ns < ideal_ns {
+            // Wake arrived slightly before the ideal boundary: shift anchor gently earlier.
+            let deficit = ideal_ns - now_ns;
+            let max_step = (half_dur.as_nanos() as i128) / 8;
+            let adj = (deficit / 4).max(1).min(max_step);
+            self.clock_anchor_offset_ns = self.clock_anchor_offset_ns.saturating_sub(adj);
+        }
     }
 
-    fn step_wall_clock_fallback(&mut self, now_since_run: Option<Duration>) -> (usize, bool) {
-        let halves_elapsed = match (now_since_run, self.half_duration) {
+    fn step_wall_clock_fallback(&mut self, now_since_run: Option<Duration>) -> WaveRtWakeDecision {
+        let next_bidx = self.last_boundary_idx.saturating_add(1);
+        let new_bidx = match (now_since_run, self.half_duration) {
             (Some(now), Some(half_dur)) => {
-                let prev_t = self.last_boundary_instant.unwrap_or(Duration::ZERO);
-                let since = now.saturating_sub(prev_t);
-                let two_halves = half_dur.saturating_mul(2);
-                if since >= two_halves {
-                    ((since.as_nanos() / half_dur.as_nanos()) as u64).max(2)
+                let now_ns = now.as_nanos() as i128;
+                let half_ns = half_dur.as_nanos() as i128;
+                let ideal_next_ns = self.ideal_boundary_ns(next_bidx, half_dur);
+                let early_margin_ns = half_ns / 8;
+
+                // Ignore stale/spurious wakes arriving < half/2 after the previous processed wake
+                // while still before the next ideal boundary, or any wake well before ideal_next.
+                if self.last_boundary_idx > 0 {
+                    if let Some(prev_wake) = self.last_wake_instant {
+                        if now.saturating_sub(prev_wake) < half_dur / 2 && now_ns < ideal_next_ns {
+                            return WaveRtWakeDecision::Spurious;
+                        }
+                    }
+                }
+                if now_ns.saturating_add(early_margin_ns) < ideal_next_ns {
+                    return WaveRtWakeDecision::Spurious;
+                }
+
+                if now_ns < ideal_next_ns {
+                    // Slightly early crystal wake within [ideal_next - H/8, ideal_next).
+                    next_bidx
                 } else {
-                    1
+                    let anchored_ns = now_ns.saturating_sub(self.clock_anchor_offset_ns).max(0);
+                    let computed = (anchored_ns / half_ns) as u64;
+                    computed.max(next_bidx)
                 }
             }
-            _ => 1,
+            _ => next_bidx,
         };
-        self.advance_boundary_clock(now_since_run, halves_elapsed);
-        self.last_boundary_idx = self.last_boundary_idx.saturating_add(halves_elapsed);
-        let write_half = ((self.last_boundary_idx as usize) & 1) ^ 1;
-        (write_half, halves_elapsed >= 2)
+
+        let halves_elapsed = new_bidx.saturating_sub(self.last_boundary_idx);
+        self.trim_clock_anchor_if_early(now_since_run, new_bidx);
+        if let Some(now) = now_since_run {
+            self.last_wake_instant = Some(now);
+        }
+        self.last_boundary_idx = new_bidx;
+        let write_half = ((new_bidx as usize) & 1) ^ 1;
+        WaveRtWakeDecision::Write {
+            write_half,
+            coalesced: halves_elapsed >= 2,
+        }
     }
 
-    /// Decide which half to write and whether at least one notification was coalesced.
-    ///
-    /// Tracks unwrapped, lag-compensated DMA byte position and counts actual half-boundary
-    /// crossings rather than rounding position deltas. A late-but-not-coalesced wake (still in
-    /// the expected DMA half) writes the opposite half and does NOT falsely credit unplayed
-    /// frames. Coalesced wakes (whether on monotonic or modular cursors, including wake #1)
-    /// self-heal immediately and keep `next_expected_half` locked to hardware DMA.
+    /// Decide which half to write, whether notifications coalesced, or whether the wake is
+    /// spurious (arrived before the next half boundary).
     fn select_write_half(
         &mut self,
         play_offset_bytes: Option<u64>,
         now_since_run: Option<Duration>,
-    ) -> (usize, bool) {
+    ) -> WaveRtWakeDecision {
         let Some(pos) = play_offset_bytes else {
             return self.step_wall_clock_fallback(now_since_run);
         };
@@ -1071,44 +1157,57 @@ impl WaveRtLoopController {
         let half = self.layout.half_len() as u64;
         let buf = self.layout.buf_len() as u64;
         let guard = (self.layout.half_len() / 4).max(self.layout.bytes_per_frame()) as u64;
+        let max_plausible_lag = (half / 2).max(guard);
 
-        let clock_since_boundary = match (now_since_run, self.half_duration) {
-            (Some(now), Some(half_dur)) => {
-                let prev_t = self.last_boundary_instant.unwrap_or(Duration::ZERO);
-                Some((now.saturating_sub(prev_t), half_dur))
-            }
+        let clock_info = match (now_since_run, self.half_duration) {
+            (Some(now), Some(hd)) if !hd.is_zero() => Some((now, hd)),
             _ => None,
         };
-        let clock_allows_full_ring_wrap: Option<bool> = clock_since_boundary.map(|(since, hd)| {
-            // Require >= 1.5 halves since last boundary before treating a small modular delta
-            // as a full-ring (2-half) wrap.
-            let threshold = hd.saturating_add(hd / 2);
-            since >= threshold
-        });
 
         let unwrapped: u64 = match (self.last_raw_pos, self.last_unwrapped_pos) {
             (None, _) => {
                 // First wake after KSSTATE_RUN (DMA started at byte 0).
-                if pos < half {
-                    let is_coalesced_modular_first_wake = match clock_allows_full_ring_wrap {
-                        Some(true) => true,
-                        Some(false) => false,
-                        None => {
-                            self.wrap_mode == PositionWrapMode::Modular
-                                && pos < half.saturating_sub(guard)
+                if let Some((now, hd)) = clock_info {
+                    if pos < buf && self.wrap_mode != PositionWrapMode::Monotonic {
+                        let expected_pos = ((now.as_nanos() * u128::from(half)) / hd.as_nanos()) as u64;
+                        if expected_pos > pos.saturating_add(buf / 2)
+                            && (self.wrap_mode == PositionWrapMode::Modular
+                                || now >= hd.saturating_add(hd / 2))
+                        {
+                            let extra_rings = (expected_pos - pos + buf / 2) / buf;
+                            self.observed_wrap = true;
+                            self.lag_bytes = 0;
+                            pos.saturating_add(extra_rings.saturating_mul(buf))
+                        } else {
+                            if pos < half {
+                                self.record_lag_sample(half - pos);
+                            } else {
+                                self.record_lag_sample(0);
+                            }
+                            pos
                         }
-                    };
+                    } else {
+                        if pos < half {
+                            self.record_lag_sample(half - pos);
+                        } else {
+                            self.record_lag_sample(0);
+                        }
+                        pos
+                    }
+                } else if pos < half {
+                    let is_coalesced_modular_first_wake = self.wrap_mode
+                        == PositionWrapMode::Modular
+                        && pos < half.saturating_sub(guard);
                     if is_coalesced_modular_first_wake {
                         self.lag_bytes = 0;
                         self.observed_wrap = true;
                         buf.saturating_add(pos)
                     } else {
-                        // Normal first wake with a lagging PlayOffset cursor (e.g. usbaudio2.sys).
-                        self.lag_bytes = half - pos;
+                        self.record_lag_sample(half - pos);
                         pos
                     }
                 } else {
-                    self.lag_bytes = 0;
+                    self.record_lag_sample(0);
                     pos
                 }
             }
@@ -1118,62 +1217,55 @@ impl WaveRtLoopController {
                     self.last_raw_pos = Some(pos);
                     return self.step_wall_clock_fallback(now_since_run);
                 }
+
                 let is_modular = self.wrap_mode == PositionWrapMode::Modular || self.observed_wrap;
-                if pos >= prev_raw {
-                    let raw_delta = pos - prev_raw;
-                    let is_full_ring_wrap = prev_raw < buf
-                        && pos < buf
-                        && raw_delta < half / 2
-                        && self.wrap_mode != PositionWrapMode::Monotonic
-                        && match clock_allows_full_ring_wrap {
-                            Some(true) => {
-                                (is_modular || self.lag_bytes == 0)
-                                    && self.layout.is_clearly_inside_half(
-                                        self.next_expected_half,
-                                        pos.saturating_add(self.lag_bytes),
-                                    )
-                            }
-                            Some(false) => false,
-                            None => {
-                                is_modular
-                                    && self.lag_bytes == 0
-                                    && self.layout.is_clearly_inside_half(
-                                        self.next_expected_half,
-                                        pos,
-                                    )
-                            }
-                        };
-                    if is_full_ring_wrap {
-                        let extra_rings = match clock_since_boundary {
-                            Some((since, hd)) => {
-                                let h = (since.as_nanos() / hd.as_nanos()) as u64;
-                                (h / 2).max(1)
-                            }
-                            None => 1,
-                        };
+                let can_be_modular =
+                    prev_raw < buf && pos < buf && self.wrap_mode != PositionWrapMode::Monotonic;
+
+                if can_be_modular {
+                    if pos < prev_raw {
                         self.observed_wrap = true;
-                        prev_unwrapped
-                            .saturating_add(raw_delta)
-                            .saturating_add(extra_rings.saturating_mul(buf))
-                    } else {
-                        prev_unwrapped.saturating_add(raw_delta)
                     }
-                } else if prev_raw < buf && pos < buf && self.wrap_mode != PositionWrapMode::Monotonic
-                {
-                    // Modular wrap around buf_len.
-                    self.observed_wrap = true;
-                    let ring_delta = (buf - prev_raw).saturating_add(pos);
-                    let extra_rings = match clock_since_boundary {
-                        Some((since, hd)) if since >= hd.saturating_mul(3) => {
-                            let h = (since.as_nanos() / hd.as_nanos()) as u64;
-                            let base_halves = if ring_delta >= half { 1 } else { 0 };
-                            h.saturating_sub(base_halves) / 2
-                        }
-                        _ => 0,
+                    let base_delta = if pos >= prev_raw {
+                        pos - prev_raw
+                    } else {
+                        (buf - prev_raw).saturating_add(pos)
                     };
+
+                    let extra_rings = if let Some((now, hd)) = clock_info {
+                        let prev_t = self.last_wake_instant.unwrap_or(Duration::ZERO);
+                        let elapsed = now.saturating_sub(prev_t);
+                        let expected_delta =
+                            ((elapsed.as_nanos() * u128::from(half)) / hd.as_nanos()) as u64;
+                        if expected_delta > base_delta.saturating_add(buf / 2)
+                            && (is_modular
+                                || self.observed_wrap
+                                || elapsed >= hd.saturating_add(hd / 2))
+                        {
+                            self.observed_wrap = true;
+                            (expected_delta - base_delta + buf / 2) / buf
+                        } else {
+                            0
+                        }
+                    } else if pos >= prev_raw
+                        && is_modular
+                        && self.lag_bytes == 0
+                        && base_delta < half / 2
+                        && self
+                            .layout
+                            .is_clearly_inside_half(self.next_expected_half, pos)
+                    {
+                        // Clockless modular full-ring coalesce fallback.
+                        1
+                    } else {
+                        0
+                    };
+
                     prev_unwrapped
-                        .saturating_add(ring_delta)
+                        .saturating_add(base_delta)
                         .saturating_add(extra_rings.saturating_mul(buf))
+                } else if pos >= prev_raw {
+                    prev_unwrapped.saturating_add(pos - prev_raw)
                 } else {
                     // 32-bit counter wrap or non-monotonic quirk: step 1 half cleanly.
                     self.boundary_byte(self.last_boundary_idx.saturating_add(1))
@@ -1183,43 +1275,93 @@ impl WaveRtLoopController {
             _ => pos,
         };
 
-        let adj_pos = unwrapped.saturating_add(self.lag_bytes);
-        let raw_bidx = self.boundary_idx_for_byte(adj_pos);
         let next_expected_bidx = self.last_boundary_idx.saturating_add(1);
         let next_expected_byte = self.boundary_byte(next_expected_bidx);
+        let adj_pos = unwrapped.saturating_add(self.lag_bytes);
+        let mut raw_bidx = self.boundary_idx_for_byte(adj_pos);
 
-        let (new_bidx, coalesced) = if raw_bidx >= next_expected_bidx.saturating_add(1) {
+        // Guard against an initially overestimated stale lag sample falsely triggering coalescing
+        // when the wall clock proves the subsequent boundary has not yet been reached.
+        if raw_bidx == next_expected_bidx.saturating_add(1) {
+            if let Some((now, hd)) = clock_info {
+                let now_ns = now.as_nanos() as i128;
+                let ideal_raw = self.ideal_boundary_ns(raw_bidx, hd);
+                let early_margin = (hd.as_nanos() as i128) / 8;
+                if now_ns.saturating_add(early_margin) < ideal_raw
+                    && unwrapped < self.boundary_byte(raw_bidx)
+                {
+                    raw_bidx = next_expected_bidx;
+                }
+            }
+        }
+
+        let (new_bidx, coalesced, record_lag) = if raw_bidx >= next_expected_bidx.saturating_add(1)
+        {
             // Crossed >= 2 half boundaries: genuine coalescing; resync directly to DMA half.
-            (raw_bidx, true)
+            (raw_bidx, true, false)
         } else if raw_bidx == next_expected_bidx {
             // Exactly 1 half boundary crossed (including late-but-not-coalesced wakes).
-            (raw_bidx, false)
+            (raw_bidx, false, self.last_raw_pos.is_some())
         } else {
             // Position is still short of `next_expected_byte`.
             let shortfall = next_expected_byte.saturating_sub(adj_pos);
             if shortfall <= guard {
                 // Inside pre-boundary jitter guard band: trust expected half boundary.
-                (next_expected_bidx, false)
+                (next_expected_bidx, false, self.last_raw_pos.is_some())
             } else {
-                // Clearly inside `raw_bidx`'s half (outside guard band): self-heal by writing
-                // the half opposite DMA rather than overwriting the active DMA half.
-                (raw_bidx, false)
+                // Outside guard band: distinguish a genuine boundary wake whose true cursor lag
+                // was underestimated (e.g. wake #1 arrived late) from a spurious/duplicate wake.
+                let candidate_lag = next_expected_byte.saturating_sub(unwrapped);
+                let clock_reached_boundary = match clock_info {
+                    Some((now, hd)) => {
+                        let now_ns = now.as_nanos() as i128;
+                        let ideal_next = self.ideal_boundary_ns(next_expected_bidx, hd);
+                        let early_margin = (hd.as_nanos() as i128) / 8;
+                        now_ns.saturating_add(early_margin) >= ideal_next
+                    }
+                    None => self
+                        .last_unwrapped_pos
+                        .map(|prev| unwrapped.saturating_sub(prev) >= half / 2)
+                        .unwrap_or(false),
+                };
+
+                if self.last_raw_pos.is_some()
+                    && candidate_lag <= max_plausible_lag
+                    && clock_reached_boundary
+                {
+                    (next_expected_bidx, false, true)
+                } else {
+                    // Spurious / duplicate wake before the next half boundary: do NOT overwrite
+                    // the pending half and do NOT credit unplayed frames.
+                    return WaveRtWakeDecision::Spurious;
+                }
             }
         };
 
-        let halves_advanced = new_bidx.saturating_sub(self.last_boundary_idx).max(1);
-        self.advance_boundary_clock(now_since_run, halves_advanced);
+        if record_lag {
+            // Update the sliding lag estimator from this non-coalesced wake.
+            let observed_lag = self.boundary_byte(new_bidx).saturating_sub(unwrapped);
+            self.record_lag_sample(observed_lag);
+        }
+
+        self.trim_clock_anchor_if_early(now_since_run, new_bidx);
+        if let Some(now) = now_since_run {
+            self.last_wake_instant = Some(now);
+        }
         self.last_raw_pos = Some(pos);
         self.last_unwrapped_pos = Some(unwrapped);
         self.last_boundary_idx = new_bidx;
 
         let write_half = ((new_bidx as usize) & 1) ^ 1;
-        (write_half, coalesced)
+        WaveRtWakeDecision::Write {
+            write_half,
+            coalesced,
+        }
     }
 
     /// Process one WaveRT half-buffer completion notification without wall-clock timing.
     ///
-    /// Returns the half index that was written alongside `Continue` / `Finished`.
+    /// Returns the half index that was written alongside `Continue` / `Spurious` / `Finished`.
     pub fn on_notification(
         &mut self,
         cyclic_slice: &mut [u8],
@@ -1240,7 +1382,20 @@ impl WaveRtLoopController {
         play_offset_bytes: Option<u64>,
         now_since_run: Option<Duration>,
     ) -> Result<(usize, WaveRtStepOutcome), OutputError> {
-        let (write_half, coalesced) = self.select_write_half(play_offset_bytes, now_since_run);
+        let (write_half, coalesced) = match self.select_write_half(play_offset_bytes, now_since_run)
+        {
+            WaveRtWakeDecision::Write {
+                write_half,
+                coalesced,
+            } => (write_half, coalesced),
+            WaveRtWakeDecision::Spurious => {
+                self.spurious_wakes = self.spurious_wakes.saturating_add(1);
+                return Ok((
+                    self.last_written_half.unwrap_or(0),
+                    WaveRtStepOutcome::Spurious,
+                ));
+            }
+        };
         self.next_expected_half = write_half ^ 1;
 
         if coalesced {

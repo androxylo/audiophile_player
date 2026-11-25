@@ -908,8 +908,9 @@ fn memory_lock_guard_refcounts_shared_pages_across_overlapping_guards() {
     let _mem_lock = MEMORY_LOCK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let cap = MemoryLockGuard::working_set_growth_cap_bytes();
+    let max_cap = (4u64 << 30).min(usize::MAX as u64) as usize;
     assert!(
-        (512 * 1024 * 1024..=4 * 1024 * 1024 * 1024).contains(&cap),
+        (512 * 1024 * 1024..=max_cap).contains(&cap),
         "expected dynamic VirtualLock cap in [512 MiB, 4 GiB], got {cap}"
     );
 
@@ -932,6 +933,258 @@ fn memory_lock_guard_refcounts_shared_pages_across_overlapping_guards() {
         baseline,
         "dropping last guard must release all refcounted pages back to baseline"
     );
+}
+
+#[test]
+fn wavert_loop_controller_reestimates_lag_after_late_or_stale_first_wake() {
+    // Review #4 Finding #1 (HIGH):
+    // Ring 6400 B (half 3200 B = 50 ms, 400 frames/half), PlayOffset-only driver with 960 B
+    // (15 ms = 0.3 half) constant lag. First wake arrives 14 ms late (real 4096 -> reports 3136),
+    // underestimating initial lag as 64 B instead of 960 B. All subsequent on-time wakes at
+    // real k*3200 + 64 (reporting k*3200 - 896) must STILL write the safe opposite half!
+    let layout = WaveRtRingLayout::new(6400, 8).unwrap();
+    let frames = vec![[77_i32, -77_i32]; 8000];
+    let half_dur = Duration::from_millis(50);
+
+    for wrap_mode in [PositionWrapMode::Monotonic, PositionWrapMode::Modular] {
+        let mut ring = vec![0u8; 6400];
+        let mut pump = WaveRtFramePump::new(&frames, DacWireFormat::Int32);
+        let mut ctrl = WaveRtLoopController::new(layout)
+            .with_half_duration(half_dur)
+            .with_wrap_mode(wrap_mode);
+        ctrl.prefill(&mut ring, &mut pump).unwrap();
+
+        // Wake 1: 14 ms late (t = 64 ms), real DMA = 4096 (half 1), reports 3136.
+        let pos1 = if wrap_mode == PositionWrapMode::Modular {
+            3136 % 6400
+        } else {
+            3136
+        };
+        let (h1, out1) = ctrl
+            .on_notification_at(&mut ring, &mut pump, false, Some(pos1), Some(Duration::from_millis(64)))
+            .unwrap();
+        assert_eq!(out1, WaveRtStepOutcome::Continue);
+        assert_eq!(h1, 0, "wake 1 DMA in half 1 -> must write safe half 0");
+
+        // Wakes 2..=9: on-time at real k*3200 + 64 (1 ms after boundary), reporting k*3200 - 896.
+        for k in 2u64..=9 {
+            let real = k * 3200 + 64;
+            let reported = real - 960;
+            let pos = if wrap_mode == PositionWrapMode::Modular {
+                reported % 6400
+            } else {
+                reported
+            };
+            let t = Duration::from_millis(k * 50 + 1);
+            let (h, out) = ctrl
+                .on_notification_at(&mut ring, &mut pump, false, Some(pos), Some(t))
+                .unwrap();
+            let dma_half = ((real / 3200) & 1) as usize;
+            let safe_half = dma_half ^ 1;
+            assert_eq!(out, WaveRtStepOutcome::Continue);
+            assert_eq!(
+                h, safe_half,
+                "wrap_mode={wrap_mode:?} wake {k}: must write safe half {safe_half}, not active DMA half {dma_half}"
+            );
+        }
+        assert_eq!(ctrl.frames_played(), 9 * 400);
+    }
+
+    // Converse: stale/coarse first wake overestimates lag (reports 2200 -> 1000 B instead of
+    // true 100 B lag). After two on-time wakes the estimator drops the stale outlier so a late
+    // wake at boundary 4 + 2500 B is NOT falsely treated as crossing boundary 5.
+    let mut ring = vec![0u8; 6400];
+    let mut pump = WaveRtFramePump::new(&frames, DacWireFormat::Int32);
+    let mut ctrl = WaveRtLoopController::new(layout)
+        .with_half_duration(half_dur)
+        .with_wrap_mode(PositionWrapMode::Monotonic);
+    ctrl.prefill(&mut ring, &mut pump).unwrap();
+
+    let (h1, _) = ctrl
+        .on_notification_at(&mut ring, &mut pump, false, Some(2200), Some(Duration::from_millis(50)))
+        .unwrap();
+    let (h2, _) = ctrl
+        .on_notification_at(&mut ring, &mut pump, false, Some(6364), Some(Duration::from_millis(101)))
+        .unwrap();
+    let (h3, _) = ctrl
+        .on_notification_at(&mut ring, &mut pump, false, Some(9564), Some(Duration::from_millis(151)))
+        .unwrap();
+    // Wake 4 late (real = 12800 + 2500 = 15300 in half 0, true lag 100 -> reports 15200, t = 239 ms).
+    let (h4, _) = ctrl
+        .on_notification_at(&mut ring, &mut pump, false, Some(15200), Some(Duration::from_millis(239)))
+        .unwrap();
+    assert_eq!([h1, h2, h3, h4], [0, 1, 0, 1]);
+    assert_eq!(ctrl.frames_played(), 4 * 400);
+}
+
+#[test]
+fn wavert_loop_controller_recovers_multi_half_stalls_on_modular_register() {
+    // Review #4 Finding #6: Register (modular) source, ring 6400 B (half 3200 B = 50 ms).
+    // Stall of ~2.8 halves (from t=251 ms pos=3263 bidx=5 to t=390 ms real=24960 pos=5760 bidx=7)
+    // and ~4.8 halves must infer exact full-ring wraps, mark coalesced, and write the safe half.
+    let layout = WaveRtRingLayout::new(6400, 8).unwrap();
+    let frames = vec![[55_i32, -55_i32]; 12000];
+    let mut ring = vec![0u8; 6400];
+    let mut pump = WaveRtFramePump::new(&frames, DacWireFormat::Int32);
+    let mut ctrl = WaveRtLoopController::new(layout)
+        .with_half_duration(Duration::from_millis(50))
+        .with_wrap_mode(PositionWrapMode::Modular);
+    ctrl.prefill(&mut ring, &mut pump).unwrap();
+
+    // Wakes 1..=5 on time: t = 51, 101, 151, 201, 251 ms.
+    for k in 1u64..=5 {
+        let real = k * 3200 + 63;
+        let (h, out) = ctrl
+            .on_notification_at(
+                &mut ring,
+                &mut pump,
+                false,
+                Some(real % 6400),
+                Some(Duration::from_millis(k * 50 + 1)),
+            )
+            .unwrap();
+        assert_eq!(out, WaveRtStepOutcome::Continue);
+        assert_eq!(h, ((k as usize) & 1) ^ 1);
+    }
+    assert_eq!(ctrl.frames_played(), 5 * 400);
+
+    // Stall of 2.8 halves -> wake at t=390 ms, real=24960 (bidx 7, half 1), pos=5760 >= prev_raw=3263.
+    let (h_stall, out_stall) = ctrl
+        .on_notification_at(&mut ring, &mut pump, false, Some(5760), Some(Duration::from_millis(390)))
+        .unwrap();
+    assert_eq!(out_stall, WaveRtStepOutcome::Continue);
+    assert_eq!(h_stall, 0, "DMA is in half 1 (bidx 7) -> must write safe half 0");
+    assert_eq!(ctrl.frames_played(), 7 * 400, "coalesced 2-half stall credits both halves");
+
+    // Next on-time wake at t=401 ms, real=25664 (bidx 8, half 0), pos=64 -> writes safe half 1.
+    let (h_after, out_after) = ctrl
+        .on_notification_at(&mut ring, &mut pump, false, Some(64), Some(Duration::from_millis(401)))
+        .unwrap();
+    assert_eq!(out_after, WaveRtStepOutcome::Continue);
+    assert_eq!(h_after, 1);
+
+    // Stall of 4.8 halves -> wake at t=641 ms, real=41024 (bidx 12, half 0), pos=2624 >= 64.
+    let (h_big, out_big) = ctrl
+        .on_notification_at(&mut ring, &mut pump, false, Some(2624), Some(Duration::from_millis(641)))
+        .unwrap();
+    assert_eq!(out_big, WaveRtStepOutcome::Continue);
+    assert_eq!(h_big, 1, "DMA is in half 0 (bidx 12) -> must write safe half 1");
+}
+
+#[test]
+fn wavert_loop_controller_unavailable_clock_anchor_resists_steady_latency_and_stale_events() {
+    // Review #4 Finding #7: Unavailable position source with 50 ms halves and consistent 10 ms
+    // wake latency (t = 60, 110, ..., 460). Boundary 500 is missed; merged wake arrives at
+    // t = 550.2 ms (DMA in half 1, boundary 11). Must advance 2 halves and write safe half 0,
+    // and ignore a stale duplicate wake arriving at t = 555 ms.
+    let layout = WaveRtRingLayout::new(6400, 8).unwrap();
+    let frames = vec![[88_i32, -88_i32]; 12000];
+    let mut ring = vec![0u8; 6400];
+    let mut pump = WaveRtFramePump::new(&frames, DacWireFormat::Int32);
+    let mut ctrl = WaveRtLoopController::new(layout).with_half_duration(Duration::from_millis(50));
+    ctrl.prefill(&mut ring, &mut pump).unwrap();
+
+    for k in 1u64..=9 {
+        let (h, out) = ctrl
+            .on_notification_at(
+                &mut ring,
+                &mut pump,
+                false,
+                None,
+                Some(Duration::from_millis(k * 50 + 10)),
+            )
+            .unwrap();
+        assert_eq!(out, WaveRtStepOutcome::Continue);
+        assert_eq!(h, ((k as usize) & 1) ^ 1);
+    }
+    assert_eq!(ctrl.frames_played(), 9 * 400);
+
+    // Missed boundary 10 (500 ms); coalesced wake at 550.2 ms -> boundary 11 (DMA in half 1).
+    let (h_coal, out_coal) = ctrl
+        .on_notification_at(
+            &mut ring,
+            &mut pump,
+            false,
+            None,
+            Some(Duration::from_micros(550_200)),
+        )
+        .unwrap();
+    assert_eq!(out_coal, WaveRtStepOutcome::Continue);
+    assert_eq!(h_coal, 0, "DMA at 550.2 ms is in half 1 -> must write safe half 0");
+    assert_eq!(ctrl.frames_played(), 11 * 400);
+
+    // Stale duplicate event right after catch-up at 555 ms -> must be ignored as Spurious!
+    let ring_before = ring.clone();
+    let (_, out_stale) = ctrl
+        .on_notification_at(&mut ring, &mut pump, false, None, Some(Duration::from_millis(555)))
+        .unwrap();
+    assert_eq!(out_stale, WaveRtStepOutcome::Spurious);
+    assert_eq!(ctrl.spurious_wakes(), 1);
+    assert_eq!(ctrl.frames_played(), 11 * 400, "spurious wake must not credit frames");
+    assert_eq!(ring, ring_before, "spurious wake must not overwrite either half");
+
+    // Subsequent on-time wakes at 600.5, 650.5 ms remain strictly in phase.
+    let (h12, out12) = ctrl
+        .on_notification_at(
+            &mut ring,
+            &mut pump,
+            false,
+            None,
+            Some(Duration::from_micros(600_500)),
+        )
+        .unwrap();
+    assert_eq!(out12, WaveRtStepOutcome::Continue);
+    assert_eq!(h12, 1);
+    let (h13, out13) = ctrl
+        .on_notification_at(
+            &mut ring,
+            &mut pump,
+            false,
+            None,
+            Some(Duration::from_micros(650_500)),
+        )
+        .unwrap();
+    assert_eq!(out13, WaveRtStepOutcome::Continue);
+    assert_eq!(h13, 0);
+}
+
+#[test]
+fn wavert_loop_controller_ignores_spurious_no_boundary_wakes_without_overwriting_pending_half() {
+    // Review #4 Finding #18: Spurious driver wake mid-half (e.g. t=60 ms after wake 1 at t=50 ms)
+    // or immediately after a coalesced wake (t=206 ms after t=201 ms) must NOT overwrite the
+    // pending half and must NOT credit unplayed frames.
+    let layout = WaveRtRingLayout::new(6400, 8).unwrap();
+    let frames = vec![[99_i32, -99_i32]; 8000];
+    let mut ring = vec![0u8; 6400];
+    let mut pump = WaveRtFramePump::new(&frames, DacWireFormat::Int32);
+    let mut ctrl = WaveRtLoopController::new(layout)
+        .with_half_duration(Duration::from_millis(50))
+        .with_wrap_mode(PositionWrapMode::Modular);
+    ctrl.prefill(&mut ring, &mut pump).unwrap();
+
+    // Wake 1 on time at t=50 ms, pos=3200 -> writes half 0, credits 400 frames.
+    let (h1, out1) = ctrl
+        .on_notification_at(&mut ring, &mut pump, false, Some(3200), Some(Duration::from_millis(50)))
+        .unwrap();
+    assert_eq!((h1, out1), (0, WaveRtStepOutcome::Continue));
+    assert_eq!(ctrl.frames_played(), 400);
+
+    // Spurious wake at t=60 ms, pos=3840 (still inside half 1, no boundary crossed).
+    let ring_snapshot = ring.clone();
+    let (_, out_spurious) = ctrl
+        .on_notification_at(&mut ring, &mut pump, false, Some(3840), Some(Duration::from_millis(60)))
+        .unwrap();
+    assert_eq!(out_spurious, WaveRtStepOutcome::Spurious);
+    assert_eq!(ctrl.spurious_wakes(), 1);
+    assert_eq!(ctrl.frames_played(), 400, "spurious wake must not credit pending half");
+    assert_eq!(ring, ring_snapshot, "spurious wake must not overwrite pending half 0");
+
+    // Real wake 2 at t=100 ms, pos=0 (wrapped into half 0) -> writes half 1, credits 400 frames.
+    let (h2, out2) = ctrl
+        .on_notification_at(&mut ring, &mut pump, false, Some(0), Some(Duration::from_millis(100)))
+        .unwrap();
+    assert_eq!((h2, out2), (1, WaveRtStepOutcome::Continue));
+    assert_eq!(ctrl.frames_played(), 800);
 }
 
 // ---------------------------------------------------------------------------
