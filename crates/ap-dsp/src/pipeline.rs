@@ -23,7 +23,9 @@ use crate::convolution::{
     StereoConvolverFactory,
 };
 use crate::delay::{ChannelDelayer, ChannelDelayerFactory, NullChannelDelayerFactory};
-use crate::quantize::{QuantizerStats, StreamingQuantizer, apply_safe_gain_f64};
+use crate::quantize::{
+    QuantizerCarryoverState, QuantizerStats, StreamingQuantizer, apply_safe_gain_f64,
+};
 use crate::selector::{
     FilterArchetype, FilterDesignMetrics, MAX_SUPPORTED_SOURCE_RATE_HZ,
     MIN_SUPPORTED_SOURCE_RATE_HZ, NoiseShaperProfile, SelectedDspPlan, TrackSourceInfo,
@@ -45,6 +47,9 @@ pub struct GaplessCarryover {
     pub effective_shaper: NoiseShaperProfile,
     pub upsampler: Option<UpsamplerCarryover>,
     pub convolver: Option<ConvolutionTail>,
+    /// Continuous PRNG + per-channel error-feedback shaper state preserved across equal-rate
+    /// gapless boundaries (`docs/research/04-noise-shapers.md` §6.4).
+    pub quantizer_state: Option<QuantizerCarryoverState>,
 }
 
 impl GaplessCarryover {
@@ -248,6 +253,15 @@ impl StreamingPipelineSession {
         if let Some(conv) = carryover.convolver.take() {
             self.convolver.set_incoming_tail(conv);
         }
+        // §6.4: Preserve PRNG + error-feedback shaper state across equal-rate gapless transitions
+        // when the effective shaper profile and bit depth match; reset cleanly otherwise.
+        if let Some(q_state) = carryover.quantizer_state.take() {
+            if carryover.effective_shaper == self.report.effective_shaper
+                && carryover.output_bits == self.report.output_bits
+            {
+                self.quantizer.restore_state(q_state);
+            }
+        }
         Ok(())
     }
 
@@ -327,13 +341,20 @@ impl StreamingPipelineSession {
             frames.extend(self.quantizer.quantize_block(&delay_tail).frames);
         }
 
-        let carryover = if up_carry.is_some() || conv_tail.is_some() {
+        let has_shaper_state = !self.quantizer.coeffs().is_empty();
+        let carryover = if up_carry.is_some() || conv_tail.is_some() || has_shaper_state {
+            let quantizer_state = if self.report.effective_shaper != NoiseShaperProfile::Bypass {
+                Some(self.quantizer.export_state())
+            } else {
+                None
+            };
             Some(GaplessCarryover {
                 output_rate_hz: rate,
                 output_bits: self.report.output_bits,
                 effective_shaper: self.report.effective_shaper,
                 upsampler: up_carry,
                 convolver: conv_tail,
+                quantizer_state,
             })
         } else {
             None
@@ -504,7 +525,9 @@ impl AudioPipeline {
             && convolver.name() == "null-convolver"
             && delayer.name() == "null-delay";
 
-        let (requested_shaper, output_bits) = if untouched_native {
+        let (requested_shaper, output_bits) = if untouched_native
+            && (dsp_plan.dac_bits == 24 || u16::from(dsp_plan.dac_bits) >= spec.bits_per_sample)
+        {
             let out_bits = (spec.bits_per_sample as u8).clamp(16, 32);
             // Truly bit-perfect native pass-through: never add TPDF dither when no DSP modified
             // the signal and output bit depth can represent every source bit losslessly.
@@ -517,9 +540,9 @@ impl AudioPipeline {
             };
             (shaper, out_bits)
         } else if dsp_plan.shaper == NoiseShaperProfile::Bypass {
-            (NoiseShaperProfile::TpdfDither, 24)
+            (NoiseShaperProfile::TpdfDither, dsp_plan.dac_bits)
         } else {
-            (dsp_plan.shaper, 24)
+            (dsp_plan.shaper, dsp_plan.dac_bits)
         };
 
         let quantizer =
@@ -608,8 +631,14 @@ impl AudioPipeline {
                         conv.set_incoming_tail(conv_tail);
                     }
                     let mut delayer = self.delayer_factory.create_for_rate(rate)?;
-                    let mut quantizer =
-                        StreamingQuantizer::new(rejected.effective_shaper, rejected.output_bits)?;
+                    let mut quantizer = StreamingQuantizer::with_rate(
+                        rejected.effective_shaper,
+                        rejected.output_bits,
+                        rate,
+                    )?;
+                    if let Some(q_state) = rejected.quantizer_state.take() {
+                        quantizer.restore_state(q_state);
+                    }
 
                     if !up_tail_exact.is_empty() {
                         let c_out = conv.process_block(up_tail_exact)?;
@@ -633,6 +662,12 @@ impl AudioPipeline {
                         frames.extend(quantizer.quantize_block(&delay_tail).frames);
                     }
                     tail_stats = quantizer.stats();
+                    if rejected.effective_shaper == session.report.effective_shaper
+                        && rejected.output_bits == session.report.output_bits
+                        && rejected.effective_shaper != NoiseShaperProfile::Bypass
+                    {
+                        session.quantizer.restore_state(quantizer.export_state());
+                    }
 
                     // Review #6 Finding #13: preserve Track A's post-ringing FIR decay past
                     // `exact_len` by convolving it and overlap-adding onto the incoming tail of
@@ -690,6 +725,13 @@ impl AudioPipeline {
                         session.set_incoming_convolver_tail(conv_tail);
                         attached_convolver_tail = true;
                     }
+                    if let Some(q_state) = rejected.quantizer_state.take() {
+                        if rejected.effective_shaper == session.report.effective_shaper
+                            && rejected.output_bits == session.report.output_bits
+                        {
+                            session.quantizer.restore_state(q_state);
+                        }
+                    }
                 }
 
                 Ok(GaplessAttachOutcome::ConvolverOnlyHandoff {
@@ -734,8 +776,14 @@ impl AudioPipeline {
         }
 
         let mut delayer = self.delayer_factory.create_for_rate(rate)?;
-        let mut quantizer =
-            StreamingQuantizer::new(carryover.effective_shaper, carryover.output_bits)?;
+        let mut quantizer = StreamingQuantizer::with_rate(
+            carryover.effective_shaper,
+            carryover.output_bits,
+            rate,
+        )?;
+        if let Some(q_state) = carryover.quantizer_state {
+            quantizer.restore_state(q_state);
+        }
 
         let mut frames = Vec::new();
         let conv_opt = self.convolver_factory.create_for_rate(rate).ok();

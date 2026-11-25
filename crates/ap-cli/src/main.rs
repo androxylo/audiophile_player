@@ -47,6 +47,7 @@ fn main() -> ExitCode {
             optimization,
             http_port,
             upsampler_policy,
+            quantizer_override,
             rew_override,
             upnp_override,
         } => engine::run_random_music_player(
@@ -56,6 +57,7 @@ fn main() -> ExitCode {
             optimization,
             http_port,
             upsampler_policy,
+            quantizer_override,
             rew_override,
             upnp_override,
             controller,

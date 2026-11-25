@@ -10,12 +10,22 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use ap_core::config::ConvolutionConfig;
+use ap_core::config::{ConvolutionConfig, is_valid_dac_bits};
 use ap_dsp::MAX_FILTER_TAPS;
 use ap_dsp::selector::{FilterArchetype, NoiseShaperProfile, UpsamplerPolicy};
 use ap_output_win::hygiene::OptimizationLevel;
 
 pub const MANUAL_URL: &str = "https://github.com/androxylo/audiophile_player";
+
+/// Explicit CLI overrides for `[quantizer]` in `config.toml` (`--dac-bits`, `--shaper`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QuantizerCliOverride {
+    /// `Some(bits)` when `--dac-bits` was explicitly passed on the CLI.
+    pub dac_bits: Option<u8>,
+    /// `Some(None)` = explicit `--shaper auto`; `Some(Some(p))` = explicit `--shaper <p>`;
+    /// `None` = not passed on CLI (defer to `[quantizer] shaper` in `config.toml`).
+    pub shaper: Option<Option<NoiseShaperProfile>>,
+}
 
 /// Explicit CLI overrides for the built-in UPnP AV MediaRenderer (`--upnp-*` / `--no-upnp`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -36,6 +46,8 @@ pub enum RunMode {
         optimization: OptimizationLevel,
         http_port: Option<u16>,
         upsampler_policy: UpsamplerPolicy,
+        /// Explicit CLI overrides for `[quantizer]` in `config.toml`.
+        quantizer_override: QuantizerCliOverride,
         /// Explicit CLI override for `[convolution]` in `config.toml` (`None` = use config file).
         rew_override: Option<ConvolutionConfig>,
         /// Explicit CLI overrides for `[upnp]` in `config.toml`.
@@ -66,6 +78,7 @@ where
     let mut optimization = OptimizationLevel::High;
     let mut http_port: Option<u16> = None;
     let mut upsampler_policy = UpsamplerPolicy::default();
+    let mut quantizer_override = QuantizerCliOverride::default();
     let mut rew_override: Option<ConvolutionConfig> = None;
     let mut upnp_override = UpnpCliOverride::default();
     let mut idle = false;
@@ -129,10 +142,28 @@ where
                 let val_str = require_utf8_arg("--shaper", val)?;
                 if val_str.eq_ignore_ascii_case("auto") {
                     upsampler_policy.shaper_override = None;
+                    quantizer_override.shaper = Some(None);
                 } else {
-                    upsampler_policy.shaper_override =
-                        Some(NoiseShaperProfile::from_str(&val_str)?);
+                    let parsed = NoiseShaperProfile::from_str(&val_str)?;
+                    upsampler_policy.shaper_override = Some(parsed);
+                    quantizer_override.shaper = Some(Some(parsed));
                 }
+            }
+            "--dac-bits" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| "--dac-bits requires 16, 18, 20, or 24".to_string())?;
+                let val_str = require_utf8_arg("--dac-bits", val)?;
+                let bits = val_str.parse::<u8>().map_err(|_| {
+                    format!("invalid --dac-bits '{val_str}'; expected 16, 18, 20, or 24")
+                })?;
+                if !is_valid_dac_bits(bits) {
+                    return Err(format!(
+                        "invalid --dac-bits {bits}; expected one of 16, 18, 20, or 24"
+                    ));
+                }
+                upsampler_policy.dac_bits = bits;
+                quantizer_override.dac_bits = Some(bits);
             }
             "--max-taps" => {
                 let val = iter
@@ -238,6 +269,7 @@ where
         optimization,
         http_port,
         upsampler_policy,
+        quantizer_override,
         rew_override,
         upnp_override,
     })
@@ -254,7 +286,7 @@ pub fn help_text() -> String {
            audiophile-player [OPTIONS]\n\n\
          CONFIG FILE:\n\
            Auto-loads .\\audiophile-player.toml or %APPDATA%\\audiophile-player\\config.toml\n\
-           (or pass --config <PATH>). Configures [convolution] and [upnp].\n\n\
+           (or pass --config <PATH>). Configures [convolution], [quantizer], and [upnp].\n\n\
          OPTIONS:\n\
            --config <PATH>      Path to TOML config file (default: auto-discover)\n\
            --music-dir <PATH>   Root folder containing FLAC subfolders (default: ~/Music)\n\
@@ -268,8 +300,11 @@ pub fn help_text() -> String {
                                 null | simple-test | gauss-apod-4m | sinc-steep-4m | ext-sharp-lp |\n\
                                 minphase-long | intermediate-long | short-lp | short-mp\n\
                                 (default: auto -> gauss-long-lp 1x, gauss-hires-lp hi-res, null 8fS)\n\
-           --shaper <NAME>      Enforce 8fS shaper: auto | bypass | ns5 | lns15 |\n\
-                                pggb-optimal | tpdf (default: auto per track)\n\
+           --dac-bits <N>       Quantizer DAC bit depth: 16 | 18 | 20 | 24 (default: 24)\n\
+           --shaper <NAME>      Enforce 8fS shaper: auto | bypass | tpdf | ns-gentle-2 |\n\
+                                ns5 (clean-room ns5-class) | lns15 (clean-room lns15-class) |\n\
+                                pggb-optimal (clean-room wide40-9)\n\
+                                (default: auto -> tpdf at 24-bit, ns-gentle-2 at <= 20-bit)\n\
            --max-taps <N>       Tap ceiling <= 4000000 (default: 4000000)\n\
            --conv-dir <PATH>    Override config: REW stereo WAV folder (auto-picks newest\n\
                                 2-ch WAV matching 352.8 / 384 kHz)\n\
@@ -298,6 +333,7 @@ mod tests {
                 optimization: OptimizationLevel::High,
                 http_port: None,
                 upsampler_policy: UpsamplerPolicy::default(),
+                quantizer_override: QuantizerCliOverride::default(),
                 rew_override: None,
                 upnp_override: UpnpCliOverride::default(),
             }
@@ -324,6 +360,8 @@ mod tests {
             "192.168.0.187",
             "--filter",
             "sinc-steep-4m",
+            "--dac-bits",
+            "18",
             "--shaper",
             "lns15",
             "--max-taps",
@@ -346,6 +384,11 @@ mod tests {
                     filter_override: Some(FilterArchetype::SincSteep4M),
                     shaper_override: Some(NoiseShaperProfile::Lns15Smooth),
                     max_taps: 2_000_000,
+                    dac_bits: 18,
+                },
+                quantizer_override: QuantizerCliOverride {
+                    dac_bits: Some(18),
+                    shaper: Some(Some(NoiseShaperProfile::Lns15Smooth)),
                 },
                 rew_override: Some(ConvolutionConfig::explicit_file(
                     r"C:\Filters\room-384k.wav"
@@ -379,8 +422,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_filter_and_over_4m_taps() {
+    fn rejects_invalid_filter_dac_bits_and_over_4m_taps() {
         assert!(parse_args(["audiophile-player", "--filter", "bogus"]).is_err());
+        assert!(parse_args(["audiophile-player", "--dac-bits", "22"]).is_err());
+        assert!(parse_args(["audiophile-player", "--dac-bits", "32"]).is_err());
         assert!(parse_args(["audiophile-player", "--max-taps", "4000001"]).is_err());
         assert!(parse_args(["audiophile-player", "--bad-flag"]).is_err());
     }

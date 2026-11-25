@@ -26,6 +26,19 @@
 # Option C: Single explicit 2-channel WAV file (used when its sample rate matches).
 # file = 'C:\path\to\room-384000.wav'
 
+[quantizer]
+# Target DAC quantization bit depth on the 32-bit WDM-KS wire (allowed: 16, 18, 20, 24).
+# Default is 24-bit with flat TPDF dither (zero ultrasonic noise shaping). For R-2R NOS DACs
+# (e.g. Schiit Gungnir 2 / TI DAC8812 16-bit R-2R), setting dac_bits = 16, 18, or 20 lets
+# shaper = 'auto' automatically engage clean-room 2nd-order gentle shaping (`ns-gentle-2`).
+# dac_bits = 24
+#
+# Optional 8fS shaper override: 'auto' | 'bypass' | 'tpdf' | 'ns-gentle-2' |
+# 'ns5' (clean-room ns5-class) | 'lns15' (clean-room lns15-class) | 'pggb-optimal' (wide40-9).
+# Note: ns5, lns15, and pggb-optimal are independent clean-room Levinson-Durbin designs
+# matching those order/passband/envelope classes (not proprietary copies).
+# shaper = 'auto'
+
 [upnp]
 # Built-in UPnP AV MediaRenderer (for foobar2000 >= 2.25 play-to output & BubbleUPnP).
 # Enabled by default; set `enabled = false` or pass `--no-upnp` to disable.

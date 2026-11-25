@@ -19,6 +19,7 @@ use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use ap_core::config::{DEFAULT_DAC_BITS, is_valid_dac_bits};
 use ap_core::format::{StreamSpec, TargetDspRate};
 
 use crate::MAX_FILTER_TAPS;
@@ -479,12 +480,14 @@ impl FromStr for NoiseShaperProfile {
     }
 }
 
-/// User/CLI policy configuring [`UpsamplerPicker`].
+/// User/CLI/config policy configuring [`UpsamplerPicker`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UpsamplerPolicy {
     pub filter_override: Option<FilterArchetype>,
     pub shaper_override: Option<NoiseShaperProfile>,
     pub max_taps: usize,
+    /// Target DAC quantization bit depth (`16`, `18`, `20`, or `24`; default `24`).
+    pub dac_bits: u8,
 }
 
 impl Default for UpsamplerPolicy {
@@ -493,6 +496,7 @@ impl Default for UpsamplerPolicy {
             filter_override: None,
             shaper_override: None,
             max_taps: MAX_FILTER_TAPS,
+            dac_bits: DEFAULT_DAC_BITS,
         }
     }
 }
@@ -503,6 +507,12 @@ impl UpsamplerPolicy {
             return Err(format!(
                 "max_taps ({}) exceeds hard 4,000,000-tap cap ({MAX_FILTER_TAPS})",
                 self.max_taps
+            ));
+        }
+        if !is_valid_dac_bits(self.dac_bits) {
+            return Err(format!(
+                "dac_bits ({}) is invalid; expected one of 16, 18, 20, or 24",
+                self.dac_bits
             ));
         }
         Ok(())
@@ -523,6 +533,8 @@ pub struct SelectedDspPlan {
     /// Filter archetype chosen by the active [`FilterSelector`] before any fallback/override.
     pub target_audiophile_filter: FilterArchetype,
     pub shaper: NoiseShaperProfile,
+    /// Target DAC quantization bit depth (`16`, `18`, `20`, or `24`).
+    pub dac_bits: u8,
     /// Planned tap count (`<= max_taps <= 4,000,000`).
     pub tap_budget: usize,
     /// User/policy `--max-taps` ceiling (preserved so `build_upsampler` enforces the hard cap).
@@ -536,12 +548,13 @@ impl SelectedDspPlan {
     /// Concise one-line summary suitable for stdout and the HTTP bottom action log.
     pub fn summary(&self) -> String {
         format!(
-            "DSP plan: filter={} ({} -> {} Hz f64, {} taps) + shaper={} [{}]",
+            "DSP plan: filter={} ({} -> {} Hz f64, {} taps) + shaper={} ({}-bit) [{}]",
             self.filter,
             self.ratio,
             self.target_rate_hz,
             self.tap_budget,
             self.shaper,
+            self.dac_bits,
             self.reason
         )
     }
@@ -688,7 +701,10 @@ impl UpsamplerPicker {
 
         let (shaper, shaper_overridden) = match self.policy.shaper_override {
             Some(forced) => (forced, true),
-            None => (auto_select_shaper(source, filter, ratio), false),
+            None => (
+                auto_select_shaper(source, filter, ratio, self.policy.dac_bits),
+                false,
+            ),
         };
 
         let resolved_target_hz = if filter == FilterArchetype::Null {
@@ -740,6 +756,7 @@ impl UpsamplerPicker {
             filter,
             target_audiophile_filter: selected_auto,
             shaper,
+            dac_bits: self.policy.dac_bits,
             tap_budget,
             max_taps: self.policy.max_taps,
             filter_overridden,
@@ -749,17 +766,27 @@ impl UpsamplerPicker {
     }
 }
 
+/// Automatic `8fS` shaper selection (`docs/research/04-noise-shapers.md` §1 & §6.6):
+/// - Untouched native `>= 32-bit` `8fS` at `dac_bits >= 24` -> `Bypass`.
+/// - `dac_bits <= 20` (`16`, `18`, `20` bits for R-2R NOS experiments) -> `NsGentle2`.
+/// - `dac_bits == 24` (default) -> `TpdfDither` (zero ultrasonic noise shaping).
+/// Higher-order shapers (`ns5`, `lns15`, `pggb-optimal`) are explicit opt-in overrides only.
 fn auto_select_shaper(
     source: &TrackSourceInfo,
     filter: FilterArchetype,
     ratio: UpsampleRatio,
+    dac_bits: u8,
 ) -> NoiseShaperProfile {
     if filter == FilterArchetype::Null
         && ratio == UpsampleRatio::Bypass1x
         && source.bits_per_sample >= 32
+        && dac_bits >= 24
     {
         return NoiseShaperProfile::Bypass;
     }
-    // Initial implemented quantizer (TPDF dither); upgraded to NS5/LNS15/PGGB after INV-04.
-    NoiseShaperProfile::TpdfDither
+    if dac_bits <= 20 {
+        NoiseShaperProfile::NsGentle2
+    } else {
+        NoiseShaperProfile::TpdfDither
+    }
 }

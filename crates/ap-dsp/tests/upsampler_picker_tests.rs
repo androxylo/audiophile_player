@@ -139,6 +139,7 @@ fn cli_filter_and_shaper_overrides_are_enforced_across_tracks() {
         filter_override: Some(FilterArchetype::SincSteep4M),
         shaper_override: Some(NoiseShaperProfile::Lns15Smooth),
         max_taps: MAX_FILTER_TAPS,
+        ..UpsamplerPolicy::default()
     };
     let picker = UpsamplerPicker::new(policy).unwrap();
 
@@ -169,6 +170,7 @@ fn cli_null_override_disables_resampling_while_staying_in_f64_domain() {
         filter_override: Some(FilterArchetype::Null),
         shaper_override: Some(NoiseShaperProfile::Bypass),
         max_taps: MAX_FILTER_TAPS,
+        ..UpsamplerPolicy::default()
     };
     let picker = UpsamplerPicker::new(policy).unwrap();
 
@@ -269,10 +271,36 @@ fn policy_enforces_strict_4_million_tap_ceiling() {
         filter_override: Some(FilterArchetype::SincSteep4M),
         shaper_override: None,
         max_taps: 1_000_000,
+        ..UpsamplerPolicy::default()
     };
     let picker = UpsamplerPicker::new(custom).unwrap();
     let p = picker.select(&track(44_100, 16));
     assert_eq!(p.tap_budget, 1_000_000);
+    assert_eq!(p.dac_bits, 24);
+    assert_eq!(p.shaper, NoiseShaperProfile::TpdfDither);
+
+    // Invalid dac_bits rejected; dac_bits <= 20 auto-selects NsGentle2 per INV-04 §6.6.
+    for bad_bits in [0_u8, 12, 15, 22, 32] {
+        assert!(
+            UpsamplerPicker::new(UpsamplerPolicy {
+                dac_bits: bad_bits,
+                ..UpsamplerPolicy::default()
+            })
+            .is_err(),
+            "dac_bits={bad_bits} must be rejected"
+        );
+    }
+    for low_bits in [16_u8, 18, 20] {
+        let low_picker = UpsamplerPicker::new(UpsamplerPolicy {
+            dac_bits: low_bits,
+            ..UpsamplerPolicy::default()
+        })
+        .unwrap();
+        let plan = low_picker.select(&track(44_100, 16));
+        assert_eq!(plan.dac_bits, low_bits);
+        assert_eq!(plan.shaper, NoiseShaperProfile::NsGentle2);
+        assert!(!plan.shaper_overridden);
+    }
 }
 
 #[test]

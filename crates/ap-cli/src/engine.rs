@@ -20,10 +20,12 @@ use ap_control::server::{
 };
 use ap_control::state::{ControlCommand, PlayModeLabel, SharedControl, UpnpPlayRequest};
 use ap_core::buffer::DEFAULT_SOURCE_BLOCK_FRAMES;
-use ap_core::config::{ConvolutionConfig, PlayerConfig};
+use std::str::FromStr;
+
+use ap_core::config::{ConvolutionConfig, PlayerConfig, QuantizerConfig};
 use ap_core::format::DacWireFormat;
 use ap_dsp::pipeline::{AudioPipeline, GaplessAttachOutcome, GaplessCarryover};
-use ap_dsp::selector::{UNSUPPORTED_SAMPLE_RATE_PREFIX, UpsamplerPolicy};
+use ap_dsp::selector::{NoiseShaperProfile, UNSUPPORTED_SAMPLE_RATE_PREFIX, UpsamplerPolicy};
 use ap_output_win::hygiene::OptimizationLevel;
 use ap_output_win::sink::{OutputError, PlaybackStats};
 use ap_output_win::wdm_ks::WdmKsSink;
@@ -34,7 +36,7 @@ use ap_source::http_stream::{HttpAudioSource, HttpStreamHints};
 use ap_source::library::{SequentialFlacCursor, default_user_music_dir, pick_random_flac_walk};
 use ap_upnp::{UpnpRendererConfig, UpnpRendererServer, UpnpRendererState};
 
-use crate::cli_args::UpnpCliOverride;
+use crate::cli_args::{QuantizerCliOverride, UpnpCliOverride};
 use crate::prefetch::{
     BoundedBlockStreamBuffer, DEFAULT_MAX_BUFFERED_FRAMES, PREBUFFER_SECONDS, PopBlockResult,
     StreamEvent,
@@ -523,6 +525,59 @@ impl Drop for RuntimeUrlGuard {
     }
 }
 
+/// Merge `[quantizer]` config settings with explicit CLI `--dac-bits` / `--shaper` overrides
+/// (CLI always takes precedence over `config.toml`).
+fn resolve_upsampler_policy(
+    mut cli_policy: UpsamplerPolicy,
+    cli_quant: QuantizerCliOverride,
+    cfg_quant: &QuantizerConfig,
+) -> Result<UpsamplerPolicy, String> {
+    cli_policy.dac_bits = cli_quant.dac_bits.unwrap_or(cfg_quant.dac_bits);
+    cli_policy.shaper_override = match cli_quant.shaper {
+        Some(explicit) => explicit,
+        None => match cfg_quant.shaper.as_deref() {
+            None => None,
+            Some(name) if name.eq_ignore_ascii_case("auto") => None,
+            Some(name) => Some(NoiseShaperProfile::from_str(name)?),
+        },
+    };
+    cli_policy.validate()?;
+    Ok(cli_policy)
+}
+
+#[cfg(test)]
+mod quantizer_policy_tests {
+    use super::*;
+
+    #[test]
+    fn cli_quantizer_flags_override_toml_config_and_auto_clears_toml_shaper() {
+        let cfg = QuantizerConfig {
+            dac_bits: 16,
+            shaper: Some("ns5".to_string()),
+        };
+
+        // No CLI flags -> config wins.
+        let p_cfg =
+            resolve_upsampler_policy(UpsamplerPolicy::default(), QuantizerCliOverride::default(), &cfg)
+                .unwrap();
+        assert_eq!(p_cfg.dac_bits, 16);
+        assert_eq!(p_cfg.shaper_override, Some(NoiseShaperProfile::Ns5Multibit));
+
+        // Explicit --dac-bits 20 --shaper auto overrides both TOML fields.
+        let p_cli = resolve_upsampler_policy(
+            UpsamplerPolicy::default(),
+            QuantizerCliOverride {
+                dac_bits: Some(20),
+                shaper: Some(None),
+            },
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(p_cli.dac_bits, 20);
+        assert_eq!(p_cli.shaper_override, None);
+    }
+}
+
 /// Run default zero-config random FLAC playback via bounded-memory block streaming,
 /// tidy `AudioPipeline`, native Windows Kernel Streaming (`WDM-KS`), localhost HTTP UI,
 /// and built-in UPnP AV MediaRenderer (for foobar2000 / BubbleUPnP).
@@ -534,6 +589,7 @@ pub fn run_random_music_player(
     optimization: OptimizationLevel,
     http_port: Option<u16>,
     upsampler_policy: UpsamplerPolicy,
+    quantizer_override: QuantizerCliOverride,
     rew_override: Option<ConvolutionConfig>,
     upnp_override: UpnpCliOverride,
     controller: &ShutdownController,
@@ -541,6 +597,11 @@ pub fn run_random_music_player(
     let loaded_cfg = PlayerConfig::discover_and_load(config_path.as_deref())?;
     let effective_conv = rew_override.unwrap_or(loaded_cfg.config.convolution);
     effective_conv.validate_paths()?;
+    let effective_policy = resolve_upsampler_policy(
+        upsampler_policy,
+        quantizer_override,
+        &loaded_cfg.config.quantizer,
+    )?;
 
     let upnp_explicit = upnp_override.port.is_some()
         || upnp_override.bind_ip.is_some()
@@ -566,7 +627,7 @@ pub fn run_random_music_player(
         enable_ssdp: true,
     };
 
-    let pipeline = AudioPipeline::with_rew_config(upsampler_policy, effective_conv)?;
+    let pipeline = AudioPipeline::with_rew_config(effective_policy, effective_conv)?;
     let music_dir = match music_dir_override {
         Some(dir) => dir,
         None => default_user_music_dir()

@@ -1266,3 +1266,106 @@ fn review6_gapless_rew_pair_preserves_equal_gain_full_drain_decay_and_pre_dither
         assert_eq!(q.stats().overs_count, 4);
     }
 }
+
+#[test]
+fn inv04_dac_bits_auto_shaper_and_gapless_shaper_continuity_matches_continuous_stream() {
+    // 1. dac_bits = 16 auto-selects NsGentle2 and quantizes to exact 16-bit left-justified PCM.
+    let policy_16 = UpsamplerPolicy {
+        filter_override: Some(FilterArchetype::SimpleTest),
+        dac_bits: 16,
+        ..UpsamplerPolicy::default()
+    };
+    let pipe_16 = AudioPipeline::new(policy_16).unwrap();
+    let spec_44 = StreamSpec {
+        sample_rate_hz: 44_100,
+        bits_per_sample: 16,
+        channels: 2,
+    };
+    let mut sess = pipe_16
+        .start_track(spec_44, &TrackPeakMetadata::default(), false)
+        .unwrap();
+    assert_eq!(sess.report().output_bits, 16);
+    assert_eq!(sess.report().effective_shaper, NoiseShaperProfile::NsGentle2);
+    let blk = StereoF64Buffer {
+        sample_rate_hz: 44_100,
+        left: (0..256).map(|i| 0.25 * (0.07 * i as f64).sin()).collect(),
+        right: (0..256).map(|i| -0.20 * (0.11 * i as f64).cos()).collect(),
+    };
+    let pcm = sess.process_block(blk).unwrap();
+    assert!(!pcm.frames.is_empty());
+    for &[l, r] in &pcm.frames {
+        assert_eq!(l & 0xFFFF, 0, "16-bit left-justified sample must zero lower 16 bits");
+        assert_eq!(r & 0xFFFF, 0, "16-bit left-justified sample must zero lower 16 bits");
+    }
+
+    // 2. Gapless FullHandoff with 15th-order Lns15Smooth preserves both upsampler FIR history
+    //    AND quantizer/shaper state, producing bit-for-bit identical PCM to one continuous track!
+    let policy_lns15 = UpsamplerPolicy {
+        filter_override: Some(FilterArchetype::SimpleTest),
+        shaper_override: Some(NoiseShaperProfile::Lns15Smooth),
+        dac_bits: 18,
+        ..UpsamplerPolicy::default()
+    };
+    let pipe_lns = AudioPipeline::new(policy_lns15).unwrap();
+    let total_src = 2_048_usize;
+    let split = 1_024_usize;
+    let full_l: Vec<f64> = (0..total_src)
+        .map(|i| 0.3 * (2.0 * std::f64::consts::PI * 997.0 * (i as f64) / 44_100.0).sin())
+        .collect();
+    let full_r: Vec<f64> = (0..total_src)
+        .map(|i| 0.25 * (2.0 * std::f64::consts::PI * 1_481.0 * (i as f64) / 44_100.0).cos())
+        .collect();
+
+    let continuous = pipe_lns
+        .process(
+            StereoF64Buffer {
+                sample_rate_hz: 44_100,
+                left: full_l.clone(),
+                right: full_r.clone(),
+            },
+            spec_44,
+            &TrackPeakMetadata::default(),
+            false,
+        )
+        .unwrap();
+
+    let mut track_a = pipe_lns
+        .start_track(spec_44, &TrackPeakMetadata::default(), false)
+        .unwrap();
+    let mut stitched = track_a
+        .process_block(StereoF64Buffer {
+            sample_rate_hz: 44_100,
+            left: full_l[..split].to_vec(),
+            right: full_r[..split].to_vec(),
+        })
+        .unwrap()
+        .frames;
+    let (tail_a, carryover) = track_a.flush_for_gapless().unwrap();
+    stitched.extend(tail_a.frames);
+    let carryover = carryover.expect("expected gapless carryover with quantizer state");
+    assert!(carryover.quantizer_state.is_some());
+
+    let mut track_b = pipe_lns
+        .start_track(spec_44, &TrackPeakMetadata::default(), false)
+        .unwrap();
+    let outcome = pipe_lns
+        .attach_gapless_carryover(&mut track_b, carryover)
+        .unwrap();
+    assert!(matches!(outcome, GaplessAttachOutcome::FullHandoff));
+    stitched.extend(
+        track_b
+            .process_block(StereoF64Buffer {
+                sample_rate_hz: 44_100,
+                left: full_l[split..].to_vec(),
+                right: full_r[split..].to_vec(),
+            })
+            .unwrap()
+            .frames,
+    );
+    stitched.extend(track_b.flush().unwrap().frames);
+
+    assert_eq!(
+        stitched, continuous.pcm.frames,
+        "equal-rate gapless handoff with Lns15Smooth must match continuous stream bit-for-bit"
+    );
+}

@@ -28,6 +28,7 @@ fn simple_test_policy(max_taps: usize) -> UpsamplerPolicy {
         filter_override: Some(FilterArchetype::SimpleTest),
         shaper_override: None,
         max_taps,
+        ..UpsamplerPolicy::default()
     }
 }
 

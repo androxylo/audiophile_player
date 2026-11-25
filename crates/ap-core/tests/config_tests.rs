@@ -241,3 +241,39 @@ bind_ip = "192.168.0.187"
     assert!(PlayerConfig::from_toml_str("[upnp]\nbind_ip = 'not-an-ip'\n").is_err());
     assert!(PlayerConfig::from_toml_str("[upnp]\nfriendly_name = ''\n").is_err());
 }
+
+#[test]
+fn parses_and_validates_quantizer_section_with_strict_dac_bits_and_shaper() {
+    let default_cfg = PlayerConfig::default();
+    assert_eq!(default_cfg.quantizer.dac_bits, 24);
+    assert_eq!(default_cfg.quantizer.shaper, None);
+
+    for bits in [16_u8, 18, 20, 24] {
+        let cfg = PlayerConfig::from_toml_str(&format!("[quantizer]\ndac_bits = {bits}\n")).unwrap();
+        assert_eq!(cfg.quantizer.dac_bits, bits);
+        assert_eq!(cfg.quantizer.shaper, None);
+    }
+
+    let custom = PlayerConfig::from_toml_str(
+        "[quantizer]\ndac_bits = 18\nshaper = 'ns-gentle-2'\n",
+    )
+    .unwrap();
+    assert_eq!(custom.quantizer.dac_bits, 18);
+    assert_eq!(custom.quantizer.shaper.as_deref(), Some("ns-gentle-2"));
+
+    let auto_cfg = PlayerConfig::from_toml_str("[quantizer]\nshaper = 'auto'\n").unwrap();
+    assert_eq!(auto_cfg.quantizer.dac_bits, 24);
+    assert_eq!(auto_cfg.quantizer.shaper, None);
+
+    // Invalid dac_bits, unknown shaper, duplicate section, duplicate key.
+    for bad_bits in [0, 8, 12, 15, 22, 32] {
+        assert!(
+            PlayerConfig::from_toml_str(&format!("[quantizer]\ndac_bits = {bad_bits}\n")).is_err(),
+            "dac_bits = {bad_bits} must be rejected"
+        );
+    }
+    assert!(PlayerConfig::from_toml_str("[quantizer]\nshaper = 'bogus'\n").is_err());
+    assert!(PlayerConfig::from_toml_str("[quantizer]\ndac_bits = 24\ndac_bits = 16\n").is_err());
+    assert!(PlayerConfig::from_toml_str("[quantizer]\ndac_bits = 24\n[quantizer]\n").is_err());
+    assert!(PlayerConfig::from_toml_str("[quantizer]\nunknown_key = 1\n").is_err());
+}

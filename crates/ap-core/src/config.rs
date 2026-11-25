@@ -1,14 +1,14 @@
 //! Engine configuration schema & zero-dependency TOML config file loader.
 //!
-//! Currently configures **REW stereo convolution** (`[convolution]`), since upsampling
-//! and noise-shaping have strong automatic defaults whereas room-correction filters are
-//! strictly user- and room-specific.
+//! Configures **REW stereo convolution** (`[convolution]`), **quantizer / noise shaping**
+//! (`[quantizer]`), and the built-in **UPnP AV MediaRenderer** (`[upnp]`).
 //!
 //! ## Config Discovery Order
 //! 1. Explicit `--config <PATH>` (must exist and parse cleanly).
 //! 2. `./audiophile-player.toml` (next to working directory, if present).
 //! 3. `%APPDATA%\audiophile-player\config.toml` on Windows (or `$HOME/.config/audiophile-player/config.toml`).
-//! 4. If no config file is found: safe default with convolution **disabled** (null pass-through).
+//! 4. If no config file is found: safe default with convolution **disabled** (null pass-through),
+//!    quantizer `dac_bits = 24` (`shaper = auto`), and UPnP enabled.
 
 use std::collections::HashSet;
 use std::fs;
@@ -20,6 +20,37 @@ pub const LOCAL_CONFIG_FILENAME: &str = "audiophile-player.toml";
 /// Standard per-user subdirectory + filename under `%APPDATA%`.
 pub const USER_CONFIG_DIR_NAME: &str = "audiophile-player";
 pub const USER_CONFIG_FILENAME: &str = "config.toml";
+
+/// Allowed explicit DAC quantization bit depths (`docs/research/04-noise-shapers.md` §6.5).
+pub const ALLOWED_DAC_BITS: [u8; 4] = [16, 18, 20, 24];
+
+/// Default DAC quantization bit depth (`24-bit` TPDF on 32-bit WDM-KS wire).
+pub const DEFAULT_DAC_BITS: u8 = 24;
+
+/// Returns `true` iff `bits` is one of the allowed DAC quantization bit depths (`16, 18, 20, 24`).
+pub const fn is_valid_dac_bits(bits: u8) -> bool {
+    matches!(bits, 16 | 18 | 20 | 24)
+}
+
+/// Allowed `[quantizer] shaper` string values (case-insensitive).
+pub const ALLOWED_SHAPER_NAMES: [&str; 10] = [
+    "auto",
+    "bypass",
+    "tpdf",
+    "ns-gentle-2",
+    "ns5",
+    "ns5-class",
+    "lns15",
+    "lns15-class",
+    "pggb-optimal",
+    "wide40-9",
+];
+
+/// Returns `true` iff `name` (trimmed, ASCII case-insensitive) is a valid `[quantizer] shaper`.
+pub fn is_valid_shaper_name(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    ALLOWED_SHAPER_NAMES.iter().any(|&a| a == lower)
+}
 
 /// Strictly mixer-free Windows output transport selection.
 /// Shared Mode is intentionally unrepresentable.
@@ -156,10 +187,52 @@ impl Default for UpnpConfig {
     }
 }
 
+/// Quantizer & `8fS` noise-shaper configuration loaded from `[quantizer]` in `config.toml`
+/// or overridden via `--dac-bits` / `--shaper` CLI flags (`docs/research/04-noise-shapers.md` §6.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuantizerConfig {
+    /// Target DAC quantization bit depth (`16`, `18`, `20`, or `24`; default `24`).
+    pub dac_bits: u8,
+    /// Optional explicit shaper profile override (`None` = `"auto"` -> `tpdf` at 24-bit,
+    /// `ns-gentle-2` at `<= 20-bit`, `bypass` for untouched native 32-bit 8fS).
+    pub shaper: Option<String>,
+}
+
+impl Default for QuantizerConfig {
+    fn default() -> Self {
+        Self {
+            dac_bits: DEFAULT_DAC_BITS,
+            shaper: None,
+        }
+    }
+}
+
+impl QuantizerConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !is_valid_dac_bits(self.dac_bits) {
+            return Err(format!(
+                "[quantizer] invalid 'dac_bits' ({}); expected one of 16, 18, 20, or 24",
+                self.dac_bits
+            ));
+        }
+        if let Some(ref shaper) = self.shaper {
+            if !is_valid_shaper_name(shaper) {
+                return Err(format!(
+                    "[quantizer] unknown 'shaper' '{shaper}'; expected auto, bypass, tpdf, \
+                     ns-gentle-2, ns5 (alias ns5-class), lns15 (alias lns15-class), \
+                     or pggb-optimal (alias wide40-9)"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Top-level user configuration file (`config.toml` / `audiophile-player.toml`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlayerConfig {
     pub convolution: ConvolutionConfig,
+    pub quantizer: QuantizerConfig,
     pub upnp: UpnpConfig,
 }
 
@@ -198,7 +271,7 @@ impl PlayerConfig {
         None
     }
 
-    /// Parse a strict TOML config string (`[convolution]` and `[upnp]` sections).
+    /// Parse a strict TOML config string (`[convolution]`, `[quantizer]`, and `[upnp]` sections).
     pub fn from_toml_str(input: &str) -> Result<Self, String> {
         // Strip optional UTF-8 BOM (Windows editors such as Notepad may emit it).
         let text = input.strip_prefix('\u{feff}').unwrap_or(input);
@@ -207,16 +280,20 @@ impl PlayerConfig {
         enum Section {
             None,
             Convolution,
+            Quantizer,
             Upnp,
         }
 
         let mut active_section = Section::None;
         let mut seen_convolution_section = false;
+        let mut seen_quantizer_section = false;
         let mut seen_upnp_section = false;
         let mut seen_conv_keys: HashSet<&str> = HashSet::new();
+        let mut seen_quant_keys: HashSet<&str> = HashSet::new();
         let mut seen_upnp_keys: HashSet<&str> = HashSet::new();
         let mut explicit_conv_enabled: Option<bool> = None;
         let mut conv = ConvolutionConfig::default();
+        let mut quantizer = QuantizerConfig::default();
         let mut upnp = UpnpConfig::default();
 
         for (idx, raw_line) in text.lines().enumerate() {
@@ -243,6 +320,15 @@ impl PlayerConfig {
                         seen_convolution_section = true;
                         active_section = Section::Convolution;
                     }
+                    "quantizer" => {
+                        if seen_quantizer_section {
+                            return Err(format!(
+                                "config line {line_no}: duplicate section '[quantizer]'"
+                            ));
+                        }
+                        seen_quantizer_section = true;
+                        active_section = Section::Quantizer;
+                    }
                     "upnp" => {
                         if seen_upnp_section {
                             return Err(format!(
@@ -254,7 +340,7 @@ impl PlayerConfig {
                     }
                     other => {
                         return Err(format!(
-                            "config line {line_no}: unknown section '[{other}]' (supported: [convolution], [upnp])"
+                            "config line {line_no}: unknown section '[{other}]' (supported: [convolution], [quantizer], [upnp])"
                         ));
                     }
                 }
@@ -263,7 +349,7 @@ impl PlayerConfig {
 
             if active_section == Section::None {
                 return Err(format!(
-                    "config line {line_no}: key-value entry outside a section (expected [convolution] or [upnp])"
+                    "config line {line_no}: key-value entry outside a section (expected [convolution], [quantizer], or [upnp])"
                 ));
             }
 
@@ -307,6 +393,47 @@ impl PlayerConfig {
                         other => {
                             return Err(format!(
                                 "config line {line_no}: unknown key '{other}' in [convolution] (allowed: enabled, dir, file, file_352800, file_384000)"
+                            ));
+                        }
+                    }
+                }
+                Section::Quantizer => {
+                    if !seen_quant_keys.insert(key) {
+                        return Err(format!(
+                            "config line {line_no}: duplicate key '{key}' in [quantizer]"
+                        ));
+                    }
+                    match key {
+                        "dac_bits" => {
+                            let bits = val.parse::<u8>().map_err(|_| {
+                                format!(
+                                    "config line {line_no}: invalid integer for 'dac_bits' in [quantizer]: '{val}' (expected 16, 18, 20, or 24)"
+                                )
+                            })?;
+                            if !is_valid_dac_bits(bits) {
+                                return Err(format!(
+                                    "config line {line_no}: invalid 'dac_bits' ({bits}) in [quantizer]; expected 16, 18, 20, or 24"
+                                ));
+                            }
+                            quantizer.dac_bits = bits;
+                        }
+                        "shaper" => {
+                            let s = parse_toml_string(val, line_no, "shaper")?;
+                            let trimmed = s.trim();
+                            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
+                                quantizer.shaper = None;
+                            } else if is_valid_shaper_name(trimmed) {
+                                quantizer.shaper = Some(trimmed.to_ascii_lowercase());
+                            } else {
+                                return Err(format!(
+                                    "config line {line_no}: unknown 'shaper' '{trimmed}' in [quantizer] \
+                                     (allowed: auto, bypass, tpdf, ns-gentle-2, ns5, lns15, pggb-optimal)"
+                                ));
+                            }
+                        }
+                        other => {
+                            return Err(format!(
+                                "config line {line_no}: unknown key '{other}' in [quantizer] (allowed: dac_bits, shaper)"
                             ));
                         }
                     }
@@ -369,9 +496,11 @@ impl PlayerConfig {
         // If `enabled` was omitted in [convolution], enable automatically iff at least one filter source was set.
         conv.enabled = explicit_conv_enabled.unwrap_or_else(|| conv.has_any_source());
         conv.validate()?;
+        quantizer.validate()?;
 
         Ok(Self {
             convolution: conv,
+            quantizer,
             upnp,
         })
     }
