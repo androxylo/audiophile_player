@@ -173,12 +173,11 @@ fn pipeline_native_24bit_and_16bit_untouched_paths_are_bit_perfect_without_dithe
 }
 
 #[test]
-fn pipeline_adds_upsampler_isp_safety_margin_on_0_db_headroom_selection() {
+fn pipeline_uses_exact_minus_3_dbfs_ceiling_without_extra_upsampler_margin() {
     let pipeline = AudioPipeline::new(UpsamplerPolicy::default()).unwrap();
 
-    // Sample peak right at -3.00 dBFS (0.7079):
-    // - When upsampling (44.1 -> 352.8 kHz), the +0.5 dB ISP/Gibbs safety margin requires <= -3.5 dBFS
-    //   so this track cleanly drops back to hardcoded -3 dB!
+    // Per HEADROOM_DESIGN.md (Addendum 1): sample peak <= -3.00 dBFS suffices for 0 dB upsampler
+    // headroom (A_isp = 3 dB -> -3 + 3 = 0 dBFS; the old 0.5 dB margin is removed).
     let at_minus_3 = TrackPeakMetadata {
         replaygain_track_peak: Some(10.0_f64.powf(-3.0 / 20.0)),
         ..TrackPeakMetadata::default()
@@ -188,18 +187,19 @@ fn pipeline_adds_upsampler_isp_safety_margin_on_0_db_headroom_selection() {
         bits_per_sample: 16,
         channels: 2,
     };
-    let s_cd_hot = pipeline.start_track(cd_spec, &at_minus_3, false).unwrap();
-    assert_eq!(s_cd_hot.report().headroom.mode, HeadroomMode::Minus3Db);
+    let s_cd = pipeline.start_track(cd_spec, &at_minus_3, false).unwrap();
+    assert_eq!(s_cd.report().headroom.mode, HeadroomMode::ZeroDb);
+    assert_eq!(s_cd.report().headroom.convolution_scale_db, 0.0);
 
-    // - A quieter track at -3.6 dBFS clears the -3.5 dBFS upsampling ceiling -> 0 dB.
-    let at_minus_3_6 = TrackPeakMetadata {
-        replaygain_track_peak: Some(10.0_f64.powf(-3.6 / 20.0)),
+    // Slightly above -3.0 dBFS (-2.9 dBFS) drops cleanly to -3 dB.
+    let at_minus_2_9 = TrackPeakMetadata {
+        replaygain_track_peak: Some(10.0_f64.powf(-2.9 / 20.0)),
         ..TrackPeakMetadata::default()
     };
-    let s_cd_quiet = pipeline.start_track(cd_spec, &at_minus_3_6, false).unwrap();
-    assert_eq!(s_cd_quiet.report().headroom.mode, HeadroomMode::ZeroDb);
+    let s_cd_hot = pipeline.start_track(cd_spec, &at_minus_2_9, false).unwrap();
+    assert_eq!(s_cd_hot.report().headroom.mode, HeadroomMode::Minus3Db);
 
-    // - Native 384 kHz (no upsampling) at -3.00 dBFS has no upsampler ISP reconstruction -> 0 dB.
+    // Native 384 kHz at -3.00 dBFS -> 0 dB & bit-perfect bypass.
     let native_spec = StreamSpec {
         sample_rate_hz: 384_000,
         bits_per_sample: 24,
@@ -209,8 +209,9 @@ fn pipeline_adds_upsampler_isp_safety_margin_on_0_db_headroom_selection() {
         .start_track(native_spec, &at_minus_3, false)
         .unwrap();
     assert_eq!(s_native.report().headroom.mode, HeadroomMode::ZeroDb);
+    assert_eq!(s_native.report().effective_shaper, NoiseShaperProfile::Bypass);
 
-    // - Verified TRUE_PEAK at -3.00 dBTP already includes ISPs, so 44.1 -> 352.8 kHz qualifies for 0 dB.
+    // Verified TRUE_PEAK at -3.00 dBTP -> 0 dB.
     let at_minus_3_tp = TrackPeakMetadata {
         true_peak_linear: Some(10.0_f64.powf(-3.0 / 20.0)),
         ..TrackPeakMetadata::default()
@@ -220,37 +221,132 @@ fn pipeline_adds_upsampler_isp_safety_margin_on_0_db_headroom_selection() {
 }
 
 #[test]
-fn incoming_gapless_rew_tail_forces_minus_3db_when_sum_would_exceed_full_scale() {
-    let pipeline = AudioPipeline::new(UpsamplerPolicy::default()).unwrap();
-    let native_spec = StreamSpec {
+fn incoming_gapless_rew_tail_demotes_active_convolver_only_and_preserves_null_convolver_bit_perfect() {
+    // Review #4 Findings #12 & #13:
+    // 1. With an active REW convolver (`accepts_tail() == true`), a hot incoming tail forces
+    //    -3 dB, and `up_hist_peak * conv_gain` is included in `start_track_for_carryover`!
+    // 2. With `NullConvolver` (`accepts_tail() == false`), a carried REW tail does NOT demote
+    //    Track B (bit-perfect `ZeroDb` + `Bypass` preserved!), AND `attach_gapless_carryover`
+    //    returns `IncompatibleRate` so `drain_gapless_carryover` drains A's tail cleanly instead
+    //    of silently dropping it!
+    let mut h = vec![0.0_f64; 256];
+    h[0] = 0.5;
+    h[128] = 0.5; // unity DC gain (max |H| = 1.0 = 0 dB)
+    let ir_352 = Arc::new(PreparedStereoIr::from_stereo_ir("unit-352k", 352_800, &h, &h).unwrap());
+
+    let rew_pipeline = AudioPipeline::with_factories(
+        UpsamplerPolicy::default(),
+        Box::new(FixedRateEchoConvolverFactory { ir_352 }),
+        Box::new(NullChannelDelayerFactory),
+    )
+    .unwrap();
+
+    let spec_44 = StreamSpec {
+        sample_rate_hz: 44_100,
+        bits_per_sample: 16,
+        channels: 2,
+    };
+    let spec_352 = StreamSpec {
+        sample_rate_hz: 352_800,
+        bits_per_sample: 24,
+        channels: 2,
+    };
+    let spec_384 = StreamSpec {
         sample_rate_hz: 384_000,
         bits_per_sample: 24,
         channels: 2,
     };
-    // Track B has peak = -3.0 dBFS (~0.7079): qualifies for 0 dB on its own.
-    let quiet_b = TrackPeakMetadata {
-        replaygain_track_peak: Some(10.0_f64.powf(-3.0 / 20.0)),
+
+    // Quiet verified True Peak Track B (0.60 = -4.44 dBTP): qualifies for 0 dB on its own.
+    let quiet_tp = TrackPeakMetadata {
+        true_peak_linear: Some(0.60),
         ..TrackPeakMetadata::default()
     };
 
-    // Small incoming tail (0.10): 0.7079 + 0.10 = 0.8079 <= 1.0 -> stays 0 dB.
-    let s_small = pipeline
-        .start_track_with_tail_hint(native_spec, &quiet_b, false, Some((384_000, 0.10)))
+    // Small incoming tail (0.10): 0.60 + 0.10 = 0.70 <= 1.0 -> stays 0 dB.
+    let s_small = rew_pipeline
+        .start_track_with_tail_hint(spec_352, &quiet_tp, false, Some((352_800, 0.10)))
         .unwrap();
     assert_eq!(s_small.report().headroom.mode, HeadroomMode::ZeroDb);
 
-    // Loud incoming tail (0.40): 0.7079 + 0.40 = 1.1079 > 1.0 -> safely forces -3 dB!
-    let s_hot = pipeline
-        .start_track_with_tail_hint(native_spec, &quiet_b, false, Some((384_000, 0.40)))
+    // Loud incoming tail (0.50): 0.60 + 0.50 = 1.10 > 1.0 -> forces -3 dB!
+    let s_hot = rew_pipeline
+        .start_track_with_tail_hint(spec_352, &quiet_tp, false, Some((352_800, 0.50)))
         .unwrap();
     assert_eq!(s_hot.report().headroom.mode, HeadroomMode::Minus3Db);
     assert!(s_hot.report().headroom.reason.contains("incoming gapless REW tail"));
 
-    // Different-rate incoming tail (352.8 kHz) won't be attached to 384 kHz Track B -> stays 0 dB.
-    let s_other_rate = pipeline
-        .start_track_with_tail_hint(native_spec, &quiet_b, false, Some((352_800, 0.40)))
+    // Different-rate incoming tail (384k vs 352.8k) -> stays 0 dB.
+    let s_other_rate = rew_pipeline
+        .start_track_with_tail_hint(spec_384, &quiet_tp, false, Some((352_800, 0.50)))
         .unwrap();
     assert_eq!(s_other_rate.report().headroom.mode, HeadroomMode::ZeroDb);
+
+    // Exercise `start_track_for_carryover` with `up_hist_peak` term (Finding #13):
+    // Track A (44.1k) ends loud so carry has conv_peak (~0.25, alone 0.60+0.25=0.85 <= 1.0) PLUS
+    // up_hist_peak (~0.55), pushing 0.60 + conv_peak + up_hist_peak > 1.0 -> MUST demote to -3 dB!
+    let mut sess_a = rew_pipeline
+        .start_track(spec_44, &TrackPeakMetadata::default(), false)
+        .unwrap();
+    let _ = sess_a
+        .process_block(StereoF64Buffer {
+            sample_rate_hz: 44_100,
+            left: vec![0.8; 512],
+            right: vec![0.8; 512],
+        })
+        .unwrap();
+    let (_, carry_a) = sess_a.flush_for_gapless().unwrap();
+    let carry_a = carry_a.expect("expected carryover from 44.1k REW track");
+    assert!(
+        carry_a.convolver_tail_peak_linear() < 0.39,
+        "conv tail alone ({:.3}) should be under 1.0 - 0.60 = 0.40",
+        carry_a.convolver_tail_peak_linear()
+    );
+    assert!(
+        carry_a.convolver_tail_peak_linear() + carry_a.upsampler_history_peak_linear() > 0.40,
+        "conv + up_hist ({:.3} + {:.3}) must exceed 0.40",
+        carry_a.convolver_tail_peak_linear(),
+        carry_a.upsampler_history_peak_linear()
+    );
+    let s_b_rew = rew_pipeline
+        .start_track_for_carryover(spec_44, &quiet_tp, false, Some(&carry_a))
+        .unwrap();
+    assert_eq!(
+        s_b_rew.report().headroom.mode,
+        HeadroomMode::Minus3Db,
+        "same-rate active-convolver carry where conv_peak + up_hist_peak pushes over 1.0 must demote to -3 dB"
+    );
+
+    // Null-convolver pipeline (e.g. REW filter removed before native 352.8k Track B starts):
+    // MUST keep ZeroDb + bit-perfect Bypass, reject attach as IncompatibleRate, and drain Track A's
+    // REW tail with non-zero reverb energy instead of silently discarding it!
+    let null_pipeline = AudioPipeline::new(UpsamplerPolicy::default()).unwrap();
+    let mut s_b_null = null_pipeline
+        .start_track_for_carryover(spec_352, &quiet_tp, false, Some(&carry_a))
+        .unwrap();
+    assert_eq!(s_b_null.report().headroom.mode, HeadroomMode::ZeroDb);
+    assert_eq!(
+        s_b_null.report().effective_shaper,
+        NoiseShaperProfile::Bypass,
+        "NullConvolver native Track B must stay bit-perfect untouched_native"
+    );
+    let outcome = null_pipeline
+        .attach_gapless_carryover(&mut s_b_null, carry_a)
+        .unwrap();
+    let rejected = match outcome {
+        GaplessAttachOutcome::IncompatibleRate(c) => c,
+        other => panic!("NullConvolver must not silently drop carried REW tail, got {other:?}"),
+    };
+    let drained = null_pipeline.drain_gapless_carryover(rejected).unwrap();
+    let drained_energy: i64 = drained
+        .frames
+        .iter()
+        .map(|f| i64::from(f[0]).abs())
+        .sum();
+    assert!(
+        drained_energy > 0,
+        "drain_gapless_carryover must preserve pre-convolved REW tail even when factory returns NullConvolver"
+    );
 }
 
 #[test]
@@ -512,10 +608,14 @@ fn same_output_rate_different_upsampler_ratio_hands_off_rew_tail_without_gap() {
     let outcome = pipeline
         .attach_gapless_carryover(&mut sess_b, carry_a)
         .unwrap();
-    let up_tail_pcm = match outcome {
-        GaplessAttachOutcome::ConvolverOnlyHandoff { upsampler_tail_pcm } => upsampler_tail_pcm,
+    let (up_tail_pcm, attached_conv_tail) = match outcome {
+        GaplessAttachOutcome::ConvolverOnlyHandoff {
+            upsampler_tail_pcm,
+            attached_convolver_tail,
+        } => (upsampler_tail_pcm, attached_convolver_tail),
         other => panic!("expected ConvolverOnlyHandoff for 44.1k->88.2k, got {other:?}"),
     };
+    assert!(attached_conv_tail, "REW echo tail must be flagged as attached");
     a_frames.extend(up_tail_pcm.frames);
     assert_eq!(
         a_frames.len(),

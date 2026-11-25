@@ -73,20 +73,20 @@ pub enum GaplessAttachOutcome {
     FullHandoff,
     /// Output sample rate matched (e.g. `44.1k -> 88.2k` or `44.1k -> native 352.8k`, both at
     /// `352.8k`), while the upsampler ratio/filter differed: only the short upsampler FIR history
-    /// was flushed into `upsampler_tail_pcm` (to close Track A), and the resulting REW convolution
+    /// was flushed into `upsampler_tail_pcm` (to close Track A), and any resulting REW convolution
     /// tail was seamlessly attached to Track B without inserting a multi-second IR drain gap.
     ConvolverOnlyHandoff {
         upsampler_tail_pcm: InterleavedInt32Buffer,
+        /// True iff a non-empty REW convolution tail was actually attached to Track B (false when
+        /// REW convolution is inactive and only upsampler history was drained onto Track A).
+        attached_convolver_tail: bool,
     },
-    /// Output sample rate changed (e.g. `352.8k -> 384k`): nothing was attached to Track B and the
-    /// untouched carryover is returned so the caller can drain it completely onto Track A.
+    /// Output sample rate changed (e.g. `352.8k -> 384k`) or Track B's convolver cannot accept a
+    /// carried REW tail (e.g. `NullConvolver` after filter removal): nothing was attached to
+    /// Track B and the untouched carryover is returned so the caller can drain it completely onto
+    /// Track A.
     IncompatibleRate(GaplessCarryover),
 }
-
-/// Extra safety margin (dB) required on ReplayGain sample peak for `0 dB` headroom whenever the
-/// steep windowed-sinc upsampler is active, protecting against inter-sample peaks (`~+3 dB` on
-/// `fs/4` signals) plus Gibbs ringing overshoot and `+1 LSB` TPDF dither (`-3.5 dBFS` ceiling).
-pub const UPSAMPLER_ISP_SAFETY_MARGIN_DB: f64 = 0.5;
 
 /// Diagnostic summary of every pipeline stage chosen for a track/stream.
 #[derive(Debug, Clone)]
@@ -155,6 +155,11 @@ impl StreamingPipelineSession {
         &self.report
     }
 
+    /// True when this session's convolver actively accepts an incoming gapless [`ConvolutionTail`].
+    pub fn accepts_convolver_tail(&self) -> bool {
+        self.convolver.accepts_tail()
+    }
+
     /// Process one bounded source `f64` block through all 5 stages -> ready `i32` PCM block.
     pub fn process_block(
         &mut self,
@@ -208,6 +213,9 @@ impl StreamingPipelineSession {
         mut carryover: GaplessCarryover,
     ) -> Result<(), GaplessCarryover> {
         if carryover.output_rate_hz != self.report.output_rate_hz {
+            return Err(carryover);
+        }
+        if carryover.convolver.is_some() && !self.convolver.accepts_tail() {
             return Err(carryover);
         }
         if let Some(up) = carryover.upsampler.take() {
@@ -450,38 +458,44 @@ impl AudioPipeline {
             select_headroom(peak_meta, is_streaming_source, active_conv_gain_db, None);
 
         // If an equal-rate decaying REW tail from the previous track will overlap-add onto this
-        // track's opening (either via full handoff or convolver-only handoff), ensure
-        // `next_track_peak * conv_and_isp_bound + tail_peak <= 1.0`; if `0 dB` would risk
-        // exceeding full scale, safely fall back to hardcoded `-3 dB`.
-        if headroom.mode == HeadroomMode::ZeroDb {
-            if let Some((tail_rate_hz, conv_tail_peak, up_hist_peak, has_conv_tail)) =
+        // track's opening (ONLY when Track B's convolver actively accepts tails!), ensure
+        // `next_track_peak * effective_conv_gain + total_tail_peak <= 1.0` without using L1.
+        // If `0 dB` would risk exceeding full scale, safely fall back to hardcoded `-3 dB` and
+        // recompute any excess-only convolution scaling for `-3 dB`.
+        if headroom.mode == HeadroomMode::ZeroDb && convolver.accepts_tail() {
+            if let Some((tail_rate_hz, conv_tail_peak, up_hist_peak, _has_conv_tail)) =
                 incoming_tail_hint
             {
                 if tail_rate_hz == dsp_plan.target_rate_hz {
-                    let conv_l1_lin = 10.0_f64.powf(convolver.peak_gain_bound_db() / 20.0);
-                    let extra_up_reverb = if has_conv_tail || convolver.name() != "null-convolver" {
-                        up_hist_peak * conv_l1_lin
-                    } else {
-                        0.0
-                    };
+                    let effective_conv_lin = 10.0_f64
+                        .powf((convolver.max_boost_db() + headroom.convolution_scale_db) / 20.0);
+                    let extra_up_reverb = up_hist_peak * effective_conv_lin;
                     let total_tail_peak = conv_tail_peak + extra_up_reverb;
                     if total_tail_peak.is_finite() && total_tail_peak > 1e-6 {
                         let track_peak_lin = peak_meta
                             .effective_peak_linear()
                             .map_or(1.0, |(p, _)| p);
-                        let bound_lin = 10.0_f64.powf(convolver.peak_gain_bound_db() / 20.0);
-                        let combined_peak = track_peak_lin * bound_lin + total_tail_peak;
+                        let b_own_peak = track_peak_lin * effective_conv_lin;
+                        let combined_peak = b_own_peak + total_tail_peak;
                         if combined_peak > 1.0 {
+                            // Recompute convolution excess for G_up = -3 dB so we don't double-cut.
+                            let conv_scale_db = if let Some(cp) = peak_meta.classified_peak() {
+                                let predicted = cp.dbfs
+                                    + cp.isp_allowance_db()
+                                    + HeadroomMode::Minus3Db.gain_db()
+                                    + convolver.max_boost_db().max(0.0);
+                                if predicted > 1e-9 { -predicted } else { 0.0 }
+                            } else {
+                                headroom.convolution_scale_db
+                            };
                             headroom = HeadroomDecision {
                                 mode: HeadroomMode::Minus3Db,
                                 peak_dbfs: headroom.peak_dbfs,
                                 peak_kind: headroom.peak_kind,
-                                convolution_scale_db: headroom.convolution_scale_db,
+                                convolution_scale_db: conv_scale_db,
                                 reason: format!(
-                                    "incoming gapless REW tail ({:.3}) + track peak bound ({:.3}) = {:.3} > 1.0 -> -3 dB",
-                                    total_tail_peak,
-                                    track_peak_lin * bound_lin,
-                                    combined_peak
+                                    "incoming gapless REW tail ({:.3}) + track peak ({:.3}) = {:.3} > 1.0 -> -3 dB",
+                                    total_tail_peak, b_own_peak, combined_peak
                                 ),
                             };
                         }
@@ -494,6 +508,7 @@ impl AudioPipeline {
 
         let untouched_native = dsp_plan.filter == FilterArchetype::Null
             && headroom.mode == HeadroomMode::ZeroDb
+            && headroom.convolution_scale_db == 0.0
             && convolver.name() == "null-convolver"
             && delayer.name() == "null-delay";
 
@@ -552,7 +567,9 @@ impl AudioPipeline {
         carryover: GaplessCarryover,
     ) -> Result<GaplessAttachOutcome, String> {
         let rate = session.report().output_rate_hz;
-        if carryover.output_rate_hz != rate {
+        if carryover.output_rate_hz != rate
+            || (carryover.convolver.is_some() && !session.accepts_convolver_tail())
+        {
             return Ok(GaplessAttachOutcome::IncompatibleRate(carryover));
         }
 
@@ -560,6 +577,7 @@ impl AudioPipeline {
             Ok(()) => Ok(GaplessAttachOutcome::FullHandoff),
             Err(mut rejected) => {
                 let mut frames = Vec::new();
+                let mut attached_convolver_tail = false;
                 if let Some(up_carry) = rejected.upsampler.take() {
                     let up_tail_f64 = up_carry.flush_to_f64();
                     let mut conv = self.convolver_factory.create_for_rate(rate)?;
@@ -592,10 +610,16 @@ impl AudioPipeline {
                         frames.extend(quantizer.quantize_block(&delay_tail).frames);
                     }
                     if let Some(tail) = updated_tail {
-                        session.set_incoming_convolver_tail(tail);
+                        if !tail.left.is_empty() && session.accepts_convolver_tail() {
+                            session.set_incoming_convolver_tail(tail);
+                            attached_convolver_tail = true;
+                        }
                     }
                 } else if let Some(conv_tail) = rejected.convolver.take() {
-                    session.set_incoming_convolver_tail(conv_tail);
+                    if !conv_tail.left.is_empty() && session.accepts_convolver_tail() {
+                        session.set_incoming_convolver_tail(conv_tail);
+                        attached_convolver_tail = true;
+                    }
                 }
 
                 Ok(GaplessAttachOutcome::ConvolverOnlyHandoff {
@@ -603,6 +627,7 @@ impl AudioPipeline {
                         sample_rate_hz: rate,
                         frames,
                     },
+                    attached_convolver_tail,
                 })
             }
         }
@@ -612,7 +637,8 @@ impl AudioPipeline {
     /// cleanly into integer PCM at its native `output_rate_hz`.
     ///
     /// Called at end-of-queue, before a sample-rate/ratio change, or when the next track fails
-    /// to open so the end of the preceding track and its room reverb decay are never truncated.
+    /// to open so the end of the preceding track and its room reverb decay are never truncated —
+    /// even if the REW filter WAV was removed or fails to reload before draining.
     pub fn drain_gapless_carryover(
         &self,
         carryover: GaplessCarryover,
@@ -622,33 +648,62 @@ impl AudioPipeline {
             return Ok(InterleavedInt32Buffer::empty(rate));
         }
 
-        let mut convolver = self.convolver_factory.create_for_rate(rate)?;
-        if let Some(conv_tail) = carryover.convolver {
-            convolver.set_incoming_tail(conv_tail);
-        }
         let mut delayer = self.delayer_factory.create_for_rate(rate)?;
         let mut quantizer =
             StreamingQuantizer::new(carryover.effective_shaper, carryover.output_bits)?;
 
         let mut frames = Vec::new();
-        if let Some(up_carry) = carryover.upsampler {
-            let up_tail = up_carry.flush_to_f64();
-            if !up_tail.is_empty() {
-                let c_out = convolver.process_block(up_tail)?;
-                if !c_out.is_empty() {
-                    let d_out = delayer.process_block(c_out)?;
-                    if !d_out.is_empty() {
-                        frames.extend(quantizer.quantize_block(&d_out).frames);
+        let conv_opt = self.convolver_factory.create_for_rate(rate).ok();
+        let use_active_conv = conv_opt.as_ref().is_some_and(|c| c.accepts_tail());
+
+        if use_active_conv {
+            let mut convolver = conv_opt.unwrap();
+            if let Some(conv_tail) = carryover.convolver {
+                convolver.set_incoming_tail(conv_tail);
+            }
+            if let Some(up_carry) = carryover.upsampler {
+                let up_tail = up_carry.flush_to_f64();
+                if !up_tail.is_empty() {
+                    let c_out = convolver.process_block(up_tail)?;
+                    if !c_out.is_empty() {
+                        let d_out = delayer.process_block(c_out)?;
+                        if !d_out.is_empty() {
+                            frames.extend(quantizer.quantize_block(&d_out).frames);
+                        }
                     }
                 }
             }
-        }
 
-        let conv_tail = convolver.flush()?;
-        if !conv_tail.is_empty() {
-            let d_out = delayer.process_block(conv_tail)?;
-            if !d_out.is_empty() {
-                frames.extend(quantizer.quantize_block(&d_out).frames);
+            let conv_tail = convolver.flush()?;
+            if !conv_tail.is_empty() {
+                let d_out = delayer.process_block(conv_tail)?;
+                if !d_out.is_empty() {
+                    frames.extend(quantizer.quantize_block(&d_out).frames);
+                }
+            }
+        } else {
+            // Active convolver unavailable (NullConvolver after WAV removal, or factory error):
+            // directly overlap-add any pre-convolved `ConvolutionTail` onto the flushed upsampler
+            // tail in pure f64 so Track A's decaying room reverb is NEVER silently dropped.
+            let mut combined = match carryover.upsampler {
+                Some(up_carry) => up_carry.flush_to_f64(),
+                None => StereoF64Buffer::empty(rate),
+            };
+            if let Some(conv_tail) = carryover.convolver {
+                if conv_tail.left.len() > combined.left.len() {
+                    combined.left.resize(conv_tail.left.len(), 0.0);
+                    combined.right.resize(conv_tail.right.len(), 0.0);
+                }
+                for (i, (&l, &r)) in conv_tail.left.iter().zip(conv_tail.right.iter()).enumerate() {
+                    combined.left[i] += l;
+                    combined.right[i] += r;
+                }
+            }
+            if !combined.is_empty() {
+                let d_out = delayer.process_block(combined)?;
+                if !d_out.is_empty() {
+                    frames.extend(quantizer.quantize_block(&d_out).frames);
+                }
             }
         }
 

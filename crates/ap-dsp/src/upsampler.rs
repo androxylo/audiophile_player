@@ -234,6 +234,7 @@ pub struct SimpleWindowedSincUpsampler {
     hist_l: Vec<f64>,
     hist_r: Vec<f64>,
     total_in_frames: usize,
+    has_incoming_carryover: bool,
     flushed: bool,
 }
 
@@ -253,6 +254,7 @@ impl SimpleWindowedSincUpsampler {
             hist_l: vec![0.0_f64; lead],
             hist_r: vec![0.0_f64; lead],
             total_in_frames: 0,
+            has_incoming_carryover: false,
             flushed: false,
         }
     }
@@ -339,7 +341,7 @@ impl Upsampler for SimpleWindowedSincUpsampler {
 
     fn flush(&mut self) -> Result<StereoF64Buffer, String> {
         let out_rate = self.source_rate_hz * (self.ratio as u32);
-        if self.flushed || self.total_in_frames == 0 {
+        if self.flushed || (self.total_in_frames == 0 && !self.has_incoming_carryover) {
             self.flushed = true;
             return Ok(StereoF64Buffer::empty(out_rate));
         }
@@ -379,12 +381,13 @@ impl Upsampler for SimpleWindowedSincUpsampler {
         }
         self.hist_l = carryover.hist_l;
         self.hist_r = carryover.hist_r;
+        self.has_incoming_carryover = true;
         Ok(())
     }
 
     fn flush_for_gapless(&mut self) -> Result<(StereoF64Buffer, Option<UpsamplerCarryover>), String> {
         let out_rate = self.source_rate_hz * (self.ratio as u32);
-        if self.flushed || self.total_in_frames == 0 {
+        if self.flushed || (self.total_in_frames == 0 && !self.has_incoming_carryover) {
             self.flushed = true;
             return Ok((StereoF64Buffer::empty(out_rate), None));
         }

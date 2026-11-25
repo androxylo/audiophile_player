@@ -1248,8 +1248,11 @@ fn stream_single_track(
                     }
                 }
             }
-            Ok(GaplessAttachOutcome::ConvolverOnlyHandoff { upsampler_tail_pcm }) => {
-                had_gapless_carryover = had_active_tail;
+            Ok(GaplessAttachOutcome::ConvolverOnlyHandoff {
+                upsampler_tail_pcm,
+                attached_convolver_tail,
+            }) => {
+                had_gapless_carryover = attached_convolver_tail;
                 if !upsampler_tail_pcm.is_empty()
                     && !buf.push_for_epoch(epoch, StreamEvent::PcmBlock(upsampler_tail_pcm))
                 {
