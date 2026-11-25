@@ -1,62 +1,111 @@
 # Audiophile Player
 
-An extreme, headless, zero-compromise audiophile playback engine for Windows, targeting sound quality at or above HQPlayer (without a desktop GUI) and exceeding Audirvana.
+**A headless, no-compromise upsampling player for Windows: every track is rendered in 64-bit float to 8fS (352.8 / 384 kHz), with REW room correction and a single noise-shaped quantizer, sent bit-exact to your DAC over kernel streaming.**
 
-## Quick Start (Windows)
+![Output](https://img.shields.io/badge/output-352.8%20%2F%20384%20kHz-6f42c1)
+![Math](https://img.shields.io/badge/DSP-64--bit%20float-1f6feb)
+![Filters](https://img.shields.io/badge/filters-up%20to%204M%20taps-d73a49)
+![Transport](https://img.shields.io/badge/transport-WDM--KS%20exclusive-2da44e)
+![UPnP](https://img.shields.io/badge/UPnP-renderer-fb8500)
+![License](https://img.shields.io/badge/license-GPL--3.0--or--later-555)
 
-```powershell
-# 1. Build optimized release binary
-cargo build --release --bin audiophile-player
+No GUI and no volume knob. There is no EQ beyond your REW filter, and no Windows mixer anywhere in the path. All the effort goes into the signal.
 
-# 2. (Optional) Configure REW stereo convolution
-#    Copy audiophile-player.example.toml -> %APPDATA%\audiophile-player\config.toml
+---
 
-# 3. Install Desktop & Start Menu "Audiophile Player" icon (starts player + opens Web UI)
-powershell -ExecutionPolicy Bypass -File scripts\install-shortcuts.ps1
+## The signal path
 
-# Or run directly from terminal (zero args = random FLACs from ~/Music via WDM-KS + Web UI at :8085)
-.\target\release\audiophile-player.exe
+```mermaid
+flowchart LR
+    SRC["🎵 FLAC file<br/>or UPnP stream<br/>44.1 … 384 kHz"]:::src
+    UP["⬆️ Upsampling<br/>to 8fS<br/>Gaussian / sinc / apodizing<br/>up to 4M taps"]:::dsp
+    DE["De-emphasis<br/>50/15 µs<br/><i>only when flagged</i>"]:::opt
+    REW["🏠 REW room<br/>convolution<br/>up to 4M-tap IR"]:::dsp
+    Q["🎚️ One quantizer<br/>TPDF + noise shaping<br/>16 / 18 / 20 / 24 bit"]:::q
+    DAC["🔊 Your DAC<br/>WDM-KS exclusive<br/>352.8 / 384 kHz"]:::dac
+
+    SRC --> UP --> DE --> REW --> Q --> DAC
+
+    classDef src fill:#fff3bf,stroke:#f08c00,color:#000
+    classDef dsp fill:#d0ebff,stroke:#1c7ed6,color:#000
+    classDef opt fill:#f1f3f5,stroke:#868e96,color:#000,stroke-dasharray: 4 3
+    classDef q fill:#e5dbff,stroke:#7048e8,color:#000
+    classDef dac fill:#d3f9d8,stroke:#2f9e44,color:#000
 ```
 
-## Project Structure
+Everything between source and DAC runs in **f64**. The DAC sees exactly **one** rounding operation in the whole chain: the final dithered, noise-shaped quantization. **Upsampling always comes before room correction**, so your REW filter works at the full 8fS rate and covers the whole spectrum.
 
-```text
-audiophile_player/
-├── Cargo.toml                  # Rust production workspace root (architectural outline)
-├── README.md
-├── REQUIREMENTS.md             # Full project specification & constraints
-├── crates/                     # Production Rust workspace (not compiled yet; ported from proven POCs)
-│   ├── ap-core/                # Pure f64 buffers, 352.8/384 kHz targets, <= 0 dB headroom policy, config
-│   ├── ap-source/              # Local FLAC RAM decoder, recursive shuffle, Milestone 2 Tidal trait
-│   ├── ap-dsp/                 # Pure f64 4M-tap upsampling, core REW convolution, delay, 8fS quantization
-│   ├── ap-output-win/          # Windows-only zero-mixer output (WDM-KS & WASAPI Exclusive ONLY)
-│   ├── ap-control/             # Rudimentary local HTTP server (file/folder, Play/Stop, GitHub manual link)
-│   └── ap-cli/                 # Headless binary wiring source -> DSP -> zero-mixer output + HTTP control
-├── docs/
-│   └── research/               # Phase 0 research documents & open questions
-├── poc/                        # Self-contained prototypes (Python / C++) before Rust port
-│   └── python/                 # Working zero-mixer WDM-KS/WASAPI Exclusive POC & CC0 synthesizer
-└── tests/                      # Automated TDD test suite (zero copyrighted audio)
-    ├── fixtures/audio/         # Original algorithmically synthesized CC0 FLAC fixtures
-    └── python/
+---
+
+## Two ways to play
+
+```mermaid
+flowchart TB
+    subgraph N["⚡ Normal mode (default)"]
+        direction LR
+        N1["Track arrives"] --> N2["Pick filter<br/>by sample rate"] --> N3["Play immediately"]
+    end
+    subgraph U["💎 Ultimate mode  (--ultimate)"]
+        direction LR
+        U1["Track arrives"] --> U2["Listen 30 s ahead<br/>+ read tags + track DB"] --> U3["Pick the best filter<br/>for <b>this</b> recording"] --> U4["One exact gain<br/>for the whole track"] --> U5["Remember it<br/>for next time"]
+    end
+    style N fill:#e7f5ff,stroke:#1c7ed6,color:#000
+    style U fill:#f3f0ff,stroke:#7048e8,color:#000
 ```
 
-## Research & Specification Documents
+| | ⚡ Normal | 💎 Ultimate |
+|---|---|---|
+| Filter choice | By sample rate: Gaussian long LP (1×) or hi-res LP | Per recording: apodizing, steep sinc, extended-sharp, min/intermediate phase… |
+| Detects fake hi-res, pre-ringing (apodizing need), loud & clipped masters | — | ✅ |
+| Uses FLAC tags (genre, original year, ReplayGain, pre-emphasis, your overrides) | Peak tags only | ✅ everything |
+| Headroom | −3 dB or 0 dB from peak tags | One exact gain per track, measured after the full chain |
+| REW impulse tail | Tail below −200 dB is trimmed on very long IRs | Full tail, never truncated |
+| Start-up | Instant | First 30 s are rendered before the first sample plays |
 
-- [REQUIREMENTS.md](REQUIREMENTS.md) — Full project specification, explicit compromises, `352.8 / 384 kHz` DSP pipeline constraints, rudimentary local HTTP control page, and milestones.
-- [docs/research/INVESTIGATION_PLAN.md](docs/research/INVESTIGATION_PLAN.md) — Ordered Phase 0 investigation plan, resource-scanning scope, and browser-PDF handoff protocol.
-- [docs/research/OPEN_QUESTIONS.md](docs/research/OPEN_QUESTIONS.md) — Tracked open technical, mathematical, hardware, and architectural questions.
-- [docs/research/00-landscape-and-sources.md](docs/research/00-landscape-and-sources.md) — Landscape survey of existing audiophile players, best practices, and curated reference sources.
-- [docs/research/02-audiophile-filter-survey.md](docs/research/02-audiophile-filter-survey.md) — Upsampling & noise-shaping algorithm sources, audiophile consensus, and list of inaccessible sources for user snippets.
-- [docs/research/03-filter-knowledge-base.md](docs/research/03-filter-knowledge-base.md) — Comprehensive filter, noise-shaping & community experience knowledge base synthesized from primary manuals (HQPlayer 5, PGGB V9), community listening threads, technical guides, and DSP literature.
-- [docs/research/04-noise-shapers.md](docs/research/04-noise-shapers.md) — INV-04 final quantization, TPDF dither, clean-room 8fS Levinson–Durbin error-feedback noise shapers (`ns-gentle-2`, `ns5-class`, `lns15-class`, `wide40-9`), NOS R-2R code-activity analysis, and `dac_bits` hardware probes.
-- [docs/research/05-rew-convolution-and-delay.md](docs/research/05-rew-convolution-and-delay.md) — REW stereo convolution and channel delay design.
-- [docs/research/06-windows-kernel-streaming.md](docs/research/06-windows-kernel-streaming.md) — WASAPI Exclusive vs. Audirvana-style WDM-KS (`usbaudio2.sys` / WaveRT), bit-perfect verification, and minimal-effort zero-mixer POC design.
-- [docs/research/07-ultimate-mode.md](docs/research/07-ultimate-mode.md) — Opt-in Ultimate Mode specification (30 s look-ahead cap, lossless-only FFT/UPOLS optimizations, content-adaptive filters & detectors, metadata × analyser fusion, learn-on-play YAML DB, and showcase decision report).
-- [poc/README.md](poc/README.md) — Prototype setup, hardware probe, and test-tone/FLAC verification commands.
+👉 **[How Ultimate Mode thinks →](docs/ULTIMATE_MODE.md)**
+
+---
+
+## Where to go next
+
+| | Page | What you'll find |
+|---|---|---|
+| 💎 | **[Ultimate Mode](docs/ULTIMATE_MODE.md)** | The 30-second look-ahead, the detectors, how a filter is chosen, exact headroom, learn-on-play, per-track overrides |
+| 🎛️ | **[Sound Engine](docs/SOUND_ENGINE.md)** | Every filter and noise shaper explained for HQPlayer users, DAC bits, headroom policy, REW convolution, gapless |
+| 🚀 | **[Getting Started](docs/GETTING_STARTED.md)** | Install, first play, web page, UPnP with foobar2000 / BubbleUPnP, config file, every command-line option |
+
+---
+
+## At a glance
+
+```mermaid
+mindmap
+  root((Audiophile<br/>Player))
+    Sources
+      Local FLAC library
+      UPnP / DLNA renderer
+      Tidal: planned
+    DSP
+      f64 throughout
+      8fS only
+      ≤ 4M taps
+      REW convolution
+    Output
+      WDM-KS kernel streaming
+      Exclusive only
+      Releases DAC on pause
+    Control
+      Tiny local web page
+      foobar2000 / BubbleUPnP
+      Command line
+```
+
+**Status and honest limits**
+- 🟢 **Works today:** local FLAC (random or sequential, gapless), UPnP renderer (gapless), normal and ultimate modes, REW convolution, offline library scan, local web page.
+- 🟡 **Planned:** Tidal, WASAPI exclusive output, per-channel delay.
+- 🔴 **Not supported, by design:** Windows shared mode, volume control, DSP effects, macOS / Linux playback, DACs without 352.8 / 384 kHz input.
+- Reference DAC: **Schiit Gungnir 2** (Unison USB, NOS). Any DAC that accepts 32-bit 352.8 / 384 kHz over a kernel-streaming driver should work.
 
 ## License
 
-This project is licensed under the **GNU General Public License v3.0 or later (`GPL-3.0-or-later`)**.
-
-See [LICENSE](LICENSE) (or [COPYING](COPYING)) for the full GNU GPL v3.0 terms.
+[GPL-3.0-or-later](LICENSE). The repository contains no copyrighted music and no proprietary filter coefficients. Shapers named after familiar ones (`ns5`, `lns15`, `pggb-optimal`) are clean-room designs that follow the published *intent* of those shapers. They are not copies.
