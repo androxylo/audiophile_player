@@ -2056,3 +2056,341 @@ fn wavert_unavailable_fallback_adapts_to_non_nominal_cadence_and_preserves_dma_i
         assert_eq!(ctrl.coalesced_wakes(), 0, "cadence={cadence_ms}ms");
     }
 }
+
+#[test]
+fn review6_wavert_exhaustive_regression_matrix_all_7_findings() {
+    // Replicates EVERY Review #6 WaveRT failure matrix (#2, #3, #4, #5, #6, #11, #12 + Unavailable D)
+    // and asserts 0 bad writes and 0 false spurious wakes!
+    let mut rng: u64 = 0x600D_F00D_1234_5678;
+    let mut next_f64 = || -> f64 {
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((rng >> 11) as f64) / ((1u64 << 53) as f64)
+    };
+
+    let frames_pool = vec![[17_i32, -17_i32]; 4800]; // enough for up to 50 ms @ 48kHz
+
+    // --- 1. Finding #2 + #12: Zero-lag Modular Register with heavy jitter + D=0..0.9*half ---
+    for &half_ms in &[5.0_f64, 10.0, 50.0] {
+        let half_frames = (48.0 * half_ms).round() as usize;
+        let layout = WaveRtRingLayout::new(half_frames * 2 * 8, 8).unwrap();
+        let half_b = layout.half_len() as u64;
+        let buf_b = layout.buf_len() as u64;
+        let half_dur = Duration::from_secs_f64(half_ms / 1000.0);
+
+        for &d_frac in &[0.0_f64, 0.5, 0.7, 0.9] {
+            for run in 0..20usize {
+                let mut ring = vec![0u8; layout.buf_len()];
+                let mut ctrl = WaveRtLoopController::new(layout)
+                    .with_half_duration(half_dur)
+                    .with_wrap_mode(PositionWrapMode::Modular);
+                {
+                    let mut pump = WaveRtFramePump::new(&frames_pool, DacWireFormat::Int32);
+                    ctrl.prefill(&mut ring, &mut pump).unwrap();
+                }
+                let d_ms = d_frac * half_ms;
+                for k in 1u64..=1000 {
+                    let lat_ms = if next_f64() < 0.05 {
+                        0.5 + next_f64() * (0.9 * half_ms - 0.5).max(0.1)
+                    } else {
+                        0.5 + next_f64() * (0.3 * half_ms)
+                    };
+                    let t_ms = d_ms + (k as f64) * half_ms + lat_ms;
+                    let dma_bytes =
+                        ((((k as f64) * half_ms + lat_ms) / half_ms) * (half_b as f64)) as u64;
+                    let actual_bidx = dma_bytes / half_b;
+                    let pos = dma_bytes % buf_b;
+                    let mut pump = WaveRtFramePump::new(&frames_pool, DacWireFormat::Int32);
+                    let (h, out) = ctrl
+                        .on_notification_at(
+                            &mut ring,
+                            &mut pump,
+                            false,
+                            Some(pos),
+                            Some(Duration::from_nanos((t_ms * 1_000_000.0).round() as u64)),
+                        )
+                        .unwrap();
+                    let safe_half = ((actual_bidx as usize) & 1) ^ 1;
+                    assert_eq!(
+                        out,
+                        WaveRtStepOutcome::Continue,
+                        "#2/#12 Register half={half_ms}ms D={d_frac} run={run} k={k}: spurious!"
+                    );
+                    assert_eq!(
+                        h, safe_half,
+                        "#2/#12 Register half={half_ms}ms D={d_frac} run={run} k={k}: wrote playing half!"
+                    );
+                }
+                assert_eq!(ctrl.lag_bytes(), 0);
+            }
+        }
+    }
+
+    // --- 2. Findings #3 & #5: Coalesced first wake (50.5..155.5 ms) with lagging AUDIO_POSITION/Monotonic ---
+    let layout_50 = WaveRtRingLayout::new(38_400, 8).unwrap(); // 48 kHz, 50 ms half = 19,200 B
+    let half_50 = Duration::from_millis(50);
+    for wrap_mode in [PositionWrapMode::Auto, PositionWrapMode::Monotonic] {
+        for &first_lat_ms in &[50.5_f64, 52.0, 55.0, 75.0, 99.5, 105.5] {
+            let mut ring = vec![0u8; layout_50.buf_len()];
+            let mut ctrl = WaveRtLoopController::new(layout_50)
+                .with_half_duration(half_50)
+                .with_wrap_mode(wrap_mode);
+            {
+                let mut pump = WaveRtFramePump::new(&frames_pool, DacWireFormat::Int32);
+                ctrl.prefill(&mut ring, &mut pump).unwrap();
+            }
+            let lag = 3840u64; // 0.2 * half (10 ms)
+            let t1_ms = 50.0 + first_lat_ms;
+            let dma1 = ((t1_ms / 50.0) * 19_200.0).round() as u64;
+            let bidx1 = dma1 / 19_200;
+            let pos1 = if wrap_mode == PositionWrapMode::Monotonic {
+                dma1 - lag
+            } else {
+                (dma1 - lag) % 38_400
+            };
+            let mut pump = WaveRtFramePump::new(&frames_pool, DacWireFormat::Int32);
+            let (h1, out1) = ctrl
+                .on_notification_at(
+                    &mut ring,
+                    &mut pump,
+                    false,
+                    Some(pos1),
+                    Some(Duration::from_nanos((t1_ms * 1_000_000.0).round() as u64)),
+                )
+                .unwrap();
+            assert_eq!(out1, WaveRtStepOutcome::Continue);
+            assert_eq!(
+                h1,
+                ((bidx1 as usize) & 1) ^ 1,
+                "#3/#5 coalesced first wake mode={wrap_mode:?} lat={first_lat_ms}ms wrote playing half!"
+            );
+
+            for step in 1u64..=300 {
+                let k = bidx1 + step;
+                let t_ms = (k as f64) * 50.0 + 1.0;
+                let dma = ((t_ms / 50.0) * 19_200.0).round() as u64;
+                let pos = if wrap_mode == PositionWrapMode::Monotonic {
+                    dma - lag
+                } else {
+                    (dma - lag) % 38_400
+                };
+                let mut pump = WaveRtFramePump::new(&frames_pool, DacWireFormat::Int32);
+                let (h, out) = ctrl
+                    .on_notification_at(
+                        &mut ring,
+                        &mut pump,
+                        false,
+                        Some(pos),
+                        Some(Duration::from_nanos((t_ms * 1_000_000.0).round() as u64)),
+                    )
+                    .unwrap();
+                assert_eq!(out, WaveRtStepOutcome::Continue);
+                assert_eq!(
+                    h,
+                    ((k as usize) & 1) ^ 1,
+                    "#3/#5 mode={wrap_mode:?} first_lat={first_lat_ms}ms k={k}: wrote playing half!"
+                );
+            }
+        }
+    }
+
+    // --- 3. Finding #4: 4 (Unavailable) and 12 (lagging AUDIO_POSITION/Monotonic) late warmup wakes ---
+    for &half_ms in &[5.0_f64, 10.0, 50.0] {
+        let half_frames = (48.0 * half_ms).round() as usize;
+        let layout = WaveRtRingLayout::new(half_frames * 2 * 8, 8).unwrap();
+        let half_dur = Duration::from_secs_f64(half_ms / 1000.0);
+        let mut ring = vec![0u8; layout.buf_len()];
+        let mut ctrl = WaveRtLoopController::new(layout).with_half_duration(half_dur);
+        {
+            let mut pump = WaveRtFramePump::new(&frames_pool, DacWireFormat::Int32);
+            ctrl.prefill(&mut ring, &mut pump).unwrap();
+        }
+        for k in 1u64..=2000 {
+            let lat_ms = if k <= 4 {
+                0.3 * half_ms
+            } else {
+                0.3 + next_f64() * 0.2
+            };
+            let t_ms = (k as f64) * half_ms + lat_ms;
+            let mut pump = WaveRtFramePump::new(&frames_pool, DacWireFormat::Int32);
+            let (h, out) = ctrl
+                .on_notification_at(
+                    &mut ring,
+                    &mut pump,
+                    false,
+                    None,
+                    Some(Duration::from_nanos((t_ms * 1_000_000.0).round() as u64)),
+                )
+                .unwrap();
+            assert_eq!(out, WaveRtStepOutcome::Continue, "#4 Unavailable half={half_ms}ms k={k}");
+            assert_eq!(
+                h,
+                ((k as usize) & 1) ^ 1,
+                "#4 Unavailable half={half_ms}ms k={k}: inverted!"
+            );
+        }
+    }
+
+    for wrap_mode in [PositionWrapMode::Auto, PositionWrapMode::Monotonic] {
+        let mut ring = vec![0u8; layout_50.buf_len()];
+        let mut ctrl = WaveRtLoopController::new(layout_50)
+            .with_half_duration(half_50)
+            .with_wrap_mode(wrap_mode);
+        {
+            let mut pump = WaveRtFramePump::new(&frames_pool, DacWireFormat::Int32);
+            ctrl.prefill(&mut ring, &mut pump).unwrap();
+        }
+        let lag = 7680u64; // 0.4 * half
+        for k in 1u64..=500 {
+            let lat_ms = if k <= 12 { 15.0 } else { 0.3 };
+            let t_ms = (k as f64) * 50.0 + lat_ms;
+            let dma = ((t_ms / 50.0) * 19_200.0).round() as u64;
+            let pos = if wrap_mode == PositionWrapMode::Monotonic {
+                dma - lag
+            } else {
+                (dma - lag) % 38_400
+            };
+            let mut pump = WaveRtFramePump::new(&frames_pool, DacWireFormat::Int32);
+            let (h, out) = ctrl
+                .on_notification_at(
+                    &mut ring,
+                    &mut pump,
+                    false,
+                    Some(pos),
+                    Some(Duration::from_nanos((t_ms * 1_000_000.0).round() as u64)),
+                )
+                .unwrap();
+            assert_eq!(out, WaveRtStepOutcome::Continue, "#4 lagging {wrap_mode:?} k={k}");
+            assert_eq!(
+                h,
+                ((k as usize) & 1) ^ 1,
+                "#4 lagging {wrap_mode:?} k={k}: inverted!"
+            );
+        }
+    }
+
+    // --- 4. Finding #6: Unavailable with U(0.1, 0.6*half) jitter for 10 runs x 1200 wakes ---
+    for &half_ms in &[5.0_f64, 10.0, 50.0] {
+        let half_frames = (48.0 * half_ms).round() as usize;
+        let layout = WaveRtRingLayout::new(half_frames * 2 * 8, 8).unwrap();
+        let half_dur = Duration::from_secs_f64(half_ms / 1000.0);
+        for run in 0..10usize {
+            let mut ring = vec![0u8; layout.buf_len()];
+            let mut ctrl = WaveRtLoopController::new(layout).with_half_duration(half_dur);
+            {
+                let mut pump = WaveRtFramePump::new(&frames_pool, DacWireFormat::Int32);
+                ctrl.prefill(&mut ring, &mut pump).unwrap();
+            }
+            for k in 1u64..=1200 {
+                let lat_ms = 0.1 + next_f64() * (0.6 * half_ms - 0.1);
+                let t_ms = (k as f64) * half_ms + lat_ms;
+                let mut pump = WaveRtFramePump::new(&frames_pool, DacWireFormat::Int32);
+                let (h, out) = ctrl
+                    .on_notification_at(
+                        &mut ring,
+                        &mut pump,
+                        false,
+                        None,
+                        Some(Duration::from_nanos((t_ms * 1_000_000.0).round() as u64)),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    out,
+                    WaveRtStepOutcome::Continue,
+                    "#6 Unavailable half={half_ms}ms run={run} k={k}: spurious replay!"
+                );
+                assert_eq!(
+                    h,
+                    ((k as usize) & 1) ^ 1,
+                    "#6 Unavailable half={half_ms}ms run={run} k={k}: wrote playing half!"
+                );
+            }
+        }
+    }
+
+    // --- 5. Finding #11: Unavailable non-nominal 52.86 ms & 46.0 ms with U(0, 10) ms jitter ---
+    for &cadence_ms in &[46.0_f64, 52.856, 54.0] {
+        for &jitter_ms in &[3.0_f64, 10.0] {
+            for run in 0..5usize {
+                let mut ring = vec![0u8; layout_50.buf_len()];
+                let mut ctrl = WaveRtLoopController::new(layout_50).with_half_duration(half_50);
+                {
+                    let mut pump = WaveRtFramePump::new(&frames_pool, DacWireFormat::Int32);
+                    ctrl.prefill(&mut ring, &mut pump).unwrap();
+                }
+                for k in 1u64..=2000 {
+                    let lat_ms = 0.5 + next_f64() * jitter_ms;
+                    let t_ms = (k as f64) * cadence_ms + lat_ms;
+                    let mut pump = WaveRtFramePump::new(&frames_pool, DacWireFormat::Int32);
+                    let (h, out) = ctrl
+                        .on_notification_at(
+                            &mut ring,
+                            &mut pump,
+                            false,
+                            None,
+                            Some(Duration::from_nanos((t_ms * 1_000_000.0).round() as u64)),
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        out,
+                        WaveRtStepOutcome::Continue,
+                        "#11 Unavailable cadence={cadence_ms}ms jitter={jitter_ms}ms run={run} k={k}"
+                    );
+                    assert_eq!(
+                        h,
+                        ((k as usize) & 1) ^ 1,
+                        "#11 Unavailable cadence={cadence_ms}ms jitter={jitter_ms}ms run={run} k={k}: inverted! eff={:?} coal={} spur={}",
+                        ctrl.effective_half_duration(),
+                        ctrl.coalesced_wakes(),
+                        ctrl.spurious_wakes()
+                    );
+                }
+            }
+        }
+    }
+
+    // --- 6. Follow-up: Unavailable delayed DMA start D = 0.7..1.2 * half ---
+    for &half_ms in &[5.0_f64, 10.0, 50.0] {
+        let half_frames = (48.0 * half_ms).round() as usize;
+        let layout = WaveRtRingLayout::new(half_frames * 2 * 8, 8).unwrap();
+        let half_dur = Duration::from_secs_f64(half_ms / 1000.0);
+        for &d_frac in &[0.7_f64, 0.9, 1.2] {
+            let mut ring = vec![0u8; layout.buf_len()];
+            let mut ctrl = WaveRtLoopController::new(layout).with_half_duration(half_dur);
+            {
+                let mut pump = WaveRtFramePump::new(&frames_pool, DacWireFormat::Int32);
+                ctrl.prefill(&mut ring, &mut pump).unwrap();
+            }
+            let d_ms = d_frac * half_ms;
+            for k in 1u64..=1000 {
+                let lat_ms = if next_f64() < 0.05 {
+                    0.5 + next_f64() * (0.45 * half_ms)
+                } else {
+                    0.5 + next_f64() * (0.25 * half_ms)
+                };
+                let t_ms = d_ms + (k as f64) * half_ms + lat_ms;
+                let mut pump = WaveRtFramePump::new(&frames_pool, DacWireFormat::Int32);
+                let (h, out) = ctrl
+                    .on_notification_at(
+                        &mut ring,
+                        &mut pump,
+                        false,
+                        None,
+                        Some(Duration::from_nanos((t_ms * 1_000_000.0).round() as u64)),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    out,
+                    WaveRtStepOutcome::Continue,
+                    "Unavailable D={d_frac} half={half_ms}ms k={k}"
+                );
+                assert_eq!(
+                    h,
+                    ((k as usize) & 1) ^ 1,
+                    "Unavailable D={d_frac} half={half_ms}ms k={k}: inverted!"
+                );
+            }
+        }
+    }
+}
