@@ -43,31 +43,42 @@ fn pipeline_runs_all_stages_in_order_for_cd_44100_to_352800_f64() {
     assert!(processed.report.log_line().contains("filter_metrics="));
     assert_eq!(processed.report.convolver_name, "null-convolver");
     assert_eq!(processed.report.delayer_name, "null-delay");
-    assert_eq!(processed.report.effective_shaper, NoiseShaperProfile::TpdfDither);
+    assert_eq!(processed.report.effective_shaper, NoiseShaperProfile::NsGentle2);
     assert_eq!(processed.report.output_bits, 24);
 
-    // Verify exact interior PCM values (~ 0.5 * 10^(-3/20) * 2^23 << 8, within +/- 1 LSB TPDF).
-    let expected_l_24 = (0.5_f64 * 10.0_f64.powf(-3.0 / 20.0) * (1_u64 << 23) as f64).round() as i64;
-    let expected_r_24 = -expected_l_24;
+    // Verify exact interior PCM values (~ 0.5 * 10^(-3/20) * 2^23 << 8, within +/- 3 LSB for ns-gentle-2,
+    // and mean recovering the exact fractional sub-LSB f64 level to < 0.01 LSB!).
+    let expected_l_f64 = 0.5_f64 * 10.0_f64.powf(-3.0 / 20.0) * (1_u64 << 23) as f64;
+    let expected_r_f64 = -expected_l_f64;
     let margin = 340 * 8;
-    for (idx, &[l32, r32]) in processed.pcm.frames[margin..(n_in * 8 - margin)]
-        .iter()
-        .enumerate()
-    {
+    let interior = &processed.pcm.frames[margin..(n_in * 8 - margin)];
+    let mut sum_err_l = 0.0_f64;
+    let mut sum_err_r = 0.0_f64;
+    for (idx, &[l32, r32]) in interior.iter().enumerate() {
         // Lower 8 bits of 24-in-32 MSB-aligned sample must be zero.
         assert_eq!(l32 & 0xFF, 0, "non-zero LSB padding L at {idx}");
         assert_eq!(r32 & 0xFF, 0, "non-zero LSB padding R at {idx}");
-        let got_l_24 = i64::from(l32 >> 8);
-        let got_r_24 = i64::from(r32 >> 8);
+        let got_l_24 = f64::from(l32 >> 8);
+        let got_r_24 = f64::from(r32 >> 8);
+        let err_l = got_l_24 - expected_l_f64;
+        let err_r = got_r_24 - expected_r_f64;
+        sum_err_l += err_l;
+        sum_err_r += err_r;
         assert!(
-            (got_l_24 - expected_l_24).abs() <= 1,
-            "interior L mismatch at {idx}: got {got_l_24}, expected {expected_l_24} +/- 1"
+            err_l.abs() <= 3.0,
+            "interior L mismatch at {idx}: got {got_l_24}, expected {expected_l_f64:.2} +/- 3"
         );
         assert!(
-            (got_r_24 - expected_r_24).abs() <= 1,
-            "interior R mismatch at {idx}: got {got_r_24}, expected {expected_r_24} +/- 1"
+            err_r.abs() <= 3.0,
+            "interior R mismatch at {idx}: got {got_r_24}, expected {expected_r_f64:.2} +/- 3"
         );
     }
+    let mean_err_l = sum_err_l / (interior.len() as f64);
+    let mean_err_r = sum_err_r / (interior.len() as f64);
+    assert!(
+        mean_err_l.abs() < 0.01 && mean_err_r.abs() < 0.01,
+        "ns-gentle-2 sub-LSB DC bias too large: L={mean_err_l:.5}, R={mean_err_r:.5} LSB"
+    );
 }
 
 #[test]
@@ -500,19 +511,19 @@ fn gapless_pipeline_sessions_eliminate_boundary_dip_and_drain_on_rate_change() {
     combined.extend(sess_b.flush().unwrap().frames);
 
     assert_eq!(combined.len(), (n_a + n_b) * 8);
-    let expected_l_24 = (0.5_f64 * 10.0_f64.powf(-3.0 / 20.0) * (1_u64 << 23) as f64).round() as i64;
+    let expected_l_f64 = 0.5_f64 * 10.0_f64.powf(-3.0 / 20.0) * (1_u64 << 23) as f64;
     let boundary = n_a * 8;
     for idx in (boundary - 128)..(boundary + 128) {
-        let got_l = i64::from(combined[idx][0] >> 8);
-        let got_r = i64::from(combined[idx][1] >> 8);
+        let got_l = f64::from(combined[idx][0] >> 8);
+        let got_r = f64::from(combined[idx][1] >> 8);
         assert!(
-            (got_l - expected_l_24).abs() <= 1,
-            "gapless pipeline boundary L dip at {idx}: got {got_l}, expected {expected_l_24} +/- 1"
+            (got_l - expected_l_f64).abs() <= 3.0,
+            "gapless pipeline boundary L dip at {idx}: got {got_l}, expected {expected_l_f64:.2} +/- 3"
         );
         assert!(
-            (got_r + expected_l_24).abs() <= 1,
-            "gapless pipeline boundary R dip at {idx}: got {got_r}, expected {} +/- 1",
-            -expected_l_24
+            (got_r + expected_l_f64).abs() <= 3.0,
+            "gapless pipeline boundary R dip at {idx}: got {got_r}, expected {:.2} +/- 3",
+            -expected_l_f64
         );
     }
 }

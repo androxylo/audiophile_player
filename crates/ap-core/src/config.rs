@@ -193,8 +193,8 @@ impl Default for UpnpConfig {
 pub struct QuantizerConfig {
     /// Target DAC quantization bit depth (`16`, `18`, `20`, or `24`; default `24`).
     pub dac_bits: u8,
-    /// Optional explicit shaper profile override (`None` = `"auto"` -> `tpdf` at 24-bit,
-    /// `ns-gentle-2` at `<= 20-bit`, `bypass` for untouched native 32-bit 8fS).
+    /// Optional explicit shaper profile override (`None` = `"auto"` -> `ns-gentle-2` at 8fS,
+    /// `bypass` for untouched native 32-bit 8fS, `tpdf` at non-8fS).
     pub shaper: Option<String>,
 }
 

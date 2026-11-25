@@ -699,18 +699,18 @@ impl UpsamplerPicker {
             }
         };
 
-        let (shaper, shaper_overridden) = match self.policy.shaper_override {
-            Some(forced) => (forced, true),
-            None => (
-                auto_select_shaper(source, filter, ratio, self.policy.dac_bits),
-                false,
-            ),
-        };
-
         let resolved_target_hz = if filter == FilterArchetype::Null {
             source.sample_rate_hz
         } else {
             t_hz
+        };
+
+        let (shaper, shaper_overridden) = match self.policy.shaper_override {
+            Some(forced) => (forced, true),
+            None => (
+                auto_select_shaper(source, filter, ratio, resolved_target_hz, self.policy.dac_bits),
+                false,
+            ),
         };
 
         let tap_budget = filter.planned_taps(
@@ -766,15 +766,18 @@ impl UpsamplerPicker {
     }
 }
 
-/// Automatic `8fS` shaper selection (`docs/research/04-noise-shapers.md` §1 & §6.6):
-/// - Untouched native `>= 32-bit` `8fS` at `dac_bits >= 24` -> `Bypass`.
-/// - `dac_bits <= 20` (`16`, `18`, `20` bits for R-2R NOS experiments) -> `NsGentle2`.
-/// - `dac_bits == 24` (default) -> `TpdfDither` (zero ultrasonic noise shaping).
-/// Higher-order shapers (`ns5`, `lns15`, `pggb-optimal`) are explicit opt-in overrides only.
+/// Automatic `8fS` shaper selection (`docs/research/04-noise-shapers.md`):
+/// - Untouched native `>= 32-bit` `8fS` at `dac_bits >= 24` -> `Bypass` (bit-perfect pass-through).
+/// - All `8fS` (`352.8 / 384 kHz`) DSP output -> `NsGentle2` (best all-around shaper across all
+///   genres and bit depths: `-14.6 dB` in-band @ 384k, `-6.5 dB` 20–40k, `+6 dB` ultrasonic ceiling,
+///   minimal `1.21 LSB` R-2R code activity, safe for NOS multibit DACs and wideband amps).
+/// - Non-`8fS` rates (e.g. `--filter null` at 44.1–192 kHz) -> `TpdfDither`.
+/// Higher-order shapers (`ns5`, `lns15`, `pggb-optimal`) and flat `tpdf` remain explicit overrides.
 fn auto_select_shaper(
     source: &TrackSourceInfo,
     filter: FilterArchetype,
     ratio: UpsampleRatio,
+    resolved_target_hz: u32,
     dac_bits: u8,
 ) -> NoiseShaperProfile {
     if filter == FilterArchetype::Null
@@ -784,7 +787,7 @@ fn auto_select_shaper(
     {
         return NoiseShaperProfile::Bypass;
     }
-    if dac_bits <= 20 {
+    if matches!(resolved_target_hz, 352_800 | 384_000) {
         NoiseShaperProfile::NsGentle2
     } else {
         NoiseShaperProfile::TpdfDither

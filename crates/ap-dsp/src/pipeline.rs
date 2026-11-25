@@ -540,7 +540,14 @@ impl AudioPipeline {
             };
             (shaper, out_bits)
         } else if dsp_plan.shaper == NoiseShaperProfile::Bypass {
-            (NoiseShaperProfile::TpdfDither, dsp_plan.dac_bits)
+            let fallback = if !dsp_plan.shaper_overridden
+                && matches!(dsp_plan.target_rate_hz, 352_800 | 384_000)
+            {
+                NoiseShaperProfile::NsGentle2
+            } else {
+                NoiseShaperProfile::TpdfDither
+            };
+            (fallback, dsp_plan.dac_bits)
         } else {
             (dsp_plan.shaper, dsp_plan.dac_bits)
         };

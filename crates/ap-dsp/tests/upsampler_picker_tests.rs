@@ -37,7 +37,7 @@ fn default_selector_picks_gauss_long_for_1x_gauss_hires_for_hires_and_null_for_8
     assert_eq!(p_cd.ratio, UpsampleRatio::Integer(8));
     assert_eq!(p_cd.filter, FilterArchetype::GaussLongLp);
     assert_eq!(p_cd.target_audiophile_filter, FilterArchetype::GaussLongLp);
-    assert_eq!(p_cd.shaper, NoiseShaperProfile::TpdfDither);
+    assert_eq!(p_cd.shaper, NoiseShaperProfile::NsGentle2);
     assert!(p_cd.tap_budget > 0 && p_cd.tap_budget <= MAX_FILTER_TAPS);
     assert!(!p_cd.filter_overridden);
 
@@ -277,7 +277,17 @@ fn policy_enforces_strict_4_million_tap_ceiling() {
     let p = picker.select(&track(44_100, 16));
     assert_eq!(p.tap_budget, 1_000_000);
     assert_eq!(p.dac_bits, 24);
-    assert_eq!(p.shaper, NoiseShaperProfile::TpdfDither);
+    assert_eq!(p.shaper, NoiseShaperProfile::NsGentle2);
+
+    // Non-8fS `--filter null` pass-through in auto shaper mode cleanly picks TpdfDither.
+    let null_auto_picker = UpsamplerPicker::new(UpsamplerPolicy {
+        filter_override: Some(FilterArchetype::Null),
+        ..UpsamplerPolicy::default()
+    })
+    .unwrap();
+    let p_null_44 = null_auto_picker.select(&track(44_100, 16));
+    assert_eq!(p_null_44.target_rate_hz, 44_100);
+    assert_eq!(p_null_44.shaper, NoiseShaperProfile::TpdfDither);
 
     // Invalid dac_bits rejected; dac_bits <= 20 auto-selects NsGentle2 per INV-04 §6.6.
     for bad_bits in [0_u8, 12, 15, 22, 32] {

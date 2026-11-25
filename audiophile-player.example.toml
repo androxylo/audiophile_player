@@ -28,9 +28,11 @@
 
 [quantizer]
 # Target DAC quantization bit depth on the 32-bit WDM-KS wire (allowed: 16, 18, 20, 24).
-# Default is 24-bit with flat TPDF dither (zero ultrasonic noise shaping). For R-2R NOS DACs
-# (e.g. Schiit Gungnir 2 / TI DAC8812 16-bit R-2R), setting dac_bits = 16, 18, or 20 lets
-# shaper = 'auto' automatically engage clean-room 2nd-order gentle shaping (`ns-gentle-2`).
+# Default is 24-bit with automatic clean-room 2nd-order gentle 8fS shaping (`ns-gentle-2`:
+# -14.6 dB in-band @ 384 kHz, +6 dB max ultrasonic gain, minimal 1.21 LSB R-2R code activity;
+# untouched native 8fS remains bit-perfect `bypass`, non-8fS falls back to `tpdf`).
+# For R-2R NOS DAC experiments (e.g. Schiit Gungnir 2 / TI DAC8812 16-bit R-2R), you can also
+# set dac_bits = 16, 18, or 20.
 # dac_bits = 24
 #
 # Optional 8fS shaper override: 'auto' | 'bypass' | 'tpdf' | 'ns-gentle-2' |

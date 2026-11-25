@@ -304,7 +304,7 @@ pub fn help_text() -> String {
            --shaper <NAME>      Enforce 8fS shaper: auto | bypass | tpdf | ns-gentle-2 |\n\
                                 ns5 (clean-room ns5-class) | lns15 (clean-room lns15-class) |\n\
                                 pggb-optimal (clean-room wide40-9)\n\
-                                (default: auto -> tpdf at 24-bit, ns-gentle-2 at <= 20-bit)\n\
+                                (default: auto -> ns-gentle-2 at 8fS, bypass native 32-bit, tpdf non-8fS)\n\
            --max-taps <N>       Tap ceiling <= 4000000 (default: 4000000)\n\
            --conv-dir <PATH>    Override config: REW stereo WAV folder (auto-picks newest\n\
                                 2-ch WAV matching 352.8 / 384 kHz)\n\
