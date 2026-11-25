@@ -23,9 +23,9 @@ use crate::convolution::{
 use crate::delay::{ChannelDelayer, ChannelDelayerFactory, NullChannelDelayerFactory};
 use crate::quantize::{StreamingQuantizer, apply_safe_gain_f64};
 use crate::selector::{
-    FilterArchetype, MAX_SUPPORTED_SOURCE_RATE_HZ, MIN_SUPPORTED_SOURCE_RATE_HZ,
-    NoiseShaperProfile, SelectedDspPlan, TrackSourceInfo, UNSUPPORTED_SAMPLE_RATE_PREFIX,
-    UpsamplerPicker, UpsamplerPolicy,
+    FilterArchetype, FilterDesignMetrics, MAX_SUPPORTED_SOURCE_RATE_HZ,
+    MIN_SUPPORTED_SOURCE_RATE_HZ, NoiseShaperProfile, SelectedDspPlan, TrackSourceInfo,
+    UNSUPPORTED_SAMPLE_RATE_PREFIX, UpsamplerPicker, UpsamplerPolicy,
 };
 use crate::upsampler::{Upsampler, UpsamplerCarryover, build_upsampler};
 
@@ -96,6 +96,7 @@ pub struct PipelineReport {
     pub output_bits: u8,
     pub headroom: HeadroomDecision,
     pub dsp_plan: SelectedDspPlan,
+    pub filter_metrics: Option<FilterDesignMetrics>,
     pub convolver_name: &'static str,
     pub convolver_description: String,
     pub delayer_name: &'static str,
@@ -122,9 +123,14 @@ impl PipelineReport {
     }
 
     pub fn log_line(&self) -> String {
+        let metrics_part = match &self.filter_metrics {
+            Some(m) => format!(" | filter_metrics=[{}]", m.summary()),
+            None => String::new(),
+        };
         format!(
-            "{} | effective_shaper={} ({}-bit) | {} | conv={} | delay={}",
+            "{}{} | effective_shaper={} ({}-bit) | {} | conv={} | delay={}",
             self.dsp_plan.summary(),
+            metrics_part,
             self.effective_shaper,
             self.output_bits,
             self.headroom.summary(),
@@ -538,6 +544,7 @@ impl AudioPipeline {
             output_bits,
             headroom,
             dsp_plan,
+            filter_metrics: upsampler.design_metrics(),
             convolver_name: convolver.name(),
             convolver_description: convolver.description(),
             delayer_name: delayer.name(),

@@ -23,14 +23,14 @@ fn pipeline_runs_all_stages_in_order_for_cd_44100_to_352800_f64() {
         bits_per_sample: 16,
         channels: 2,
     };
-    let n_in = 512;
+    let n_in = 1024;
     let audio = StereoF64Buffer {
         sample_rate_hz: 44_100,
         left: vec![0.5; n_in],
         right: vec![-0.5; n_in],
     };
 
-    // Untagged track -> fail-safe -3 dB headroom, 8x simple-test -> 352,800 Hz, null conv/delay
+    // Untagged track -> fail-safe -3 dB headroom, 8x gauss-long-lp -> 352,800 Hz, null conv/delay
     let processed = pipeline
         .process(audio, spec, &TrackPeakMetadata::default(), false)
         .expect("pipeline failed");
@@ -38,7 +38,9 @@ fn pipeline_runs_all_stages_in_order_for_cd_44100_to_352800_f64() {
     assert_eq!(processed.pcm.sample_rate_hz, 352_800);
     assert_eq!(processed.pcm.frames.len(), n_in * 8);
     assert_eq!(processed.report.headroom.mode, HeadroomMode::Minus3Db);
-    assert_eq!(processed.report.dsp_plan.filter, FilterArchetype::SimpleTest);
+    assert_eq!(processed.report.dsp_plan.filter, FilterArchetype::GaussLongLp);
+    assert!(processed.report.filter_metrics.is_some());
+    assert!(processed.report.log_line().contains("filter_metrics="));
     assert_eq!(processed.report.convolver_name, "null-convolver");
     assert_eq!(processed.report.delayer_name, "null-delay");
     assert_eq!(processed.report.effective_shaper, NoiseShaperProfile::TpdfDither);
@@ -47,7 +49,7 @@ fn pipeline_runs_all_stages_in_order_for_cd_44100_to_352800_f64() {
     // Verify exact interior PCM values (~ 0.5 * 10^(-3/20) * 2^23 << 8, within +/- 1 LSB TPDF).
     let expected_l_24 = (0.5_f64 * 10.0_f64.powf(-3.0 / 20.0) * (1_u64 << 23) as f64).round() as i64;
     let expected_r_24 = -expected_l_24;
-    let margin = 136 * 8;
+    let margin = 340 * 8;
     for (idx, &[l32, r32]) in processed.pcm.frames[margin..(n_in * 8 - margin)]
         .iter()
         .enumerate()

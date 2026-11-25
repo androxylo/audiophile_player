@@ -1,14 +1,17 @@
-//! TDD unit tests for the dynamic per-track `UpsamplerPicker` and CLI overrides.
+//! TDD unit tests for the dynamic per-track `UpsamplerPicker`, Phase 1 dummy
+//! `DefaultFilterSelector`, pluggable `FilterSelector` trait, and CLI overrides.
 
 use std::str::FromStr;
+use std::sync::Arc;
 
 use ap_core::format::{StreamSpec, TargetDspRate};
 use ap_core::headroom::TrackPeakMetadata;
 use ap_dsp::MAX_FILTER_TAPS;
 use ap_dsp::pipeline::AudioPipeline;
 use ap_dsp::selector::{
-    FilterArchetype, NoiseShaperProfile, TrackSourceInfo, UNSUPPORTED_SAMPLE_RATE_PREFIX,
-    UpsampleRatio, UpsamplerPicker, UpsamplerPolicy, select_target_rate,
+    DefaultFilterSelector, FilterArchetype, FilterSelector, NoiseShaperProfile, TrackSourceInfo,
+    UNSUPPORTED_SAMPLE_RATE_PREFIX, UpsampleRatio, UpsamplerPicker, UpsamplerPolicy,
+    select_target_rate,
 };
 use ap_dsp::upsampler::build_upsampler;
 
@@ -23,36 +26,51 @@ fn track(rate: u32, bits: u16) -> TrackSourceInfo {
 }
 
 #[test]
-fn auto_picker_uses_initial_simple_test_upsampler_and_tracks_future_curated_defaults() {
+fn default_selector_picks_gauss_long_for_1x_gauss_hires_for_hires_and_null_for_8fs() {
     let picker = UpsamplerPicker::new(UpsamplerPolicy::default()).unwrap();
+    assert_eq!(picker.selector_name(), "default");
 
-    // 1. 16/44.1 Redbook -> 8x 352.8 kHz f64 (active: SimpleTest; future default: GaussApod4M)
+    // 1. 16/44.1 Redbook -> 8x 352.8 kHz f64, default gauss-long-lp
     let p_cd = picker.select(&track(44_100, 16));
     assert_eq!(p_cd.target_rate, Some(TargetDspRate::Hz352800));
     assert_eq!(p_cd.target_rate_hz, 352_800);
     assert_eq!(p_cd.ratio, UpsampleRatio::Integer(8));
-    assert_eq!(p_cd.filter, FilterArchetype::SimpleTest);
-    assert_eq!(p_cd.target_audiophile_filter, FilterArchetype::GaussApod4M);
+    assert_eq!(p_cd.filter, FilterArchetype::GaussLongLp);
+    assert_eq!(p_cd.target_audiophile_filter, FilterArchetype::GaussLongLp);
     assert_eq!(p_cd.shaper, NoiseShaperProfile::TpdfDither);
     assert!(p_cd.tap_budget > 0 && p_cd.tap_budget <= MAX_FILTER_TAPS);
     assert!(!p_cd.filter_overridden);
 
-    // 2. 24/96 HiRes -> 4x 384 kHz f64 (active: SimpleTest; future default: GaussLongLp)
+    // 2. 24/48 -> 8x 384 kHz f64, default gauss-long-lp
+    let p_48 = picker.select(&track(48_000, 24));
+    assert_eq!(p_48.target_rate, Some(TargetDspRate::Hz384000));
+    assert_eq!(p_48.ratio, UpsampleRatio::Integer(8));
+    assert_eq!(p_48.filter, FilterArchetype::GaussLongLp);
+
+    // 3. 24/88.2 & 24/96 HiRes -> 4x 352.8/384 kHz f64, default gauss-hires-lp
+    let p_88 = picker.select(&track(88_200, 24));
+    assert_eq!(p_88.target_rate, Some(TargetDspRate::Hz352800));
+    assert_eq!(p_88.ratio, UpsampleRatio::Integer(4));
+    assert_eq!(p_88.filter, FilterArchetype::GaussHiresLp);
+
     let p_96 = picker.select(&track(96_000, 24));
     assert_eq!(p_96.target_rate, Some(TargetDspRate::Hz384000));
     assert_eq!(p_96.target_rate_hz, 384_000);
     assert_eq!(p_96.ratio, UpsampleRatio::Integer(4));
-    assert_eq!(p_96.filter, FilterArchetype::SimpleTest);
-    assert_eq!(p_96.target_audiophile_filter, FilterArchetype::GaussLongLp);
+    assert_eq!(p_96.filter, FilterArchetype::GaussHiresLp);
+    assert_eq!(p_96.target_audiophile_filter, FilterArchetype::GaussHiresLp);
 
-    // 3. 24/192 HiRes -> 2x 384 kHz f64 (active: SimpleTest; future default: GaussHiresIp)
+    // 4. 24/176.4 & 24/192 HiRes -> 2x 352.8/384 kHz f64, default gauss-hires-lp
+    let p_176 = picker.select(&track(176_400, 24));
+    assert_eq!(p_176.ratio, UpsampleRatio::Integer(2));
+    assert_eq!(p_176.filter, FilterArchetype::GaussHiresLp);
+
     let p_192 = picker.select(&track(192_000, 24));
     assert_eq!(p_192.target_rate, Some(TargetDspRate::Hz384000));
     assert_eq!(p_192.ratio, UpsampleRatio::Integer(2));
-    assert_eq!(p_192.filter, FilterArchetype::SimpleTest);
-    assert_eq!(p_192.target_audiophile_filter, FilterArchetype::GaussHiresIp);
+    assert_eq!(p_192.filter, FilterArchetype::GaussHiresLp);
 
-    // 4. 32/384 pre-upsampled PGGB FLAC -> Null 1:1 f64 upsampler (still in f64 domain!)
+    // 5. 32/384 & 32/352.8 pre-upsampled PGGB FLAC -> Null 1:1 f64 upsampler
     let p_384 = picker.select(&track(384_000, 32));
     assert_eq!(p_384.target_rate, Some(TargetDspRate::Hz384000));
     assert_eq!(p_384.ratio, UpsampleRatio::Bypass1x);
@@ -60,28 +78,59 @@ fn auto_picker_uses_initial_simple_test_upsampler_and_tracks_future_curated_defa
     assert_eq!(p_384.shaper, NoiseShaperProfile::Bypass);
     assert_eq!(p_384.tap_budget, 0);
 
-    // 5. 32/352.8 pre-upsampled PGGB FLAC -> Null 1:1 f64 upsampler
     let p_352 = picker.select(&track(352_800, 32));
     assert_eq!(p_352.target_rate, Some(TargetDspRate::Hz352800));
     assert_eq!(p_352.ratio, UpsampleRatio::Bypass1x);
     assert_eq!(p_352.filter, FilterArchetype::Null);
 
-    // Distinct target rates & future curated filters across the playlist sequence
+    // Distinct target rates & filters across playlist
     assert_ne!(p_cd.target_rate, p_96.target_rate);
-    assert_ne!(p_cd.target_audiophile_filter, p_96.target_audiophile_filter);
-    assert_ne!(p_96.target_audiophile_filter, p_192.target_audiophile_filter);
+    assert_ne!(p_cd.filter, p_96.filter);
     assert_ne!(p_192.filter, p_384.filter);
 }
 
 #[test]
-fn apodizing_flag_targets_gauss_apod_for_hires_sources() {
-    let picker = UpsamplerPicker::new(UpsamplerPolicy::default()).unwrap();
+fn dummy_default_selector_ignores_apodizing_flag_while_custom_selector_can_plug_in() {
+    // Phase 1 dummy DefaultFilterSelector always picks the researched per-rate default.
+    let default_picker = UpsamplerPicker::with_selector(
+        UpsamplerPolicy::default(),
+        Arc::new(DefaultFilterSelector),
+    )
+    .unwrap();
     let mut bad_master = track(96_000, 24);
     bad_master.apodizing_needed = true;
+    let plan = default_picker.select(&bad_master);
+    assert_eq!(plan.filter, FilterArchetype::GaussHiresLp);
 
-    let plan = picker.select(&bad_master);
-    assert_eq!(plan.target_audiophile_filter, FilterArchetype::GaussApod4M);
-    assert_eq!(plan.filter, FilterArchetype::SimpleTest); // sole implemented non-bypass filter for now
+    // Custom FilterSelector plugs cleanly into UpsamplerPicker (Phase 5 SmartFilterSelector hook).
+    struct StubSmartSelector;
+    impl FilterSelector for StubSmartSelector {
+        fn name(&self) -> &'static str {
+            "stub-smart"
+        }
+        fn select_filter(
+            &self,
+            source: &TrackSourceInfo,
+            ratio: UpsampleRatio,
+        ) -> (FilterArchetype, String) {
+            if ratio == UpsampleRatio::Bypass1x {
+                (FilterArchetype::Null, "stub: bypass".to_string())
+            } else if source.apodizing_needed {
+                (FilterArchetype::GaussApod4M, "stub: apodizing".to_string())
+            } else {
+                (FilterArchetype::GaussLongLp, "stub: default".to_string())
+            }
+        }
+    }
+
+    let custom_picker =
+        UpsamplerPicker::with_selector(UpsamplerPolicy::default(), Arc::new(StubSmartSelector))
+            .unwrap();
+    assert_eq!(custom_picker.selector_name(), "stub-smart");
+    let custom_plan = custom_picker.select(&bad_master);
+    assert_eq!(custom_plan.filter, FilterArchetype::GaussApod4M);
+    assert_eq!(custom_plan.target_audiophile_filter, FilterArchetype::GaussApod4M);
+    assert!(custom_plan.reason.contains("stub: apodizing"));
 }
 
 #[test]
@@ -182,8 +231,8 @@ fn extreme_and_unsupported_source_rates_are_rejected_without_oom() {
         assert!(err_null.starts_with(UNSUPPORTED_SAMPLE_RATE_PREFIX));
     }
 
-    // In-range non-integer rates (e.g. 50 kHz, 37.8 kHz) also reject cleanly under SimpleTest
-    // with UNSUPPORTED_SAMPLE_RATE_PREFIX so Random/Sequential can skip them without pausing.
+    // In-range non-integer rates (e.g. 50 kHz, 37.8 kHz) also reject cleanly with
+    // UNSUPPORTED_SAMPLE_RATE_PREFIX so Random/Sequential can skip them without pausing.
     for &odd_rate in &[37_800_u32, 50_000] {
         let spec = StreamSpec {
             sample_rate_hz: odd_rate,
@@ -193,17 +242,18 @@ fn extreme_and_unsupported_source_rates_are_rejected_without_oom() {
         let err = pipeline
             .start_track(spec, &TrackPeakMetadata::default(), false)
             .err()
-            .expect("simple-test must reject non-integer rate");
+            .expect("default upsampler must reject non-integer rate");
         assert!(
             err.starts_with(UNSUPPORTED_SAMPLE_RATE_PREFIX),
             "unexpected err for {odd_rate} Hz: {err}"
         );
     }
 
-    // Valid low integer rate 8 kHz (48x <= 64) still succeeds cleanly!
+    // Valid low integer rate 8 kHz (48x <= 64) still succeeds cleanly under default gauss-long-lp!
     let p_8k = picker.select(&track(8_000, 16));
     assert_eq!(p_8k.ratio, UpsampleRatio::Integer(48));
     assert_eq!(p_8k.target_rate_hz, 384_000);
+    assert_eq!(p_8k.filter, FilterArchetype::GaussLongLp);
     assert!(build_upsampler(&p_8k).is_ok());
 }
 
@@ -226,21 +276,45 @@ fn policy_enforces_strict_4_million_tap_ceiling() {
 }
 
 #[test]
-fn cli_names_parse_roundtrip_for_all_filters_and_shapers() {
+fn cli_names_and_compatibility_aliases_parse_roundtrip_for_all_filters_and_shapers() {
     for f in [
         FilterArchetype::Null,
         FilterArchetype::SimpleTest,
+        FilterArchetype::GaussLongLp,
+        FilterArchetype::GaussHiresLp,
         FilterArchetype::GaussApod4M,
         FilterArchetype::SincSteep4M,
-        FilterArchetype::GaussLongLp,
-        FilterArchetype::GaussHiresIp,
-        FilterArchetype::GaussHiresMp,
         FilterArchetype::ExtSharpLp,
+        FilterArchetype::MinphaseLong,
+        FilterArchetype::IntermediateLong,
+        FilterArchetype::ShortLp,
+        FilterArchetype::ShortMp,
     ] {
         assert_eq!(FilterArchetype::from_str(f.cli_name()).unwrap(), f);
     }
     assert_eq!(FilterArchetype::from_str("bypass").unwrap(), FilterArchetype::Null);
+    assert_eq!(
+        FilterArchetype::from_str("gauss-hires-mp").unwrap(),
+        FilterArchetype::MinphaseLong
+    );
+    assert_eq!(
+        FilterArchetype::from_str("gauss-hires-ip").unwrap(),
+        FilterArchetype::IntermediateLong
+    );
     assert!(FilterArchetype::from_str("nonexistent").is_err());
+
+    // Verify implemented flags for Phase 1.
+    assert!(FilterArchetype::Null.is_implemented());
+    assert!(FilterArchetype::SimpleTest.is_implemented());
+    assert!(FilterArchetype::GaussLongLp.is_implemented());
+    assert!(FilterArchetype::GaussHiresLp.is_implemented());
+    assert!(!FilterArchetype::GaussApod4M.is_implemented());
+    assert!(!FilterArchetype::SincSteep4M.is_implemented());
+    assert!(!FilterArchetype::ExtSharpLp.is_implemented());
+    assert!(!FilterArchetype::MinphaseLong.is_implemented());
+    assert!(!FilterArchetype::IntermediateLong.is_implemented());
+    assert!(!FilterArchetype::ShortLp.is_implemented());
+    assert!(!FilterArchetype::ShortMp.is_implemented());
 
     for s in [
         NoiseShaperProfile::Bypass,

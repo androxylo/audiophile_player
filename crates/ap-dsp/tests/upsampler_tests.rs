@@ -23,9 +23,17 @@ fn run_oneshot(
     out
 }
 
+fn simple_test_policy(max_taps: usize) -> UpsamplerPolicy {
+    UpsamplerPolicy {
+        filter_override: Some(FilterArchetype::SimpleTest),
+        shaper_override: None,
+        max_taps,
+    }
+}
+
 #[test]
 fn simple_upsampler_outputs_float64_at_352800_and_384000_preserving_dc_exactly() {
-    let picker = UpsamplerPicker::new(UpsamplerPolicy::default()).unwrap();
+    let picker = UpsamplerPicker::new(simple_test_policy(ap_dsp::MAX_FILTER_TAPS)).unwrap();
 
     for &(src_rate, expected_out_rate) in &[
         (44_100_u32, 352_800_u32),
@@ -139,7 +147,7 @@ fn streaming_chunked_upsampling_is_bit_exact_with_oneshot_across_arbitrary_chunk
 
 #[test]
 fn simple_upsampler_reconstructs_1khz_sine_at_8x_352800_with_high_accuracy() {
-    let picker = UpsamplerPicker::new(UpsamplerPolicy::default()).unwrap();
+    let picker = UpsamplerPicker::new(simple_test_policy(ap_dsp::MAX_FILTER_TAPS)).unwrap();
     let info = TrackSourceInfo::from_stream_spec(StreamSpec {
         sample_rate_hz: 44_100,
         bits_per_sample: 16,
@@ -186,7 +194,7 @@ fn simple_upsampler_reconstructs_1khz_sine_at_8x_352800_with_high_accuracy() {
 
 #[test]
 fn simple_upsampler_suppresses_ultrasonic_images_at_8x() {
-    let picker = UpsamplerPicker::new(UpsamplerPolicy::default()).unwrap();
+    let picker = UpsamplerPicker::new(simple_test_policy(ap_dsp::MAX_FILTER_TAPS)).unwrap();
     let plan = picker.select(&TrackSourceInfo::from_stream_spec(StreamSpec {
         sample_rate_hz: 44_100,
         bits_per_sample: 16,
@@ -231,7 +239,7 @@ fn simple_upsampler_suppresses_ultrasonic_images_at_8x() {
 
 #[test]
 fn simple_upsampler_is_flat_through_20khz_for_44100_to_352800() {
-    let picker = UpsamplerPicker::new(UpsamplerPolicy::default()).unwrap();
+    let picker = UpsamplerPicker::new(simple_test_policy(ap_dsp::MAX_FILTER_TAPS)).unwrap();
     let plan = picker.select(&TrackSourceInfo::from_stream_spec(StreamSpec {
         sample_rate_hz: 44_100,
         bits_per_sample: 16,
@@ -343,19 +351,15 @@ fn upsampler_honors_max_taps_budget_and_matches_plan_tap_budget() {
         channels: 2,
     });
 
-    // Default cap -> 256 taps/phase * 8 = 2048 taps
-    let default_picker = UpsamplerPicker::new(UpsamplerPolicy::default()).unwrap();
+    // Default cap for legacy SimpleTest -> 256 taps/phase * 8 = 2048 taps
+    let default_picker = UpsamplerPicker::new(simple_test_policy(ap_dsp::MAX_FILTER_TAPS)).unwrap();
     let default_plan = default_picker.select(&info);
     let default_up = build_upsampler(&default_plan).unwrap();
     assert_eq!(default_plan.tap_budget, 256 * 8);
     assert_eq!(default_up.total_taps(), default_plan.tap_budget);
 
     // Explicit --max-taps 512 -> 64 taps/phase * 8 = 512 taps
-    let cap512 = UpsamplerPicker::new(UpsamplerPolicy {
-        max_taps: 512,
-        ..UpsamplerPolicy::default()
-    })
-    .unwrap();
+    let cap512 = UpsamplerPicker::new(simple_test_policy(512)).unwrap();
     let p512 = cap512.select(&info);
     let u512 = build_upsampler(&p512).unwrap();
     assert_eq!(p512.tap_budget, 512);
@@ -363,11 +367,7 @@ fn upsampler_honors_max_taps_budget_and_matches_plan_tap_budget() {
 
     // Non-multiple --max-taps 100 -> floor-even 12 taps/phase * 8 = 96 taps (reported == actual)
     // and warns because 12 < 64 taps/phase quality floor.
-    let cap100 = UpsamplerPicker::new(UpsamplerPolicy {
-        max_taps: 100,
-        ..UpsamplerPolicy::default()
-    })
-    .unwrap();
+    let cap100 = UpsamplerPicker::new(simple_test_policy(100)).unwrap();
     let p100 = cap100.select(&info);
     let u100 = build_upsampler(&p100).unwrap();
     assert_eq!(p100.tap_budget, 96);
@@ -380,11 +380,7 @@ fn upsampler_honors_max_taps_budget_and_matches_plan_tap_budget() {
 
     // --max-taps 10 at 8x is below minimum 64 taps (8 taps/phase * 8): must NEVER exceed user cap
     // and build_upsampler must reject cleanly with an error.
-    let cap10 = UpsamplerPicker::new(UpsamplerPolicy {
-        max_taps: 10,
-        ..UpsamplerPolicy::default()
-    })
-    .unwrap();
+    let cap10 = UpsamplerPicker::new(simple_test_policy(10)).unwrap();
     let p10 = cap10.select(&info);
     assert!(
         p10.tap_budget <= 10,

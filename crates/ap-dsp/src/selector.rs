@@ -1,23 +1,28 @@
-//! Dynamic per-track upsampler & 8fS noise-shaper picker with CLI override support.
+//! Dynamic per-track upsampler & 8fS noise-shaper picker with pluggable [`FilterSelector`].
 //!
 //! Architectural design:
 //! 1. **Per-track dynamic switching:** Every track is evaluated fresh by [`UpsamplerPicker`]
-//!    so the engine always expects a potentially different upsampler/ratio per track.
-//! 2. **Initial simple test upsampler (`SimpleTest`):** Before deep `INV-03` algorithm
-//!    research lands, `SimpleTest` is the sole implemented upsampling filter (and therefore
-//!    the active temporary default for non-8fS tracks). Once the curated audiophile filter
-//!    families (`GaussApod4M`, `SincSteep4M`, `GaussLongLp`, `GaussHiresIp`, etc.) are
-//!    implemented, `SimpleTest` will be retired as default and retained strictly for testing.
+//!    using its pluggable [`FilterSelector`] so the engine always expects a potentially
+//!    different upsampler, ratio, or filter identity per track.
+//! 2. **Phase 1 dummy selector ([`DefaultFilterSelector`]):** Always selects the researched
+//!    default per-rate filter (`gauss-long-lp` for 1x `<= 48 kHz`, `gauss-hires-lp` for hi-res
+//!    `88.2–192 kHz`, `null` for native `8fS` `352.8 / 384 kHz`), while honoring `--filter` CLI
+//!    overrides. A future Phase 5 `SmartFilterSelector` plugs into the same [`FilterSelector`]
+//!    trait without changing pipeline callers.
 //! 3. **Always floating point:** Every upsampler operates strictly on `StereoF64Buffer`
 //!    (`f64` -> `f64`) targeting `352.8 kHz` / `384 kHz`.
-//! 4. **CLI enforcement:** `--filter`, `--shaper`, and `--max-taps` can override selection.
+//! 4. **Legacy `SimpleTest`:** Retired as default and retained strictly for testing
+//!    (`--filter simple-test`).
+//! 5. **CLI enforcement:** `--filter`, `--shaper`, and `--max-taps` can override selection.
 
 use std::fmt;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use ap_core::format::{StreamSpec, TargetDspRate};
 
 use crate::MAX_FILTER_TAPS;
+use crate::upsampler::default_gaussian_num_taps;
 
 /// Minimum sane source sample rate accepted by the DSP pipeline (protects against corrupt
 /// ultra-low-rate headers causing extreme upsampling ratios and OOM allocations).
@@ -66,7 +71,8 @@ pub struct TrackSourceInfo {
     pub sample_rate_hz: u32,
     pub bits_per_sample: u16,
     pub channels: u16,
-    /// True when pre-analysis detects mastering/ADC pre-ringing errors needing an apodizing filter.
+    /// True when pre-analysis detects mastering/ADC pre-ringing errors needing an apodizing filter
+    /// (used by future smart selectors in Phase 5+; ignored by [`DefaultFilterSelector`]).
     pub apodizing_needed: bool,
     /// True for live streaming sources (Milestone 2 Tidal); false for local FLAC files.
     pub is_streaming_source: bool,
@@ -105,29 +111,126 @@ impl fmt::Display for UpsampleRatio {
     }
 }
 
-/// Curated audiophile PCM filter archetypes (plus `Null` 1:1 `f64` pass-through and initial `SimpleTest`).
+/// Phase response class of an upsampling filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterPhase {
+    Linear,
+    Minimum,
+    Intermediate,
+}
+
+impl fmt::Display for FilterPhase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Linear => f.write_str("linear"),
+            Self::Minimum => f.write_str("minimum"),
+            Self::Intermediate => f.write_str("intermediate"),
+        }
+    }
+}
+
+/// Design and diagnostic metadata exposed by an active upsampling filter for logging, UI, and
+/// DR-1 compliance verification (`UPSAMPLING_RESEARCH.md` §4.5, §6, §7, §9.4).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FilterDesignMetrics {
+    pub phase: FilterPhase,
+    /// Exact prototype filter length `N` (odd for linear-phase integer group delay).
+    pub num_taps: usize,
+    /// Taps per polyphase branch.
+    pub taps_per_phase: usize,
+    /// Total prototype duration `(N - 1) / fs_out` in seconds.
+    pub length_seconds: f64,
+    /// Group delay at DC in seconds (`length_seconds / 2.0` for linear phase).
+    pub group_delay_seconds: f64,
+    /// Passband `-0.01 dB` edge in Hz (`fc - 3.05 * sigma_f` for Gaussian).
+    pub passband_edge_001db_hz: f64,
+    /// Exact response magnitude at `20 kHz` in dB (`None` when `source_rate_hz <= 40_000`).
+    pub level_at_20khz_db: Option<f64>,
+    /// Stopband edge frequency in Hz (where response reaches `stopband_attenuation_db`).
+    pub stopband_edge_hz: f64,
+    /// Target stopband attenuation in dB (negative, e.g. `-300.0`).
+    pub stopband_attenuation_db: f64,
+    /// Worst-case per-phase L1 norm `max_p sum_k |bank[p][k]|` (diagnostic only per HEADROOM_DESIGN.md).
+    pub l1_norm: f64,
+    /// Worst-case per-phase L1 norm in dB (`20 * log10(l1_norm)`).
+    pub l1_norm_db: f64,
+}
+
+impl FilterDesignMetrics {
+    /// Concise diagnostic string suitable for stdout and the HTTP bottom action log.
+    pub fn summary(&self) -> String {
+        let lvl_20k = match self.level_at_20khz_db {
+            Some(db) => format!("{db:+.4}dB@20k"),
+            None => "n/a@20k".to_string(),
+        };
+        format!(
+            "phase={} N={} ({}t/ph, {:.2}ms, gd={:.2}ms) -0.01dB={:.0}Hz {} stop={:.0}Hz({:.0}dB) L1={:.3}({:+.2}dB)",
+            self.phase,
+            self.num_taps,
+            self.taps_per_phase,
+            self.length_seconds * 1_000.0,
+            self.group_delay_seconds * 1_000.0,
+            self.passband_edge_001db_hz,
+            lvl_20k,
+            self.stopband_edge_hz,
+            self.stopband_attenuation_db,
+            self.l1_norm,
+            self.l1_norm_db,
+        )
+    }
+}
+
+/// Unique mathematical identity of an active upsampler kernel (`FILTER_SELECTION_RESEARCH.md` §4).
+///
+/// Checked inside `Upsampler::set_incoming_carryover` so two different filters (or the same
+/// archetype with different parameters/effective Nyquist) NEVER splice their FIR histories even
+/// when their tap lengths happen to match — forcing a clean `ConvolverOnlyHandoff` instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FilterIdentity {
+    pub archetype: FilterArchetype,
+    pub source_rate_hz: u32,
+    pub target_rate_hz: u32,
+    pub ratio: usize,
+    pub num_taps: usize,
+    pub taps_per_phase: usize,
+    /// IEEE 754 `f64::to_bits()` of filter cutoff `fc` in Hz (`0` for non-parametric/bypass).
+    pub fc_hz_bits: u64,
+    /// IEEE 754 `f64::to_bits()` of Gaussian `sigma_f` in Hz (`0` for non-Gaussian).
+    pub sigma_f_hz_bits: u64,
+    /// Optional content-derived effective Nyquist (reserved for Phase 6 Detector H).
+    pub effective_nyquist_hz: Option<u32>,
+}
+
+/// Curated audiophile PCM filter archetypes (`UPSAMPLING_RESEARCH.md` §1 & §7), plus `Null`
+/// (native 8fS 1:1 `f64` pass-through) and test-only `SimpleTest`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterArchetype {
     /// Null 1:1 floating-point upsampler (`StereoF64Buffer -> StereoF64Buffer`, zero copy).
-    /// Used for native `352.8 / 384 kHz` sources so they still enter the `f64` DSP domain
-    /// (REW convolution, headroom, channel delay) without resampling.
+    /// Used for native `352.8 / 384 kHz` sources so they enter the `f64` DSP domain without resampling.
     Null,
-    /// Initial simple windowed-sinc `f64` polyphase upsampler (temporary sole implemented
-    /// upsampler until deep `INV-03` algorithms land; will NOT remain default once curated
-    /// filters are implemented).
+    /// Legacy Kaiser-windowed sinc `f64` polyphase upsampler retained strictly for testing
+    /// (`--filter simple-test`).
     SimpleTest,
-    /// Future (`INV-03`): ultra-long Gaussian-windowed apodizing sinc (`sinc-MGa` / PGGB class).
-    GaussApod4M,
-    /// Future (`INV-03`): ultra-steep linear-phase windowed sinc (`sinc-M`/`sinc-L`/WTA class).
-    SincSteep4M,
-    /// Future (`INV-03`): long linear-phase Gaussian polyphase (`poly-sinc-gauss-long` class).
+    /// #1 (DEFAULT 1x): Long linear-phase Gaussian windowed-sinc (`poly-sinc-gauss-long` class).
+    /// Flat `-0.01 dB` to `20 kHz` (scaled with `fs_in`), `-300 dB` at `fs_in / 2`.
     GaussLongLp,
-    /// Future (`INV-03`): intermediate-phase HiRes Gaussian (`poly-sinc-gauss-hires-ip` class).
-    GaussHiresIp,
-    /// Future (`INV-03`): minimum-phase HiRes Gaussian (`poly-sinc-gauss-hires-mp` class).
-    GaussHiresMp,
-    /// Future (`INV-03`): sharp extended-passband linear-phase (`poly-sinc-ext3` class).
+    /// #2 (DEFAULT hi-res): Linear-phase hi-res Gaussian (`poly-sinc-gauss-hires-lp` class).
+    /// Flat `-0.01 dB` to `0.42 * fs_in`, `-300 dB` at `fs_in / 2`.
+    GaussHiresLp,
+    /// #3 (Phase 2): Extra-long strong-apodizing Gaussian (`poly-sinc-gauss-xla` / `sinc-MGa` class).
+    GaussApod4M,
+    /// #4 (Phase 2): Ultra-steep constant-time Kaiser sinc (`sinc-L` class, `131,070 * ratio`).
+    SincSteep4M,
+    /// #5 (Phase 2): Sharp extended-passband linear-phase (`ext3` / `sinc-Mx` class, `65,536 * ratio`).
     ExtSharpLp,
+    /// #6 (Phase 3): Minimum-phase Gaussian (`minphase-long`; CLI alias `gauss-hires-mp`).
+    MinphaseLong,
+    /// #7 (Phase 3): Intermediate-phase Gaussian (`intermediate-long`; CLI alias `gauss-hires-ip`).
+    IntermediateLong,
+    /// #8a (Phase 2): Short linear-phase Gaussian (`short-lp`, flat to 19 kHz DR-1 floor).
+    ShortLp,
+    /// #8b (Phase 3): Short minimum-phase Gaussian (`short-mp`, flat to 19 kHz DR-1 floor).
+    ShortMp,
 }
 
 impl FilterArchetype {
@@ -135,42 +238,76 @@ impl FilterArchetype {
         match self {
             Self::Null => "null",
             Self::SimpleTest => "simple-test",
+            Self::GaussLongLp => "gauss-long-lp",
+            Self::GaussHiresLp => "gauss-hires-lp",
             Self::GaussApod4M => "gauss-apod-4m",
             Self::SincSteep4M => "sinc-steep-4m",
-            Self::GaussLongLp => "gauss-long-lp",
-            Self::GaussHiresIp => "gauss-hires-ip",
-            Self::GaussHiresMp => "gauss-hires-mp",
             Self::ExtSharpLp => "ext-sharp-lp",
+            Self::MinphaseLong => "minphase-long",
+            Self::IntermediateLong => "intermediate-long",
+            Self::ShortLp => "short-lp",
+            Self::ShortMp => "short-mp",
         }
     }
 
     /// True if this filter kernel is currently implemented and runnable in `ap-dsp`.
     pub fn is_implemented(self) -> bool {
-        matches!(self, Self::Null | Self::SimpleTest)
+        matches!(
+            self,
+            Self::Null | Self::SimpleTest | Self::GaussLongLp | Self::GaussHiresLp
+        )
     }
 
-    /// Recommended tap budget per archetype (strictly bounded by `max_taps <= 4,000,000`).
-    pub fn default_taps(self, ratio: UpsampleRatio, max_taps: usize) -> usize {
+    /// Shape-derived (for Gaussian archetypes) or researched constant-time tap count, bounded by
+    /// `max_taps <= MAX_FILTER_TAPS`.
+    pub fn planned_taps(
+        self,
+        source_rate_hz: u32,
+        target_rate_hz: u32,
+        ratio: UpsampleRatio,
+        max_taps: usize,
+    ) -> usize {
         let cap = max_taps.min(MAX_FILTER_TAPS);
         let mult = match ratio {
             UpsampleRatio::Bypass1x => return 0,
             UpsampleRatio::Integer(n) => n as usize,
             UpsampleRatio::Arbitrary => 8,
         };
-        if self == Self::SimpleTest {
-            return simple_test_taps_per_phase(mult, cap)
-                .map_or(0, |m| m.saturating_mul(mult));
-        }
-        let desired = match self {
+        match self {
             Self::Null => 0,
-            Self::SimpleTest => unreachable!(),
-            Self::GaussApod4M => 262_144 * mult, // 2.1M @ 8x, 1.05M @ 4x, 524k @ 2x
-            Self::SincSteep4M => 500_000 * mult, // 4.0M @ 8x, 2.0M @ 4x, 1.0M @ 2x
-            Self::GaussLongLp => 32_768 * mult,
-            Self::GaussHiresIp | Self::GaussHiresMp => 8_192 * mult,
-            Self::ExtSharpLp => 65_536 * mult,
+            Self::SimpleTest => simple_test_taps_per_phase(mult, cap)
+                .map_or(0, |m| m.saturating_mul(mult)),
+            Self::GaussLongLp | Self::GaussHiresLp => {
+                default_gaussian_num_taps(self, source_rate_hz, target_rate_hz)
+                    .map_or(0, |n| n.min(cap))
+            }
+            // Future Phase 2/3 researched constant-time lengths (`UPSAMPLING_RESEARCH.md` §4.4, §7).
+            Self::GaussApod4M => (65_536_usize.saturating_mul(mult)).min(cap),
+            Self::SincSteep4M => (131_070_usize.saturating_mul(mult)).min(cap),
+            Self::ExtSharpLp => (65_536_usize.saturating_mul(mult)).min(cap),
+            Self::MinphaseLong | Self::IntermediateLong => {
+                let ref_arch = if source_rate_hz <= 48_000 {
+                    Self::GaussLongLp
+                } else {
+                    Self::GaussHiresLp
+                };
+                default_gaussian_num_taps(ref_arch, source_rate_hz, target_rate_hz)
+                    .map_or((8_192_usize.saturating_mul(mult)).min(cap), |n| n.min(cap))
+            }
+            Self::ShortLp | Self::ShortMp => (256_usize.saturating_mul(mult)).min(cap),
+        }
+    }
+
+    /// Backwards-compatible ratio-only tap budget helper (uses canonical 44.1/96/192k reference rates).
+    pub fn default_taps(self, ratio: UpsampleRatio, max_taps: usize) -> usize {
+        let (src, dst) = match ratio {
+            UpsampleRatio::Bypass1x => (384_000, 384_000),
+            UpsampleRatio::Integer(2) => (192_000, 384_000),
+            UpsampleRatio::Integer(4) => (96_000, 384_000),
+            UpsampleRatio::Integer(r) => (352_800 / r.max(1), 352_800),
+            UpsampleRatio::Arbitrary => (44_100, 352_800),
         };
-        desired.min(cap)
+        self.planned_taps(src, dst, ratio, max_taps)
     }
 }
 
@@ -187,16 +324,84 @@ impl FromStr for FilterArchetype {
         match s.trim().to_ascii_lowercase().as_str() {
             "null" | "bypass" => Ok(Self::Null),
             "simple-test" => Ok(Self::SimpleTest),
+            "gauss-long-lp" => Ok(Self::GaussLongLp),
+            "gauss-hires-lp" => Ok(Self::GaussHiresLp),
             "gauss-apod-4m" => Ok(Self::GaussApod4M),
             "sinc-steep-4m" => Ok(Self::SincSteep4M),
-            "gauss-long-lp" => Ok(Self::GaussLongLp),
-            "gauss-hires-ip" => Ok(Self::GaussHiresIp),
-            "gauss-hires-mp" => Ok(Self::GaussHiresMp),
             "ext-sharp-lp" => Ok(Self::ExtSharpLp),
+            "minphase-long" | "gauss-hires-mp" => Ok(Self::MinphaseLong),
+            "intermediate-long" | "gauss-hires-ip" => Ok(Self::IntermediateLong),
+            "short-lp" => Ok(Self::ShortLp),
+            "short-mp" => Ok(Self::ShortMp),
             other => Err(format!(
-                "unknown filter '{other}'; expected auto, null, simple-test, gauss-apod-4m, \
-                 sinc-steep-4m, gauss-long-lp, gauss-hires-ip, gauss-hires-mp, or ext-sharp-lp"
+                "unknown filter '{other}'; expected auto, null, simple-test, gauss-long-lp, \
+                 gauss-hires-lp, gauss-apod-4m, sinc-steep-4m, ext-sharp-lp, minphase-long \
+                 (alias gauss-hires-mp), intermediate-long (alias gauss-hires-ip), short-lp, \
+                 or short-mp"
             )),
+        }
+    }
+}
+
+/// Pluggable per-track filter selector (`FILTER_SELECTION_RESEARCH.md`).
+///
+/// Phase 1 ships [`DefaultFilterSelector`], which always picks the researched default per-rate
+/// Gaussian filter (`gauss-long-lp` for 1x, `gauss-hires-lp` for hi-res, `null` for native 8fS).
+/// Phase 5 plugs `SmartFilterSelector` into this same trait without changing pipeline callers.
+pub trait FilterSelector: Send + Sync {
+    /// Short identifier for logs and diagnostics.
+    fn name(&self) -> &'static str;
+
+    /// Select the per-track [`FilterArchetype`] and an explainable reason string.
+    fn select_filter(
+        &self,
+        source: &TrackSourceInfo,
+        ratio: UpsampleRatio,
+    ) -> (FilterArchetype, String);
+}
+
+/// Dummy initial filter selector (Phase 1): always picks the researched default per-rate filter:
+/// - Native `8fS` (`352.8 / 384 kHz`, `Bypass1x`) -> [`FilterArchetype::Null`]
+/// - 1x rates (`<= 48 kHz`, e.g. `44.1 / 48 kHz` and sub-44.1k integer divisors) -> [`FilterArchetype::GaussLongLp`]
+/// - Hi-res rates (`88.2 / 96 / 176.4 / 192 kHz`) -> [`FilterArchetype::GaussHiresLp`]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DefaultFilterSelector;
+
+impl FilterSelector for DefaultFilterSelector {
+    fn name(&self) -> &'static str {
+        "default"
+    }
+
+    fn select_filter(
+        &self,
+        source: &TrackSourceInfo,
+        ratio: UpsampleRatio,
+    ) -> (FilterArchetype, String) {
+        if ratio == UpsampleRatio::Bypass1x {
+            return (
+                FilterArchetype::Null,
+                format!(
+                    "auto (default selector): native 8fS ({} Hz) -> null (1:1 f64 pass-through)",
+                    source.sample_rate_hz
+                ),
+            );
+        }
+        if source.sample_rate_hz <= 48_000 {
+            (
+                FilterArchetype::GaussLongLp,
+                format!(
+                    "auto (default selector): {} Hz (1x) -> gauss-long-lp",
+                    source.sample_rate_hz
+                ),
+            )
+        } else {
+            (
+                FilterArchetype::GaussHiresLp,
+                format!(
+                    "auto (default selector): {} Hz (hi-res) -> gauss-hires-lp",
+                    source.sample_rate_hz
+                ),
+            )
         }
     }
 }
@@ -297,10 +502,13 @@ pub struct SelectedDspPlan {
     pub ratio: UpsampleRatio,
     /// Active filter selected to execute right now.
     pub filter: FilterArchetype,
-    /// Intended long-term curated filter archetype for this source class once `INV-03` lands.
+    /// Filter archetype chosen by the active [`FilterSelector`] before any fallback/override.
     pub target_audiophile_filter: FilterArchetype,
     pub shaper: NoiseShaperProfile,
+    /// Planned tap count (`<= max_taps <= 4,000,000`).
     pub tap_budget: usize,
+    /// User/policy `--max-taps` ceiling (preserved so `build_upsampler` enforces the hard cap).
+    pub max_taps: usize,
     pub filter_overridden: bool,
     pub shaper_overridden: bool,
     pub reason: String,
@@ -362,30 +570,53 @@ fn target_rate_from_hz(hz: u32) -> Option<TargetDspRate> {
     }
 }
 
-/// Per-track upsampler & noise-shaper picker.
+/// Per-track upsampler & noise-shaper picker backed by a pluggable [`FilterSelector`].
 ///
 /// Always called fresh on every track so the engine naturally expects the upsampler,
 /// ratio, and target rate to vary from track to track.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct UpsamplerPicker {
     policy: UpsamplerPolicy,
+    selector: Arc<dyn FilterSelector>,
+}
+
+impl fmt::Debug for UpsamplerPicker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UpsamplerPicker")
+            .field("policy", &self.policy)
+            .field("selector", &self.selector.name())
+            .finish()
+    }
 }
 
 impl UpsamplerPicker {
+    /// Construct a picker backed by [`DefaultFilterSelector`] (Phase 1 dummy selector).
     pub fn new(policy: UpsamplerPolicy) -> Result<Self, String> {
+        Self::with_selector(policy, Arc::new(DefaultFilterSelector))
+    }
+
+    /// Construct a picker backed by a custom [`FilterSelector`] (e.g. Phase 5 `SmartFilterSelector`).
+    pub fn with_selector(
+        policy: UpsamplerPolicy,
+        selector: Arc<dyn FilterSelector>,
+    ) -> Result<Self, String> {
         policy.validate()?;
-        Ok(Self { policy })
+        Ok(Self { policy, selector })
     }
 
     pub fn policy(&self) -> UpsamplerPolicy {
         self.policy
     }
 
+    pub fn selector_name(&self) -> &'static str {
+        self.selector.name()
+    }
+
     /// Select the per-track `f64` upsampling plan, honoring CLI overrides.
     pub fn select(&self, source: &TrackSourceInfo) -> SelectedDspPlan {
         let (target_rate, raw_ratio) = select_target_rate(source.sample_rate_hz);
         let t_hz = target_rate_hz(target_rate);
-        let target_audiophile = planned_audiophile_filter(source, raw_ratio);
+        let (selected_auto, selected_reason) = self.selector.select_filter(source, raw_ratio);
 
         let (filter, ratio, filter_overridden, filter_reason) = match self.policy.filter_override {
             Some(FilterArchetype::Null) => (
@@ -409,7 +640,7 @@ impl UpsamplerPicker {
                     (forced, raw_ratio, true, format!("cli --filter {forced}"))
                 }
             }
-            None => auto_select_active_filter(source, raw_ratio, target_audiophile),
+            None => (selected_auto, raw_ratio, false, selected_reason),
         };
 
         let (shaper, shaper_overridden) = match self.policy.shaper_override {
@@ -417,12 +648,25 @@ impl UpsamplerPicker {
             None => (auto_select_shaper(source, filter, ratio), false),
         };
 
-        let tap_budget = filter.default_taps(ratio, self.policy.max_taps);
+        let resolved_target_hz = if filter == FilterArchetype::Null {
+            source.sample_rate_hz
+        } else {
+            t_hz
+        };
+
+        let tap_budget = filter.planned_taps(
+            source.sample_rate_hz,
+            resolved_target_hz,
+            ratio,
+            self.policy.max_taps,
+        );
+
         let mut reason = if shaper_overridden {
             format!("{filter_reason}; cli --shaper {shaper}")
         } else {
             filter_reason
         };
+
         if filter == FilterArchetype::SimpleTest {
             if let UpsampleRatio::Integer(r) = ratio {
                 let mult = r as usize;
@@ -445,82 +689,21 @@ impl UpsamplerPicker {
             }
         }
 
-        let resolved_target_hz = if filter == FilterArchetype::Null {
-            source.sample_rate_hz
-        } else {
-            t_hz
-        };
-
         SelectedDspPlan {
             source_rate_hz: source.sample_rate_hz,
             target_rate: target_rate_from_hz(resolved_target_hz),
             target_rate_hz: resolved_target_hz,
             ratio,
             filter,
-            target_audiophile_filter: target_audiophile,
+            target_audiophile_filter: selected_auto,
             shaper,
             tap_budget,
+            max_taps: self.policy.max_taps,
             filter_overridden,
             shaper_overridden,
             reason,
         }
     }
-}
-
-/// Curated long-term audiophile filter mapping (active once `INV-03` filters are implemented).
-fn planned_audiophile_filter(source: &TrackSourceInfo, ratio: UpsampleRatio) -> FilterArchetype {
-    if ratio == UpsampleRatio::Bypass1x {
-        return FilterArchetype::Null;
-    }
-    if source.apodizing_needed {
-        return FilterArchetype::GaussApod4M;
-    }
-    match ratio {
-        UpsampleRatio::Integer(r) if r >= 8 => FilterArchetype::GaussApod4M,
-        UpsampleRatio::Integer(4) => FilterArchetype::GaussLongLp,
-        UpsampleRatio::Integer(2) => FilterArchetype::GaussHiresIp,
-        _ => FilterArchetype::GaussApod4M,
-    }
-}
-
-/// Select the currently implemented active filter: uses `target_audiophile` once implemented,
-/// otherwise cleanly selects our initial bootstrap `SimpleTest` kernel for non-8fS tracks.
-fn auto_select_active_filter(
-    source: &TrackSourceInfo,
-    ratio: UpsampleRatio,
-    target_audiophile: FilterArchetype,
-) -> (FilterArchetype, UpsampleRatio, bool, String) {
-    if ratio == UpsampleRatio::Bypass1x {
-        return (
-            FilterArchetype::Null,
-            UpsampleRatio::Bypass1x,
-            false,
-            format!(
-                "auto: native 8fS ({} Hz) -> null upsampler (f64 domain)",
-                source.sample_rate_hz
-            ),
-        );
-    }
-
-    if target_audiophile.is_implemented() {
-        return (
-            target_audiophile,
-            ratio,
-            false,
-            format!("auto: {} Hz -> {target_audiophile}", source.sample_rate_hz),
-        );
-    }
-
-    // Only initial `SimpleTest` upsampler is implemented prior to deep INV-03 filter research.
-    (
-        FilterArchetype::SimpleTest,
-        ratio,
-        false,
-        format!(
-            "auto: initial simple-test ({} Hz -> {} f64; future default: {target_audiophile})",
-            source.sample_rate_hz, ratio
-        ),
-    )
 }
 
 fn auto_select_shaper(

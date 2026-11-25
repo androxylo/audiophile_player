@@ -208,10 +208,10 @@ pub fn help_text() -> String {
            --music-dir <PATH>   Root folder containing FLAC subfolders (default: ~/Music)\n\
            --device <NAME>      WDM-KS DAC name filter (default: auto-select best USB DAC)\n\
            --port <PORT>        Local HTTP UI port (default: auto-pick free port in 8085..8199)\n\
-           --filter <NAME>      Enforce upsampling filter: auto | simple-test | null |\n\
-                                gauss-apod-4m | sinc-steep-4m | gauss-long-lp |\n\
-                                gauss-hires-ip | gauss-hires-mp | ext-sharp-lp\n\
-                                (default: auto per track; simple-test/null until INV-03 lands)\n\
+           --filter <NAME>      Enforce upsampling filter: auto | gauss-long-lp | gauss-hires-lp |\n\
+                                null | simple-test | gauss-apod-4m | sinc-steep-4m | ext-sharp-lp |\n\
+                                minphase-long | intermediate-long | short-lp | short-mp\n\
+                                (default: auto -> gauss-long-lp 1x, gauss-hires-lp hi-res, null 8fS)\n\
            --shaper <NAME>      Enforce 8fS shaper: auto | bypass | ns5 | lns15 |\n\
                                 pggb-optimal | tpdf (default: auto per track)\n\
            --max-taps <N>       Tap ceiling <= 4000000 (default: 4000000)\n\
