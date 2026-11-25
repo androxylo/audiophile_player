@@ -623,29 +623,26 @@ fn upsamplers_reject_sample_rate_mismatch_and_post_flush_blocks() {
 }
 
 #[test]
-fn future_unimplemented_noise_shapers_report_clear_error_until_inv04() {
+fn all_inv04_noise_shaper_profiles_are_implemented_and_construct_cleanly() {
     let dummy = StereoF64Buffer {
         sample_rate_hz: 384_000,
-        left: vec![0.1; 4],
-        right: vec![-0.1; 4],
+        left: vec![0.1; 16],
+        right: vec![-0.1; 16],
     };
-    for unimpl in [
+    for profile in [
+        NoiseShaperProfile::Bypass,
+        NoiseShaperProfile::TpdfDither,
+        NoiseShaperProfile::NsGentle2,
         NoiseShaperProfile::Ns5Multibit,
         NoiseShaperProfile::Lns15Smooth,
         NoiseShaperProfile::PggbOptimal,
     ] {
-        assert!(!unimpl.is_implemented());
-        let err = StreamingQuantizer::new(unimpl, 24).unwrap_err();
-        assert!(
-            err.contains("not implemented yet"),
-            "unexpected err for {unimpl}: {err}"
-        );
-        assert!(quantize_to_int32(&dummy, unimpl, 24).is_err());
+        assert!(profile.is_implemented(), "{profile} should be implemented");
+        let q = StreamingQuantizer::with_rate(profile, 24, 384_000).unwrap();
+        assert_eq!(q.effective_shaper(), profile);
+        let pcm = quantize_to_int32(&dummy, profile, 24).unwrap();
+        assert_eq!(pcm.frames.len(), 16);
     }
-    assert!(NoiseShaperProfile::Bypass.is_implemented());
-    assert!(NoiseShaperProfile::TpdfDither.is_implemented());
-    assert!(StreamingQuantizer::new(NoiseShaperProfile::Bypass, 24).is_ok());
-    assert!(StreamingQuantizer::new(NoiseShaperProfile::TpdfDither, 24).is_ok());
 }
 
 #[test]

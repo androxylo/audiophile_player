@@ -350,13 +350,14 @@ fn incoming_gapless_rew_tail_demotes_active_convolver_only_and_preserves_null_co
 }
 
 #[test]
-fn pipeline_rejects_unimplemented_noise_shapers_and_unsupported_rates() {
+fn pipeline_runs_all_inv04_noise_shapers_and_rejects_unsupported_rates() {
     let spec_44 = StreamSpec {
         sample_rate_hz: 44_100,
         bits_per_sample: 16,
         channels: 2,
     };
     for shaper in [
+        NoiseShaperProfile::NsGentle2,
         NoiseShaperProfile::Ns5Multibit,
         NoiseShaperProfile::Lns15Smooth,
         NoiseShaperProfile::PggbOptimal,
@@ -366,14 +367,11 @@ fn pipeline_rejects_unimplemented_noise_shapers_and_unsupported_rates() {
             ..UpsamplerPolicy::default()
         })
         .unwrap();
-        let err = p
+        let session = p
             .start_track(spec_44, &TrackPeakMetadata::default(), false)
-            .err()
-            .expect("expected unimplemented noise shaper error");
-        assert!(
-            err.contains("not implemented yet"),
-            "unexpected err for {shaper}: {err}"
-        );
+            .expect("all INV-04 noise shapers must start cleanly at 8fS");
+        assert_eq!(session.report().effective_shaper, shaper);
+        assert_eq!(session.report().output_rate_hz, 352_800);
     }
 
     let p_default = AudioPipeline::new(UpsamplerPolicy::default()).unwrap();

@@ -443,7 +443,14 @@ impl NoiseShaperProfile {
 
     /// True if this quantizer / noise-shaper profile is currently implemented in `ap-dsp`.
     pub fn is_implemented(self) -> bool {
-        matches!(self, Self::Bypass | Self::TpdfDither)
+        match self {
+            Self::Bypass
+            | Self::TpdfDither
+            | Self::NsGentle2
+            | Self::Ns5Multibit
+            | Self::Lns15Smooth
+            | Self::PggbOptimal => true,
+        }
     }
 }
 

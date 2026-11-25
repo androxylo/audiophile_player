@@ -504,7 +504,7 @@ impl AudioPipeline {
             && convolver.name() == "null-convolver"
             && delayer.name() == "null-delay";
 
-        let (effective_shaper, output_bits) = if untouched_native {
+        let (requested_shaper, output_bits) = if untouched_native {
             let out_bits = (spec.bits_per_sample as u8).clamp(16, 32);
             // Truly bit-perfect native pass-through: never add TPDF dither when no DSP modified
             // the signal and output bit depth can represent every source bit losslessly.
@@ -522,7 +522,9 @@ impl AudioPipeline {
             (dsp_plan.shaper, 24)
         };
 
-        let quantizer = StreamingQuantizer::new(effective_shaper, output_bits)?;
+        let quantizer =
+            StreamingQuantizer::with_rate(requested_shaper, output_bits, dsp_plan.target_rate_hz)?;
+        let effective_shaper = quantizer.effective_shaper();
         let conv_desc = if headroom.convolution_scale_db < -1e-6 {
             format!(
                 "{} [scale {:.2} dB]",
