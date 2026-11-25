@@ -621,6 +621,10 @@ fn reparse_target_allow_list_blocks_mixed_case_unc_and_global_verbatim_targets()
         r"\\?\Global\UNC\evil\share\a.flac",
         r"\\?\GLOBALROOT\Device\LanmanRedirector\evil\share",
         r"\??\UNC\evil\share",
+        r"\Device\Mup\evil\share\track.flac",
+        r"\GLOBAL??\UNC\evil\share",
+        r"\RPC Control\trap",
+        r"\BaseNamedObjects\trap",
         r"\\.\pipe\ntlm_trap",
         r"\\evil\share\track.flac",
         r"//evil/share/track.flac",
@@ -667,18 +671,50 @@ fn samba_hidden_dot_prefixed_album_remains_visible_while_non_dot_hidden_is_skipp
     let root = make_temp_tree("samba_hidden_dots");
     let ellipsis_album = root.join("...And Justice for All");
     let hidden_nondot = root.join("HiddenNonDot");
+    let hidden_single_dot = root.join(".hidden_local_dir");
     let dot_git = root.join(".git");
-    fs::create_dir_all(&ellipsis_album).unwrap();
-    fs::create_dir_all(&hidden_nondot).unwrap();
-    fs::create_dir_all(&dot_git).unwrap();
+    let dot_recycle = root.join(".recycle");
+    let dot_stversions = root.join(".stversions");
+    let dot_trash_1000 = root.join(".Trash-1000");
+    let dot_snapshot = root.join(".snapshot");
+    let ea_dir = root.join("@eaDir");
+    for d in [
+        &ellipsis_album,
+        &hidden_nondot,
+        &hidden_single_dot,
+        &dot_git,
+        &dot_recycle,
+        &dot_stversions,
+        &dot_trash_1000,
+        &dot_snapshot,
+        &ea_dir,
+    ] {
+        fs::create_dir_all(d).unwrap();
+    }
     let ellipsis_track = ellipsis_album.join("...One.flac");
     fs::write(&ellipsis_track, b"").unwrap();
     fs::write(hidden_nondot.join("secret.flac"), b"").unwrap();
+    fs::write(hidden_single_dot.join("hidden.flac"), b"").unwrap();
     fs::write(dot_git.join("ignored.flac"), b"").unwrap();
+    fs::write(dot_recycle.join("deleted.flac"), b"").unwrap();
+    fs::write(dot_stversions.join("track~20241101.flac"), b"").unwrap();
+    fs::write(dot_trash_1000.join("trashed.flac"), b"").unwrap();
+    fs::write(dot_snapshot.join("snap.flac"), b"").unwrap();
+    fs::write(ea_dir.join("thumb.flac"), b"").unwrap();
     let apple_double = root.join("._01.flac");
     fs::write(&apple_double, b"").unwrap();
 
-    for p in [&ellipsis_album, &ellipsis_track, &hidden_nondot, &dot_git, &apple_double] {
+    for p in [
+        &ellipsis_album,
+        &ellipsis_track,
+        &hidden_nondot,
+        &hidden_single_dot,
+        &dot_git,
+        &dot_recycle,
+        &dot_stversions,
+        &dot_trash_1000,
+        &apple_double,
+    ] {
         let st = std::process::Command::new("attrib")
             .args(["+H", &p.to_string_lossy()])
             .status()
@@ -695,7 +731,7 @@ fn samba_hidden_dot_prefixed_album_remains_visible_while_non_dot_hidden_is_skipp
     assert_eq!(
         dir_names,
         vec!["...And Justice for All"],
-        "hidden ellipsis album must stay visible while HiddenNonDot and .git are skipped"
+        "hidden ellipsis album must stay visible while recycle/version/hidden local dot dirs are skipped"
     );
     assert!(frame.flacs.is_empty(), "._01.flac must stay excluded");
 
@@ -706,5 +742,79 @@ fn samba_hidden_dot_prefixed_album_remains_visible_while_non_dot_hidden_is_skipp
         "hidden dot-prefixed track inside ellipsis album must stay visible"
     );
 
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[cfg(windows)]
+#[test]
+fn verify_symlink_chain_blocks_intermediate_junction_hop_before_following() {
+    // Review #4 Finding #4 (MEDIUM):
+    // Build a multi-hop local junction where `A` points to `B\nested` (an intermediate component
+    // `B` is itself a junction). Verify that `verify_symlink_chain_is_allowed` walks every
+    // intermediate component with `symlink_metadata`, detects cycles/hop limits through
+    // intermediate components, AND allows safe local intermediate junctions!
+    use ap_source::library::verify_symlink_chain_is_allowed;
+
+    let root = make_temp_tree("intermediate_junc_check");
+    let real_dir = root.join("Real");
+    let nested = real_dir.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(nested.join("ok.flac"), b"").unwrap();
+
+    // Safe intermediate junction: B -> Real, A -> B\nested.
+    let junc_b = root.join("B");
+    let junc_a = root.join("A");
+    for (link, target) in [(&junc_b, &real_dir), (&junc_a, &junc_b.join("nested"))] {
+        let st = std::process::Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &link.to_string_lossy(),
+                &target.to_string_lossy(),
+            ])
+            .status()
+            .expect("mklink /J failed");
+        assert!(st.success(), "mklink failed for {}", link.display());
+    }
+    assert!(
+        verify_symlink_chain_is_allowed(&junc_a, None).is_ok(),
+        "safe local intermediate junction chain must be allowed"
+    );
+
+    // Cyclic intermediate junction: LoopB -> root, LoopA -> LoopB\LoopA (intermediate component
+    // re-enters LoopB infinitely -> per-component walker MUST hit MAX_SYMLINK_HOPS and reject!).
+    let loop_b = root.join("LoopB");
+    let loop_a = root.join("LoopA");
+    let st1 = std::process::Command::new("cmd")
+        .args([
+            "/C",
+            "mklink",
+            "/J",
+            &loop_b.to_string_lossy(),
+            &root.to_string_lossy(),
+        ])
+        .status()
+        .expect("mklink /J failed");
+    assert!(st1.success());
+    let st2 = std::process::Command::new("cmd")
+        .args([
+            "/C",
+            "mklink",
+            "/J",
+            &loop_a.to_string_lossy(),
+            &loop_b.join("LoopA").to_string_lossy(),
+        ])
+        .status()
+        .expect("mklink /J failed");
+    assert!(st2.success());
+    let err = verify_symlink_chain_is_allowed(&loop_a, None)
+        .expect_err("intermediate junction cycle MUST be rejected via per-component inspection");
+    assert!(err.contains("exceeded"), "unexpected error: {err}");
+
+    let _ = fs::remove_dir(&junc_a);
+    let _ = fs::remove_dir(&junc_b);
+    let _ = fs::remove_dir(&loop_a);
+    let _ = fs::remove_dir(&loop_b);
     let _ = fs::remove_dir_all(&root);
 }

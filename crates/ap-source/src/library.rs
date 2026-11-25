@@ -68,26 +68,37 @@ pub fn is_flac_path(path: &Path) -> bool {
 /// as `...And Justice for All`, `...Like Clockwork`, and `...Baby One More Time.flac` remain
 /// visible; real hidden entries on Windows are filtered via `FILE_ATTRIBUTE_HIDDEN`/`SYSTEM`.
 fn is_excluded_entry_name(name: &str) -> bool {
-    if name.starts_with("._") {
+    let lower = name.to_ascii_lowercase();
+    if lower.starts_with("._")
+        || lower.starts_with(".trash")
+        || lower.starts_with(".@__")
+    {
         return true;
     }
     const EXCLUDED: &[&str] = &[
-        ".DS_Store",
-        ".AppleDouble",
-        ".Trash",
-        ".Trashes",
-        ".Spotlight-V100",
+        ".ds_store",
+        ".appledouble",
+        ".spotlight-v100",
         ".fseventsd",
-        ".TemporaryItems",
+        ".temporaryitems",
         ".git",
         ".svn",
         ".hg",
-        "$RECYCLE.BIN",
-        "System Volume Information",
-        "Thumbs.db",
+        ".recycle",
+        ".recycle.bin",
+        "#recycle",
+        "$recycle.bin",
+        ".stversions",
+        ".stfolder",
+        ".snapshot",
+        ".snapshots",
+        ".zfs",
+        "@eadir",
+        "system volume information",
+        "thumbs.db",
         "desktop.ini",
     ];
-    EXCLUDED.iter().any(|ex| name.eq_ignore_ascii_case(ex))
+    EXCLUDED.iter().any(|&ex| lower == ex)
 }
 
 /// Returns `true` if a `DirEntry` should be skipped due to name or Windows `HIDDEN`/`SYSTEM`
@@ -95,12 +106,16 @@ fn is_excluded_entry_name(name: &str) -> bool {
 /// junctions/volume mount points, so a normal junction pointing to a drive root like `D:\` is
 /// preserved).
 ///
-/// Review #3 Finding #8: Samba NAS shares (Synology/QNAP/TrueNAS) default to
-/// `hide dot files = yes`, automatically setting `FILE_ATTRIBUTE_HIDDEN` on real dot-prefixed
-/// albums/tracks such as `...And Justice for All`. Since [`is_excluded_entry_name`] already
-/// filters dot-metadata (`._*`, `.DS_Store`, `.git`, `.Trash`, `.Spotlight-V100`, etc.), we apply
-/// `FILE_ATTRIBUTE_SYSTEM` to all entries and `FILE_ATTRIBUTE_HIDDEN` only to non-dot names.
-fn should_skip_dir_entry(entry: &fs::DirEntry) -> bool {
+/// Review #3 #8 + Review #4 #5:
+/// - Always excludes known metadata, recycle-bin, snapshot, and sync-version folders (`.recycle`,
+///   `.stversions`, `.stfolder`, `.Trash-*`, `.Recycle.Bin`, `.snapshot`, `.zfs`, `.@__thumb`,
+///   `@eaDir`, `#recycle`, `$RECYCLE.BIN`, `.git`, `._*`, etc.) regardless of attributes.
+/// - Always excludes `FILE_ATTRIBUTE_SYSTEM` entries and non-dot `FILE_ATTRIBUTE_HIDDEN` entries.
+/// - For dot-prefixed `FILE_ATTRIBUTE_HIDDEN` entries, exempts ONLY ellipsis names (`..*`, e.g.
+///   `...And Justice for All`) or entries on a remote UNC/SMB share (`is_unc_dir`, where Samba
+///   `hide dot files = yes` marks legitimate dot-prefixed albums hidden). Local hidden single-dot
+///   folders remain skipped.
+fn should_skip_dir_entry(entry: &fs::DirEntry, is_unc_dir: bool) -> bool {
     let file_name = entry.file_name();
     let name = file_name.to_string_lossy();
     if is_excluded_entry_name(&name) {
@@ -117,11 +132,16 @@ fn should_skip_dir_entry(entry: &fs::DirEntry) -> bool {
             if (attrs & FILE_ATTRIBUTE_SYSTEM) != 0 {
                 return true;
             }
-            if !name.starts_with('.') && (attrs & FILE_ATTRIBUTE_HIDDEN) != 0 {
-                return true;
+            if (attrs & FILE_ATTRIBUTE_HIDDEN) != 0 {
+                let is_exempt_dot = name.starts_with("..") || (is_unc_dir && name.starts_with('.'));
+                if !is_exempt_dot {
+                    return true;
+                }
             }
         }
     }
+    #[cfg(not(windows))]
+    let _ = is_unc_dir;
 
     false
 }
@@ -314,6 +334,18 @@ pub fn check_reparse_target_is_allowed(
         return Ok(());
     }
 
+    // Reject prefix-less rooted paths (e.g. `\Device\Mup\evil\share`, `\GLOBAL??\...`,
+    // `\RPC Control\...`, `\BaseNamedObjects\...`) which point into the Windows NT object
+    // namespace when followed by the I/O manager (Review #4 Finding #21).
+    if matches!(target.components().next(), Some(Component::RootDir))
+        || raw.starts_with('\\')
+        || raw.starts_with('/')
+    {
+        return Err(
+            "symlink/junction targeting a rooted NT object or prefix-less path is forbidden".into(),
+        );
+    }
+
     // Defense-in-depth component Prefix allow-list.
     if let Some(Component::Prefix(p)) = target.components().next() {
         match p.kind() {
@@ -353,44 +385,129 @@ pub fn is_symlink_or_mount_point(meta: &fs::Metadata) -> bool {
     meta.file_type().is_symlink()
 }
 
+/// Purely lexical `.` / `..` resolution without touching the filesystem.
+fn lexical_clean_path(path: &Path) -> PathBuf {
+    let mut prefix_or_root = PathBuf::new();
+    let mut has_root = false;
+    let mut parts: Vec<std::ffi::OsString> = Vec::new();
+
+    for comp in path.components() {
+        match comp {
+            Component::Prefix(p) => {
+                prefix_or_root.push(p.as_os_str());
+            }
+            Component::RootDir => {
+                prefix_or_root.push(comp.as_os_str());
+                has_root = true;
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !parts.is_empty() {
+                    parts.pop();
+                } else if !has_root {
+                    parts.push(comp.as_os_str().to_os_string());
+                }
+            }
+            Component::Normal(seg) => {
+                parts.push(seg.to_os_string());
+            }
+        }
+    }
+
+    for part in parts {
+        prefix_or_root.push(part);
+    }
+    prefix_or_root
+}
+
+/// Walk `resolved_path` component by component from its safe root prefix using `symlink_metadata`,
+/// recursively inspecting and resolving EVERY intermediate AND final symlink/junction hop BEFORE
+/// any metadata call can cross an unchecked intermediate reparse point (Review #4 Finding #4).
+fn verify_resolved_path_components(
+    resolved_path: &Path,
+    allowed_unc_share: Option<(&str, &str)>,
+    remaining_hops: usize,
+) -> Result<(), String> {
+    let clean = lexical_clean_path(resolved_path);
+    let mut cur = PathBuf::new();
+    let mut comps = clean.components().peekable();
+
+    // Assemble safe prefix/root first without statting `C:\` or `\\NAS\Share\` as a link.
+    while let Some(c) = comps.peek() {
+        match c {
+            Component::Prefix(_) | Component::RootDir => {
+                cur.push(c.as_os_str());
+                comps.next();
+            }
+            _ => break,
+        }
+    }
+
+    while let Some(comp) = comps.next() {
+        cur.push(comp.as_os_str());
+        let Ok(meta) = fs::symlink_metadata(&cur) else {
+            // Non-existent suffix is syntactically safe; downstream open will fail cleanly.
+            return Ok(());
+        };
+        if is_symlink_or_mount_point(&meta) {
+            if remaining_hops == 0 {
+                return Err(format!(
+                    "symlink/junction chain exceeded {MAX_SYMLINK_HOPS} hops at '{}'",
+                    cur.display()
+                ));
+            }
+            let target = fs::read_link(&cur).map_err(|e| {
+                format!(
+                    "cannot inspect symlink/junction target for '{}': {e}",
+                    cur.display()
+                )
+            })?;
+            check_reparse_target_is_allowed(&target, allowed_unc_share)?;
+
+            let mut next = if target.is_absolute() {
+                target
+            } else {
+                cur.parent()
+                    .map(|p| p.join(&target))
+                    .unwrap_or(target)
+            };
+            // Append any remaining suffix components after this intermediate reparse point and
+            // continue walking component-by-component from the resolved target.
+            for rest in comps {
+                next.push(rest.as_os_str());
+            }
+            return verify_resolved_path_components(&next, allowed_unc_share, remaining_hops - 1);
+        }
+    }
+
+    Ok(())
+}
+
 /// Walk a symlink/junction chain starting at `start_link` up to [`MAX_SYMLINK_HOPS`] hops
-/// WITHOUT calling `fs::metadata` on unsafe hops. Returns `Ok(())` only if every hop target
-/// satisfies [`check_reparse_target_is_allowed`] and the chain terminates within the hop cap.
+/// WITHOUT calling `fs::metadata` on unsafe hops or crossing unchecked intermediate links.
+/// Returns `Ok(())` only if every hop target (including any intermediate reparse points along
+/// resolved relative or local targets) satisfies [`check_reparse_target_is_allowed`] and the
+/// chain terminates within the hop cap.
 pub fn verify_symlink_chain_is_allowed(
     start_link: &Path,
     allowed_unc_share: Option<(&str, &str)>,
 ) -> Result<(), String> {
-    let mut current = start_link.to_path_buf();
-    for _ in 0..MAX_SYMLINK_HOPS {
-        let target = fs::read_link(&current).map_err(|e| {
-            format!(
-                "cannot inspect symlink/junction target for '{}': {e}",
-                current.display()
-            )
-        })?;
-        check_reparse_target_is_allowed(&target, allowed_unc_share)?;
-        let next = if target.is_absolute() {
-            target
-        } else {
-            current
-                .parent()
-                .map(|p| p.join(&target))
-                .unwrap_or(target)
-        };
-        // Check if `next` itself is another symlink/junction (without following it!).
-        let Ok(meta) = fs::symlink_metadata(&next) else {
-            // Non-existent target is syntactically safe; downstream open will fail cleanly.
-            return Ok(());
-        };
-        if !is_symlink_or_mount_point(&meta) {
-            return Ok(());
-        }
-        current = next;
-    }
-    Err(format!(
-        "symlink/junction chain exceeded {MAX_SYMLINK_HOPS} hops at '{}'",
-        start_link.display()
-    ))
+    let target = fs::read_link(start_link).map_err(|e| {
+        format!(
+            "cannot inspect symlink/junction target for '{}': {e}",
+            start_link.display()
+        )
+    })?;
+    check_reparse_target_is_allowed(&target, allowed_unc_share)?;
+    let next = if target.is_absolute() {
+        target
+    } else {
+        start_link
+            .parent()
+            .map(|p| p.join(&target))
+            .unwrap_or(target)
+    };
+    verify_resolved_path_components(&next, allowed_unc_share, MAX_SYMLINK_HOPS.saturating_sub(1))
 }
 
 /// Read ONLY the immediate subdirectories and `.flac` files of `dir`.
@@ -408,6 +525,7 @@ pub fn verify_symlink_chain_is_allowed(
 pub fn read_dir_frame(dir: &Path) -> io::Result<DirEntries> {
     let entries = fs::read_dir(dir)?;
     let allowed_unc = extract_unc_share(dir);
+    let is_unc_dir = allowed_unc.is_some();
     let share_ref = allowed_unc
         .as_ref()
         .map(|(s, sh)| (s.as_str(), sh.as_str()));
@@ -415,7 +533,7 @@ pub fn read_dir_frame(dir: &Path) -> io::Result<DirEntries> {
     let mut flacs = Vec::new();
 
     for entry in entries.flatten() {
-        if should_skip_dir_entry(&entry) {
+        if should_skip_dir_entry(&entry, is_unc_dir) {
             continue;
         }
         let Ok(ft) = entry.file_type() else {
@@ -453,13 +571,15 @@ fn canonical_dir_id(dir: &Path) -> PathBuf {
     fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
 }
 
-/// Wall-clock TTL for cached directory weights (prevents stale grandchild aggregates and
-/// eliminates per-subdir `fs::metadata` / SMB `CreateFile` calls in the `> 32`-subdir branch).
-const WEIGHT_CACHE_TTL: Duration = Duration::from_secs(60);
+/// Wall-clock TTL for cached directory weights (60 minutes — spans many 3–6 min random-play
+/// track intervals so auto-advance stays hot and learned aggregates in the `> 32`-subdir branch
+/// persist throughout a listening session, while never caching `0`).
+const WEIGHT_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug, Clone, Copy)]
 struct CachedDirWeight {
     stored_at: Instant,
+    mtime: Option<std::time::SystemTime>,
     weight: u64,
 }
 
@@ -468,6 +588,7 @@ fn dir_weight_cache() -> &'static Mutex<HashMap<PathBuf, CachedDirWeight>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Pure in-memory TTL lookup (zero `fs::metadata` syscalls) for the `> 32`-subdir branch.
 fn lookup_cached_weight(dir: &Path) -> Option<u64> {
     let cache = dir_weight_cache().lock().unwrap_or_else(|e| e.into_inner());
     cache.get(dir).and_then(|entry| {
@@ -479,7 +600,23 @@ fn lookup_cached_weight(dir: &Path) -> Option<u64> {
     })
 }
 
-fn store_cached_weight(dir: PathBuf, weight: u64) {
+/// Mtime-validated TTL lookup for the `<= 32`-subdir shallow-peek branch (catches newly added
+/// direct files immediately while avoiding `read_dir` on unchanged folders across 3–6 min tracks).
+fn lookup_cached_weight_with_mtime(dir: &Path, current_mtime: Option<std::time::SystemTime>) -> Option<u64> {
+    let cache = dir_weight_cache().lock().unwrap_or_else(|e| e.into_inner());
+    cache.get(dir).and_then(|entry| {
+        if entry.weight > 0
+            && entry.stored_at.elapsed() < WEIGHT_CACHE_TTL
+            && (current_mtime.is_none() || entry.mtime == current_mtime)
+        {
+            Some(entry.weight)
+        } else {
+            None
+        }
+    })
+}
+
+fn store_cached_weight(dir: PathBuf, mtime: Option<std::time::SystemTime>, weight: u64) {
     let mut cache = dir_weight_cache().lock().unwrap_or_else(|e| e.into_inner());
     // Review #3 Finding #5: NEVER cache a 0 aggregate weight (e.g. a newly created empty rip
     // directory or transient NAS error); removing the entry ensures future picks revisit it once
@@ -495,6 +632,7 @@ fn store_cached_weight(dir: PathBuf, weight: u64) {
         dir,
         CachedDirWeight {
             stored_at: Instant::now(),
+            mtime,
             weight,
         },
     );
@@ -504,7 +642,8 @@ fn store_cached_weight(dir: PathBuf, weight: u64) {
 /// non-excluded subdirectories, never `cover.jpg`/`.cue`/`.log`), avoiding repeated directory
 /// scans across consecutive random picks on NAS/SMB libraries.
 fn cached_shallow_flac_weight(dir: &Path) -> u64 {
-    if let Some(w) = lookup_cached_weight(dir) {
+    let current_mtime = fs::metadata(dir).ok().and_then(|m| m.modified().ok());
+    if let Some(w) = lookup_cached_weight_with_mtime(dir, current_mtime) {
         return w;
     }
     let Ok(frame) = read_dir_frame(dir) else {
@@ -514,7 +653,7 @@ fn cached_shallow_flac_weight(dir: &Path) -> u64 {
     let flac_w = frame.flacs.len() as u64;
     let sub_w = (frame.subdirs.len() as u64).saturating_mul(DEFAULT_SUBDIR_WEIGHT);
     let weight = flac_w.saturating_add(sub_w);
-    store_cached_weight(dir.to_path_buf(), weight);
+    store_cached_weight(dir.to_path_buf(), current_mtime, weight);
     weight
 }
 
@@ -591,7 +730,8 @@ fn walk_pick_recursive(
     }
     // Refine this directory's cached weight from its actual FLACs + child weights (only when > 0,
     // never caching 0 so newly populated grandchildren remain immediately reachable).
-    store_cached_weight(dir.to_path_buf(), learned_total);
+    let dir_mtime = fs::metadata(dir).ok().and_then(|m| m.modified().ok());
+    store_cached_weight(dir.to_path_buf(), dir_mtime, learned_total);
 
     // Weighted random selection without replacement so we descend into ONE weighted-random
     // branch on the happy path and backtrack cleanly only if a chosen branch has no `.flac` files.
