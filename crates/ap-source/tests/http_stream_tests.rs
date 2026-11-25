@@ -558,3 +558,171 @@ fn open_at_offset_seeks_accurately_into_flac_stream() {
     assert_eq!(remaining, 2205);
     srv.join().unwrap();
 }
+
+#[test]
+fn review6_http_stream_resumes_after_connection_reset_and_validates_content_range() {
+    // Review #6 Finding #15:
+    // Part A: Mid-stream TCP RST (SO_LINGER=0 / ConnectionReset) on a Content-Length +
+    //         Accept-Ranges stream MUST resume via Range: bytes=<offset>- with valid Content-Range!
+    let mut pcm_bytes = Vec::with_capacity(1024 * 4);
+    for i in 0..1024i16 {
+        let v = (i.wrapping_mul(17)) % 30_000;
+        pcm_bytes.extend_from_slice(&v.to_le_bytes());
+        pcm_bytes.extend_from_slice(&(-v).to_le_bytes());
+    }
+    let wav = build_wav_bytes(44_100, 16, &pcm_bytes, false);
+    let split = 44 + 512 * 4;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let wav_a = wav.clone();
+    let srv_a = thread::spawn(move || {
+        // First connection sends half then forces TCP RST via Windows/BSD SO_LINGER(on=1, linger=0).
+        {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut req = [0u8; 512];
+            let _ = s.read(&mut req);
+            let hdr = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                wav_a.len()
+            );
+            s.write_all(hdr.as_bytes()).unwrap();
+            s.write_all(&wav_a[..split]).unwrap();
+            s.flush().unwrap();
+            // Give the client a moment to drain the first half before forcing TCP RST so we test
+            // mid-PCM ConnectionReset rather than wiping the loopback receive buffer during header read.
+            thread::sleep(std::time::Duration::from_millis(40));
+            #[cfg(windows)]
+            {
+                use std::os::windows::io::AsRawSocket;
+                #[repr(C)]
+                struct Linger {
+                    l_onoff: u16,
+                    l_linger: u16,
+                }
+                const SOL_SOCKET: i32 = 0xffff;
+                const SO_LINGER: i32 = 0x0080;
+                unsafe extern "system" {
+                    fn setsockopt(
+                        s: usize,
+                        level: i32,
+                        optname: i32,
+                        optval: *const u8,
+                        optlen: i32,
+                    ) -> i32;
+                }
+                let ling = Linger {
+                    l_onoff: 1,
+                    l_linger: 0,
+                };
+                unsafe {
+                    setsockopt(
+                        s.as_raw_socket() as usize,
+                        SOL_SOCKET,
+                        SO_LINGER,
+                        (&ling as *const Linger).cast::<u8>(),
+                        std::mem::size_of::<Linger>() as i32,
+                    );
+                }
+            }
+            drop(s);
+        }
+        // Second connection receives Range: bytes=<split>- and responds with matching Content-Range.
+        {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut req = [0u8; 512];
+            let n = s.read(&mut req).unwrap();
+            let req_str = String::from_utf8_lossy(&req[..n]);
+            let range_start: usize = req_str
+                .lines()
+                .find_map(|l| {
+                    let rest = l.strip_prefix("Range: bytes=")?;
+                    let (start_s, _) = rest.split_once('-')?;
+                    start_s.trim().parse::<usize>().ok()
+                })
+                .unwrap_or_else(|| panic!("expected Range resume header after TCP RST, got: {req_str}"));
+            assert!(
+                range_start > 0 && range_start <= split,
+                "expected Range resume start in (0..={split}], got {range_start}"
+            );
+            let rest = &wav_a[range_start..];
+            let hdr = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Type: audio/wav\r\nContent-Range: bytes {range_start}-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                wav_a.len() - 1,
+                wav_a.len(),
+                rest.len()
+            );
+            s.write_all(hdr.as_bytes()).unwrap();
+            s.write_all(rest).unwrap();
+        }
+    });
+
+    let mut src = HttpAudioSource::open(
+        &format!("http://{addr}/rst.wav"),
+        &HttpStreamHints::default(),
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    let mut total_frames = 0usize;
+    while let Some(b) = src.read_next_block(256).unwrap() {
+        total_frames += b.len();
+    }
+    assert_eq!(total_frames, 1024, "must recover all 1024 frames across TCP RST");
+    srv_a.join().unwrap();
+
+    // Part B: 206 response with mismatched Content-Range start byte MUST be rejected cleanly!
+    let listener_b = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr_b = listener_b.local_addr().unwrap();
+    let wav_b = wav;
+    let srv_b = thread::spawn(move || {
+        {
+            let (mut s, _) = listener_b.accept().unwrap();
+            let mut req = [0u8; 512];
+            let _ = s.read(&mut req);
+            let hdr = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                wav_b.len()
+            );
+            s.write_all(hdr.as_bytes()).unwrap();
+            s.write_all(&wav_b[..split]).unwrap();
+        }
+        {
+            let (mut s, _) = listener_b.accept().unwrap();
+            let mut req = [0u8; 512];
+            let _ = s.read(&mut req);
+            let rest = &wav_b[split..];
+            // Bogus Content-Range start = 0 instead of `split`!
+            let hdr = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Type: audio/wav\r\nContent-Range: bytes 0-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                rest.len() - 1,
+                wav_b.len(),
+                rest.len()
+            );
+            s.write_all(hdr.as_bytes()).unwrap();
+            s.write_all(rest).unwrap();
+        }
+    });
+
+    let mut src_b = HttpAudioSource::open(
+        &format!("http://{addr_b}/bad_range.wav"),
+        &HttpStreamHints::default(),
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    let mut err_seen = false;
+    loop {
+        match src_b.read_next_block(256) {
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => {
+                err_seen = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        err_seen,
+        "mismatched Content-Range start byte on 206 resume must fail instead of splicing bad bytes"
+    );
+    srv_b.join().unwrap();
+}

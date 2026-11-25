@@ -358,7 +358,15 @@ impl HttpBodyReader {
         if parsed.status_code != 206 {
             return Ok(false);
         }
-        // Verify resumed response supplies at least the remaining byte count.
+        // Review #6 Finding #15: if the server sent a `Content-Range` header, require its
+        // byte-range start to match `self.bytes_consumed` exactly so mismatched offsets never
+        // splice corrupted audio into the PCM stream.
+        if parsed.content_range_seen {
+            if parsed.content_range_start != Some(self.bytes_consumed) {
+                return Ok(false);
+            }
+        }
+        // Verify resumed response supplies the exact remaining byte count when declared.
         if let Some(cl) = parsed.content_length {
             if cl != remaining {
                 return Ok(false);
@@ -431,11 +439,23 @@ impl Read for HttpBodyReader {
                     return Ok(0);
                 }
                 let want = (buf.len() as u64).min(remaining) as usize;
-                let n = self.read_raw_socket(&mut buf[..want])?;
-                if n == 0 {
-                    // Review #5 Finding #9: premature EOF before declared Content-Length must
-                    // never masquerade as clean end-of-stream. Attempt a single Range resume if
-                    // supported; otherwise fail loudly with UnexpectedEof.
+                let read_res = self.read_raw_socket(&mut buf[..want]);
+                let recoverable_drop = match &read_res {
+                    Ok(0) => true,
+                    Err(e) if !self.cancel.load(Ordering::Acquire) => matches!(
+                        e.kind(),
+                        ErrorKind::ConnectionReset
+                            | ErrorKind::ConnectionAborted
+                            | ErrorKind::BrokenPipe
+                            | ErrorKind::TimedOut
+                            | ErrorKind::UnexpectedEof
+                    ),
+                    _ => false,
+                };
+                if recoverable_drop {
+                    // Review #5 #9 & Review #6 #15: premature EOF or mid-stream socket drop
+                    // (RST/abort/pipe/stall timeout) before declared Content-Length attempts a
+                    // single verified Range resume when supported; otherwise fails loudly.
                     if self.try_resume_content_length(remaining)? {
                         let n2 = self.read_raw_socket(&mut buf[..want])?;
                         if n2 == 0 {
@@ -452,11 +472,15 @@ impl Read for HttpBodyReader {
                         self.bytes_consumed = self.bytes_consumed.saturating_add(n2 as u64);
                         return Ok(n2);
                     }
-                    return Err(io::Error::new(
-                        ErrorKind::UnexpectedEof,
-                        format!("HTTP stream truncated: {remaining} declared bytes remaining"),
-                    ));
+                    return match read_res {
+                        Err(e) => Err(e),
+                        Ok(_) => Err(io::Error::new(
+                            ErrorKind::UnexpectedEof,
+                            format!("HTTP stream truncated: {remaining} declared bytes remaining"),
+                        )),
+                    };
                 }
+                let n = read_res?;
                 if let BodyFraming::ContentLength(r) = &mut self.framing {
                     *r = r.saturating_sub(n as u64);
                 }
@@ -534,8 +558,29 @@ struct ParsedHttpResponse {
     framing: BodyFraming,
     content_type: Option<String>,
     content_length: Option<u64>,
+    content_range_seen: bool,
+    content_range_start: Option<u64>,
     accept_ranges: bool,
     location: Option<String>,
+}
+
+/// Parse `Content-Range: bytes <start>-<end>/<total>` and return `Some(start)`.
+fn parse_content_range_start(val: &str) -> Option<u64> {
+    let rest = val
+        .trim()
+        .strip_prefix("bytes ")
+        .or_else(|| val.trim().strip_prefix("BYTES "))
+        .or_else(|| {
+            let trimmed = val.trim();
+            if trimmed.len() > 6 && trimmed[..6].eq_ignore_ascii_case("bytes ") {
+                Some(&trimmed[6..])
+            } else {
+                None
+            }
+        })?
+        .trim_start();
+    let (start_str, _) = rest.split_once('-')?;
+    start_str.trim().parse::<u64>().ok()
 }
 
 fn connect_with_timeout(
@@ -657,6 +702,8 @@ fn send_get_and_read_headers(
 
     let mut content_type = None;
     let mut content_length = None;
+    let mut content_range_seen = false;
+    let mut content_range_start = None;
     let mut accept_ranges = false;
     let mut chunked = false;
     let mut location = None;
@@ -673,6 +720,9 @@ fn send_get_and_read_headers(
             if let Ok(len) = val.parse::<u64>() {
                 content_length = Some(len);
             }
+        } else if key.eq_ignore_ascii_case("content-range") {
+            content_range_seen = true;
+            content_range_start = parse_content_range_start(val);
         } else if key.eq_ignore_ascii_case("accept-ranges") {
             if val.to_ascii_lowercase().contains("bytes") {
                 accept_ranges = true;
@@ -706,6 +756,8 @@ fn send_get_and_read_headers(
         framing,
         content_type,
         content_length,
+        content_range_seen,
+        content_range_start,
         accept_ranges,
         location,
     })

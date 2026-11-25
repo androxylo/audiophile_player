@@ -92,9 +92,28 @@ pub struct MatchedMSearch {
     pub mx_secs: u8,
 }
 
+fn host_is_ssdp_multicast(host: &str) -> bool {
+    let trimmed = host.trim();
+    // Strip optional `:port` (handling bracketed IPv6 `[ff02::c]:1900`).
+    let host_only = if let Some(rest) = trimmed.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(trimmed)
+    } else {
+        trimmed.split(':').next().unwrap_or(trimmed)
+    };
+    if let Ok(ip) = host_only.parse::<IpAddr>() {
+        return ip.is_multicast();
+    }
+    host_only.eq_ignore_ascii_case("239.255.255.250")
+}
+
 /// Parse an incoming SSDP `M-SEARCH` datagram and return the matching `ST` values plus `MX`
-/// (clamped to `1..=5` per UPnP Device Architecture 1.1). Multicast searches missing a valid
-/// `MX` header are ignored cleanly.
+/// (clamped to `0..=5` per UPnP Device Architecture 1.1).
+///
+/// Review #6 Finding #16:
+/// - Multicast-addressed `M-SEARCH` (`HOST: 239.255.255.250:...`) requires a valid `MX` header
+///   (missing `MX` is ignored cleanly); `MX: 0` is treated as immediate (`mx_secs = 0`).
+/// - Unicast `M-SEARCH` (e.g. `HOST: 192.168.1.10:1900` without `MX`, used by UDA 1.1 control
+///   points to re-verify a known device) is answered immediately (`mx_secs = 0`).
 pub fn parse_msearch_request(packet: &str, udn: &str) -> Option<MatchedMSearch> {
     let mut lines = packet.split("\r\n");
     let first = lines.next()?;
@@ -104,6 +123,7 @@ pub fn parse_msearch_request(packet: &str, udn: &str) -> Option<MatchedMSearch> 
     let mut man_ok = false;
     let mut st: Option<String> = None;
     let mut mx: Option<u8> = None;
+    let mut host: Option<String> = None;
     for line in lines {
         let Some((k, v)) = line.split_once(':') else {
             continue;
@@ -116,18 +136,23 @@ pub fn parse_msearch_request(packet: &str, udn: &str) -> Option<MatchedMSearch> 
             }
         } else if key.eq_ignore_ascii_case("ST") {
             st = Some(val.to_string());
+        } else if key.eq_ignore_ascii_case("HOST") {
+            host = Some(val.to_string());
         } else if key.eq_ignore_ascii_case("MX") {
             if let Ok(parsed) = val.parse::<u32>() {
-                if parsed >= 1 {
-                    mx = Some(parsed.min(5) as u8);
-                }
+                mx = Some(parsed.min(5) as u8);
             }
         }
     }
     if !man_ok {
         return None;
     }
-    let mx_secs = mx?;
+    let is_multicast = host.as_deref().is_none_or(host_is_ssdp_multicast);
+    let mx_secs = if is_multicast {
+        mx?
+    } else {
+        mx.unwrap_or(0)
+    };
     let st_val = st?;
     let all = advertised_targets(udn);
     let targets: Vec<String> = if st_val.eq_ignore_ascii_case("ssdp:all") {
@@ -349,8 +374,8 @@ fn ssdp_loop(local_ip: Ipv4Addr, location_url: String, udn: String, stop: Arc<At
                     if let Ok(text) = std::str::from_utf8(&buf[..n]) {
                         if let Some(matched) = parse_msearch_request(text, &udn) {
                             let is_local_host = matches!(src.ip(), IpAddr::V4(v4) if v4.is_loopback() || v4 == local_ip);
-                            if is_local_host {
-                                // Answer local host (e.g. foobar2000 on same PC) promptly.
+                            if is_local_host || matched.mx_secs == 0 {
+                                // Answer local host, unicast M-SEARCH, or MX: 0 promptly.
                                 let reply_sock = send_sock.as_ref().unwrap_or(rs);
                                 for st in matched.targets {
                                     let resp =

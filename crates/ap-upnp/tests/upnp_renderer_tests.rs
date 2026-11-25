@@ -486,3 +486,127 @@ fn review6_repeat_one_seek_preserves_reltime_and_next_uri() {
 
     srv.shutdown();
 }
+
+#[test]
+fn review6_gena_per_sid_strict_seq_ordering_per_peer_cap_and_ssdp_unicast_mx0() {
+    use ap_upnp::gena::{GenaEventHub, GenaService, SubscribeError};
+    use ap_upnp::ssdp::parse_msearch_request;
+
+    // 1. Finding #10: Per-SID strict FIFO SEQ ordering (0, 1, 2, ..., 20) across the 4-worker pool!
+    let cb_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let cb_port = cb_listener.local_addr().unwrap().port();
+    let expected_count = 21usize; // SEQ 0 + 20 notify_service events
+    let receiver = thread::spawn(move || {
+        let mut seqs = Vec::with_capacity(expected_count);
+        for _ in 0..expected_count {
+            let (mut conn, _) = cb_listener.accept().unwrap();
+            conn.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                match conn.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        raw.extend_from_slice(&buf[..n]);
+                        if raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let text = String::from_utf8_lossy(&raw);
+            for line in text.split("\r\n") {
+                if let Some((k, v)) = line.split_once(':') {
+                    if k.trim().eq_ignore_ascii_case("SEQ") {
+                        if let Ok(s) = v.trim().parse::<u32>() {
+                            seqs.push(s);
+                        }
+                    }
+                }
+            }
+            let _ = conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        }
+        seqs
+    });
+
+    let hub = GenaEventHub::start();
+    let (_sid, _timeout, initial_job) = hub
+        .subscribe(
+            GenaService::AvTransport,
+            &format!("<http://127.0.0.1:{cb_port}/cb>"),
+            Some("Second-300"),
+            "<e:propertyset/>".to_string(),
+        )
+        .unwrap();
+    hub.enqueue_initial(initial_job);
+    for i in 1..=20 {
+        hub.notify_service(GenaService::AvTransport, format!("<e:propertyset n=\"{i}\"/>"));
+    }
+
+    let got_seqs = receiver.join().unwrap();
+    let expected: Vec<u32> = (0..=20).collect();
+    assert_eq!(
+        got_seqs, expected,
+        "GENA NOTIFY events for the same SID must arrive strictly in SEQ 0..=20 order!"
+    );
+
+    // 2. Follow-up (gena.rs:129): Per-peer cap (max 4 subscriptions per peer IP) prevents one LAN
+    //    peer from exhausting all 16 global slots!
+    let hub_cap = GenaEventHub::new_for_test();
+    for i in 0..4 {
+        hub_cap
+            .subscribe(
+                GenaService::AvTransport,
+                &format!("<http://127.0.0.1:{}/cb>", 50_000 + i),
+                Some("Second-1800"),
+                "<e:propertyset/>".to_string(),
+            )
+            .expect("first 4 subscriptions from 127.0.0.1 must succeed");
+    }
+    let fifth = hub_cap.subscribe(
+        GenaService::AvTransport,
+        "<http://127.0.0.1:50004/cb>",
+        Some("Second-1800"),
+        "<e:propertyset/>".to_string(),
+    );
+    assert_eq!(
+        fifth.unwrap_err(),
+        SubscribeError::CapacityExceeded,
+        "5th healthy subscription from same peer IP must be rejected by per-peer cap"
+    );
+    // Different loopback IP (127.0.0.2) still succeeds cleanly!
+    hub_cap
+        .subscribe(
+            GenaService::AvTransport,
+            "<http://127.0.0.2:50005/cb>",
+            Some("Second-1800"),
+            "<e:propertyset/>".to_string(),
+        )
+        .expect("a different peer IP must not be starved by the first peer's 4 subscriptions");
+    hub.shutdown();
+
+    // 3. Finding #16: UDA 1.1 unicast M-SEARCH without MX AND M-SEARCH with MX: 0 are answered
+    //    immediately (`mx_secs == 0`), while multicast M-SEARCH without MX is still ignored!
+    let udn = deterministic_udn("Review 6 SSDP");
+    let unicast_no_mx = "M-SEARCH * HTTP/1.1\r\nHOST: 192.168.1.10:1900\r\nMAN: \"ssdp:discover\"\r\nST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n\r\n";
+    let matched_uni = parse_msearch_request(unicast_no_mx, &udn)
+        .expect("unicast M-SEARCH without MX must be answered");
+    assert_eq!(matched_uni.mx_secs, 0);
+    assert_eq!(
+        matched_uni.targets,
+        vec!["urn:schemas-upnp-org:device:MediaRenderer:1"]
+    );
+
+    let mcast_mx0 = "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 0\r\nST: ssdp:all\r\n\r\n";
+    let matched_mx0 = parse_msearch_request(mcast_mx0, &udn)
+        .expect("M-SEARCH with MX: 0 must be accepted as immediate");
+    assert_eq!(matched_mx0.mx_secs, 0);
+    assert_eq!(matched_mx0.targets.len(), 6);
+
+    let mcast_no_mx = "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nST: ssdp:all\r\n\r\n";
+    assert!(
+        parse_msearch_request(mcast_no_mx, &udn).is_none(),
+        "multicast M-SEARCH missing MX must still be ignored"
+    );
+}
