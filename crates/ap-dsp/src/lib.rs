@@ -5,10 +5,12 @@
 //! - All internal math strictly in floating point; integer quantization happens once in `quantize`.
 //! - Core first-class REW stereo convolution + optional integer-sample channel delay only.
 
+pub mod analysis;
 pub mod convolution;
 pub mod dd;
 pub mod deemphasis;
 pub mod delay;
+pub mod fusion;
 pub mod phase;
 pub mod pipeline;
 pub mod quantize;
