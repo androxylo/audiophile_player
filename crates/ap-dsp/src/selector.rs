@@ -81,6 +81,8 @@ pub struct TrackSourceInfo {
     pub effective_nyquist_hz: Option<u32>,
     /// True when Detector H detects 4fS ultrasonic ADC/DSD noise above 40 kHz (`OQ-37`).
     pub hf_noise_filter: bool,
+    /// True when CD-DA 50/15 µs de-emphasis is active from CUESHEET or `AP_DEEMPHASIS` (Rule P).
+    pub deemphasis: bool,
 }
 
 impl TrackSourceInfo {
@@ -93,6 +95,7 @@ impl TrackSourceInfo {
             is_streaming_source: false,
             effective_nyquist_hz: None,
             hf_noise_filter: false,
+            deemphasis: false,
         }
     }
 }
@@ -528,6 +531,8 @@ pub struct SelectedDspPlan {
     pub effective_nyquist_hz: Option<u32>,
     /// True when 4fS ultrasonic HF noise filtering above 40 kHz is requested (`OQ-37`).
     pub hf_noise_filter: bool,
+    /// True when 50/15 µs de-emphasis runs post-upsampler / pre-REW (`U6`, Rule P).
+    pub deemphasis: bool,
     pub filter_overridden: bool,
     pub shaper_overridden: bool,
     pub reason: String,
@@ -759,6 +764,7 @@ impl UpsamplerPicker {
             max_taps: self.policy.max_taps,
             effective_nyquist_hz: source.effective_nyquist_hz,
             hf_noise_filter: source.hf_noise_filter,
+            deemphasis: source.deemphasis,
             filter_overridden,
             shaper_overridden,
             reason,

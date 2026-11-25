@@ -15,8 +15,11 @@ use ap_core::headroom::{
     MAX_REALISTIC_TRUE_PEAK_DB, MAX_REALISTIC_TRUE_PEAK_LINEAR, MIN_REALISTIC_PEAK_DB,
     PEAK_TAG_ROUNDING_TOLERANCE, TrackPeakMetadata,
 };
+use ap_core::metadata::{TrackMetadata, parse_track_metadata_fields};
 use flac_codec::decode::{FlacSampleReader, Metadata};
-use flac_codec::metadata::VorbisComment;
+use flac_codec::metadata::{Cuesheet, VorbisComment};
+
+use crate::md5::FlacSampleMd5Hasher;
 
 /// Unified bounded-block audio source interface (local FLAC files now; live Tidal streams in Milestone 2).
 pub trait AudioBlockSource: Send {
@@ -25,6 +28,11 @@ pub trait AudioBlockSource: Send {
     fn is_streaming(&self) -> bool;
     fn total_frames(&self) -> Option<u64>;
 
+    /// Extended per-track FLAC metadata (`VORBIS_COMMENT` + `CUESHEET` pre-emphasis, Phase 3).
+    fn track_meta(&self) -> TrackMetadata {
+        TrackMetadata::default()
+    }
+
     /// Optional 16-byte `STREAMINFO` MD5 signature for exact track-identity verification
     /// (`HEADROOM_DESIGN.md` §2 full-scan YAML lookup). Returns `None` for live streams or
     /// FLAC files with an all-zero/unset MD5 field.
@@ -32,9 +40,55 @@ pub trait AudioBlockSource: Send {
         None
     }
 
+    /// RFC 9639 §8.2 sample MD5 computed incrementally over decoded integer samples.
+    /// Returns `Some(digest)` ONLY after the stream reached clean EOF with zero decode errors.
+    fn computed_md5(&self) -> Option<[u8; 16]> {
+        None
+    }
+
     /// Decode up to `max_frames` stereo frames into a pure IEEE 754 `f64` block.
     /// Returns `Ok(None)` cleanly at end-of-stream.
     fn read_next_block(&mut self, max_frames: usize) -> Result<Option<StereoF64Buffer>, String>;
+}
+
+/// Extract per-track pre-emphasis facts from a FLAC `CUESHEET` block (`OQ-41`):
+/// returns `(track1_pre_emphasis, mixed_emphasis_flags, audio_track_count)`.
+pub fn parse_cuesheet_emphasis(cuesheet: &Cuesheet) -> (bool, bool, u16) {
+    let mut track1_emph: Option<bool> = None;
+    let mut mixed = false;
+    let mut audio_tracks: u16 = 0;
+
+    for track in cuesheet.tracks() {
+        // Ignore lead-out (`number == None`) and non-audio data tracks.
+        if track.number.is_none() || track.non_audio {
+            continue;
+        }
+        audio_tracks = audio_tracks.saturating_add(1);
+        match track1_emph {
+            None => track1_emph = Some(track.pre_emphasis),
+            Some(first) if first != track.pre_emphasis => mixed = true,
+            Some(_) => {}
+        }
+    }
+
+    (track1_emph.unwrap_or(false), mixed, audio_tracks)
+}
+
+/// Extract extended [`TrackMetadata`] from FLAC `VorbisComment` and `Cuesheet` metadata blocks.
+pub fn extract_flac_track_metadata(
+    vc: Option<&VorbisComment>,
+    cuesheet: Option<&Cuesheet>,
+) -> TrackMetadata {
+    let mut meta = vc
+        .map(|v| parse_track_metadata_fields(&v.fields))
+        .unwrap_or_default();
+    if let Some(cs) = cuesheet {
+        let (pre_emph, mixed, count) = parse_cuesheet_emphasis(cs);
+        meta.cuesheet_pre_emphasis = pre_emph;
+        meta.cuesheet_mixed_emphasis = mixed;
+        meta.cuesheet_audio_tracks = count;
+    }
+    meta
 }
 
 /// Upper bound on upfront `Vec::with_capacity` frame pre-allocation from untrusted
@@ -60,6 +114,7 @@ struct ValidatedFlac {
     source_channels: u8,
     spec: StreamSpec,
     peak_meta: TrackPeakMetadata,
+    track_meta: TrackMetadata,
     total_frames: Option<u64>,
     streaminfo_md5: Option<[u8; 16]>,
     shift: u32,
@@ -115,7 +170,10 @@ fn open_validated(path: &Path) -> Result<ValidatedFlac, String> {
     // Mono sources are duplicated into dual-mono stereo (L == R) so downstream stereo DSP
     // and DAC stages always receive 2-channel frames.
     let spec = validate_flac_stream_params(source_channels, sample_rate_hz, bits_per_sample, path)?;
-    let peak_meta = parse_peak_metadata(reader.metadata().get::<VorbisComment>());
+    let vc = reader.metadata().get::<VorbisComment>();
+    let cs = reader.metadata().get::<Cuesheet>();
+    let peak_meta = parse_peak_metadata(vc);
+    let track_meta = extract_flac_track_metadata(vc, cs);
     let total_frames = reader.total_samples();
     let streaminfo_md5 = reader.md5().copied();
     let shift = 32 - bits_per_sample;
@@ -125,6 +183,7 @@ fn open_validated(path: &Path) -> Result<ValidatedFlac, String> {
         source_channels,
         spec,
         peak_meta,
+        track_meta,
         total_frames,
         streaminfo_md5,
         shift,
@@ -141,8 +200,12 @@ pub struct FlacBlockReader {
     source_channels: usize,
     spec: StreamSpec,
     peak_meta: TrackPeakMetadata,
+    track_meta: TrackMetadata,
     total_frames: Option<u64>,
     streaminfo_md5: Option<[u8; 16]>,
+    md5_hasher: Option<FlacSampleMd5Hasher>,
+    finalized_md5: Option<[u8; 16]>,
+    saw_decode_error: bool,
     shift: u32,
     scratch: Vec<i32>,
     eof: bool,
@@ -152,13 +215,18 @@ pub struct FlacBlockReader {
 impl FlacBlockReader {
     pub fn open(path: &Path) -> Result<Self, String> {
         let validated = open_validated(path)?;
+        let md5_hasher = Some(FlacSampleMd5Hasher::new(validated.spec.bits_per_sample));
         Ok(Self {
             reader: validated.reader,
             source_channels: usize::from(validated.source_channels),
             spec: validated.spec,
             peak_meta: validated.peak_meta,
+            track_meta: validated.track_meta,
             total_frames: validated.total_frames,
             streaminfo_md5: validated.streaminfo_md5,
+            md5_hasher,
+            finalized_md5: None,
+            saw_decode_error: false,
             shift: validated.shift,
             scratch: Vec::new(),
             eof: false,
@@ -181,6 +249,10 @@ impl AudioBlockSource for FlacBlockReader {
         self.peak_meta
     }
 
+    fn track_meta(&self) -> TrackMetadata {
+        self.track_meta.clone()
+    }
+
     fn is_streaming(&self) -> bool {
         false
     }
@@ -193,9 +265,16 @@ impl AudioBlockSource for FlacBlockReader {
         self.streaminfo_md5
     }
 
+    fn computed_md5(&self) -> Option<[u8; 16]> {
+        self.finalized_md5
+    }
+
     fn read_next_block(&mut self, max_frames: usize) -> Result<Option<StereoF64Buffer>, String> {
         if let Some(err) = self.pending_error.take() {
             self.eof = true;
+            self.saw_decode_error = true;
+            self.md5_hasher = None;
+            self.finalized_md5 = None;
             return Err(err);
         }
         if self.eof || max_frames == 0 {
@@ -219,6 +298,9 @@ impl AudioBlockSource for FlacBlockReader {
                     filled += n;
                 }
                 Err(e) => {
+                    self.saw_decode_error = true;
+                    self.md5_hasher = None;
+                    self.finalized_md5 = None;
                     let msg = format!("FLAC stream decode error: {e}");
                     if filled >= ch {
                         // Return the valid frames already decoded before the error and surface
@@ -234,6 +316,17 @@ impl AudioBlockSource for FlacBlockReader {
         }
 
         let frames = filled / ch;
+        let sample_count = frames * ch;
+        if sample_count > 0 {
+            if let Some(ref mut hasher) = self.md5_hasher {
+                hasher.update_raw_samples(&self.scratch[..sample_count]);
+            }
+        }
+        if self.eof && !self.saw_decode_error {
+            if let Some(hasher) = self.md5_hasher.take() {
+                self.finalized_md5 = Some(hasher.finalize());
+            }
+        }
         if frames == 0 {
             return Ok(None);
         }

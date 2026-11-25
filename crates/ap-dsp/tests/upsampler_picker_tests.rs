@@ -24,6 +24,7 @@ fn track(rate: u32, bits: u16) -> TrackSourceInfo {
         is_streaming_source: false,
         effective_nyquist_hz: None,
         hf_noise_filter: false,
+        deemphasis: false,
     }
 }
 

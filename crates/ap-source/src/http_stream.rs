@@ -24,12 +24,15 @@ use std::time::{Duration, Instant};
 use ap_core::buffer::StereoF64Buffer;
 use ap_core::format::StreamSpec;
 use ap_core::headroom::TrackPeakMetadata;
+use ap_core::metadata::TrackMetadata;
 use flac_codec::decode::{FlacSampleReader, Metadata};
-use flac_codec::metadata::VorbisComment;
+use flac_codec::metadata::{Cuesheet, VorbisComment};
 
 use crate::flac::{
-    AudioBlockSource, parse_peak_metadata_fields, validate_flac_stream_params,
+    AudioBlockSource, extract_flac_track_metadata, parse_peak_metadata_fields,
+    validate_flac_stream_params,
 };
+use crate::md5::FlacSampleMd5Hasher;
 
 /// Maximum URL length accepted by the HTTP streaming client.
 pub const MAX_STREAM_URL_BYTES: usize = 4096;
@@ -1406,7 +1409,12 @@ struct GenericFlacDecoder<R: Read> {
     source_channels: usize,
     spec: StreamSpec,
     peak_meta: TrackPeakMetadata,
+    track_meta: TrackMetadata,
     total_frames: Option<u64>,
+    streaminfo_md5: Option<[u8; 16]>,
+    md5_hasher: Option<FlacSampleMd5Hasher>,
+    finalized_md5: Option<[u8; 16]>,
+    saw_decode_error: bool,
     shift: u32,
     scratch: Vec<i32>,
     eof: bool,
@@ -1426,19 +1434,27 @@ impl<R: Read> GenericFlacDecoder<R> {
             bits_per_sample,
             Path::new(label),
         )?;
-        let peak_meta = reader
-            .metadata()
-            .get::<VorbisComment>()
-            .map(|vc| parse_peak_metadata_fields(&vc.fields))
+        let vc = reader.metadata().get::<VorbisComment>();
+        let cs = reader.metadata().get::<Cuesheet>();
+        let peak_meta = vc
+            .map(|v| parse_peak_metadata_fields(&v.fields))
             .unwrap_or_default();
+        let track_meta = extract_flac_track_metadata(vc, cs);
         let total_frames = reader.total_samples();
+        let streaminfo_md5 = reader.md5().copied();
         let shift = 32 - bits_per_sample;
+        let md5_hasher = Some(FlacSampleMd5Hasher::new(spec.bits_per_sample));
         Ok(Self {
             reader,
             source_channels: usize::from(source_channels),
             spec,
             peak_meta,
+            track_meta,
             total_frames,
+            streaminfo_md5,
+            md5_hasher,
+            finalized_md5: None,
+            saw_decode_error: false,
             shift,
             scratch: Vec::new(),
             eof: false,
@@ -1449,6 +1465,9 @@ impl<R: Read> GenericFlacDecoder<R> {
     fn read_next_block(&mut self, max_frames: usize) -> Result<Option<StereoF64Buffer>, String> {
         if let Some(err) = self.pending_error.take() {
             self.eof = true;
+            self.saw_decode_error = true;
+            self.md5_hasher = None;
+            self.finalized_md5 = None;
             return Err(err);
         }
         if self.eof || max_frames == 0 {
@@ -1469,6 +1488,9 @@ impl<R: Read> GenericFlacDecoder<R> {
                 }
                 Ok(n) => filled += n,
                 Err(e) => {
+                    self.saw_decode_error = true;
+                    self.md5_hasher = None;
+                    self.finalized_md5 = None;
                     let msg = format!("streaming FLAC decode error: {e}");
                     if filled >= ch {
                         self.pending_error = Some(msg);
@@ -1480,6 +1502,17 @@ impl<R: Read> GenericFlacDecoder<R> {
             }
         }
         let frames = filled / ch;
+        let sample_count = frames * ch;
+        if sample_count > 0 {
+            if let Some(ref mut hasher) = self.md5_hasher {
+                hasher.update_raw_samples(&self.scratch[..sample_count]);
+            }
+        }
+        if self.eof && !self.saw_decode_error {
+            if let Some(hasher) = self.md5_hasher.take() {
+                self.finalized_md5 = Some(hasher.finalize());
+            }
+        }
         if frames == 0 {
             return Ok(None);
         }
@@ -1530,7 +1563,9 @@ pub struct HttpAudioSource {
     format: StreamContainerFormat,
     spec: StreamSpec,
     peak_meta: TrackPeakMetadata,
+    track_meta: TrackMetadata,
     total_frames: Option<u64>,
+    streaminfo_md5: Option<[u8; 16]>,
     decoder: ActiveHttpDecoder,
     /// When a chained Ogg FLAC stream switches sample rate or bit depth mid-HTTP-connection,
     /// the next opened segment is staged here so the caller can hand off to a fresh DSP session.
@@ -1611,7 +1646,9 @@ impl HttpAudioSource {
                 format: StreamContainerFormat::Flac,
                 spec: dec.spec,
                 peak_meta: dec.peak_meta,
+                track_meta: dec.track_meta.clone(),
                 total_frames: dec.total_frames,
+                streaminfo_md5: dec.streaminfo_md5,
                 decoder: ActiveHttpDecoder::Flac(dec),
                 next_chained_segment: None,
             }
@@ -1623,7 +1660,9 @@ impl HttpAudioSource {
                 format: StreamContainerFormat::OggFlac,
                 spec: dec.spec,
                 peak_meta: dec.peak_meta,
+                track_meta: dec.track_meta.clone(),
                 total_frames: dec.total_frames,
+                streaminfo_md5: dec.streaminfo_md5,
                 decoder: ActiveHttpDecoder::OggFlac {
                     decoder: Some(dec),
                     shared_http,
@@ -1636,7 +1675,9 @@ impl HttpAudioSource {
                 format: StreamContainerFormat::Wav,
                 spec: dec.spec,
                 peak_meta: TrackPeakMetadata::default(),
+                track_meta: TrackMetadata::default(),
                 total_frames: dec.total_frames,
+                streaminfo_md5: None,
                 decoder: ActiveHttpDecoder::Wav(dec),
                 next_chained_segment: None,
             }
@@ -1666,7 +1707,9 @@ impl HttpAudioSource {
                                 format,
                                 spec: dec.spec,
                                 peak_meta: TrackPeakMetadata::default(),
+                                track_meta: TrackMetadata::default(),
                                 total_frames: content_length.map(|l| l / frame_bytes),
+                                streaminfo_md5: None,
                                 decoder: ActiveHttpDecoder::LpcmBe(dec),
                                 next_chained_segment: None,
                             });
@@ -1684,7 +1727,9 @@ impl HttpAudioSource {
                 format,
                 spec: dec.spec,
                 peak_meta: TrackPeakMetadata::default(),
+                track_meta: TrackMetadata::default(),
                 total_frames: dec.total_frames,
+                streaminfo_md5: None,
                 decoder: ActiveHttpDecoder::LpcmBe(dec),
                 next_chained_segment: None,
             }
@@ -1767,7 +1812,9 @@ impl HttpAudioSource {
                 format: StreamContainerFormat::OggFlac,
                 spec: next_dec.spec,
                 peak_meta: next_dec.peak_meta,
+                track_meta: next_dec.track_meta.clone(),
                 total_frames: next_dec.total_frames,
+                streaminfo_md5: next_dec.streaminfo_md5,
                 decoder: ActiveHttpDecoder::OggFlac {
                     decoder: Some(next_dec),
                     shared_http: shared_http.clone(),
@@ -1789,12 +1836,30 @@ impl AudioBlockSource for HttpAudioSource {
         self.peak_meta
     }
 
+    fn track_meta(&self) -> TrackMetadata {
+        self.track_meta.clone()
+    }
+
     fn is_streaming(&self) -> bool {
         true
     }
 
     fn total_frames(&self) -> Option<u64> {
         self.total_frames
+    }
+
+    fn streaminfo_md5(&self) -> Option<[u8; 16]> {
+        self.streaminfo_md5
+    }
+
+    fn computed_md5(&self) -> Option<[u8; 16]> {
+        match &self.decoder {
+            ActiveHttpDecoder::Flac(d) => d.finalized_md5,
+            ActiveHttpDecoder::OggFlac {
+                decoder: Some(d), ..
+            } => d.finalized_md5,
+            _ => None,
+        }
     }
 
     fn read_next_block(&mut self, max_frames: usize) -> Result<Option<StereoF64Buffer>, String> {

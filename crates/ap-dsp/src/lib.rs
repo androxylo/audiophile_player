@@ -7,6 +7,7 @@
 
 pub mod convolution;
 pub mod dd;
+pub mod deemphasis;
 pub mod delay;
 pub mod phase;
 pub mod pipeline;

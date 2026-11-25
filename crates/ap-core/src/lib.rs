@@ -9,3 +9,4 @@ pub mod buffer;
 pub mod config;
 pub mod format;
 pub mod headroom;
+pub mod metadata;

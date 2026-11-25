@@ -3,4 +3,5 @@
 pub mod flac;
 pub mod http_stream;
 pub mod library;
+pub mod md5;
 pub mod tidal;
