@@ -10,7 +10,7 @@
 //! - Epoch-guarded instant flush (`reset_and_flush`) on Pause or mode/folder switch drops stale
 //!   buffered blocks immediately and discards in-flight producer work cleanly.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -18,6 +18,7 @@ use std::time::Duration;
 use ap_control::state::PlayModeLabel;
 use ap_core::buffer::InterleavedInt32Buffer;
 use ap_dsp::pipeline::PipelineReport;
+use ap_output_win::hygiene::MemoryLockGuard;
 
 /// Default buffered lead time held in RAM ahead of the DAC (`24 s` at any output rate).
 /// Absorbs multi-second mid-stream DSP/convolution/disk/rate-switch spikes with zero underruns
@@ -26,6 +27,13 @@ pub const DEFAULT_MAX_BUFFERED_SECONDS: u64 = 24;
 
 /// Hard maximum buffered PCM frames held in RAM ahead of the DAC (~24 s @ 384 kHz ≈ 73.7 MB).
 pub const DEFAULT_MAX_BUFFERED_FRAMES: usize = 384_000 * (DEFAULT_MAX_BUFFERED_SECONDS as usize);
+
+/// Hard look-ahead cap for Ultimate Mode (Mandate M1: strictly `<= 30 s` ahead of playhead,
+/// `384 kHz * 30 s * 8 B = 92.16 MB` max RAM, `VirtualLock`-pinned per block).
+pub const ULTIMATE_MAX_BUFFERED_SECONDS: u64 = 30;
+
+/// Hard maximum buffered PCM frames in Ultimate Mode (~30 s @ 384 kHz ≈ 92.16 MB).
+pub const ULTIMATE_MAX_BUFFERED_FRAMES: usize = 384_000 * (ULTIMATE_MAX_BUFFERED_SECONDS as usize);
 
 /// Minimum cushion buffered before starting a new local WDM-KS stream (`4 s` at output rate).
 pub const PREBUFFER_SECONDS: u32 = 4;
@@ -117,19 +125,29 @@ struct BufferInner {
     /// Consumed PCM blocks handed off by the real-time WaveRT thread so large `Vec<[i32; 2]>`
     /// buffers are deallocated exclusively on the non-RT producer/control thread.
     deferred_drops: Vec<InterleavedInt32Buffer>,
+    /// When `true` (Ultimate Mode `U11`), each queued PCM block is `VirtualLock`-pinned on the
+    /// producer thread and unlocked strictly off-RT on drop/flush.
+    pin_blocks: bool,
+    /// Active `VirtualLock` guards keyed by `frames.as_ptr() as usize` while a block is queued
+    /// or currently playing on the RT DMA thread.
+    pinned_guards: HashMap<usize, MemoryLockGuard>,
+    /// Guards corresponding to `deferred_drops`, unlocked BEFORE `deferred_drops` are freed.
+    deferred_guards: Vec<MemoryLockGuard>,
     closed: bool,
 }
 
 impl BufferInner {
-    fn flush_locked(&mut self) -> (u64, Vec<InterleavedInt32Buffer>) {
+    fn flush_locked(&mut self) -> (u64, Vec<MemoryLockGuard>, Vec<InterleavedInt32Buffer>) {
         self.epoch = self.epoch.wrapping_add(1);
         self.events.clear();
         self.buffered_frames = 0;
         self.buffered_duration_ns = 0;
         self.terminal_markers = 0;
         self.track_min_buffered_ns = None;
+        let mut guards = std::mem::take(&mut self.deferred_guards);
+        guards.extend(self.pinned_guards.drain().map(|(_, g)| g));
         let drops = std::mem::take(&mut self.deferred_drops);
-        (self.epoch, drops)
+        (self.epoch, guards, drops)
     }
 
     fn push_back_event(&mut self, ev: StreamEvent) {
@@ -180,6 +198,16 @@ impl BoundedBlockStreamBuffer {
 
     /// Create a bounded buffer with explicit frame ceiling and duration cap.
     pub fn with_limits(max_buffered_frames: usize, max_buffered_duration: Duration) -> Arc<Self> {
+        Self::with_limits_and_pinning(max_buffered_frames, max_buffered_duration, false)
+    }
+
+    /// Create a bounded buffer with explicit frame ceiling, duration cap, and optional
+    /// per-block `VirtualLock` RAM pinning (`U11` Ultimate Mode).
+    pub fn with_limits_and_pinning(
+        max_buffered_frames: usize,
+        max_buffered_duration: Duration,
+        pin_blocks: bool,
+    ) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(BufferInner {
                 epoch: 0,
@@ -191,6 +219,9 @@ impl BoundedBlockStreamBuffer {
                 max_buffered_duration_ns: max_buffered_duration.as_nanos().max(1),
                 track_min_buffered_ns: None,
                 deferred_drops: Vec::with_capacity(MAX_DEFERRED_DROP_BLOCKS),
+                pin_blocks,
+                pinned_guards: HashMap::new(),
+                deferred_guards: Vec::with_capacity(MAX_DEFERRED_DROP_BLOCKS),
                 closed: false,
             }),
             cv: Condvar::new(),
@@ -218,26 +249,37 @@ impl BoundedBlockStreamBuffer {
     }
 
     /// Hand a consumed PCM block off the real-time MMCSS WaveRT thread for deferred deallocation
-    /// on the producer thread (avoids `HeapFree` / `VirtualFree` kernel locks on the RT thread).
+    /// on the producer thread (avoids `HeapFree` / `VirtualFree` / `VirtualUnlock` on the RT thread).
     pub fn recycle_consumed_block(&self, buf: InterleavedInt32Buffer) {
-        let overflow = {
+        let ptr_key = buf.frames.as_ptr() as usize;
+        let (overflow_guard, overflow_buf) = {
             let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let guard = st.pinned_guards.remove(&ptr_key);
             if st.deferred_drops.len() < MAX_DEFERRED_DROP_BLOCKS {
+                if let Some(g) = guard {
+                    st.deferred_guards.push(g);
+                }
                 st.deferred_drops.push(buf);
-                None
+                (None, None)
             } else {
-                Some(buf)
+                (guard, Some(buf))
             }
         };
-        drop(overflow);
+        // Unlock before freeing if overflow occurred.
+        drop(overflow_guard);
+        drop(overflow_buf);
     }
 
-    /// Explicitly drop any deferred consumed PCM blocks on a non-RT thread.
+    /// Explicitly unlock and drop any deferred consumed PCM blocks on a non-RT thread.
     pub fn drain_deferred_drops(&self) {
-        let drops = {
+        let (guards, drops) = {
             let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            std::mem::take(&mut st.deferred_drops)
+            (
+                std::mem::take(&mut st.deferred_guards),
+                std::mem::take(&mut st.deferred_drops),
+            )
         };
+        drop(guards);
         drop(drops);
     }
 
@@ -260,12 +302,13 @@ impl BoundedBlockStreamBuffer {
 
     /// Increment epoch and immediately drop all queued PCM blocks (frees RAM on Pause / switch).
     pub fn reset_and_flush(&self) -> u64 {
-        let (ep, drops) = {
+        let (ep, guards, drops) = {
             let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let res = st.flush_locked();
             self.cv.notify_all();
             res
         };
+        drop(guards);
         drop(drops);
         ep
     }
@@ -335,11 +378,19 @@ impl BoundedBlockStreamBuffer {
                     let mut drop_frames = 0usize;
                     let mut drop_dur_ns = 0u128;
                     let mut drop_terms = 0usize;
-                    for ev in st.events.drain(..next_idx) {
+                    let drained: Vec<StreamEvent> = st.events.drain(..next_idx).collect();
+                    for ev in drained {
                         let (frames, dur_ns, term) = event_metrics(&ev);
                         drop_frames += frames;
                         drop_dur_ns = drop_dur_ns.saturating_add(dur_ns);
                         drop_terms += term;
+                        if let StreamEvent::PcmBlock(b) = ev {
+                            let ptr_key = b.frames.as_ptr() as usize;
+                            if let Some(g) = st.pinned_guards.remove(&ptr_key) {
+                                st.deferred_guards.push(g);
+                            }
+                            st.deferred_drops.push(b);
+                        }
                     }
                     st.buffered_frames = st.buffered_frames.saturating_sub(drop_frames);
                     st.buffered_duration_ns = st.buffered_duration_ns.saturating_sub(drop_dur_ns);
@@ -349,16 +400,17 @@ impl BoundedBlockStreamBuffer {
                 }
             }
         }
-        let (ep, drops) = st.flush_locked();
+        let (ep, guards, drops) = st.flush_locked();
         self.cv.notify_all();
         drop(st);
+        drop(guards);
         drop(drops);
         (false, ep, skipped_front_path)
     }
 
     /// Permanently close the buffer for graceful shutdown, waking all blocked threads.
     pub fn close(&self) {
-        let drops = {
+        let (guards, drops) = {
             let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             st.closed = true;
             st.events.clear();
@@ -366,23 +418,29 @@ impl BoundedBlockStreamBuffer {
             st.buffered_duration_ns = 0;
             st.terminal_markers = 0;
             st.track_min_buffered_ns = None;
+            let mut g = std::mem::take(&mut st.deferred_guards);
+            g.extend(st.pinned_guards.drain().map(|(_, guard)| guard));
             let d = std::mem::take(&mut st.deferred_drops);
             self.cv.notify_all();
-            d
+            (g, d)
         };
+        drop(guards);
         drop(drops);
     }
 
     /// Producer side: push a stream event, applying backpressure whenever buffered PCM reaches
-    /// either the duration cap (`24 s` at the output rate) or `max_buffered_frames`.
-    /// Also drains any RT-recycled PCM blocks so `HeapFree` / `VirtualFree` runs here off-RT.
+    /// either the duration cap (`24 s` normal / `30 s` ultimate) or `max_buffered_frames`.
+    /// Also drains any RT-recycled PCM blocks so `VirtualUnlock` / `HeapFree` runs here off-RT.
     pub fn push_for_epoch(&self, epoch: u64, event: StreamEvent) -> bool {
         let (frames_in_event, dur_ns_in_event, _) = event_metrics(&event);
         let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guards = std::mem::take(&mut st.deferred_guards);
         let mut drops = std::mem::take(&mut st.deferred_drops);
+        let should_pin = st.pin_blocks;
         loop {
             if st.closed || st.epoch != epoch {
                 drop(st);
+                drop(guards);
                 drop(drops);
                 return false;
             }
@@ -394,25 +452,45 @@ impl BoundedBlockStreamBuffer {
                     && st.buffered_duration_ns.saturating_add(dur_ns_in_event)
                         <= st.max_buffered_duration_ns)
             {
+                if should_pin {
+                    if let StreamEvent::PcmBlock(ref b) = event {
+                        if !b.frames.is_empty() {
+                            let ptr_key = b.frames.as_ptr() as usize;
+                            let guard = MemoryLockGuard::lock_slice(&b.frames);
+                            st.pinned_guards.insert(ptr_key, guard);
+                        }
+                    }
+                }
                 st.push_back_event(event);
+                if !st.deferred_guards.is_empty() {
+                    guards.append(&mut st.deferred_guards);
+                }
                 if !st.deferred_drops.is_empty() {
                     drops.append(&mut st.deferred_drops);
                 }
                 self.cv.notify_all();
                 drop(st);
+                drop(guards);
                 drop(drops);
                 return true;
             }
-            if !drops.is_empty() {
+            if !drops.is_empty() || !guards.is_empty() {
                 drop(st);
+                guards.clear();
                 drops.clear();
                 st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                if !st.deferred_guards.is_empty() {
+                    guards.append(&mut st.deferred_guards);
+                }
                 if !st.deferred_drops.is_empty() {
                     drops.append(&mut st.deferred_drops);
                 }
                 continue;
             }
             st = self.cv.wait(st).unwrap_or_else(|e| e.into_inner());
+            if !st.deferred_guards.is_empty() {
+                guards.append(&mut st.deferred_guards);
+            }
             if !st.deferred_drops.is_empty() {
                 drops.append(&mut st.deferred_drops);
             }
@@ -795,5 +873,28 @@ mod tests {
             buf.try_pop_track_pcm_block(ep),
             PopBlockResult::StaleOrClosed
         ));
+    }
+
+    #[test]
+    fn ultimate_30s_pinned_buffer_enforces_m1_cap_and_unlocks_off_rt_thread() {
+        let buf = BoundedBlockStreamBuffer::with_limits_and_pinning(
+            ULTIMATE_MAX_BUFFERED_FRAMES,
+            Duration::from_secs(ULTIMATE_MAX_BUFFERED_SECONDS),
+            true,
+        );
+        let ep = buf.current_epoch();
+
+        // Push 2 blocks of 1 s @ 44.1 kHz, pop & recycle -> deferred drops + guards clean up cleanly.
+        assert!(buf.push_for_epoch(ep, StreamEvent::PcmBlock(make_block_at(44_100, 44_100))));
+        assert!(buf.push_for_epoch(ep, StreamEvent::PcmBlock(make_block_at(44_100, 44_100))));
+        if let PopBlockResult::Block(b) = buf.try_pop_track_pcm_block(ep) {
+            buf.recycle_consumed_block(b);
+        } else {
+            panic!("expected pinned block");
+        }
+        assert_eq!(buf.deferred_drop_count(), 1);
+        buf.drain_deferred_drops();
+        assert_eq!(buf.deferred_drop_count(), 0);
+        buf.close();
     }
 }

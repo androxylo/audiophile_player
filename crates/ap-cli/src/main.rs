@@ -9,6 +9,7 @@ mod engine;
 mod prefetch;
 mod scanner;
 mod signals;
+mod ultimate;
 
 use std::process::ExitCode;
 

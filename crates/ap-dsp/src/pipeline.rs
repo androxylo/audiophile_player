@@ -100,6 +100,55 @@ pub enum GaplessAttachOutcome {
     IncompatibleRate(GaplessCarryover),
 }
 
+/// Structured Ultimate Mode decision report (`docs/research/07-ultimate-mode.md` U13).
+#[derive(Debug, Clone, PartialEq)]
+pub struct UltimateDecisionReport {
+    /// `"ultimate: cached"`, `"ultimate: live"`, or `"normal (<30 s)"`.
+    pub mode: String,
+    /// Winning selection rule (e.g. `"rule_A_apodizing"`, `"rule_G_classical"`, `"short_track_bypass"`).
+    pub winning_rule: String,
+    /// Ordered list of rules/signals that fired for this track.
+    pub fired_rules: Vec<String>,
+    /// True when whole-track analysis and/or exact post-chain peak `M` came from Schema-1 YAML cache.
+    pub cache_hit: bool,
+    /// Measured unity-gain 30 s window post-chain peak `M30` in dBFS (when `W2` ran).
+    pub m30_dbfs: Option<f64>,
+    /// Cached whole-track unity-gain post-chain peak `M` in dBFS (when cache hit on local track).
+    pub cached_m_dbfs: Option<f64>,
+    /// Mandatory fixed whole-track gain `G` in dB (`<= 0.0`).
+    pub fixed_gain_db: f64,
+    /// Quantizer margin `m_q` in dB (`(1.5 * sum(|c_k|) + 1.5)` LSB below FS).
+    pub quantizer_margin_db: f64,
+    /// Measured first-window throughput in multiples of real time (`× RT`).
+    pub throughput_x_rt: Option<f64>,
+    /// Non-fatal diagnostic notices / warnings (stale peak tags disproved, M4 stream guard, MQA, OQ-41).
+    pub warnings: Vec<String>,
+}
+
+impl UltimateDecisionReport {
+    pub fn summary(&self) -> String {
+        let rules = if self.fired_rules.is_empty() {
+            "none".to_string()
+        } else {
+            self.fired_rules.join(",")
+        };
+        let peak_str = match (self.cached_m_dbfs, self.m30_dbfs) {
+            (Some(m), Some(m30)) => format!("M={m:+.2}dBFS(cached) M30={m30:+.2}dBFS"),
+            (Some(m), None) => format!("M={m:+.2}dBFS(cached)"),
+            (None, Some(m30)) => format!("M30={m30:+.2}dBFS"),
+            (None, None) => "M=n/a".to_string(),
+        };
+        let speed_str = self
+            .throughput_x_rt
+            .map(|s| format!(" speed={s:.1}xRT"))
+            .unwrap_or_default();
+        format!(
+            "mode=[{}] rule={} fired=[{}] {peak_str} G={:+.3}dB m_q={:.5}dB{speed_str}",
+            self.mode, self.winning_rule, rules, self.fixed_gain_db, self.quantizer_margin_db
+        )
+    }
+}
+
 /// Diagnostic summary of every pipeline stage chosen for a track/stream.
 #[derive(Debug, Clone)]
 pub struct PipelineReport {
@@ -117,6 +166,8 @@ pub struct PipelineReport {
     pub convolver_content_hash: Option<String>,
     pub delayer_name: &'static str,
     pub effective_shaper: NoiseShaperProfile,
+    /// Populated when Ultimate Mode evaluated this track (`U13`).
+    pub ultimate_report: Option<UltimateDecisionReport>,
 }
 
 impl PipelineReport {
@@ -125,8 +176,12 @@ impl PipelineReport {
             Some(s) => format!("{s:.1} s"),
             None => "stream".to_string(),
         };
+        let mode_prefix = match &self.ultimate_report {
+            Some(u) => format!("[{}] ", u.mode),
+            None => String::new(),
+        };
         format!(
-            "{}/{} Hz -> {} Hz f64 ({}, {}, {}, {}, {}) | WDM-KS Int32",
+            "{mode_prefix}{}/{} Hz -> {} Hz f64 ({}, {}, {}, {}, {}) | WDM-KS Int32",
             self.source_spec.bits_per_sample,
             self.source_spec.sample_rate_hz,
             self.output_rate_hz,
@@ -148,11 +203,16 @@ impl PipelineReport {
         } else {
             String::new()
         };
+        let ult_part = match &self.ultimate_report {
+            Some(u) => format!(" | ultimate=[{}]", u.summary()),
+            None => String::new(),
+        };
         format!(
-            "{}{}{} | effective_shaper={} ({}-bit) | {} | conv={} | delay={}",
+            "{}{}{}{} | effective_shaper={} ({}-bit) | {} | conv={} | delay={}",
             self.dsp_plan.summary(),
             metrics_part,
             deemph_part,
+            ult_part,
             self.effective_shaper,
             self.output_bits,
             self.headroom.summary(),
@@ -192,6 +252,240 @@ impl StreamingPipelineSession {
     /// Return cumulative pre-quantizer peak and clipping backstop counts (`HEADROOM_DESIGN.md` §6).
     pub fn quantizer_stats(&self) -> QuantizerStats {
         self.quantizer.stats()
+    }
+
+    /// L1 sum `sum(|c_k|)` of the active noise-shaper feedback coefficients (for `quantizer_margin_db`).
+    pub fn shaper_l1_sum(&self) -> f64 {
+        self.quantizer.coeffs().iter().map(|c| c.abs()).sum()
+    }
+
+    /// Active convolver's peak frequency-domain boost `G_c` in dB (`0.0` for `NullConvolver`).
+    pub fn convolver_max_boost_db(&self) -> f64 {
+        if self.convolver.accepts_tail() {
+            self.convolver.max_boost_db()
+        } else {
+            0.0
+        }
+    }
+
+    /// Lock the track's mandatory fixed whole-track gain `HeadroomDecision` (Ultimate Mode `W2 -> W3`).
+    pub fn set_fixed_headroom(&mut self, headroom: HeadroomDecision) {
+        self.report.headroom = headroom;
+        self.report.convolver_description = if self.report.headroom.convolution_scale_db < -1e-6 {
+            format!(
+                "{} [scale {:.2} dB]",
+                self.convolver.description(),
+                self.report.headroom.convolution_scale_db
+            )
+        } else {
+            self.convolver.description()
+        };
+    }
+
+    /// Attach structured Ultimate Mode decision metadata (`U13`) to this session's report.
+    pub fn set_ultimate_report(&mut self, report: UltimateDecisionReport) {
+        self.report.ultimate_report = Some(report);
+    }
+
+    /// Restore compatible PRNG + error-feedback shaper state from the previous track without
+    /// altering this track's linear chain or gain calculations (`OQ-40`).
+    pub fn restore_quantizer_state_if_compatible(
+        &mut self,
+        q_state: QuantizerCarryoverState,
+        shaper: NoiseShaperProfile,
+        output_bits: u8,
+    ) {
+        if shaper == self.report.effective_shaper
+            && output_bits == self.report.output_bits
+            && shaper != NoiseShaperProfile::Bypass
+        {
+            self.quantizer.restore_state(q_state);
+        }
+    }
+
+    /// Run Stages 2 -> 2.5 -> 3 -> 4 (`upsampler -> deemphasis -> convolver -> delayer`) at **unity
+    /// gain (`1.0`)** in pure `f64`, without quantizing yet.
+    ///
+    /// Used by Ultimate Mode `W2` and `W4` so the exact unity-gain post-chain peak (`M30` / `M`)
+    /// is measured in a **single linear pass** (zero double-rendering!) and Track B's calculations
+    /// remain 100% independent of Track A (`OQ-40`).
+    pub fn process_block_unity_f64(
+        &mut self,
+        block: StereoF64Buffer,
+    ) -> Result<StereoF64Buffer, String> {
+        if block.is_empty() {
+            return Ok(StereoF64Buffer::empty(self.report.output_rate_hz));
+        }
+        let block = self.upsampler.process_block(block)?;
+        if block.is_empty() {
+            return Ok(StereoF64Buffer::empty(self.report.output_rate_hz));
+        }
+        let block = self.deemphasis.process_block(block)?;
+        let block = self.convolver.process_block(block)?;
+        if block.is_empty() {
+            return Ok(StereoF64Buffer::empty(self.report.output_rate_hz));
+        }
+        self.delayer.process_block(block)
+    }
+
+    /// Flush the unity-gain linear chain cleanly at EOF (non-gapless single-track or end-of-queue).
+    pub fn flush_unity_f64(&mut self) -> Result<StereoF64Buffer, String> {
+        let rate = self.report.output_rate_hz;
+        let mut out_l = Vec::new();
+        let mut out_r = Vec::new();
+
+        let up_tail = self.upsampler.flush()?;
+        if !up_tail.is_empty() {
+            let de_out = self.deemphasis.process_block(up_tail)?;
+            let c_out = self.convolver.process_block(de_out)?;
+            if !c_out.is_empty() {
+                let d_out = self.delayer.process_block(c_out)?;
+                out_l.extend_from_slice(&d_out.left);
+                out_r.extend_from_slice(&d_out.right);
+            }
+        }
+        let conv_tail = self.convolver.flush()?;
+        if !conv_tail.is_empty() {
+            let d_out = self.delayer.process_block(conv_tail)?;
+            out_l.extend_from_slice(&d_out.left);
+            out_r.extend_from_slice(&d_out.right);
+        }
+        let delay_tail = self.delayer.flush()?;
+        if !delay_tail.is_empty() {
+            out_l.extend_from_slice(&delay_tail.left);
+            out_r.extend_from_slice(&delay_tail.right);
+        }
+        Ok(StereoF64Buffer {
+            sample_rate_hz: rate,
+            left: out_l,
+            right: out_r,
+        })
+    }
+
+    /// Flush the unity-gain linear chain at EOF for gapless continuity (`OQ-40` strict independence):
+    /// - Returns `(ending_unity_f64, peak_over_ending_and_tail_unity, Option<GaplessCarryover>)`.
+    /// - Any exported `ConvolutionTail` is pre-scaled by THIS track's fixed whole-track `fixed_gain_db`
+    ///   so the next track receives Track A's exact already-gained decay `z_A[n]` as strictly additive
+    ///   output-only audio right before quantization.
+    pub fn flush_for_gapless_unity_f64(
+        &mut self,
+        fixed_gain_db: f64,
+    ) -> Result<(StereoF64Buffer, f64, Option<GaplessCarryover>), String> {
+        let rate = self.report.output_rate_hz;
+        let mut out_l = Vec::new();
+        let mut out_r = Vec::new();
+
+        // Flush upsampler completely at track boundary so Track A and Track B never splice FIR
+        // histories when their independent filters or fixed gains differ (`OQ-40`).
+        let up_tail = self.upsampler.flush()?;
+        if !up_tail.is_empty() {
+            let de_out = self.deemphasis.process_block(up_tail)?;
+            let c_out = self.convolver.process_block(de_out)?;
+            if !c_out.is_empty() {
+                let d_out = self.delayer.process_block(c_out)?;
+                out_l.extend_from_slice(&d_out.left);
+                out_r.extend_from_slice(&d_out.right);
+            }
+        }
+        let (track_end, mut conv_tail) = self.convolver.flush_split_tail()?;
+        if !track_end.is_empty() {
+            let d_out = self.delayer.process_block(track_end)?;
+            out_l.extend_from_slice(&d_out.left);
+            out_r.extend_from_slice(&d_out.right);
+        }
+        let delay_tail = self.delayer.flush()?;
+        if !delay_tail.is_empty() {
+            out_l.extend_from_slice(&delay_tail.left);
+            out_r.extend_from_slice(&delay_tail.right);
+        }
+
+        // Measure unity-gain peak over BOTH ending frames and the unscaled convolution tail
+        // so cached whole-track `M` covers the entire impulse response!
+        let mut tail_peak_unity = 0.0_f64;
+        for &s in out_l.iter().chain(out_r.iter()) {
+            tail_peak_unity = tail_peak_unity.max(s.abs());
+        }
+        if let Some(ref ct) = conv_tail {
+            tail_peak_unity = tail_peak_unity.max(ct.peak_linear());
+        }
+
+        // Pre-scale exported `conv_tail` by this track's fixed gain `G` so it becomes `z_A[n]`.
+        if let Some(ref mut ct) = conv_tail {
+            let g_lin = if fixed_gain_db.is_finite() && fixed_gain_db < 0.0 {
+                10.0_f64.powf(fixed_gain_db / 20.0)
+            } else {
+                1.0
+            };
+            if (g_lin - 1.0).abs() > 1e-12 {
+                for s in &mut ct.left {
+                    *s *= g_lin;
+                }
+                for s in &mut ct.right {
+                    *s *= g_lin;
+                }
+            }
+        }
+
+        let has_shaper_state = !self.quantizer.coeffs().is_empty();
+        let carryover = if conv_tail.is_some() || has_shaper_state {
+            let quantizer_state = if self.report.effective_shaper != NoiseShaperProfile::Bypass {
+                Some(self.quantizer.export_state())
+            } else {
+                None
+            };
+            Some(GaplessCarryover {
+                output_rate_hz: rate,
+                output_bits: self.report.output_bits,
+                effective_shaper: self.report.effective_shaper,
+                upsampler: None,
+                deemphasis: None,
+                convolver: conv_tail,
+                quantizer_state,
+            })
+        } else {
+            None
+        };
+
+        Ok((
+            StereoF64Buffer {
+                sample_rate_hz: rate,
+                left: out_l,
+                right: out_r,
+            },
+            tail_peak_unity,
+            carryover,
+        ))
+    }
+
+    /// Apply this track's mandatory fixed whole-track gain `fixed_gain_db <= 0.0` to a unity-gain
+    /// `f64` block, overlap-add any strictly additive already-gained previous-track tail `z_A[n]`,
+    /// and quantize once to `InterleavedInt32Buffer`.
+    pub fn quantize_scaled_block(
+        &mut self,
+        unity_block: &StereoF64Buffer,
+        fixed_gain_db: f64,
+        additive_tail: &mut Option<(ConvolutionTail, usize)>,
+    ) -> Result<InterleavedInt32Buffer, String> {
+        if unity_block.is_empty() {
+            return Ok(InterleavedInt32Buffer::empty(self.report.output_rate_hz));
+        }
+        let mut scaled = unity_block.clone();
+        apply_safe_gain_f64(&mut scaled, fixed_gain_db)?;
+
+        if let Some((tail, offset)) = additive_tail.as_mut() {
+            let rem = tail.left.len().saturating_sub(*offset);
+            let n = scaled.left.len().min(rem);
+            for i in 0..n {
+                scaled.left[i] += tail.left[*offset + i];
+                scaled.right[i] += tail.right[*offset + i];
+            }
+            *offset += n;
+            if *offset >= tail.left.len() {
+                *additive_tail = None;
+            }
+        }
+
+        Ok(self.quantizer.quantize_block(&scaled))
     }
 
     /// Process one bounded source `f64` block through all 5 stages -> ready `i32` PCM block.
@@ -415,11 +709,129 @@ impl AudioPipeline {
         upsampler_policy: UpsamplerPolicy,
         rew_config: ConvolutionConfig,
     ) -> Result<Self, String> {
+        Self::with_rew_config_full_tail(upsampler_policy, rew_config, false)
+    }
+
+    /// Construct a pipeline with configured REW stereo convolution and optional `U7` lossless
+    /// full-tail mode (Ultimate Mode sets `full_tail = true` so REW tails are never truncated).
+    pub fn with_rew_config_full_tail(
+        upsampler_policy: UpsamplerPolicy,
+        rew_config: ConvolutionConfig,
+        full_tail: bool,
+    ) -> Result<Self, String> {
         Self::with_factories(
             upsampler_policy,
-            Box::new(RewConvolverFactory::new(rew_config)),
+            Box::new(RewConvolverFactory::new(rew_config).with_full_tail(full_tail)),
             Box::new(NullChannelDelayerFactory),
         )
+    }
+
+    /// Expose the active [`UpsamplerPolicy`] for Ultimate Mode selection.
+    pub fn policy(&self) -> UpsamplerPolicy {
+        self.picker.policy()
+    }
+
+    /// Open a fresh [`StreamingPipelineSession`] from an explicit pre-resolved [`SelectedDspPlan`]
+    /// and [`HeadroomDecision`] (used by Ultimate Mode `W2` and `W3`).
+    pub fn start_track_with_plan_and_headroom(
+        &self,
+        spec: StreamSpec,
+        dsp_plan: SelectedDspPlan,
+        headroom: HeadroomDecision,
+    ) -> Result<StreamingPipelineSession, String> {
+        if !(MIN_SUPPORTED_SOURCE_RATE_HZ..=MAX_SUPPORTED_SOURCE_RATE_HZ)
+            .contains(&spec.sample_rate_hz)
+        {
+            return Err(format!(
+                "{UNSUPPORTED_SAMPLE_RATE_PREFIX} {} Hz is outside the supported {}..={} Hz range",
+                spec.sample_rate_hz, MIN_SUPPORTED_SOURCE_RATE_HZ, MAX_SUPPORTED_SOURCE_RATE_HZ
+            ));
+        }
+
+        let upsampler = build_upsampler(&dsp_plan)?;
+        let deemphasis = if dsp_plan.deemphasis {
+            StereoDeemphasis::new_50_15us(dsp_plan.target_rate_hz)?
+        } else {
+            StereoDeemphasis::bypass(dsp_plan.target_rate_hz)
+        };
+        let mut convolver = self
+            .convolver_factory
+            .create_for_rate(dsp_plan.target_rate_hz)?;
+        let delayer = self
+            .delayer_factory
+            .create_for_rate(dsp_plan.target_rate_hz)?;
+
+        convolver.set_output_scale(1.0);
+
+        let untouched_native = dsp_plan.filter == FilterArchetype::Null
+            && !deemphasis.is_enabled()
+            && headroom.mode == HeadroomMode::ZeroDb
+            && headroom.convolution_scale_db == 0.0
+            && convolver.name() == "null-convolver"
+            && delayer.name() == "null-delay";
+
+        let (requested_shaper, output_bits) = if untouched_native
+            && (dsp_plan.dac_bits == 24 || u16::from(dsp_plan.dac_bits) >= spec.bits_per_sample)
+        {
+            let out_bits = (spec.bits_per_sample as u8).clamp(16, 32);
+            let shaper = if !dsp_plan.shaper_overridden
+                && u16::from(out_bits) >= spec.bits_per_sample
+            {
+                NoiseShaperProfile::Bypass
+            } else {
+                dsp_plan.shaper
+            };
+            (shaper, out_bits)
+        } else if dsp_plan.shaper == NoiseShaperProfile::Bypass {
+            let fallback = if !dsp_plan.shaper_overridden
+                && matches!(dsp_plan.target_rate_hz, 352_800 | 384_000)
+            {
+                NoiseShaperProfile::NsGentle2
+            } else {
+                NoiseShaperProfile::TpdfDither
+            };
+            (fallback, dsp_plan.dac_bits)
+        } else {
+            (dsp_plan.shaper, dsp_plan.dac_bits)
+        };
+
+        let quantizer =
+            StreamingQuantizer::with_rate(requested_shaper, output_bits, dsp_plan.target_rate_hz)?;
+        let effective_shaper = quantizer.effective_shaper();
+        let conv_desc = if headroom.convolution_scale_db < -1e-6 {
+            format!(
+                "{} [scale {:.2} dB]",
+                convolver.description(),
+                headroom.convolution_scale_db
+            )
+        } else {
+            convolver.description()
+        };
+
+        let report = PipelineReport {
+            source_spec: spec,
+            output_rate_hz: dsp_plan.target_rate_hz,
+            output_bits,
+            headroom,
+            dsp_plan,
+            filter_metrics: upsampler.design_metrics(),
+            deemphasis_name: deemphasis.name(),
+            convolver_name: convolver.name(),
+            convolver_description: conv_desc,
+            convolver_content_hash: convolver.content_hash().map(str::to_string),
+            delayer_name: delayer.name(),
+            effective_shaper,
+            ultimate_report: None,
+        };
+
+        Ok(StreamingPipelineSession {
+            report,
+            upsampler,
+            deemphasis,
+            convolver,
+            delayer,
+            quantizer,
+        })
     }
 
     /// Construct a pipeline with explicit convolver and channel delayer factories.
@@ -617,6 +1029,7 @@ impl AudioPipeline {
             convolver_content_hash: convolver.content_hash().map(str::to_string),
             delayer_name: delayer.name(),
             effective_shaper,
+            ultimate_report: None,
         };
 
         Ok(StreamingPipelineSession {

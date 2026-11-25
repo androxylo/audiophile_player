@@ -31,6 +31,10 @@ pub fn render_control_page(snapshot: &ControlSnapshot, listing: &FolderListing) 
         (Some(t), None) => html_escape(t),
         _ => "Idle &mdash; DAC pin closed (available to Audirvana / other players)".to_string(),
     };
+    let decision_html = match &snapshot.current_decision {
+        Some(d) => html_escape(d),
+        None => String::new(),
+    };
 
     let mut items_html = String::new();
     if let Some(err) = &listing.error {
@@ -100,6 +104,7 @@ h1{{margin:0;font-size:1.15rem;letter-spacing:.02em;}}a{{color:var(--accent);tex
 .badge.playing{{background:rgba(63,185,80,.18);color:var(--ok);border:1px solid rgba(63,185,80,.4);}}\n\
 .badge.paused{{background:rgba(210,153,34,.18);color:var(--warn);border:1px solid rgba(210,153,34,.4);}}\n\
 .now{{margin-top:6px;font-size:.88rem;color:var(--muted);word-break:break-all;}}\n\
+.decision{{margin-top:4px;font-family:Consolas,monospace;font-size:.78rem;color:var(--accent);word-break:break-word;}}\n\
 .controls{{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;}}\n\
 button{{background:#272c36;color:var(--fg);border:1px solid var(--border);border-radius:5px;padding:7px 14px;cursor:pointer;font-size:.9rem;font-weight:600;}}\n\
 button:hover{{background:#323946;}}button.primary{{border-color:var(--accent);}}button.pause{{border-color:var(--warn);}}\n\
@@ -125,6 +130,7 @@ pre#action-log{{margin:0;max-height:170px;overflow-y:auto;background:#0f1115;bor
     <span>DAC: <strong>{dac_html}</strong></span>\n\
   </div>\n\
   <div class=\"now\" id=\"now-playing\">{now_playing}</div>\n\
+  <div class=\"decision\" id=\"decision-report\">{decision_html}</div>\n\
 </section>\n\
 <section class=\"card\">\n\
   <div class=\"controls\">\n\
@@ -161,6 +167,7 @@ pre#action-log{{margin:0;max-height:170px;overflow-y:auto;background:#0f1115;bor
 async function poll(){{try{{const r=await fetch('/api/status');if(!r.ok)return;const d=await r.json();\n\
 const b=document.getElementById('status-badge');b.innerHTML=d.playing?'<span class=\"badge playing\">'+d.mode+'</span>':'<span class=\"badge paused\">Paused (DAC released)</span>';\n\
 const n=document.getElementById('now-playing');n.textContent=d.track?(d.format?d.track+' — '+d.format:d.track):'Idle — DAC pin closed (available to Audirvana / other players)';\n\
+const dr=document.getElementById('decision-report');if(dr)dr.textContent=d.decision||'';\n\
 const l=document.getElementById('action-log');const atBottom=(l.scrollHeight-l.scrollTop-l.clientHeight)<24;l.textContent=d.log.join('\\n');if(atBottom)l.scrollTop=l.scrollHeight;}}catch(_){{}}}}\n\
 setInterval(poll,2000);\n\
 </script>\n\
@@ -179,19 +186,24 @@ pub fn render_status_json(snapshot: &ControlSnapshot) -> String {
         Some(f) => json_escape(f),
         None => "null".to_string(),
     };
+    let decision_json = match &snapshot.current_decision {
+        Some(d) => json_escape(d),
+        None => "null".to_string(),
+    };
     let log_items: Vec<String> = snapshot
         .recent_actions
         .iter()
         .map(|s| json_escape(s))
         .collect();
     format!(
-        "{{\"playing\":{},\"mode\":{},\"dac\":{},\"folder\":{},\"track\":{},\"format\":{},\"log\":[{}]}}",
+        "{{\"playing\":{},\"mode\":{},\"dac\":{},\"folder\":{},\"track\":{},\"format\":{},\"decision\":{},\"log\":[{}]}}",
         snapshot.is_playing,
         json_escape(snapshot.mode.as_str()),
         json_escape(&snapshot.dac_name),
         json_escape(&snapshot.active_folder.to_string_lossy()),
         track_json,
         fmt_json,
+        decision_json,
         log_items.join(",")
     )
 }

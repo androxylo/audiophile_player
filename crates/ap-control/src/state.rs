@@ -82,6 +82,8 @@ pub struct ControlSnapshot {
     pub active_folder: PathBuf,
     pub current_track: Option<String>,
     pub current_format: Option<String>,
+    /// Optional Ultimate Mode showcase decision report summary (`U13`).
+    pub current_decision: Option<String>,
     pub recent_actions: Vec<String>,
 }
 
@@ -93,6 +95,7 @@ struct InnerState {
     active_folder: PathBuf,
     current_track: Option<String>,
     current_format: Option<String>,
+    current_decision: Option<String>,
     pending_commands: VecDeque<ControlCommand>,
     log: ActionLog,
     sink_stop_flag: Option<Arc<AtomicBool>>,
@@ -122,6 +125,7 @@ impl SharedControl {
                 active_folder: allowed_root,
                 current_track: None,
                 current_format: None,
+                current_decision: None,
                 pending_commands: VecDeque::new(),
                 log,
                 sink_stop_flag: None,
@@ -230,12 +234,23 @@ impl SharedControl {
     }
 
     pub fn set_playing(&self, mode: PlayModeLabel, track: String, format: String) {
+        self.set_playing_with_decision(mode, track, format, None);
+    }
+
+    pub fn set_playing_with_decision(
+        &self,
+        mode: PlayModeLabel,
+        track: String,
+        format: String,
+        decision: Option<String>,
+    ) {
         let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         st.is_playing = true;
         st.mode = mode;
         st.log.push(format!("Playing: {track} ({format})"));
         st.current_track = Some(track);
         st.current_format = Some(format);
+        st.current_decision = decision;
     }
 
     pub fn set_paused(&self, reason: impl AsRef<str>) {
@@ -244,6 +259,7 @@ impl SharedControl {
         st.mode = PlayModeLabel::Paused;
         st.current_track = None;
         st.current_format = None;
+        st.current_decision = None;
         st.log.push(reason.as_ref());
     }
 
@@ -261,6 +277,7 @@ impl SharedControl {
             active_folder: st.active_folder.clone(),
             current_track: st.current_track.clone(),
             current_format: st.current_format.clone(),
+            current_decision: st.current_decision.clone(),
             recent_actions: st.log.snapshot(),
         }
     }

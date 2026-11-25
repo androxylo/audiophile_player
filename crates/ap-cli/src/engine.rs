@@ -26,6 +26,7 @@ use ap_core::config::{
     ConvolutionConfig, PlayerConfig, QuantizerConfig, TrackDbConfig, UltimateConfig,
 };
 use ap_core::format::DacWireFormat;
+use ap_core::track_db::TrackDbStore;
 use ap_dsp::pipeline::{AudioPipeline, GaplessAttachOutcome, GaplessCarryover};
 use ap_dsp::selector::{NoiseShaperProfile, UNSUPPORTED_SAMPLE_RATE_PREFIX, UpsamplerPolicy};
 use ap_output_win::hygiene::OptimizationLevel;
@@ -41,9 +42,10 @@ use ap_upnp::{UpnpRendererConfig, UpnpRendererServer, UpnpRendererState};
 use crate::cli_args::{QuantizerCliOverride, UltimateCliOverride, UpnpCliOverride};
 use crate::prefetch::{
     BoundedBlockStreamBuffer, DEFAULT_MAX_BUFFERED_FRAMES, PREBUFFER_SECONDS, PopBlockResult,
-    StreamEvent,
+    StreamEvent, ULTIMATE_MAX_BUFFERED_FRAMES, ULTIMATE_MAX_BUFFERED_SECONDS,
 };
 use crate::signals::{ShutdownController, ShutdownSignal};
+use crate::ultimate::{UltimateRuntimeContext, UltimateStreamResult, stream_track_ultimate};
 
 /// Prebuffer cushion for live HTTP/UPnP streams (`2 s` at output rate — absorbs LAN/WAN jitter
 /// and heavy 4M-tap REW/upsampler bursts while starting playback rapidly).
@@ -662,7 +664,18 @@ pub fn run_random_music_player(
     } else {
         optimization
     };
-    let _ = (&effective_ultimate, &effective_trackdb);
+    let ultimate_ctx = if effective_ultimate.enabled {
+        let db_root = effective_trackdb
+            .dir
+            .clone()
+            .unwrap_or_else(TrackDbStore::default_central_dir);
+        Some(UltimateRuntimeContext {
+            config: effective_ultimate,
+            store: TrackDbStore::new(db_root, effective_trackdb.sidecar),
+        })
+    } else {
+        None
+    };
 
     let upnp_explicit = upnp_override.port.is_some()
         || upnp_override.bind_ip.is_some()
@@ -688,7 +701,11 @@ pub fn run_random_music_player(
         enable_ssdp: true,
     };
 
-    let pipeline = AudioPipeline::with_rew_config(effective_policy, effective_conv)?;
+    let pipeline = AudioPipeline::with_rew_config_full_tail(
+        effective_policy,
+        effective_conv,
+        effective_ultimate.enabled,
+    )?;
     let music_dir = match music_dir_override {
         Some(dir) => dir,
         None => default_user_music_dir()
@@ -753,10 +770,27 @@ pub fn run_random_music_player(
     } else {
         println!("UPnP renderer: disabled");
     }
+    if let Some(ref ult) = ultimate_ctx {
+        println!(
+            "Ultimate mode: ENABLED ({}s look-ahead, full-tail REW, VirtualLock RAM, genre_rules={}, learn_on_play={}, trackdb='{}')",
+            ULTIMATE_MAX_BUFFERED_SECONDS,
+            ult.config.genre_rules,
+            ult.config.learn_on_play,
+            ult.store.root_dir().display()
+        );
+    }
     println!("Press Ctrl+C or Ctrl+Break to stop gracefully.");
     let _ = io::stdout().flush();
 
-    let stream_buf = BoundedBlockStreamBuffer::new(DEFAULT_MAX_BUFFERED_FRAMES);
+    let stream_buf = if ultimate_ctx.is_some() {
+        BoundedBlockStreamBuffer::with_limits_and_pinning(
+            ULTIMATE_MAX_BUFFERED_FRAMES,
+            Duration::from_secs(ULTIMATE_MAX_BUFFERED_SECONDS),
+            true,
+        )
+    } else {
+        BoundedBlockStreamBuffer::new(DEFAULT_MAX_BUFFERED_FRAMES)
+    };
     let initial_epoch = stream_buf.current_epoch();
     let initial_dir = PlayDirective::Random {
         root: music_dir.clone(),
@@ -764,14 +798,23 @@ pub fn run_random_music_player(
     let prod_ctrl =
         ProducerControl::new(initial_epoch, ProducerDirective::Active(initial_dir.clone()));
 
-    // Dedicated background streaming DSP Producer thread (bounded ~12 s / 36 MB cap).
+    // Dedicated background streaming DSP Producer thread (24 s normal / 30 s VirtualLock ultimate).
     let buf_bg = Arc::clone(&stream_buf);
     let ctrl_bg = Arc::clone(&prod_ctrl);
     let shared_bg = Arc::clone(&shared);
     let upnp_bg = upnp_state.clone();
     let producer_thread = thread::Builder::new()
         .name("ap-dsp-stream".to_string())
-        .spawn(move || producer_loop_with_upnp(pipeline, ctrl_bg, buf_bg, shared_bg, upnp_bg))
+        .spawn(move || {
+            producer_loop_with_upnp(
+                pipeline,
+                ctrl_bg,
+                buf_bg,
+                shared_bg,
+                upnp_bg,
+                ultimate_ctx,
+            )
+        })
         .map_err(|e| format!("failed spawning DSP streaming thread: {e}"))?;
 
     let mut state = EngineState::with_upnp(
@@ -1090,11 +1133,18 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
 
             let fmt_str = report.format_summary(total_duration_s);
             let track_str = path.display().to_string();
+            let decision_str = report.ultimate_report.as_ref().map(|u| u.summary());
             println!("  [playing]  {track_str} ({fmt_str})");
             println!("  [pipeline] {}", report.log_line());
+            if let Some(ref ult_rep) = report.ultimate_report {
+                for w in &ult_rep.warnings {
+                    println!("  [ultimate] {w}");
+                    shared.record_action(format!("Ultimate: {w}"));
+                }
+            }
             let _ = io::stdout().flush();
             shared.record_action(report.log_line());
-            shared.set_playing(mode_label, track_str, fmt_str);
+            shared.set_playing_with_decision(mode_label, track_str, fmt_str, decision_str);
             if mode_label == PlayModeLabel::UpnpRenderer {
                 if let Some(ref upnp) = state.upnp_state {
                     // Review #5 #5 & Review #6 #8/#17: promote prefetched NextURI -> CurrentURI
@@ -1289,7 +1339,7 @@ fn producer_loop(
     buf: Arc<BoundedBlockStreamBuffer>,
     shared: Arc<SharedControl>,
 ) {
-    producer_loop_with_upnp(pipeline, ctrl, buf, shared, None);
+    producer_loop_with_upnp(pipeline, ctrl, buf, shared, None, None);
 }
 
 fn producer_loop_with_upnp(
@@ -1298,6 +1348,7 @@ fn producer_loop_with_upnp(
     buf: Arc<BoundedBlockStreamBuffer>,
     shared: Arc<SharedControl>,
     upnp_state: Option<Arc<UpnpRendererState>>,
+    ultimate_ctx: Option<UltimateRuntimeContext>,
 ) {
     const MAX_CONSECUTIVE_UNSUPPORTED: u32 = 50;
 
@@ -1394,6 +1445,7 @@ fn producer_loop_with_upnp(
                         &mut carried_tail,
                         &mut panic_backup_carry,
                         &mut pending_track_end,
+                        ultimate_ctx.as_ref(),
                     )
                 })) {
                     Ok(res) => res,
@@ -1630,6 +1682,7 @@ fn producer_loop_with_upnp(
                 &mut panic_backup_carry,
                 &mut pending_track_end,
                 !is_single_file,
+                ultimate_ctx.as_ref(),
             )
         })) {
             Ok(res) => res,
@@ -1756,6 +1809,7 @@ fn stream_single_track(
     panic_backup_carry: &mut Option<GaplessCarryover>,
     had_pending_prev_end: &mut bool,
     gapless_carryover: bool,
+    ultimate_ctx: Option<&UltimateRuntimeContext>,
 ) -> (TrackStreamOutcome, Option<GaplessCarryover>, bool) {
     let flush_prev_on_incompatible = |buf: &BoundedBlockStreamBuffer,
                                       carry: &mut Option<GaplessCarryover>,
@@ -1825,6 +1879,41 @@ fn stream_single_track(
     let total_duration_s = source
         .total_frames()
         .map(|f| f as f64 / spec.sample_rate_hz as f64);
+
+    if let Some(ult) = ultimate_ctx {
+        let out_rate_hint = if spec.sample_rate_hz % 44_100 == 0 {
+            352_800
+        } else {
+            384_000
+        };
+        let src_block_frames = source_block_frames_for_rates(spec.sample_rate_hz, out_rate_hint);
+        return match stream_track_ultimate(
+            pipeline,
+            ult,
+            buf,
+            epoch,
+            || ctrl.epoch() != epoch,
+            &mut source,
+            chosen,
+            Some(chosen),
+            None,
+            None,
+            mode_label,
+            total_duration_s,
+            incoming_carryover,
+            had_pending_prev_end,
+            gapless_carryover,
+            src_block_frames,
+        ) {
+            UltimateStreamResult::Played {
+                next_carryover,
+                next_pending_end,
+                ..
+            } => (TrackStreamOutcome::Played, next_carryover, next_pending_end),
+            UltimateStreamResult::Aborted => (TrackStreamOutcome::Aborted, None, false),
+            UltimateStreamResult::Failed(msg) => (TrackStreamOutcome::Failed(msg), None, false),
+        };
+    }
 
     let mut session = match pipeline.start_track_for_carryover(
         spec,
@@ -2192,6 +2281,7 @@ fn stream_upnp_request(
     incoming_carryover: &mut Option<GaplessCarryover>,
     panic_backup_carry: &mut Option<GaplessCarryover>,
     had_pending_prev_end: &mut bool,
+    ultimate_ctx: Option<&UltimateRuntimeContext>,
 ) -> (TrackStreamOutcome, Option<GaplessCarryover>, bool) {
     let hints = HttpStreamHints {
         protocol_info: req.protocol_info.clone(),
@@ -2245,28 +2335,68 @@ fn stream_upnp_request(
                 seg_idx + 1
             )
         };
-        let (outcome, next_carry, next_pend) = stream_open_audio_source(
-            pipeline,
-            ctrl,
-            buf,
-            shared,
-            epoch,
-            &mut cur_source,
-            &PathBuf::from(&seg_label),
-            Some(&req.uri),
-            if seg_idx == 0 {
-                req.prefetched_next_gen
+        let (outcome, next_carry, next_pend) = if let Some(ult) = ultimate_ctx {
+            let sp = cur_source.spec();
+            let out_rate_hint = if sp.sample_rate_hz % 44_100 == 0 {
+                352_800
             } else {
-                None
-            },
-            PlayModeLabel::UpnpRenderer,
-            seg_duration,
-            None,
-            incoming_carryover,
-            panic_backup_carry,
-            had_pending_prev_end,
-            true,
-        );
+                384_000
+            };
+            let src_block_frames = source_block_frames_for_rates(sp.sample_rate_hz, out_rate_hint);
+            match stream_track_ultimate(
+                pipeline,
+                ult,
+                buf,
+                epoch,
+                || ctrl.epoch() != epoch || cancel.load(Ordering::Acquire),
+                &mut cur_source,
+                &PathBuf::from(&seg_label),
+                None,
+                Some(req.uri.clone()),
+                if seg_idx == 0 {
+                    req.prefetched_next_gen
+                } else {
+                    None
+                },
+                PlayModeLabel::UpnpRenderer,
+                seg_duration,
+                incoming_carryover,
+                had_pending_prev_end,
+                true,
+                src_block_frames,
+            ) {
+                UltimateStreamResult::Played {
+                    next_carryover,
+                    next_pending_end,
+                    ..
+                } => (TrackStreamOutcome::Played, next_carryover, next_pending_end),
+                UltimateStreamResult::Aborted => (TrackStreamOutcome::Aborted, None, false),
+                UltimateStreamResult::Failed(msg) => (TrackStreamOutcome::Failed(msg), None, false),
+            }
+        } else {
+            stream_open_audio_source(
+                pipeline,
+                ctrl,
+                buf,
+                shared,
+                epoch,
+                &mut cur_source,
+                &PathBuf::from(&seg_label),
+                Some(&req.uri),
+                if seg_idx == 0 {
+                    req.prefetched_next_gen
+                } else {
+                    None
+                },
+                PlayModeLabel::UpnpRenderer,
+                seg_duration,
+                None,
+                incoming_carryover,
+                panic_backup_carry,
+                had_pending_prev_end,
+                true,
+            )
+        };
         match outcome {
             TrackStreamOutcome::Played => {
                 *incoming_carryover = next_carry;
@@ -3115,6 +3245,7 @@ mod tests {
                 &mut no_backup,
                 &mut no_pending,
                 false,
+                None,
             );
             assert!(next_tail.is_none());
             assert!(!pending_end);
@@ -4420,7 +4551,7 @@ mod tests {
         let p_shared = Arc::clone(&shared);
         let p_upnp = Some(Arc::clone(&upnp_state));
         let producer = thread::spawn(move || {
-            producer_loop_with_upnp(pipeline, p_ctrl, p_buf, p_shared, p_upnp);
+            producer_loop_with_upnp(pipeline, p_ctrl, p_buf, p_shared, p_upnp, None);
         });
 
         let controller = ShutdownController::new();
