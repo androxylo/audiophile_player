@@ -385,66 +385,53 @@ pub fn is_symlink_or_mount_point(meta: &fs::Metadata) -> bool {
     meta.file_type().is_symlink()
 }
 
-/// Purely lexical `.` / `..` resolution without touching the filesystem.
-fn lexical_clean_path(path: &Path) -> PathBuf {
-    let mut prefix_or_root = PathBuf::new();
-    let mut has_root = false;
-    let mut parts: Vec<std::ffi::OsString> = Vec::new();
-
-    for comp in path.components() {
-        match comp {
-            Component::Prefix(p) => {
-                prefix_or_root.push(p.as_os_str());
-            }
-            Component::RootDir => {
-                prefix_or_root.push(comp.as_os_str());
-                has_root = true;
-            }
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !parts.is_empty() {
-                    parts.pop();
-                } else if !has_root {
-                    parts.push(comp.as_os_str().to_os_string());
-                }
-            }
-            Component::Normal(seg) => {
-                parts.push(seg.to_os_string());
-            }
-        }
-    }
-
-    for part in parts {
-        prefix_or_root.push(part);
-    }
-    prefix_or_root
-}
-
 /// Walk `resolved_path` component by component from its safe root prefix using `symlink_metadata`,
 /// recursively inspecting and resolving EVERY intermediate AND final symlink/junction hop BEFORE
-/// any metadata call can cross an unchecked intermediate reparse point (Review #4 Finding #4).
+/// applying any subsequent `..` or crossing an unchecked reparse point (Review #4 Finding #4).
 fn verify_resolved_path_components(
     resolved_path: &Path,
     allowed_unc_share: Option<(&str, &str)>,
     remaining_hops: usize,
 ) -> Result<(), String> {
-    let clean = lexical_clean_path(resolved_path);
     let mut cur = PathBuf::new();
-    let mut comps = clean.components().peekable();
+    let mut comps = resolved_path.components().peekable();
+    let mut prefix_len = 0usize;
 
     // Assemble safe prefix/root first without statting `C:\` or `\\NAS\Share\` as a link.
     while let Some(c) = comps.peek() {
         match c {
             Component::Prefix(_) | Component::RootDir => {
                 cur.push(c.as_os_str());
+                prefix_len += 1;
                 comps.next();
             }
             _ => break,
         }
     }
 
+    let mut normal_depth = 0usize;
     while let Some(comp) = comps.next() {
-        cur.push(comp.as_os_str());
+        match comp {
+            Component::CurDir => continue,
+            Component::ParentDir => {
+                if normal_depth > 0 {
+                    cur.pop();
+                    normal_depth -= 1;
+                } else if prefix_len == 0 {
+                    cur.push(comp.as_os_str());
+                }
+                continue;
+            }
+            Component::Normal(seg) => {
+                cur.push(seg);
+                normal_depth += 1;
+            }
+            Component::Prefix(_) | Component::RootDir => {
+                cur.push(comp.as_os_str());
+                continue;
+            }
+        }
+
         let Ok(meta) = fs::symlink_metadata(&cur) else {
             // Non-existent suffix is syntactically safe; downstream open will fail cleanly.
             return Ok(());
