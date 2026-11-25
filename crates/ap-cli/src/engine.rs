@@ -1744,7 +1744,15 @@ fn stream_single_track(
             Ok(GaplessAttachOutcome::ConvolverOnlyHandoff {
                 upsampler_tail_pcm,
                 attached_convolver_tail,
+                upsampler_tail_stats,
             }) => {
+                if upsampler_tail_stats.overs_count > 0 {
+                    eprintln!(
+                        "  [clip warn] previous track gapless tail: {} pre-quantizer sample overs (max {:.2} dBFS)",
+                        upsampler_tail_stats.overs_count,
+                        upsampler_tail_stats.max_pre_quant_peak_dbfs()
+                    );
+                }
                 had_gapless_carryover = attached_convolver_tail;
                 attached_carryover_into_session = attached_convolver_tail;
                 if !upsampler_tail_pcm.is_empty()
@@ -2212,7 +2220,15 @@ fn stream_open_audio_source<S: AudioBlockSource>(
             Ok(GaplessAttachOutcome::ConvolverOnlyHandoff {
                 upsampler_tail_pcm,
                 attached_convolver_tail,
+                upsampler_tail_stats,
             }) => {
+                if upsampler_tail_stats.overs_count > 0 {
+                    eprintln!(
+                        "  [clip warn] previous track gapless tail: {} pre-quantizer sample overs (max {:.2} dBFS)",
+                        upsampler_tail_stats.overs_count,
+                        upsampler_tail_stats.max_pre_quant_peak_dbfs()
+                    );
+                }
                 had_gapless_carryover = attached_convolver_tail;
                 attached_carryover_into_session = attached_convolver_tail;
                 if !upsampler_tail_pcm.is_empty()

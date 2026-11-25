@@ -1127,6 +1127,10 @@ fn gapless_tail_is_preserved_at_end_of_queue_and_across_rate_change() {
     // Track B (48 kHz -> 384 kHz) rejects the 352.8 kHz carryover; draining it restores Track A's
     // exact N_A * 8 + 500 frames (zero truncation across the 352.8k -> 384k rate change!).
     let mut sess_b = pipeline.start_track(spec_48, &meta, false).unwrap();
+    let post_ring_a = carry_a
+        .upsampler
+        .as_ref()
+        .map_or(0, |u| u.taps_per_phase.saturating_sub(1).saturating_sub(u.pad_tail) * u.ratio);
     let rejected_a = sess_b
         .set_incoming_gapless_carryover(carry_a)
         .expect_err("384 kHz session must reject 352.8 kHz carryover");
@@ -1135,8 +1139,8 @@ fn gapless_tail_is_preserved_at_end_of_queue_and_across_rate_change() {
     frames_a.extend(drained_a.frames);
     assert_eq!(
         frames_a.len(),
-        n_a * 8 + (ir_taps - 1),
-        "Track A total frames across rate change must equal N*8 + flush_tail"
+        n_a * 8 + post_ring_a + (ir_taps - 1),
+        "Track A total frames across rate change must equal N*8 + full FIR post-ring + conv tail"
     );
     // Verify the delayed echo tail near the end of Track A is non-zero (not truncated!).
     let tail_energy_a: i64 = frames_a[(n_a * 8 + 100)..(n_a * 8 + 400)]
@@ -1145,7 +1149,7 @@ fn gapless_tail_is_preserved_at_end_of_queue_and_across_rate_change() {
         .sum();
     assert!(tail_energy_a > 0, "Track A REW tail energy was lost");
 
-    // Track B ends at end-of-queue: draining its carryover restores exact N_B * 8 + 500 frames!
+    // Track B ends at end-of-queue: draining its carryover preserves full FIR post-ring + REW tail!
     let mut frames_b = sess_b
         .process_block(StereoF64Buffer {
             sample_rate_hz: 48_000,
@@ -1156,15 +1160,18 @@ fn gapless_tail_is_preserved_at_end_of_queue_and_across_rate_change() {
         .frames;
     let (end_b, carry_b) = sess_b.flush_for_gapless().unwrap();
     frames_b.extend(end_b.frames);
-    let drained_b = pipeline
-        .drain_gapless_carryover(carry_b.expect("Track B must produce gapless carryover"))
-        .unwrap();
+    let carry_b = carry_b.expect("Track B must produce gapless carryover");
+    let post_ring_b = carry_b
+        .upsampler
+        .as_ref()
+        .map_or(0, |u| u.taps_per_phase.saturating_sub(1).saturating_sub(u.pad_tail) * u.ratio);
+    let drained_b = pipeline.drain_gapless_carryover(carry_b).unwrap();
     assert_eq!(drained_b.sample_rate_hz, 384_000);
     frames_b.extend(drained_b.frames);
     assert_eq!(
         frames_b.len(),
-        n_b * 8 + (ir_taps - 1),
-        "Track B total frames at end-of-queue must equal N*8 + flush_tail"
+        n_b * 8 + post_ring_b + (ir_taps - 1),
+        "Track B total frames at end-of-queue must equal N*8 + full FIR post-ring + conv tail"
     );
 
     let _ = fs::remove_dir_all(&tmp);

@@ -272,29 +272,29 @@ fn incoming_gapless_rew_tail_demotes_active_convolver_only_and_preserves_null_co
     assert_eq!(s_small.report().headroom.mode, HeadroomMode::ZeroDb);
     assert_eq!(s_small.report().headroom.convolution_scale_db, 0.0);
 
-    // Loud incoming tail (0.50): HEADROOM_DESIGN.md §4 (Review #5 #3) keeps G_up = 0 dB and
-    // applies exact excess scaling S_B = 20*log10(0.50) - (-4.437) = -1.584 dB!
+    // Review #6 Finding #1: Loud incoming tail (0.50) must NOT attenuate all of Track B with a
+    // whole-track S_B cut (which dropped Track B by up to -60 dB on normal-level gapless REW pairs).
+    // Track B keeps its own independent G_up=0 dB and S=0 dB, relying on the quantizer backstop.
     let s_hot = rew_pipeline
         .start_track_with_tail_hint(spec_352, &quiet_tp, false, Some((352_800, 0.50)))
         .unwrap();
     assert_eq!(s_hot.report().headroom.mode, HeadroomMode::ZeroDb);
-    assert!(
-        (s_hot.report().headroom.convolution_scale_db - (-1.5836)).abs() < 0.02,
-        "expected S_B ~= -1.584 dB, got {:.4}",
-        s_hot.report().headroom.convolution_scale_db
+    assert_eq!(
+        s_hot.report().headroom.convolution_scale_db,
+        0.0,
+        "Track B must not be attenuated for incoming gapless tail (Review #6 #1)"
     );
-    assert!(s_hot.report().headroom.reason.contains("incoming gapless tail"));
 
-    // Different-rate incoming tail (384k vs 352.8k) -> stays 0 dB, S_B = 0 dB.
+    // Different-rate incoming tail (384k vs 352.8k) -> stays 0 dB, S = 0 dB.
     let s_other_rate = rew_pipeline
         .start_track_with_tail_hint(spec_384, &quiet_tp, false, Some((352_800, 0.50)))
         .unwrap();
     assert_eq!(s_other_rate.report().headroom.mode, HeadroomMode::ZeroDb);
     assert_eq!(s_other_rate.report().headroom.convolution_scale_db, 0.0);
 
-    // Exercise `start_track_for_carryover` with `up_hist_peak` term:
-    // Track A (44.1k) ends loud so carry has conv_peak (~0.25) PLUS up_hist_peak (~0.55),
-    // pushing 0.60 + T > 1.0 -> MUST keep G_up = 0 dB and apply negative S_B!
+    // Exercise `start_track_for_carryover` with active REW + upsampler carryover:
+    // Track A (44.1k) ends loud so carry has conv_peak (~0.25) + up_hist_peak (~0.55).
+    // Track B MUST preserve its own ZeroDb + S=0 dB gain (never cutting all of Track B!).
     let mut sess_a = rew_pipeline
         .start_track(spec_44, &TrackPeakMetadata::default(), false)
         .unwrap();
@@ -307,25 +307,14 @@ fn incoming_gapless_rew_tail_demotes_active_convolver_only_and_preserves_null_co
         .unwrap();
     let (_, carry_a) = sess_a.flush_for_gapless().unwrap();
     let carry_a = carry_a.expect("expected carryover from 44.1k REW track");
-    assert!(
-        carry_a.convolver_tail_peak_linear() < 0.39,
-        "conv tail alone ({:.3}) should be under 1.0 - 0.60 = 0.40",
-        carry_a.convolver_tail_peak_linear()
-    );
-    assert!(
-        carry_a.convolver_tail_peak_linear() + carry_a.upsampler_history_peak_linear() > 0.40,
-        "conv + up_hist ({:.3} + {:.3}) must exceed 0.40",
-        carry_a.convolver_tail_peak_linear(),
-        carry_a.upsampler_history_peak_linear()
-    );
     let s_b_rew = rew_pipeline
         .start_track_for_carryover(spec_44, &quiet_tp, false, Some(&carry_a))
         .unwrap();
     assert_eq!(s_b_rew.report().headroom.mode, HeadroomMode::ZeroDb);
-    assert!(
-        s_b_rew.report().headroom.convolution_scale_db < -1.0,
-        "same-rate active-convolver carry where conv_peak + up_hist_peak pushes over 1.0 must apply negative S_B, got {:.3}",
-        s_b_rew.report().headroom.convolution_scale_db
+    assert_eq!(
+        s_b_rew.report().headroom.convolution_scale_db,
+        0.0,
+        "same-rate active-convolver carry must not cut Track B's whole-track gain (Review #6 #1)"
     );
 
     // Null-convolver pipeline (e.g. REW filter removed before native 352.8k Track B starts):
@@ -478,7 +467,11 @@ fn gapless_pipeline_sessions_eliminate_boundary_dip_and_drain_on_rate_change() {
     let carry_a = carry_a.expect("expected gapless carryover from 44.1 kHz upsampler");
 
     // Verify incompatible 48 kHz track rejects the 44.1 kHz carryover and drain_gapless_carryover
-    // recovers the exact missing upsampler tail so total Track A frames == n_a * 8.
+    // recovers Track A's full duration PLUS full zero-input FIR post-ringing decay (Review #6 #13).
+    let post_ring_a = carry_a
+        .upsampler
+        .as_ref()
+        .map_or(0, |u| u.taps_per_phase.saturating_sub(1).saturating_sub(u.pad_tail) * u.ratio);
     let mut sess_48 = pipeline.start_track(spec_48, &meta, false).unwrap();
     let rejected = sess_48
         .set_incoming_gapless_carryover(carry_a.clone())
@@ -487,8 +480,8 @@ fn gapless_pipeline_sessions_eliminate_boundary_dip_and_drain_on_rate_change() {
     assert_eq!(drained_a.sample_rate_hz, 352_800);
     assert_eq!(
         combined.len() + drained_a.frames.len(),
-        n_a * 8,
-        "draining unconsumed carryover must restore Track A's exact full length"
+        n_a * 8 + post_ring_a,
+        "draining unconsumed carryover must restore Track A's full length + FIR post-ring decay"
     );
 
     // Now test compatible 44.1 kHz Track B accepting carry_a.
@@ -623,6 +616,7 @@ fn same_output_rate_different_upsampler_ratio_hands_off_rew_tail_without_gap() {
         GaplessAttachOutcome::ConvolverOnlyHandoff {
             upsampler_tail_pcm,
             attached_convolver_tail,
+            ..
         } => (upsampler_tail_pcm, attached_convolver_tail),
         other => panic!("expected ConvolverOnlyHandoff for 44.1k->88.2k, got {other:?}"),
     };
@@ -1059,4 +1053,218 @@ fn headroom_design_issue7_14bit_zero_db_and_per_track_gapless_scale_continuity()
         (peak_b_echo - 0.25).abs() < 0.03,
         "Track A's carried REW echo inside Track B must preserve Track A's 0 dB scale (~0.25), got {peak_b_echo:.4}"
     );
+}
+
+#[test]
+fn review6_gapless_rew_pair_preserves_equal_gain_full_drain_decay_and_pre_dither_overs() {
+    use ap_dsp::quantize::StreamingQuantizer;
+    use std::f64::consts::PI;
+
+    // 1. Finding #1 [HIGH]: Continuous -1 dBFS 1 kHz sine split across Track A and Track B through
+    //    a dispersive REW convolver MUST keep Track B's gain identical to Track A (NEVER cut B by
+    //    -60 dB or -12 dB!) and render continuously with zero step vs one-shot.
+    let mut h_rew = vec![0.0_f64; 4096];
+    h_rew[0] = 0.85;
+    h_rew[1200] = 0.35;
+    h_rew[2600] = -0.25;
+    let ir_384 = Arc::new(
+        PreparedStereoIr::from_stereo_ir("rew-disp-384k", 384_000, &h_rew, &h_rew).unwrap(),
+    );
+    let spec_48_24 = StreamSpec {
+        sample_rate_hz: 48_000,
+        bits_per_sample: 24,
+        channels: 2,
+    };
+    let amp = 10.0_f64.powf(-1.0 / 20.0); // -1 dBFS
+    let n_half = 4096_usize;
+    let total_n = n_half * 2;
+    let full_sine: Vec<f64> = (0..total_n)
+        .map(|i| amp * (2.0 * PI * 1000.0 * (i as f64) / 48_000.0).sin())
+        .collect();
+    let meta = TrackPeakMetadata {
+        true_peak_linear: Some(amp),
+        ..TrackPeakMetadata::default()
+    };
+
+    struct LocalStaticIrFactory(Arc<PreparedStereoIr>);
+    impl StereoConvolverFactory for LocalStaticIrFactory {
+        fn create_for_rate(&self, rate_hz: u32) -> Result<Box<dyn StereoConvolver>, String> {
+            assert_eq!(rate_hz, self.0.sample_rate_hz);
+            Ok(Box::new(PartitionedStereoConvolver::new(Arc::clone(&self.0))))
+        }
+    }
+
+    for &arch in &[FilterArchetype::SimpleTest, FilterArchetype::GaussLongLp] {
+        let pipe = AudioPipeline::with_factories(
+            UpsamplerPolicy {
+                filter_override: Some(arch),
+                ..UpsamplerPolicy::default()
+            },
+            Box::new(LocalStaticIrFactory(Arc::clone(&ir_384))),
+            Box::new(NullChannelDelayerFactory),
+        )
+        .unwrap();
+
+        let oneshot = pipe
+            .process(
+                StereoF64Buffer {
+                    sample_rate_hz: 48_000,
+                    left: full_sine.clone(),
+                    right: full_sine.clone(),
+                },
+                spec_48_24,
+                &meta,
+                false,
+            )
+            .unwrap();
+
+        let mut sess_a = pipe.start_track(spec_48_24, &meta, false).unwrap();
+        let mut gap_frames = sess_a
+            .process_block(StereoF64Buffer {
+                sample_rate_hz: 48_000,
+                left: full_sine[..n_half].to_vec(),
+                right: full_sine[..n_half].to_vec(),
+            })
+            .unwrap()
+            .frames;
+        let (a_flush, carry_a) = sess_a.flush_for_gapless().unwrap();
+        gap_frames.extend(a_flush.frames);
+        let carry_a = carry_a.expect("expected carryover from Track A");
+
+        let mut sess_b = pipe
+            .start_track_for_carryover(spec_48_24, &meta, false, Some(&carry_a))
+            .unwrap();
+        assert!(
+            (sess_b.report().headroom.total_gain_db() - sess_a.report().headroom.total_gain_db())
+                .abs()
+                < 1e-9,
+            "{arch}: Track B gain ({:.2} dB) must equal Track A gain ({:.2} dB) on continuous REW pair!",
+            sess_b.report().headroom.total_gain_db(),
+            sess_a.report().headroom.total_gain_db(),
+        );
+        assert!(
+            (sess_b.report().headroom.convolution_scale_db
+                - sess_a.report().headroom.convolution_scale_db)
+                .abs()
+                < 1e-9,
+            "{arch}: Track B S ({:.2} dB) must equal Track A S ({:.2} dB)!",
+            sess_b.report().headroom.convolution_scale_db,
+            sess_a.report().headroom.convolution_scale_db,
+        );
+
+        let outcome = pipe.attach_gapless_carryover(&mut sess_b, carry_a).unwrap();
+        assert!(matches!(outcome, GaplessAttachOutcome::FullHandoff));
+
+        gap_frames.extend(
+            sess_b
+                .process_block(StereoF64Buffer {
+                    sample_rate_hz: 48_000,
+                    left: full_sine[n_half..].to_vec(),
+                    right: full_sine[n_half..].to_vec(),
+                })
+                .unwrap()
+                .frames,
+        );
+        gap_frames.extend(sess_b.flush().unwrap().frames);
+
+        assert_eq!(gap_frames.len(), oneshot.pcm.frames.len());
+        let max_diff = gap_frames
+            .iter()
+            .zip(oneshot.pcm.frames.iter())
+            .map(|(g, o)| ((g[0] as f64) - (o[0] as f64)).abs() / 2_147_483_648.0)
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_diff < 1e-5,
+            "{arch}: gapless REW pair must match one-shot continuously (max_diff={max_diff:.6})"
+        );
+    }
+
+    // 2. Finding #13 [LOW]: drain_gapless_carryover matches continuous zero-input render across
+    //    the FULL FIR decay (no -54 dBFS truncation past exact_flush_len).
+    for &arch in &[FilterArchetype::SimpleTest, FilterArchetype::GaussLongLp] {
+        let pipe = AudioPipeline::new(UpsamplerPolicy {
+            filter_override: Some(arch),
+            shaper_override: Some(NoiseShaperProfile::TpdfDither),
+            ..UpsamplerPolicy::default()
+        })
+        .unwrap();
+        let n_a = 2048_usize;
+        let a_sig: Vec<f64> = (0..n_a)
+            .map(|i| {
+                0.4 * (2.0 * PI * 60.0 * (i as f64) / 48_000.0).sin()
+                    + 0.4 * (2.0 * PI * 1000.0 * (i as f64) / 48_000.0).sin()
+            })
+            .collect();
+
+        // Continuous A followed by zeros (zero-input continuation).
+        let mut cont_sig = a_sig.clone();
+        cont_sig.resize(n_a + 1024, 0.0);
+        let mut s_cont = pipe.start_track(spec_48_24, &meta, false).unwrap();
+        let mut cont_frames = s_cont
+            .process_block(StereoF64Buffer {
+                sample_rate_hz: 48_000,
+                left: cont_sig.clone(),
+                right: cont_sig,
+            })
+            .unwrap()
+            .frames;
+        cont_frames.extend(s_cont.flush().unwrap().frames);
+
+        // Split A -> drain_gapless_carryover.
+        let mut s_a = pipe.start_track(spec_48_24, &meta, false).unwrap();
+        let mut drain_frames = s_a
+            .process_block(StereoF64Buffer {
+                sample_rate_hz: 48_000,
+                left: a_sig.clone(),
+                right: a_sig,
+            })
+            .unwrap()
+            .frames;
+        let (fl_a, carry_a) = s_a.flush_for_gapless().unwrap();
+        drain_frames.extend(fl_a.frames);
+        let (drained, _stats) = pipe
+            .drain_gapless_carryover_with_stats(carry_a.unwrap())
+            .unwrap();
+        drain_frames.extend(drained.frames);
+
+        // Compare every sample of the drained output against the continuous zero-input render.
+        let cmp_len = drain_frames.len().min(cont_frames.len());
+        let max_diff = drain_frames[..cmp_len]
+            .iter()
+            .zip(cont_frames[..cmp_len].iter())
+            .map(|(d, c)| ((d[0] as f64) - (c[0] as f64)).abs() / 2_147_483_648.0)
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_diff < 1e-5,
+            "{arch}: drain_gapless_carryover must match continuous zero-input FIR decay (max_diff={max_diff:.6})"
+        );
+    }
+
+    // 3. Finding #18 [LOW]: StreamingQuantizer counts overs BEFORE adding TPDF dither so a
+    //    representable 0 dBFS signal (`max_int / levels`) records 0 overs.
+    for &bits in &[16_u8, 24_u8] {
+        let levels = (1_u64 << (bits - 1)) as f64;
+        let max_rep = (((1_i64 << (bits - 1)) - 1) as f64) / levels;
+        let mut q = StreamingQuantizer::new(NoiseShaperProfile::TpdfDither, bits).unwrap();
+        let _ = q.quantize_block(&StereoF64Buffer {
+            sample_rate_hz: 48_000,
+            left: vec![max_rep; 10_000],
+            right: vec![-1.0; 10_000],
+        });
+        assert_eq!(
+            q.stats().overs_count,
+            0,
+            "{bits}-bit representable full-scale samples must record 0 pre-dither overs, got {}",
+            q.stats().overs_count
+        );
+
+        // Actual > 0 dBFS over (+1.5 LSB above max_int) IS still counted.
+        let over_val = (((1_i64 << (bits - 1)) as f64) + 0.5) / levels;
+        let _ = q.quantize_block(&StereoF64Buffer {
+            sample_rate_hz: 48_000,
+            left: vec![over_val; 4],
+            right: vec![0.0; 4],
+        });
+        assert_eq!(q.stats().overs_count, 4);
+    }
 }

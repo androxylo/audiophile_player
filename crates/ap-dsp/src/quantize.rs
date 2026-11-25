@@ -49,6 +49,15 @@ impl QuantizerStats {
             f64::NEG_INFINITY
         }
     }
+
+    /// Merge statistics from a secondary quantizer (e.g. gapless tail drain / handoff)
+    /// into this report (Review #6 Finding #18).
+    pub fn merge(&mut self, other: QuantizerStats) {
+        self.overs_count = self.overs_count.saturating_add(other.overs_count);
+        if other.max_pre_quant_peak > self.max_pre_quant_peak {
+            self.max_pre_quant_peak = other.max_pre_quant_peak;
+        }
+    }
 }
 
 /// Stateful streaming `f64 -> i32` quantizer preserving continuous dither/shaper state across blocks.
@@ -126,14 +135,20 @@ impl StreamingQuantizer {
                 self.stats.max_pre_quant_peak = peak;
             }
 
-            let raw_l = (sl * levels + dl).round();
-            if raw_l > max_int || raw_l < min_int {
+            // Review #6 Finding #18: count overs strictly BEFORE adding TPDF dither so a
+            // representable full-scale sample (`max_int / levels` = 0 dBFS) never triggers
+            // spurious `[clip warn]` or false `M` write-backs from +1 LSB dither excursions.
+            let scaled_l = sl * levels;
+            if scaled_l > max_int || scaled_l < min_int {
                 self.stats.overs_count += 1;
             }
-            let raw_r = (sr * levels + dr).round();
-            if raw_r > max_int || raw_r < min_int {
+            let scaled_r = sr * levels;
+            if scaled_r > max_int || scaled_r < min_int {
                 self.stats.overs_count += 1;
             }
+
+            let raw_l = (scaled_l + dl).round();
+            let raw_r = (scaled_r + dr).round();
 
             let ql = raw_l.clamp(min_int, max_int) as i32;
             let qr = raw_r.clamp(min_int, max_int) as i32;

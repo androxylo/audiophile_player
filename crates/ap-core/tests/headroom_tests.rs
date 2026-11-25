@@ -553,3 +553,53 @@ fn headroom_design_issue7_complete_stage1_stage2_truth_tables_and_tag_realism() 
     assert_eq!(d_m.mode, HeadroomMode::ZeroDb);
     assert!((d_m.convolution_scale_db - (-4.0206)).abs() < 0.01);
 }
+
+#[test]
+fn review6_16bit_rounded_sample_peak_tags_stay_sample_peak_and_keep_isp_reserve() {
+    use ap_core::headroom::select_headroom_for_bits;
+
+    // Review #6 Finding #14: 6-7 decimal rounded 32767-normalised 16-bit full-scale tags
+    // (`1.000031` / `1.0000306`, from HEADROOM_DESIGN.md §2) must stay `SamplePeak` (A_isp = 3 dB),
+    // NOT misclassify as `TruePeak` (A_isp = 0 dB).
+    for &rounded in &[1.000_030_6_f64, 1.000_031_f64] {
+        let meta = TrackPeakMetadata {
+            replaygain_track_peak: Some(rounded),
+            ..TrackPeakMetadata::default()
+        };
+        let cp = meta
+            .classified_peak_for_bits(16)
+            .expect("rounded 16-bit full-scale sample peak must be valid");
+        assert_eq!(
+            cp.kind,
+            PeakKind::SamplePeak,
+            "16-bit tag {rounded} must remain SamplePeak"
+        );
+        let d = select_headroom_for_bits(&meta, 16, false, Some(3.0), None);
+        assert_eq!(d.mode, HeadroomMode::Minus3Db);
+        assert!(
+            (d.convolution_scale_db - (-3.0)).abs() < 0.01,
+            "16-bit sample peak {rounded} with +3 dB REW must receive S=-3 dB (not 0 dB), got {:.3}",
+            d.convolution_scale_db
+        );
+    }
+
+    // Album peak gets the same rounding tolerance.
+    let album_rounded = TrackPeakMetadata {
+        replaygain_album_peak: Some(1.000_031),
+        ..TrackPeakMetadata::default()
+    };
+    assert_eq!(
+        album_rounded.classified_peak_for_bits(16).unwrap().kind,
+        PeakKind::SamplePeak
+    );
+
+    // Genuine above-FS true-peak values (e.g. 1.001 = +0.009 dBTP) still promote to TruePeak.
+    let genuine_isp = TrackPeakMetadata {
+        replaygain_track_peak: Some(1.001),
+        ..TrackPeakMetadata::default()
+    };
+    assert_eq!(
+        genuine_isp.classified_peak_for_bits(16).unwrap().kind,
+        PeakKind::TruePeak
+    );
+}

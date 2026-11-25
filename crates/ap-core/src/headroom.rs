@@ -43,6 +43,11 @@ pub const MAX_REALISTIC_TRUE_PEAK_DB: f64 = 6.020_599_913_279_624;
 /// (`track_peak <= album_peak` and `true_peak >= sample_peak`).
 pub const PEAK_TAG_ROUNDING_TOLERANCE: f64 = 0.005;
 
+/// Relative tag-rounding slack (`1e-5`, ~0.00009 dB) applied above `2^(b-1) / (2^(b-1) - 1)`
+/// so 6–7 decimal ReplayGain sample-peak tags (e.g. `1.000031` / `1.0000306` at 16-bit) stay
+/// classified as `SamplePeak` (preserving `A_isp = 3 dB`, Review #6 Finding #14).
+pub const SAMPLE_PEAK_UPPER_ROUNDING_TOLERANCE: f64 = 1e-5;
+
 /// Minimum realistic peak (`-120.0 dBFS`); values below this are treated as corrupted/unknown.
 pub const MIN_REALISTIC_PEAK_DB: f64 = -120.0;
 
@@ -251,7 +256,7 @@ impl TrackPeakMetadata {
                     return None;
                 }
                 if let Some(dbfs) = realistic_dbfs_for_bits(p, bits_per_sample) {
-                    let kind = if p > sp_upper + 1e-9 {
+                    let kind = if p > sp_upper * (1.0 + SAMPLE_PEAK_UPPER_ROUNDING_TOLERANCE) {
                         PeakKind::TruePeak
                     } else {
                         PeakKind::SamplePeak
@@ -273,7 +278,7 @@ impl TrackPeakMetadata {
                     return None;
                 }
                 if let Some(dbfs) = realistic_dbfs_for_bits(p, bits_per_sample) {
-                    let kind = if p > sp_upper + 1e-9 {
+                    let kind = if p > sp_upper * (1.0 + SAMPLE_PEAK_UPPER_ROUNDING_TOLERANCE) {
                         PeakKind::TruePeak
                     } else {
                         PeakKind::SamplePeak
@@ -461,12 +466,14 @@ pub fn select_headroom_for_bits(
 }
 
 /// Apply `HEADROOM_DESIGN.md` §4 gapless tail-overlap scaling (`S_B`) for Track B without ever
-/// altering Stage-1 `G_up` (Review #5 Finding #3).
+/// altering Stage-1 `G_up`.
 ///
-/// Computes `B_out = M + G_up` (when `full_scan_post_chain_peak_db` is present) or
-/// `B_out = P + A_isp + G_up + max(G_c, 0)`,
-/// `T = conv_tail_peak + up_hist_peak * 10^(max(G_c, 0)/20)`,
-/// and `S_B = min(0, -B_out, 20*log10(max(1 - T, 1e-3)) - B_out)`.
+/// NOTE (Review #6 Finding #1): `up_hist_peak` is the continuing LTI upsampler signal from Track A,
+/// NOT an additive signal on top of Track B — summing it into `T` drove `T >= 1.0` and cut all of
+/// Track B by `-60 dB` on every normal-level gapless REW transition. It is therefore excluded from
+/// `total_tail`, and [`ap_dsp::AudioPipeline`] no longer applies whole-track `S_B` attenuation on
+/// gapless REW transitions (keeping Track B's gain equal to Track A on continuous material and
+/// relying on the pre-dither quantizer overs backstop).
 #[allow(clippy::too_many_arguments)]
 pub fn apply_gapless_tail_headroom(
     base: &mut HeadroomDecision,
@@ -476,15 +483,14 @@ pub fn apply_gapless_tail_headroom(
     conv_max_boost_db: f64,
     full_scan_post_chain_peak_db: Option<f64>,
     conv_tail_peak: f64,
-    up_hist_peak: f64,
+    _up_hist_peak: f64,
 ) {
     let g_c_pos = if conv_max_boost_db.is_finite() && conv_max_boost_db > 0.0 {
         conv_max_boost_db
     } else {
         0.0
     };
-    let g_c_lin = 10.0_f64.powf(g_c_pos / 20.0);
-    let total_tail = conv_tail_peak.max(0.0) + up_hist_peak.max(0.0) * g_c_lin;
+    let total_tail = conv_tail_peak.max(0.0);
     if !total_tail.is_finite() || total_tail <= 1e-6 {
         return;
     }

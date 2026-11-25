@@ -15,8 +15,7 @@ use ap_core::buffer::{InterleavedInt32Buffer, StereoF64Buffer};
 use ap_core::config::ConvolutionConfig;
 use ap_core::format::StreamSpec;
 use ap_core::headroom::{
-    HeadroomDecision, HeadroomMode, TrackPeakMetadata, apply_gapless_tail_headroom,
-    select_headroom_for_bits,
+    HeadroomDecision, HeadroomMode, TrackPeakMetadata, select_headroom_for_bits,
 };
 
 use crate::convolution::{
@@ -83,6 +82,8 @@ pub enum GaplessAttachOutcome {
         /// True iff a non-empty REW convolution tail was actually attached to Track B (false when
         /// REW convolution is inactive and only upsampler history was drained onto Track A).
         attached_convolver_tail: bool,
+        /// Quantizer peak/over statistics from draining Track A's upsampler tail (Review #6 #18).
+        upsampler_tail_stats: QuantizerStats,
     },
     /// Output sample rate changed (e.g. `352.8k -> 384k`) or Track B's convolver cannot accept a
     /// carried REW tail (e.g. `NullConvolver` after filter removal): nothing was attached to
@@ -476,34 +477,22 @@ impl AudioPipeline {
         };
         // Review #5 Findings #14 & #16: pass source `bits_per_sample` AND `Some(conv_boost_db)`
         // (0.0 for NullConvolver) so realistic true peaks > +3 dBTP still receive `S`.
-        let mut headroom = select_headroom_for_bits(
+        //
+        // Review #6 Finding #1: Do NOT attenuate all of Track B with a gapless `S_B` cut for
+        // carried upsampler history or REW tails. In `FullHandoff`, Track A's upsampler history
+        // and REW overlap tail are the LTI continuation of one stream; attenuating Track B by
+        // `S_B` drove Track B down by up to `-60 dB` with an audible step on every gapless REW
+        // transition. Each track keeps its own `select_headroom_for_bits` gain (matching Track A
+        // on continuous equal-level material), with the pre-dither quantizer overs counter as
+        // the clipping backstop.
+        let _ = incoming_tail_hint;
+        let headroom = select_headroom_for_bits(
             peak_meta,
             spec.bits_per_sample,
             is_streaming_source,
             Some(conv_boost_db),
             None,
         );
-
-        // Review #5 Finding #3: exact `HEADROOM_DESIGN.md` §4 gapless tail-overlap scaling (`S_B`)
-        // across ALL modes (`0 dB` and `-3 dB`), preserving Stage-1 `G_up` strictly from `P`.
-        if convolver.accepts_tail() {
-            if let Some((tail_rate_hz, conv_tail_peak, up_hist_peak, _has_conv_tail)) =
-                incoming_tail_hint
-            {
-                if tail_rate_hz == dsp_plan.target_rate_hz {
-                    apply_gapless_tail_headroom(
-                        &mut headroom,
-                        peak_meta,
-                        spec.bits_per_sample,
-                        is_streaming_source,
-                        conv_boost_db,
-                        None,
-                        conv_tail_peak,
-                        up_hist_peak,
-                    );
-                }
-            }
-        }
 
         // Scale `S` / `S_B` is folded into Stage 1's linear f64 gain (Finding #4 & #14), so
         // the convolver itself runs at unity scale (1.0) and carried tails always match Track A.
@@ -592,8 +581,26 @@ impl AudioPipeline {
             Err(mut rejected) => {
                 let mut frames = Vec::new();
                 let mut attached_convolver_tail = false;
+                let mut tail_stats = QuantizerStats::default();
                 if let Some(up_carry) = rejected.upsampler.take() {
-                    let up_tail_f64 = up_carry.flush_to_f64();
+                    let exact_len = up_carry.exact_flush_len();
+                    let up_tail_full = up_carry.flush_to_f64();
+                    let split_at = exact_len.min(up_tail_full.left.len());
+                    let up_tail_exact = StereoF64Buffer {
+                        sample_rate_hz: up_tail_full.sample_rate_hz,
+                        left: up_tail_full.left[..split_at].to_vec(),
+                        right: up_tail_full.right[..split_at].to_vec(),
+                    };
+                    let up_post_ring = if split_at < up_tail_full.left.len() {
+                        Some(StereoF64Buffer {
+                            sample_rate_hz: up_tail_full.sample_rate_hz,
+                            left: up_tail_full.left[split_at..].to_vec(),
+                            right: up_tail_full.right[split_at..].to_vec(),
+                        })
+                    } else {
+                        None
+                    };
+
                     let mut conv = self.convolver_factory.create_for_rate(rate)?;
                     if let Some(conv_tail) = rejected.convolver.take() {
                         conv.set_incoming_tail(conv_tail);
@@ -602,8 +609,8 @@ impl AudioPipeline {
                     let mut quantizer =
                         StreamingQuantizer::new(rejected.effective_shaper, rejected.output_bits)?;
 
-                    if !up_tail_f64.is_empty() {
-                        let c_out = conv.process_block(up_tail_f64)?;
+                    if !up_tail_exact.is_empty() {
+                        let c_out = conv.process_block(up_tail_exact)?;
                         if !c_out.is_empty() {
                             let d_out = delayer.process_block(c_out)?;
                             if !d_out.is_empty() {
@@ -612,7 +619,7 @@ impl AudioPipeline {
                         }
                     }
 
-                    let (conv_immediate, updated_tail) = conv.flush_split_tail()?;
+                    let (conv_immediate, mut updated_tail) = conv.flush_split_tail()?;
                     if !conv_immediate.is_empty() {
                         let d_out = delayer.process_block(conv_immediate)?;
                         if !d_out.is_empty() {
@@ -623,6 +630,53 @@ impl AudioPipeline {
                     if !delay_tail.is_empty() {
                         frames.extend(quantizer.quantize_block(&delay_tail).frames);
                     }
+                    tail_stats = quantizer.stats();
+
+                    // Review #6 Finding #13: preserve Track A's post-ringing FIR decay past
+                    // `exact_len` by convolving it and overlap-adding onto the incoming tail of
+                    // Track B (when Track B accepts a convolver tail) without shifting Track B.
+                    if let Some(post_ring) = up_post_ring {
+                        if session.accepts_convolver_tail() && !post_ring.is_empty() {
+                            if let Ok(mut post_conv) = self.convolver_factory.create_for_rate(rate)
+                            {
+                                if post_conv.accepts_tail() {
+                                    if let Ok(mut p_out) = post_conv.process_block(post_ring) {
+                                        if let Ok(p_tail) = post_conv.flush() {
+                                            p_out.left.extend_from_slice(&p_tail.left);
+                                            p_out.right.extend_from_slice(&p_tail.right);
+                                        }
+                                        if !p_out.is_empty() {
+                                            match &mut updated_tail {
+                                                Some(t) => {
+                                                    if p_out.left.len() > t.left.len() {
+                                                        t.left.resize(p_out.left.len(), 0.0);
+                                                        t.right.resize(p_out.right.len(), 0.0);
+                                                    }
+                                                    for (i, (&l, &r)) in p_out
+                                                        .left
+                                                        .iter()
+                                                        .zip(p_out.right.iter())
+                                                        .enumerate()
+                                                    {
+                                                        t.left[i] += l;
+                                                        t.right[i] += r;
+                                                    }
+                                                }
+                                                None => {
+                                                    updated_tail = Some(ConvolutionTail {
+                                                        sample_rate_hz: rate,
+                                                        left: p_out.left,
+                                                        right: p_out.right,
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     if let Some(tail) = updated_tail {
                         if !tail.left.is_empty() && session.accepts_convolver_tail() {
                             session.set_incoming_convolver_tail(tail);
@@ -642,6 +696,7 @@ impl AudioPipeline {
                         frames,
                     },
                     attached_convolver_tail,
+                    upsampler_tail_stats: tail_stats,
                 })
             }
         }
@@ -657,9 +712,23 @@ impl AudioPipeline {
         &self,
         carryover: GaplessCarryover,
     ) -> Result<InterleavedInt32Buffer, String> {
+        self.drain_gapless_carryover_with_stats(carryover)
+            .map(|(pcm, _)| pcm)
+    }
+
+    /// Drain an unconsumed [`GaplessCarryover`] and also return the drain quantizer's
+    /// [`QuantizerStats`] so callers can merge tail overs/peak into the track's report
+    /// (Review #6 Finding #18).
+    pub fn drain_gapless_carryover_with_stats(
+        &self,
+        carryover: GaplessCarryover,
+    ) -> Result<(InterleavedInt32Buffer, QuantizerStats), String> {
         let rate = carryover.output_rate_hz;
         if carryover.is_empty() {
-            return Ok(InterleavedInt32Buffer::empty(rate));
+            return Ok((
+                InterleavedInt32Buffer::empty(rate),
+                QuantizerStats::default(),
+            ));
         }
 
         let mut delayer = self.delayer_factory.create_for_rate(rate)?;
@@ -726,10 +795,14 @@ impl AudioPipeline {
             frames.extend(quantizer.quantize_block(&delay_tail).frames);
         }
 
-        Ok(InterleavedInt32Buffer {
-            sample_rate_hz: rate,
-            frames,
-        })
+        let stats = quantizer.stats();
+        Ok((
+            InterleavedInt32Buffer {
+                sample_rate_hz: rate,
+                frames,
+            },
+            stats,
+        ))
     }
 
     /// Convenience one-shot helper for small test buffers (delegates directly to `start_track`).

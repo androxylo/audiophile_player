@@ -585,7 +585,8 @@ fn test_5_chunk_invariance_gapless_splice_and_filter_identity_mismatch_rejection
         gap_r.extend(tail_a.right);
         let carry_a = carry_a.expect("expected carryover from Gaussian upsampler");
 
-        // Verify standalone drain of Track A's carryover equals one-shot Track A bit-for-bit.
+        // Verify standalone drain of Track A's carryover matches one-shot Track A bit-for-bit
+        // over `exact_flush_len()` AND continues the full zero-input FIR decay beyond it (#13).
         let oneshot_a = run_oneshot_upsampler(
             build_upsampler(&plan).unwrap().as_mut(),
             StereoF64Buffer {
@@ -594,9 +595,11 @@ fn test_5_chunk_invariance_gapless_splice_and_filter_identity_mismatch_rejection
                 right: right[..n_a].to_vec(),
             },
         );
+        let exact_tail_len = carry_a.exact_flush_len();
         let drained_a = carry_a.clone().flush_to_f64();
-        assert_eq!(gap_l.len() + drained_a.len(), oneshot_a.len());
-        assert_eq!(&drained_a.left[..], &oneshot_a.left[gap_l.len()..]);
+        assert_eq!(gap_l.len() + exact_tail_len, oneshot_a.len());
+        assert!(drained_a.len() >= exact_tail_len);
+        assert_eq!(&drained_a.left[..exact_tail_len], &oneshot_a.left[gap_l.len()..]);
 
         // Hand carryover to equal-filter Track B.
         let mut up_b = build_upsampler(&plan).unwrap();

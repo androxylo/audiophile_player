@@ -80,9 +80,20 @@ impl UpsamplerCarryover {
         max_l.max(max_r)
     }
 
+    /// Output length corresponding to [`Upsampler::flush`] (i.e. exact `total_in_frames * ratio`
+    /// duration without the post-ringing zero-input FIR decay tail).
+    pub fn exact_flush_len(&self) -> usize {
+        self.pad_tail * self.ratio
+    }
+
     /// Flush the carried unpadded FIR history against trailing zeros into `f64` samples using the
     /// EXACT polyphase bank that generated this carryover (used when a gapless sequence ends,
     /// switches sample rate/filter identity, or encounters an error).
+    ///
+    /// Pads by the full `taps_per_phase - 1` zeros (Review #6 Finding #13) so the entire FIR
+    /// zero-input decay tail rings down cleanly to zero — matching a continuous zero-input render
+    /// bit-for-bit across the full impulse support, with the first [`Self::exact_flush_len`]
+    /// samples matching [`Upsampler::flush`] bit-for-bit.
     pub fn flush_to_f64(mut self) -> StereoF64Buffer {
         if self.hist_l.is_empty()
             || self.ratio == 0
@@ -91,9 +102,10 @@ impl UpsamplerCarryover {
         {
             return StereoF64Buffer::empty(self.target_rate_hz);
         }
-        if self.pad_tail > 0 {
-            self.hist_l.resize(self.hist_l.len() + self.pad_tail, 0.0_f64);
-            self.hist_r.resize(self.hist_r.len() + self.pad_tail, 0.0_f64);
+        let full_pad = self.taps_per_phase.saturating_sub(1);
+        if full_pad > 0 {
+            self.hist_l.resize(self.hist_l.len() + full_pad, 0.0_f64);
+            self.hist_r.resize(self.hist_r.len() + full_pad, 0.0_f64);
         }
         let (left, right) = convolve_polyphase_bank(
             &self.bank,

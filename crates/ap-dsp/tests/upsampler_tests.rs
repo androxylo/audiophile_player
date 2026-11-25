@@ -509,7 +509,8 @@ fn gapless_upsampler_carryover_matches_oneshot_bit_for_bit_across_track_boundary
     out_r.extend_from_slice(&tail_a.right);
     let carry_a = carry_a.expect("expected unpadded FIR carryover from track A");
 
-    // Verify draining carry_a directly matches one-shot flush of Track A alone.
+    // Verify draining carry_a directly matches one-shot flush of Track A over exact_flush_len
+    // AND reproduces the full zero-input FIR decay beyond it (Review #6 Finding #13).
     let oneshot_a = run_oneshot(
         &plan,
         StereoF64Buffer {
@@ -518,9 +519,11 @@ fn gapless_upsampler_carryover_matches_oneshot_bit_for_bit_across_track_boundary
             right: right_all[..n_a].to_vec(),
         },
     );
+    let exact_tail_len = carry_a.exact_flush_len();
     let drained_a = carry_a.clone().flush_to_f64();
-    assert_eq!(out_l.len() + drained_a.len(), oneshot_a.len());
-    for (i, &v) in drained_a.left.iter().enumerate() {
+    assert_eq!(out_l.len() + exact_tail_len, oneshot_a.len());
+    assert!(drained_a.len() >= exact_tail_len);
+    for (i, &v) in drained_a.left[..exact_tail_len].iter().enumerate() {
         assert_eq!(v, oneshot_a.left[out_l.len() + i]);
     }
 
