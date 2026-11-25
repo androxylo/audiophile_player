@@ -434,19 +434,20 @@ impl AudioPipeline {
 
         let dsp_plan = self.picker.select(&source_info);
         let upsampler = build_upsampler(&dsp_plan)?;
-        let convolver = self
+        let mut convolver = self
             .convolver_factory
             .create_for_rate(dsp_plan.target_rate_hz)?;
         let delayer = self
             .delayer_factory
             .create_for_rate(dsp_plan.target_rate_hz)?;
 
-        let active_conv_gain_db = if convolver.name() != "null-convolver" {
-            Some(convolver.peak_gain_bound_db())
+        let active_conv_gain_db = if convolver.accepts_tail() {
+            Some(convolver.max_boost_db())
         } else {
             None
         };
-        let mut headroom = select_headroom(peak_meta, is_streaming_source, active_conv_gain_db, None);
+        let mut headroom =
+            select_headroom(peak_meta, is_streaming_source, active_conv_gain_db, None);
 
         // If an equal-rate decaying REW tail from the previous track will overlap-add onto this
         // track's opening (either via full handoff or convolver-only handoff), ensure
@@ -488,6 +489,8 @@ impl AudioPipeline {
                 }
             }
         }
+
+        convolver.set_output_scale(headroom.convolution_scale_linear());
 
         let untouched_native = dsp_plan.filter == FilterArchetype::Null
             && headroom.mode == HeadroomMode::ZeroDb

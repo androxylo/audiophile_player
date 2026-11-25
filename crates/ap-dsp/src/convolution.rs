@@ -12,15 +12,12 @@
 //! including full `2^22 = 4,194,304`-tap REW filters at `352.8 / 384 kHz` with bit-exact
 //! streaming equivalence across arbitrary block sizes.
 //!
-//! At IR load time, peak frequency magnitude `max |H(f)|` is measured with a `>= 2x` zero-padded
-//! real FFT across both channels. Any IR with `max |H(f)| > 1.0` (`> 0 dB`) is **auto-normalized
-//! down to `0 dB` steady-state** (applying the same scale factor to both channels to preserve L/R
-//! balance) and logged once on first load. Steady-state `<= 0 dB` IRs are never attenuated by
-//! their time-domain L1 norm so the strict `-3 dB` / `0 dB` headroom policy (`REQUIREMENTS.md`
-//! §5.2) is preserved with zero variable gain attenuation. The post-normalization time-domain L1
-//! norm (`sum |h[n]|`) is computed as a conservative peak bound for `0 dB` headroom gating in
-//! `ap_core::headroom`; in `-3 dB` mode, fixed `-3 dB` headroom protects real-world transients
-//! and the final quantizer saturates cleanly without wraparound on adversarial worst-case impulses.
+//! Per the decided headroom design (`HEADROOM_DESIGN.md`), REW impulse responses are **never
+//! normalized at load time** so positive EQ boosts fill hardware/room dips on purpose. Peak
+//! frequency magnitude `G_c = max |H(f)|` is measured with a `>= 2x` zero-padded real FFT across
+//! both channels (uncapped), and per-track convolution output is scaled in `f64` **only** by the
+//! excess of `P + A_isp + G_up + max(G_c, 0)` over `0 dBFS` (or `M + G_up` when a full-scan peak
+//! `M` exists). Time-domain `L1` (`sum |h[n]|`) is computed for diagnostic logging only.
 //!
 //! ## Configuration & Folder Discovery
 //! Convolution is **disabled by default** ([`ConvolutionConfig::disabled()`]) until explicitly
@@ -105,20 +102,26 @@ pub trait StereoConvolver: Send {
         self.name().to_string()
     }
 
-    /// Post-normalization maximum positive frequency-domain gain boost (`>= 0.0 dB`).
+    /// Maximum positive frequency-domain gain boost `max(G_c, 0)` in dB (uncapped).
     ///
-    /// For [`PartitionedStereoConvolver`], any loaded IR exceeding `0 dB` is auto-normalized down
-    /// to `0 dB` at load time, so this returns `0.0`.
+    /// REW IRs are never normalized at load so filter boosts fill hardware dips on purpose;
+    /// per-track convolution scaling is computed solely from the excess over `0 dBFS`.
     fn max_boost_db(&self) -> f64;
 
-    /// Conservative time-domain worst-case gain margin (`>= max_boost_db()`, in dB) derived from
-    /// the filter's L1 norm (`20 * log10(max(sum|h_L|, sum|h_R|))`, clamped `>= 0.0`).
-    ///
-    /// Fed into `ap_core::headroom::select_headroom` so `0 dB` mode is only chosen when a track's
-    /// verified peak headroom also covers phase-aligned transient crest-factor growth.
+    /// Frequency-domain peak gain bound `max(G_c, 0)` in dB (L1 is diagnostic only).
     fn peak_gain_bound_db(&self) -> f64 {
         self.max_boost_db()
     }
+
+    /// True if this convolver actively consumes and overlap-adds an incoming [`ConvolutionTail`].
+    /// (`false` for [`NullConvolver`], `true` for [`PartitionedStereoConvolver`].)
+    fn accepts_tail(&self) -> bool {
+        false
+    }
+
+    /// Apply per-track excess-only linear attenuation (`<= 1.0`, never boosts) to this track's
+    /// newly convolved `f64` output without altering any already-scaled incoming tail.
+    fn set_output_scale(&mut self, _scale_linear: f64) {}
 
     /// Attach a residual impulse tail from the previous equal-rate track to overlap-add onto this
     /// track's opening output in `f64` (strictly before delay & final quantization).
@@ -517,20 +520,21 @@ fn is_newer_candidate(
     }
 }
 
-/// Auto-discover the **most recent 2-channel `.wav` by filesystem modification time (`mtime`)**
-/// in `dir` matching `target_rate_hz`, along with any `.wav` files whose header probe failed.
-pub fn discover_latest_rew_wav_with_diagnostics(
+/// Discover all rate-matched 2-channel `.wav` candidates in `dir` sorted newest-to-oldest by
+/// filesystem modification time (`mtime`, tie-breaking by filename), along with any unreadable or
+/// 0-frame rate-matched `.wav` files skipped during probing.
+fn discover_rew_wav_candidates_sorted(
     dir: &Path,
     target_rate_hz: u32,
-) -> Result<(Option<DiscoveredRewFilter>, Vec<SkippedRewWav>), String> {
+) -> Result<(Vec<DiscoveredRewFilter>, Vec<SkippedRewWav>), String> {
     if !dir.exists() {
-        return Ok((None, Vec::new()));
+        return Ok((Vec::new(), Vec::new()));
     }
 
     let entries = fs::read_dir(dir)
         .map_err(|e| format!("failed to scan REW filter directory '{}': {e}", dir.display()))?;
 
-    let mut best: Option<DiscoveredRewFilter> = None;
+    let mut candidates: Vec<DiscoveredRewFilter> = Vec::new();
     let mut skipped: Vec<SkippedRewWav> = Vec::new();
 
     for entry in entries.flatten() {
@@ -563,31 +567,48 @@ pub fn discover_latest_rew_wav_with_diagnostics(
                 continue;
             }
         };
-        if header.channels != 2 || header.sample_rate_hz != target_rate_hz || header.num_frames == 0
-        {
+        if header.channels != 2 || header.sample_rate_hz != target_rate_hz {
+            continue;
+        }
+        if header.num_frames == 0 {
+            skipped.push(SkippedRewWav {
+                path,
+                modified,
+                reason: "0 frames / unfinalized export".to_string(),
+            });
             continue;
         }
 
-        let candidate = DiscoveredRewFilter {
+        candidates.push(DiscoveredRewFilter {
             path,
             modified,
             file_len: meta.len(),
             header,
-        };
-
-        let is_newer = match &best {
-            None => true,
-            Some(prev) => {
-                is_newer_candidate(candidate.modified, &candidate.path, prev.modified, &prev.path)
-            }
-        };
-
-        if is_newer {
-            best = Some(candidate);
-        }
+        });
     }
 
-    Ok((best, skipped))
+    candidates.sort_by(|a, b| {
+        if is_newer_candidate(a.modified, &a.path, b.modified, &b.path) {
+            std::cmp::Ordering::Less
+        } else if is_newer_candidate(b.modified, &b.path, a.modified, &a.path) {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    });
+
+    Ok((candidates, skipped))
+}
+
+/// Auto-discover the **most recent 2-channel `.wav` by filesystem modification time (`mtime`)**
+/// in `dir` matching `target_rate_hz`, along with any `.wav` files whose header probe failed or
+/// contained 0 frames.
+pub fn discover_latest_rew_wav_with_diagnostics(
+    dir: &Path,
+    target_rate_hz: u32,
+) -> Result<(Option<DiscoveredRewFilter>, Vec<SkippedRewWav>), String> {
+    let (candidates, skipped) = discover_rew_wav_candidates_sorted(dir, target_rate_hz)?;
+    Ok((candidates.into_iter().next(), skipped))
 }
 
 /// Auto-discover the **most recent 2-channel `.wav` by filesystem modification time (`mtime`)**
@@ -615,15 +636,12 @@ pub struct PreparedStereoIr {
     pub flush_tail_samples: usize,
     pub block_size: usize,
     pub num_partitions: usize,
-    /// Effective post-normalization peak frequency boost in dB (`0.0` after auto-normalization).
+    /// Measured positive peak frequency-domain boost `max(G_c, 0)` in dB (uncapped; IR is never
+    /// normalized at load so boosts fill hardware dips on purpose).
     pub max_boost_db: f64,
-    /// Raw pre-normalization peak frequency boost in dB (`> 0.0` if the IR exceeded `0 dB`).
-    pub original_max_boost_db: f64,
-    /// Auto-normalization gain applied equally to both channels (`<= 0.0 dB`; `0.0` if untouched).
-    pub normalization_gain_db: f64,
-    /// Post-normalization worst-case time-domain L1 norm `max(sum|h_L|, sum|h_R|)`.
+    /// Diagnostic time-domain L1 norm `max(sum|h_L|, sum|h_R|)` (never used as a gain criterion).
     pub l1_norm: f64,
-    /// Post-normalization conservative L1 peak bound in dB (`max(0.0, 20 * log10(l1_norm))`).
+    /// Diagnostic L1 norm in dB (`max(0.0, 20 * log10(l1_norm))`; never used as a gain criterion).
     pub l1_norm_db: f64,
     r2c: Arc<dyn RealToComplex<f64>>,
     c2r: Arc<dyn ComplexToReal<f64>>,
@@ -644,8 +662,6 @@ impl std::fmt::Debug for PreparedStereoIr {
             .field("block_size", &self.block_size)
             .field("num_partitions", &self.num_partitions)
             .field("max_boost_db", &self.max_boost_db)
-            .field("original_max_boost_db", &self.original_max_boost_db)
-            .field("normalization_gain_db", &self.normalization_gain_db)
             .field("l1_norm", &self.l1_norm)
             .field("l1_norm_db", &self.l1_norm_db)
             .finish()
@@ -701,36 +717,21 @@ impl PreparedStereoIr {
         let r2c = planner.plan_fft_forward(fft_len);
         let c2r = planner.plan_fft_inverse(fft_len);
 
-        // Measure peak frequency-domain magnitude via >= 2x zero-padded full-band f64 RFFT.
-        // Auto-normalize equally on L & R (preserving exact L/R balance) ONLY when steady-state
-        // `max |H(f)| > 1.0` (`> 0 dB`) so:
-        // 1. Steady-state frequency response never boosts above `0 dB` (`max |H_norm| <= 1.0`).
-        // 2. IRs with `max |H(f)| <= 0 dB` are NEVER attenuated by variable L1-based gain,
-        //    strictly preserving the hardcoded `-3 dB` / `0 dB` headroom policy (`REQUIREMENTS.md` §5.2).
-        // 3. Post-normalization `L1 = max(sum|h_L|, sum|h_R|)` is computed and used to gate `0 dB`
-        //    headroom eligibility strictly (`peak + L1 + ISP <= -3 dB`), while `-3 dB` mode applies
-        //    fixed `-3 dB` safety headroom and the single final quantizer saturates cleanly.
+        // Measure exact peak frequency-domain magnitude `G_c = max |H(f)|` via >= 2x zero-padded
+        // full-band f64 RFFT. Per HEADROOM_DESIGN.md, the IR is NEVER normalized at load so its
+        // boosts fill hardware/room dips on purpose; per-track convolution output is scaled only
+        // by the excess over 0 dBFS. Time-domain L1 norm is computed for diagnostics only.
         let raw_max_freq_gain_lin =
             compute_max_freq_gain_linear(&mut planner, &left[..active_taps], &right[..active_taps])?;
-        let raw_l1_left: f64 = left[..active_taps].iter().map(|v| v.abs()).sum();
-        let raw_l1_right: f64 = right[..active_taps].iter().map(|v| v.abs()).sum();
-        let raw_l1_norm = raw_l1_left.max(raw_l1_right);
+        let l1_left: f64 = left[..active_taps].iter().map(|v| v.abs()).sum();
+        let l1_right: f64 = right[..active_taps].iter().map(|v| v.abs()).sum();
+        let l1_norm = l1_left.max(l1_right);
 
-        let original_max_boost_db = if raw_max_freq_gain_lin > 1.0 + 1e-5 {
+        let max_boost_db = if raw_max_freq_gain_lin > 1.0 + 1e-9 {
             20.0 * raw_max_freq_gain_lin.log10()
         } else {
             0.0
         };
-        let (norm_scale, normalization_gain_db) = if raw_max_freq_gain_lin > 1.0 + 1e-5 {
-            let atten_db = -20.0 * raw_max_freq_gain_lin.log10();
-            (1.0 / raw_max_freq_gain_lin, atten_db)
-        } else {
-            (1.0, 0.0)
-        };
-        let max_boost_db = 0.0;
-
-        // Post-normalization conservative time-domain worst-case peak bound (used to gate 0 dB mode).
-        let l1_norm = raw_l1_norm * norm_scale;
         let l1_norm_db = if l1_norm > 1.0 {
             20.0 * l1_norm.log10()
         } else {
@@ -746,15 +747,13 @@ impl PreparedStereoIr {
                 .iter()
                 .zip(right[..active_taps].iter())
                 .rposition(|(&l, &r)| {
-                    (l * norm_scale).abs() > LONG_IR_FLUSH_THRESHOLD
-                        || (r * norm_scale).abs() > LONG_IR_FLUSH_THRESHOLD
+                    l.abs() > LONG_IR_FLUSH_THRESHOLD || r.abs() > LONG_IR_FLUSH_THRESHOLD
                 })
                 .unwrap_or(0)
         };
 
-        // Pre-scale IR spectra by norm_scale / N so IRFFT output applies auto-normalization
-        // and inverse-FFT scaling in one pass with zero extra buffer copy.
-        let spec_scale = norm_scale / (fft_len as f64);
+        // Pre-scale IR spectra solely by 1 / N for inverse-FFT normalization (zero IR gain cut).
+        let spec_scale = 1.0 / (fft_len as f64);
         let mut scratch = r2c.make_scratch_vec();
         let mut time_buf = vec![0.0_f64; fft_len];
 
@@ -811,8 +810,6 @@ impl PreparedStereoIr {
             block_size,
             num_partitions,
             max_boost_db,
-            original_max_boost_db,
-            normalization_gain_db,
             l1_norm,
             l1_norm_db,
             r2c,
@@ -1055,6 +1052,9 @@ pub struct PartitionedStereoConvolver {
     ir: Arc<PreparedStereoIr>,
     left: ChannelUpolsState,
     right: ChannelUpolsState,
+    /// Per-track excess-only linear attenuation (`<= 1.0`) applied to this track's own UPOLS
+    /// output before overlap-adding any already-scaled `incoming_tail`.
+    output_scale: f64,
     incoming_tail: Option<ConvolutionTail>,
     tail_offset: usize,
     total_input_frames: usize,
@@ -1070,6 +1070,7 @@ impl PartitionedStereoConvolver {
             ir,
             left,
             right,
+            output_scale: 1.0,
             incoming_tail: None,
             tail_offset: 0,
             total_input_frames: 0,
@@ -1080,6 +1081,18 @@ impl PartitionedStereoConvolver {
 
     pub fn prepared_ir(&self) -> &PreparedStereoIr {
         &self.ir
+    }
+
+    fn apply_output_scale(&self, out_l: &mut [f64], out_r: &mut [f64]) {
+        if self.output_scale < 1.0 {
+            let g = self.output_scale;
+            for s in out_l.iter_mut() {
+                *s *= g;
+            }
+            for s in out_r.iter_mut() {
+                *s *= g;
+            }
+        }
     }
 
     /// Overlap-add the next slice of `incoming_tail` onto `out_l`/`out_r`, advancing `tail_offset`.
@@ -1125,6 +1138,7 @@ impl PartitionedStereoConvolver {
             &self.ir.nonzero_right,
         )?;
         debug_assert_eq!(out_l.len(), out_r.len());
+        self.apply_output_scale(&mut out_l, &mut out_r);
 
         if let Some(tail) = self.incoming_tail.take() {
             let rem_tail = tail.left.len().saturating_sub(self.tail_offset);
@@ -1149,10 +1163,11 @@ impl StereoConvolver for PartitionedStereoConvolver {
     }
 
     fn description(&self) -> String {
-        if self.ir.normalization_gain_db < 0.0 {
+        if self.output_scale < 1.0 - 1e-9 && self.output_scale > 0.0 {
+            let scale_db = 20.0 * self.output_scale.log10();
             format!(
-                "rew-fft-f64({}, {}t, norm {:.2} dB)",
-                self.ir.label, self.ir.total_taps, self.ir.normalization_gain_db
+                "rew-fft-f64({}, {}t, +{:.2} dB, scale {:.2} dB)",
+                self.ir.label, self.ir.total_taps, self.ir.max_boost_db, scale_db
             )
         } else {
             format!(
@@ -1167,7 +1182,17 @@ impl StereoConvolver for PartitionedStereoConvolver {
     }
 
     fn peak_gain_bound_db(&self) -> f64 {
-        self.ir.l1_norm_db.max(self.ir.max_boost_db)
+        self.ir.max_boost_db
+    }
+
+    fn accepts_tail(&self) -> bool {
+        true
+    }
+
+    fn set_output_scale(&mut self, scale_linear: f64) {
+        if scale_linear.is_finite() {
+            self.output_scale = scale_linear.clamp(0.0, 1.0);
+        }
     }
 
     fn set_incoming_tail(&mut self, tail: ConvolutionTail) {
@@ -1213,6 +1238,7 @@ impl StereoConvolver for PartitionedStereoConvolver {
         debug_assert_eq!(out_l.len(), out_r.len());
 
         if !out_l.is_empty() {
+            self.apply_output_scale(&mut out_l, &mut out_r);
             self.overlay_incoming_tail(&mut out_l, &mut out_r);
             self.total_emitted_frames += out_l.len();
         }
@@ -1387,26 +1413,15 @@ impl RewConvolverFactory {
         }
         let prepared = Arc::new(PreparedStereoIr::from_wav(&wav)?);
 
-        if prepared.normalization_gain_db < 0.0 {
+        if prepared.max_boost_db > 0.0 || prepared.l1_norm_db > 3.0 {
             let notice = format!(
-                "  [rew] Auto-normalized '{}' by {:.2} dB (raw peak freq +{:.2} dB -> 0.00 dB, post-norm L1 bound +{:.2} dB) preserving L/R balance.",
+                "  [rew] WARNING: '{}' loaded unnormalized (max |H(f)| +{:.2} dB, diagnostic L1 +{:.2} dB); per-track convolution output will scale only by any excess over 0 dBFS.",
                 prepared.label,
-                prepared.normalization_gain_db,
-                prepared.original_max_boost_db,
+                prepared.max_boost_db,
                 prepared.l1_norm_db,
             );
             self.emit_notice_once(
-                format!("norm:{}:{:?}:{}", path.display(), modified, file_len),
-                notice,
-            );
-        } else if prepared.l1_norm_db > 3.0 {
-            let notice = format!(
-                "  [rew] Note: '{}' has steady-state peak <= 0 dB with L1 transient bound +{:.2} dB (0 dB headroom gating accounts for full L1; -3 dB mode keeps fixed -3 dB headroom without extra attenuation).",
-                prepared.label,
-                prepared.l1_norm_db,
-            );
-            self.emit_notice_once(
-                format!("l1-note:{}:{:?}:{}", path.display(), modified, file_len),
+                format!("ir-diag:{}:{:?}:{}", path.display(), modified, file_len),
                 notice,
             );
         }
@@ -1473,11 +1488,35 @@ impl StereoConvolverFactory for RewConvolverFactory {
                     sample_rate_hz: target_rate_hz,
                 }));
             }
-            let (best, skipped) = discover_latest_rew_wav_with_diagnostics(dir, target_rate_hz)?;
+            let (candidates, mut skipped) =
+                discover_rew_wav_candidates_sorted(dir, target_rate_hz)?;
+
+            let mut loaded: Option<(DiscoveredRewFilter, Arc<PreparedStereoIr>)> = None;
+            for cand in candidates {
+                match self.load_or_get_cached(
+                    target_rate_hz,
+                    &cand.path,
+                    cand.modified,
+                    cand.file_len,
+                ) {
+                    Ok(ir) => {
+                        loaded = Some((cand, ir));
+                        break;
+                    }
+                    Err(reason) => {
+                        skipped.push(SkippedRewWav {
+                            path: cand.path,
+                            modified: cand.modified,
+                            reason,
+                        });
+                    }
+                }
+            }
+
             for sk in &skipped {
-                let is_relevant = match &best {
+                let is_relevant = match &loaded {
                     None => true,
-                    Some(chosen) => is_newer_candidate(
+                    Some((chosen, _)) => is_newer_candidate(
                         sk.modified,
                         &sk.path,
                         chosen.modified,
@@ -1493,22 +1532,15 @@ impl StereoConvolverFactory for RewConvolverFactory {
                     self.emit_notice_once(
                         format!("skipped-wav:{}:{:?}", sk.path.display(), sk.modified),
                         format!(
-                            "  [rew] WARNING: skipped newer/unreadable WAV '{}' during {} Hz discovery ({})",
+                            "  [rew] WARNING: skipped newer/invalid WAV '{}' during {} Hz discovery ({})",
                             fname, target_rate_hz, sk.reason
                         ),
                     );
                 }
             }
-            return match best {
-                Some(found) => {
-                    let ir = self.load_or_get_cached(
-                        target_rate_hz,
-                        &found.path,
-                        found.modified,
-                        found.file_len,
-                    )?;
-                    Ok(Box::new(PartitionedStereoConvolver::new(ir)))
-                }
+
+            return match loaded {
+                Some((_, ir)) => Ok(Box::new(PartitionedStereoConvolver::new(ir))),
                 None => {
                     self.emit_notice_once(
                         format!("no-match:{}:{target_rate_hz}", dir.display()),

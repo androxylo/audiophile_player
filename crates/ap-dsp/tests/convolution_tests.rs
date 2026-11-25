@@ -167,7 +167,7 @@ fn upols_single_partition_matches_naive_time_domain_convolution_to_float64_preci
     let expected_r = naive_convolve(&x_r, &h_r);
 
     let ir = Arc::new(PreparedStereoIr::from_stereo_ir("test-ir", 384_000, &h_l, &h_r).unwrap());
-    assert_eq!(ir.normalization_gain_db, 0.0, "test IR should stay <= 0 dB");
+    assert_eq!(ir.max_boost_db, 0.0, "test IR should stay <= 0 dB");
     let mut conv = PartitionedStereoConvolver::new(ir);
 
     let mut out_l = Vec::new();
@@ -275,7 +275,7 @@ fn upols_dense_multi_partition_ir_over_65536_taps_matches_reference_fft_convolut
     let ir = Arc::new(PreparedStereoIr::from_stereo_ir("dense-140k", 384_000, &h_l, &h_r).unwrap());
     assert_eq!(ir.block_size, 65_536);
     assert_eq!(ir.num_partitions, 3);
-    assert_eq!(ir.normalization_gain_db, 0.0);
+    assert_eq!(ir.max_boost_db, 0.0);
     assert_eq!(ir.flush_tail_samples, ir_len - 1);
 
     let sig_len = 200_000usize; // > 3 full UPOLS blocks
@@ -500,7 +500,7 @@ fn auto_discovery_picks_newest_rate_matched_stereo_wav_and_ignores_mono_helpers(
 }
 
 #[test]
-fn rew_boost_triggers_auto_normalization_l1_headroom_and_runs_before_noise_shaper() {
+fn rew_boost_is_unnormalized_at_load_scaled_only_by_excess_and_runs_before_noise_shaper() {
     let tmp = std::env::temp_dir().join(format!(
         "ap_dsp_rew_headroom_test_{}",
         std::process::id()
@@ -508,18 +508,22 @@ fn rew_boost_triggers_auto_normalization_l1_headroom_and_runs_before_noise_shape
     let _ = fs::remove_dir_all(&tmp);
     fs::create_dir_all(&tmp).unwrap();
 
-    // Case A: Phase-dispersive IR h = [0.6, 0.6, -0.6].
-    // Exact peak |H(e^{j*pi/2})| = 0.6 * |2 - j| = 0.6 * sqrt(5) ~= 1.34164 (+2.55 dB).
-    // Auto-normalization scales h by 1 / (0.6 * sqrt(5)) = 1 / sqrt(5) -> L1 norm = 3 / sqrt(5)
-    // ~= 1.34164 (+2.55 dB). On a quiet track tagged at peak 0.59 (-4.58 dBFS), the required
-    // 0 dB ceiling drops to -3.0 - 2.55 = -5.55 dBFS, so -3 dB headroom engages, convolution runs
-    // BEFORE final TPDF quantization, and the output matches the exact analytical value below FS.
-    let dispersive_path = tmp.join("dispersive_384k.wav");
+    let spec = StreamSpec {
+        sample_rate_hz: 384_000,
+        bits_per_sample: 24,
+        channels: 2,
+    };
+
+    // Case A (Addendum 1 canonical example): +1.0 dB boosting IR on a -6.0 dBTP track.
+    // G_up = 0 dB (P = -6 <= -3), A_isp = 0 dB, predicted = -6 + 0 + 0 + 1 = -5 dBFS <= 0 dBFS.
+    // Nothing is cut: IR is never normalized at load, conv_scale = 0 dB, full +1 dB boost passes!
+    let boost_1db_lin = 10.0_f64.powf(1.0 / 20.0);
+    let boost_1db_path = tmp.join("boost_1db_384k.wav");
     write_wav_f32(
-        &dispersive_path,
+        &boost_1db_path,
         384_000,
         2,
-        &[0.6, 0.6, 0.6, 0.6, -0.6, -0.6],
+        &[boost_1db_lin as f32, boost_1db_lin as f32],
         false,
     );
 
@@ -529,95 +533,65 @@ fn rew_boost_triggers_auto_normalization_l1_headroom_and_runs_before_noise_shape
             shaper_override: Some(NoiseShaperProfile::Bypass),
             ..UpsamplerPolicy::default()
         },
-        ConvolutionConfig::explicit_file(dispersive_path),
+        ConvolutionConfig::explicit_file(boost_1db_path),
     )
     .unwrap();
-
-    let spec = StreamSpec {
-        sample_rate_hz: 384_000,
-        bits_per_sample: 24,
-        channels: 2,
-    };
-    let peak = TrackPeakMetadata {
-        replaygain_track_peak: Some(0.59),
+    let peak_minus_6_tp = TrackPeakMetadata {
+        true_peak_linear: Some(10.0_f64.powf(-6.0 / 20.0)),
         ..TrackPeakMetadata::default()
     };
-
-    let mut left_in = vec![0.0_f64; 1024];
-    let mut right_in = vec![0.0_f64; 1024];
-    left_in[0] = -0.59;
-    left_in[1] = 0.59;
-    left_in[2] = 0.59;
-    right_in[0] = -0.59;
-    right_in[1] = 0.59;
-    right_in[2] = 0.59;
-
+    let amp = 0.5_f64;
     let processed_a = pipeline_a
         .process(
             StereoF64Buffer {
                 sample_rate_hz: 384_000,
-                left: left_in,
-                right: right_in,
+                left: vec![amp; 512],
+                right: vec![amp; 512],
             },
             spec,
-            &peak,
+            &peak_minus_6_tp,
             false,
         )
         .unwrap();
     assert_eq!(processed_a.report.convolver_name, "rew-fft-f64");
-    assert_eq!(processed_a.report.headroom.mode, HeadroomMode::Minus3Db);
-    assert!(
-        processed_a.report.convolver_description.contains("norm -"),
-        "expected auto-normalization tag in description, got: {}",
-        processed_a.report.convolver_description
-    );
+    assert_eq!(processed_a.report.headroom.mode, HeadroomMode::ZeroDb);
+    assert_eq!(processed_a.report.headroom.convolution_scale_db, 0.0);
     // Because convolution modified the f64 stream BEFORE final quantization, shaper cannot bypass.
     assert_eq!(
         processed_a.report.effective_shaper,
         NoiseShaperProfile::TpdfDither
     );
-
-    // At sample index 2: y[2] = x[2]*h_norm[0] + x[1]*h_norm[1] + x[0]*h_norm[2]
-    //                         = 0.59 * (3 / sqrt(5)) * 10^(-3/20) ~= 0.560387.
-    let expected_y2 = 0.59 * (3.0 / 5.0_f64.sqrt()) * HeadroomMode::Minus3Db.linear();
-    let got_y2_l = (processed_a.pcm.frames[2][0] as f64) / 2_147_483_648.0;
-    let got_y2_r = (processed_a.pcm.frames[2][1] as f64) / 2_147_483_648.0;
+    let got_a_l = (processed_a.pcm.frames[256][0] as f64) / 2_147_483_648.0;
+    let expected_a = amp * boost_1db_lin;
     assert!(
-        (got_y2_l - expected_y2).abs() < 1e-5,
-        "y[2] left mismatch: got {got_y2_l}, expected {expected_y2}"
+        (got_a_l - expected_a).abs() < 1e-4,
+        "+1 dB boost on -6 dBTP track must pass unattenuated: got {got_a_l}, expected {expected_a}"
     );
-    assert!(
-        (got_y2_r - expected_y2).abs() < 1e-5,
-        "y[2] right mismatch: got {got_y2_r}, expected {expected_y2}"
-    );
-    let max_abs_a = processed_a
-        .pcm
-        .frames
-        .iter()
-        .flat_map(|f| [f[0].unsigned_abs(), f[1].unsigned_abs()])
-        .max()
-        .unwrap_or(0);
-    assert!(max_abs_a < (i32::MAX as u32) - 1024, "must not clip full scale");
 
-    // Case B: +6.02 dB boosting IR (left = 2.0, right = 1.0 -> 2:1 L/R balance) on untagged
-    // near-full-scale (0.99) audio. Auto-normalization must bring peak gain to 0 dB while
-    // preserving exact 2:1 L/R balance, and -3 dB headroom must keep output cleanly <= full scale.
+    // Case B: +6.02 dB boosting IR (left = 2.0, right = 1.0 -> 2:1 L/R balance).
+    // Loaded unnormalized (`max_boost_db ~= +6.02 dB`), warning logged once on first load.
     let boost_6db_path = tmp.join("boost_6db_384k.wav");
     write_wav_f32(&boost_6db_path, 384_000, 2, &[2.0, 1.0], false);
 
     let factory_b = RewConvolverFactory::new(ConvolutionConfig::explicit_file(boost_6db_path.clone()));
     let conv_b = factory_b.create_for_rate(384_000).unwrap();
-    assert_eq!(conv_b.max_boost_db(), 0.0);
+    assert!(
+        (conv_b.max_boost_db() - 6.0206).abs() < 0.02,
+        "expected unnormalized max_boost_db ~+6.02 dB, got {:.4}",
+        conv_b.max_boost_db()
+    );
     assert_eq!(
         factory_b.warnings().len(),
         1,
-        "first load of >0 dB IR must emit exactly one normalization notice"
+        "first load of boosting IR must emit exactly one diagnostic warning"
     );
-    assert!(factory_b.warnings()[0].contains("Auto-normalized"));
+    assert!(factory_b.warnings()[0].contains("WARNING"));
     // Second creation uses cached IR and must not spam duplicate notices.
     let _ = factory_b.create_for_rate(384_000).unwrap();
     assert_eq!(factory_b.warnings().len(), 1);
 
+    // On untagged (unknown peak: P=0, A_isp=3, G_up=-3, G_c=+6.02 -> excess=+6.02 dB):
+    // convolution output scales by -6.02 dB (0.5x), preserving 2:1 L/R balance and staying below FS!
     let pipeline_b = AudioPipeline::with_rew_config(
         UpsamplerPolicy {
             filter_override: Some(FilterArchetype::Null),
@@ -635,23 +609,24 @@ fn rew_boost_triggers_auto_normalization_l1_headroom_and_runs_before_noise_shape
                 right: vec![0.99; 1024],
             },
             spec,
-            &TrackPeakMetadata::default(), // untagged -> -3 dB fail-safe
+            &TrackPeakMetadata::default(), // untagged -> G_up=-3 dB, conv excess=-6.02 dB
             false,
         )
         .unwrap();
     assert_eq!(processed_b.report.headroom.mode, HeadroomMode::Minus3Db);
+    assert!((processed_b.report.headroom.convolution_scale_db - (-6.0206)).abs() < 0.02);
 
     let expected_l = 0.99 * 1.0 * HeadroomMode::Minus3Db.linear();
     let expected_r = 0.99 * 0.5 * HeadroomMode::Minus3Db.linear();
     let got_l = (processed_b.pcm.frames[512][0] as f64) / 2_147_483_648.0;
     let got_r = (processed_b.pcm.frames[512][1] as f64) / 2_147_483_648.0;
     assert!(
-        (got_l - expected_l).abs() < 1e-5,
-        "+6 dB normalized left mismatch: got {got_l}, expected {expected_l}"
+        (got_l - expected_l).abs() < 1e-4,
+        "+6 dB excess-scaled left mismatch: got {got_l}, expected {expected_l}"
     );
     assert!(
-        (got_r - expected_r).abs() < 1e-5,
-        "+6 dB normalized right (2:1 balance) mismatch: got {got_r}, expected {expected_r}"
+        (got_r - expected_r).abs() < 1e-4,
+        "+6 dB excess-scaled right (2:1 balance) mismatch: got {got_r}, expected {expected_r}"
     );
     assert!(
         processed_b
@@ -659,7 +634,7 @@ fn rew_boost_triggers_auto_normalization_l1_headroom_and_runs_before_noise_shape
             .frames
             .iter()
             .all(|f| f[0] < i32::MAX && f[0] > i32::MIN && f[1] < i32::MAX && f[1] > i32::MIN),
-        "+6 dB IR must never clip after auto-normalization"
+        "+6 dB IR must not clip after excess-only convolution scaling"
     );
 
     let _ = fs::remove_dir_all(&tmp);
@@ -797,7 +772,7 @@ fn gapless_tail_carryover_matches_continuous_convolution_across_three_tracks() {
         .map(|i| (-(i as f64) / 240.0).exp() * ((i as f64) * 0.23).sin() * 0.005)
         .collect();
     let ir = Arc::new(PreparedStereoIr::from_stereo_ir("gapless-ir", 384_000, &h_l, &h_r).unwrap());
-    assert_eq!(ir.normalization_gain_db, 0.0);
+    assert_eq!(ir.max_boost_db, 0.0);
 
     // Track 1 (5000 frames), Track 2 (500 frames — SHORTER than IR tail!), Track 3 (4000 frames).
     let x1_l: Vec<f64> = (0..5_000).map(|i| 0.4 * ((i as f64) * 0.05).sin()).collect();
@@ -1187,7 +1162,7 @@ fn gapless_tail_is_preserved_at_end_of_queue_and_across_rate_change() {
 }
 
 #[test]
-fn all_pass_ir_preserves_strict_headroom_policy_and_gates_zero_db_by_l1() {
+fn all_pass_ir_treats_l1_as_diagnostic_only_under_decided_headroom_policy() {
     let tmp = std::env::temp_dir().join(format!(
         "ap_dsp_allpass_l1_test_{}",
         std::process::id()
@@ -1197,7 +1172,7 @@ fn all_pass_ir_preserves_strict_headroom_policy_and_gates_zero_db_by_l1() {
 
     // Truncated first-order all-pass IR with a = 0.5:
     //   h[0] = -0.5, h[n] = 0.75 * 0.5^(n-1) for n >= 1.
-    // Exact |H(e^{jw})| = 1.0 (0 dB), and L1 = sum|h| = 2.0 (+6.02 dB).
+    // Exact |H(e^{jw})| = 1.0 (0 dB), and diagnostic L1 = sum|h| = 2.0 (+6.02 dB).
     let n_taps = 64_usize;
     let mut h = vec![0.0_f64; n_taps];
     h[0] = -0.5;
@@ -1212,24 +1187,21 @@ fn all_pass_ir_preserves_strict_headroom_policy_and_gates_zero_db_by_l1() {
     let ap_path = tmp.join("allpass_384k.wav");
     write_wav_f32(&ap_path, 384_000, 2, &wav_samples, false);
 
-    // Review #3 Finding #2: steady-state <= 0 dB IR MUST NOT be attenuated by variable L1 gain
-    // (preserving strict -3 dB / 0 dB headroom policy), while L1 (~+6.02 dB) is preserved to gate
-    // 0 dB mode and logged once as an informational notice.
+    // Per HEADROOM_DESIGN.md: L1 is strictly diagnostic (logged as WARNING once on load) and
+    // never used as a gain criterion (`max_boost_db == 0.0`, `peak_gain_bound_db == 0.0`).
     let factory = RewConvolverFactory::new(ConvolutionConfig::explicit_file(ap_path.clone()));
     let conv = factory.create_for_rate(384_000).unwrap();
     assert!(
-        (conv.peak_gain_bound_db() - 6.0206).abs() < 0.05,
-        "expected unattenuated L1 bound ~+6.02 dB, got {:.3} dB",
-        conv.peak_gain_bound_db()
+        conv.max_boost_db() < 0.01,
+        "all-pass IR must have ~0 dB max |H(f)|, got {:.4} dB",
+        conv.max_boost_db()
     );
     assert!(
-        !conv.description().contains("norm -"),
-        "0 dB-peak all-pass IR must NOT receive variable L1 attenuation: {}",
-        conv.description()
-    );
-    assert!(
-        factory.warnings().iter().any(|w| w.contains("L1 transient bound")),
-        "expected informational L1 notice in factory.warnings(): {:?}",
+        factory
+            .warnings()
+            .iter()
+            .any(|w| w.contains("WARNING") && w.contains("diagnostic L1")),
+        "expected diagnostic L1 WARNING in factory.warnings(): {:?}",
         factory.warnings()
     );
 
@@ -1247,13 +1219,13 @@ fn all_pass_ir_preserves_strict_headroom_policy_and_gates_zero_db_by_l1() {
         channels: 2,
     };
 
-    // 1. Quiet track (-10 dBTP <= -3.0 - 6.02 = -9.02 dBFS) runs in 0 dB mode with ZERO extra attenuation!
-    let quiet_meta = TrackPeakMetadata {
-        true_peak_linear: Some(10.0_f64.powf(-10.0 / 20.0)), // ~0.3162
+    // -5 dBTP track qualifies for 0 dB upsampler gain AND 0 dB conv scale (L1 does not cut it).
+    let mid_meta = TrackPeakMetadata {
+        true_peak_linear: Some(10.0_f64.powf(-5.0 / 20.0)),
         ..TrackPeakMetadata::default()
     };
     let dc_amp = 0.25_f64;
-    let processed_quiet = pipeline
+    let processed_mid = pipeline
         .process(
             StereoF64Buffer {
                 sample_rate_hz: 384_000,
@@ -1261,61 +1233,16 @@ fn all_pass_ir_preserves_strict_headroom_policy_and_gates_zero_db_by_l1() {
                 right: vec![dc_amp; 512],
             },
             spec,
-            &quiet_meta,
-            false,
-        )
-        .unwrap();
-    assert_eq!(processed_quiet.report.headroom.mode, HeadroomMode::ZeroDb);
-    // Steady-state DC gain of all-pass h[0]=-0.5, sum_{k>=1} h[k]=1.5 is +1.0 (exact unity, NOT -3.02 dB!).
-    let steady_l = (processed_quiet.pcm.frames[256][0] as f64) / 2_147_483_648.0;
-    assert!(
-        (steady_l - dc_amp).abs() < 1e-4,
-        "0 dB mode with 0 dB-peak all-pass IR must preserve unity steady-state gain (~{dc_amp}), got {steady_l:.5}"
-    );
-
-    // 2. Track at -5 dBTP (> -9.02 dBFS) is gated to -3 dB by the L1 bound.
-    let mid_meta = TrackPeakMetadata {
-        true_peak_linear: Some(10.0_f64.powf(-5.0 / 20.0)),
-        ..TrackPeakMetadata::default()
-    };
-    let processed_mid = pipeline
-        .process(
-            StereoF64Buffer {
-                sample_rate_hz: 384_000,
-                left: vec![0.1; 128],
-                right: vec![0.1; 128],
-            },
-            spec,
             &mid_meta,
             false,
         )
         .unwrap();
-    assert_eq!(processed_mid.report.headroom.mode, HeadroomMode::Minus3Db);
-
-    // 3. Adversarial full-scale sign-aligned transient in untagged -3 dB mode saturates cleanly
-    // at positive full-scale without integer wraparound.
-    let n0 = 256_usize;
-    let mut sig = vec![0.0_f64; 512];
-    for k in 0..n_taps {
-        sig[n0 - k] = if h[k] >= 0.0 { 0.999 } else { -0.999 };
-    }
-    let processed_adv = pipeline
-        .process(
-            StereoF64Buffer {
-                sample_rate_hz: 384_000,
-                left: sig.clone(),
-                right: sig,
-            },
-            spec,
-            &TrackPeakMetadata::default(),
-            false,
-        )
-        .unwrap();
-    assert_eq!(processed_adv.report.headroom.mode, HeadroomMode::Minus3Db);
-    let max_24 = 0x7F_FFFF_i32 << 8;
-    assert_eq!(
-        processed_adv.pcm.frames[n0][0], max_24,
-        "adversarial over-scale transient must saturate cleanly at positive 24-bit max without wrapping"
+    assert_eq!(processed_mid.report.headroom.mode, HeadroomMode::ZeroDb);
+    assert_eq!(processed_mid.report.headroom.convolution_scale_db, 0.0);
+    let steady_l = (processed_mid.pcm.frames[256][0] as f64) / 2_147_483_648.0;
+    assert!(
+        (steady_l - dc_amp).abs() < 1e-4,
+        "0 dB mode with 0 dB-peak all-pass IR must preserve unity steady-state gain (~{dc_amp}), got {steady_l:.5}"
     );
 
     let _ = fs::remove_dir_all(&tmp);
@@ -1374,6 +1301,87 @@ fn discover_latest_rew_wav_warns_when_newer_wav_fails_probe_and_enforces_4m_cap(
             .iter()
             .any(|w| w.contains("z_newer_overcap.wav") && w.contains("skipped")),
         "expected warning naming skipped newer WAV 'z_newer_overcap.wav', got: {warnings:?}"
+    );
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn discovery_warns_on_zero_frame_and_falls_back_when_newest_wav_fails_prepare() {
+    // Review #4 Findings #10 & #11:
+    // 1. A newest stereo rate-matched WAV with 0 frames (unfinalized export) MUST push a
+    //    SkippedRewWav warning instead of silently falling back.
+    // 2. A newest stereo rate-matched WAV that passes header probing but fails prepare (e.g.
+    //    all-zero payload) MUST warn and fall back cleanly to the next-newest valid filter
+    //    instead of failing every track at that rate.
+    let tmp = std::env::temp_dir().join(format!(
+        "ap_dsp_discover_fallback_test_{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(&tmp).unwrap();
+
+    let older_ok = tmp.join("a_good_384k.wav");
+    write_wav_f32(&older_ok, 384_000, 2, &[0.8, 0.8, 0.0, 0.0], false);
+
+    std::thread::sleep(std::time::Duration::from_millis(25));
+    let newer_zero_frames = tmp.join("m_zero_frames_384k.wav");
+    {
+        let mut f = File::create(&newer_zero_frames).unwrap();
+        f.write_all(b"RIFF").unwrap();
+        f.write_all(&36u32.to_le_bytes()).unwrap();
+        f.write_all(b"WAVE").unwrap();
+        f.write_all(b"fmt ").unwrap();
+        f.write_all(&16u32.to_le_bytes()).unwrap();
+        f.write_all(&3u16.to_le_bytes()).unwrap();
+        f.write_all(&2u16.to_le_bytes()).unwrap();
+        f.write_all(&384_000u32.to_le_bytes()).unwrap();
+        f.write_all(&(384_000u32 * 8).to_le_bytes()).unwrap();
+        f.write_all(&8u16.to_le_bytes()).unwrap();
+        f.write_all(&32u16.to_le_bytes()).unwrap();
+        f.write_all(b"data").unwrap();
+        f.write_all(&0u32.to_le_bytes()).unwrap(); // 0 frames!
+    }
+
+    std::thread::sleep(std::time::Duration::from_millis(25));
+    let newest_all_zeros = tmp.join("z_all_zeros_384k.wav");
+    write_wav_f32(&newest_all_zeros, 384_000, 2, &[0.0, 0.0, 0.0, 0.0], false);
+
+    let factory = RewConvolverFactory::new(ConvolutionConfig::auto_dir(tmp.clone()));
+    let conv = factory
+        .create_for_rate(384_000)
+        .expect("all-zero newest WAV must fall back to older valid filter, not fail track start");
+    assert!(
+        conv.description().contains("a_good_384k.wav"),
+        "expected fallback to a_good_384k.wav, got {}",
+        conv.description()
+    );
+    let warnings = factory.warnings();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("m_zero_frames_384k.wav") && w.contains("0 frames")),
+        "expected 0-frame warning for m_zero_frames_384k.wav, got: {warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("z_all_zeros_384k.wav") && w.contains("all zeros")),
+        "expected load/prepare failure warning for z_all_zeros_384k.wav, got: {warnings:?}"
+    );
+
+    // If ONLY invalid/all-zero WAVs remain, fall back cleanly to NullConvolver with a warning.
+    fs::remove_file(&older_ok).unwrap();
+    let factory_empty = RewConvolverFactory::new(ConvolutionConfig::auto_dir(tmp.clone()));
+    let conv_null = factory_empty.create_for_rate(384_000).unwrap();
+    assert_eq!(conv_null.name(), "null-convolver");
+    assert!(
+        factory_empty
+            .warnings()
+            .iter()
+            .any(|w| w.contains("null-convolver")),
+        "expected loud fallback-to-null warning, got: {:?}",
+        factory_empty.warnings()
     );
 
     let _ = fs::remove_dir_all(&tmp);
