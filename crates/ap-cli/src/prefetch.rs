@@ -148,6 +148,12 @@ fn event_metrics(ev: &StreamEvent) -> (usize, u128, usize) {
     }
 }
 
+fn pcm_block_peak_u32(frames: &[[i32; 2]]) -> u32 {
+    frames.iter().fold(0u32, |acc, &[l, r]| {
+        acc.max(l.unsigned_abs()).max(r.unsigned_abs())
+    })
+}
+
 struct BufferInner {
     epoch: u64,
     /// Active `VirtualLock` guards keyed by `frames.as_ptr() as usize` while a block is queued
@@ -160,7 +166,9 @@ struct BufferInner {
     /// Pointer keys of PCM blocks currently popped and in-flight on the RT DMA thread (never
     /// unlocked by `flush_locked` / `close` until `recycle_consumed_block` returns them).
     in_flight_ptrs: HashSet<usize>,
-    events: VecDeque<StreamEvent>,
+    /// Queued `(event, precomputed_pcm_peak_u32)` tuples so the RT consumer updates live peak in
+    /// O(1) without scanning PCM frames on the WaveRT thread.
+    events: VecDeque<(StreamEvent, u32)>,
     buffered_frames: usize,
     buffered_duration_ns: u128,
     terminal_markers: usize,
@@ -178,7 +186,7 @@ struct BufferInner {
 struct FlushPayload {
     epoch: u64,
     guards: Vec<PinGuard>,
-    events: VecDeque<StreamEvent>,
+    events: VecDeque<(StreamEvent, u32)>,
     drops: Vec<InterleavedInt32Buffer>,
     #[cfg(test)]
     on_free_phase: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -228,7 +236,7 @@ impl BufferInner {
         // Remove and unlock ONLY guards for queued (non-in-flight) blocks; preserve the guard for
         // any block currently being read by the RT DMA thread until `recycle_consumed_block`!
         let mut release_keys = Vec::new();
-        for ev in &events {
+        for (ev, _) in &events {
             if let StreamEvent::PcmBlock(b) = ev {
                 let ptr_key = b.frames.as_ptr() as usize;
                 if !self.in_flight_ptrs.contains(&ptr_key) {
@@ -256,29 +264,33 @@ impl BufferInner {
         }
     }
 
-    fn push_back_event(&mut self, ev: StreamEvent) {
+    fn push_back_event(&mut self, ev: StreamEvent, peak_u32: u32) {
         let (frames, dur_ns, term) = event_metrics(&ev);
         self.buffered_frames += frames;
         self.buffered_duration_ns = self.buffered_duration_ns.saturating_add(dur_ns);
         self.terminal_markers += term;
-        self.events.push_back(ev);
+        self.events.push_back((ev, peak_u32));
     }
 
     fn push_front_event(&mut self, ev: StreamEvent) {
+        let peak_u32 = match &ev {
+            StreamEvent::PcmBlock(b) => pcm_block_peak_u32(&b.frames),
+            _ => 0,
+        };
         let (frames, dur_ns, term) = event_metrics(&ev);
         self.buffered_frames += frames;
         self.buffered_duration_ns = self.buffered_duration_ns.saturating_add(dur_ns);
         self.terminal_markers += term;
-        self.events.push_front(ev);
+        self.events.push_front((ev, peak_u32));
     }
 
-    fn pop_front_event(&mut self) -> Option<StreamEvent> {
-        let ev = self.events.pop_front()?;
+    fn pop_front_event(&mut self) -> Option<(StreamEvent, u32)> {
+        let (ev, peak_u32) = self.events.pop_front()?;
         let (frames, dur_ns, term) = event_metrics(&ev);
         self.buffered_frames = self.buffered_frames.saturating_sub(frames);
         self.buffered_duration_ns = self.buffered_duration_ns.saturating_sub(dur_ns);
         self.terminal_markers = self.terminal_markers.saturating_sub(term);
-        Some(ev)
+        Some((ev, peak_u32))
     }
 
     fn is_prebuffer_ready(&self, target_frames: usize) -> bool {
@@ -483,13 +495,13 @@ impl BoundedBlockStreamBuffer {
         let mut skipped_front_path = None;
         if st.epoch == expected_epoch {
             if skip_front_track_start
-                && matches!(st.events.front(), Some(StreamEvent::TrackStart { .. }))
+                && matches!(st.events.front(), Some((StreamEvent::TrackStart { .. }, _)))
             {
-                if let Some(StreamEvent::TrackStart { path, .. }) = st.pop_front_event() {
+                if let Some((StreamEvent::TrackStart { path, .. }, _)) = st.pop_front_event() {
                     skipped_front_path = Some(path);
                 }
             }
-            if let Some(next_idx) = st.events.iter().position(|ev| {
+            if let Some(next_idx) = st.events.iter().position(|(ev, _)| {
                 matches!(
                     ev,
                     StreamEvent::TrackStart { .. }
@@ -505,17 +517,20 @@ impl BoundedBlockStreamBuffer {
                 // skipped track's ending decay at the start of the next track.
                 let next_has_baked_carryover = matches!(
                     st.events.get(next_idx),
-                    Some(StreamEvent::TrackStart {
-                        had_gapless_carryover: true,
-                        ..
-                    })
+                    Some((
+                        StreamEvent::TrackStart {
+                            had_gapless_carryover: true,
+                            ..
+                        },
+                        _
+                    ))
                 );
                 if !(next_has_baked_carryover && (next_idx > 0 || skipped_front_path.is_some())) {
                     let mut drop_frames = 0usize;
                     let mut drop_dur_ns = 0u128;
                     let mut drop_terms = 0usize;
-                    let drained: Vec<StreamEvent> = st.events.drain(..next_idx).collect();
-                    for ev in drained {
+                    let drained: Vec<(StreamEvent, u32)> = st.events.drain(..next_idx).collect();
+                    for (ev, _) in drained {
                         let (frames, dur_ns, term) = event_metrics(&ev);
                         drop_frames += frames;
                         drop_dur_ns = drop_dur_ns.saturating_add(dur_ns);
@@ -573,6 +588,12 @@ impl BoundedBlockStreamBuffer {
     /// thread never contends on page-locking or working-set expansion syscalls.
     pub fn push_for_epoch(&self, epoch: u64, event: StreamEvent) -> bool {
         let (frames_in_event, dur_ns_in_event, _) = event_metrics(&event);
+        // Precompute PCM block peak on the producer thread (outside `self.inner`) so the RT
+        // WaveRT thread only executes a single lock-free `AtomicU32::fetch_max` per block!
+        let block_peak_u32 = match &event {
+            StreamEvent::PcmBlock(b) => pcm_block_peak_u32(&b.frames),
+            _ => 0,
+        };
 
         // Pin PCM pages BEFORE acquiring `self.inner` so RT pops never stall on `VirtualLock`!
         let mut pre_pinned: Option<(usize, PinGuard)> =
@@ -636,7 +657,7 @@ impl BoundedBlockStreamBuffer {
                 if let Some((ptr_key, guard)) = pre_pinned.take() {
                     st.pinned_guards.insert(ptr_key, guard);
                 }
-                st.push_back_event(event);
+                st.push_back_event(event, block_peak_u32);
                 if !st.deferred_guards.is_empty() {
                     guards.append(&mut st.deferred_guards);
                 }
@@ -691,7 +712,7 @@ impl BoundedBlockStreamBuffer {
         if st.closed || st.epoch != expected_epoch {
             return None;
         }
-        let ev = st.pop_front_event()?;
+        let (ev, _) = st.pop_front_event()?;
         // Review #7 re-review R1: `pop_for_epoch_timeout` is the non-RT control loop pop (only
         // `pop_track_pcm_locked` marks blocks in-flight for RT playback). If an orphaned `PcmBlock`
         // is popped here, release its `VirtualLock` guard immediately outside `st` BEFORE returning
@@ -738,16 +759,26 @@ impl BoundedBlockStreamBuffer {
     }
 
     /// Consumer side (real-time WaveRT audio thread): immediately pop the next PCM block
+    /// for this track without ever sleeping on the condvar, returning `(result, block_peak_u32)`.
+    pub fn try_pop_track_pcm_block_with_peak(
+        &self,
+        expected_epoch: u64,
+    ) -> (PopBlockResult, u32) {
+        let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if st.closed || st.epoch != expected_epoch {
+            return (PopBlockResult::StaleOrClosed, 0);
+        }
+        self.pop_track_pcm_locked(&mut st)
+    }
+
+    /// Consumer side (real-time WaveRT audio thread): immediately pop the next PCM block
     /// for this track without ever sleeping on the condvar.
     ///
     /// Returns `PopBlockResult::Underrun` immediately when the queue is empty so the RT loop
     /// can emit digital silence instead of blocking hardware DMA notifications.
+    #[allow(dead_code)]
     pub fn try_pop_track_pcm_block(&self, expected_epoch: u64) -> PopBlockResult {
-        let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if st.closed || st.epoch != expected_epoch {
-            return PopBlockResult::StaleOrClosed;
-        }
-        self.pop_track_pcm_locked(&mut st)
+        self.try_pop_track_pcm_block_with_peak(expected_epoch).0
     }
 
     /// Consumer side (inside active track playback): pop the next PCM block for this track.
@@ -777,13 +808,13 @@ impl BoundedBlockStreamBuffer {
         if st.events.is_empty() && wait_res.timed_out() {
             return PopBlockResult::Underrun;
         }
-        self.pop_track_pcm_locked(&mut st)
+        self.pop_track_pcm_locked(&mut st).0
     }
 
-    fn pop_track_pcm_locked(&self, st: &mut BufferInner) -> PopBlockResult {
+    fn pop_track_pcm_locked(&self, st: &mut BufferInner) -> (PopBlockResult, u32) {
         match st.events.front() {
-            Some(StreamEvent::PcmBlock(_)) => {
-                if let Some(StreamEvent::PcmBlock(b)) = st.pop_front_event() {
+            Some((StreamEvent::PcmBlock(_), _)) => {
+                if let Some((StreamEvent::PcmBlock(b), peak_u32)) = st.pop_front_event() {
                     if !b.frames.is_empty() {
                         st.in_flight_ptrs.insert(b.frames.as_ptr() as usize);
                     }
@@ -795,21 +826,21 @@ impl BoundedBlockStreamBuffer {
                         });
                     }
                     self.cv.notify_all();
-                    PopBlockResult::Block(b)
+                    (PopBlockResult::Block(b), peak_u32)
                 } else {
-                    PopBlockResult::Underrun
+                    (PopBlockResult::Underrun, 0)
                 }
             }
-            Some(StreamEvent::TrackEnd) => {
+            Some((StreamEvent::TrackEnd, _)) => {
                 let _ = st.pop_front_event();
                 self.cv.notify_all();
-                PopBlockResult::TrackEnd
+                (PopBlockResult::TrackEnd, 0)
             }
             // Leave next TrackStart / EndOfQueue / FatalError at the front for outer loop!
-            Some(_) => PopBlockResult::TrackEnd,
+            Some(_) => (PopBlockResult::TrackEnd, 0),
             None => {
                 st.track_min_buffered_ns = Some(0);
-                PopBlockResult::Underrun
+                (PopBlockResult::Underrun, 0)
             }
         }
     }

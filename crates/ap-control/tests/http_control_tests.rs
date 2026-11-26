@@ -163,13 +163,15 @@ fn http_server_serves_scrollable_no_volume_ui_and_routes_play_pause_commands() {
     assert_eq!(shared.take_pending_command(), Some(ControlCommand::Pause));
     assert!(stop_flag.load(Ordering::SeqCst));
 
-    // 5. GET /api/status returns valid JSON including recent bounded action log & ultimate decision
-    shared.set_playing_with_decision(
+    // 5. GET /api/status returns valid JSON including recent bounded action log, decision & peak
+    shared.set_playing_with_decision_and_peak(
         ap_control::state::PlayModeLabel::Random,
         "test.flac".to_string(),
         "[ultimate: cached] 16/44100 Hz -> 352800 Hz f64".to_string(),
         Some("mode=[ultimate: cached] rule=rule_R_1x_clean G=+0.000dB".to_string()),
+        Some("-0.85 dBFS (whole-track)".to_string()),
     );
+    shared.observe_output_peak_u32(1 << 30);
     let status = http_request(
         server.addr(),
         &format!("GET /api/status HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nSec-Fetch-Site: same-origin\r\n\r\n"),
@@ -178,6 +180,13 @@ fn http_server_serves_scrollable_no_volume_ui_and_routes_play_pause_commands() {
     assert!(status.contains("application/json"));
     assert!(status.contains("Command: Pause"));
     assert!(status.contains("\"decision\":\"mode=[ultimate: cached]"));
+    assert!(status.contains("\"peak\":\"-0.85 dBFS (whole-track) · Live DAC: -6.02 dBFS\""));
+
+    let page_with_peak = http_request(
+        server.addr(),
+        &format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
+    );
+    assert!(page_with_peak.contains("Max Peak: -0.85 dBFS (whole-track) · Live DAC: -6.02 dBFS"));
 
     server.shutdown();
     // Port should be cleanly released once shutdown finishes

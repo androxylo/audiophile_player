@@ -1215,6 +1215,28 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
             let fmt_str = report.format_summary(total_duration_s);
             let track_str = path.display().to_string();
             let decision_str = report.ultimate_report.as_ref().map(|u| u.summary());
+            let known_peak = report
+                .ultimate_report
+                .as_ref()
+                .and_then(|u| {
+                    u.cached_m_dbfs
+                        .map(|m| format!("{m:+.2} dBFS (whole-track)"))
+                        .or_else(|| u.m30_dbfs.map(|m| format!("{m:+.2} dBFS (30 s window)")))
+                })
+                .or_else(|| {
+                    report
+                        .headroom
+                        .peak_dbfs
+                        .map(|p| match report.headroom.peak_kind {
+                            Some(ap_core::headroom::PeakKind::TruePeak) => {
+                                format!("{p:+.2} dBTP (tag)")
+                            }
+                            Some(ap_core::headroom::PeakKind::SamplePeak) => {
+                                format!("{p:+.2} dBFS (tag)")
+                            }
+                            None => format!("{p:+.2} dBFS"),
+                        })
+                });
             println!("  [playing]  {track_str} ({fmt_str})");
             println!("  [pipeline] {}", report.log_line());
             if let Some(ref ult_rep) = report.ultimate_report {
@@ -1225,7 +1247,13 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
             }
             let _ = io::stdout().flush();
             shared.record_action(report.log_line());
-            shared.set_playing_with_decision(mode_label, track_str, fmt_str, decision_str);
+            shared.set_playing_with_decision_and_peak(
+                mode_label,
+                track_str,
+                fmt_str,
+                decision_str,
+                known_peak,
+            );
             if mode_label == PlayModeLabel::UpnpRenderer {
                 if let Some(ref upnp) = state.upnp_state {
                     // Review #5 #5 & Review #6 #8/#17: promote prefetched NextURI -> CurrentURI
@@ -1248,15 +1276,21 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
                 let ep_for_stream = state.active_epoch;
                 let buf_for_stream = Arc::clone(stream_buf);
                 let buf_for_recycle = Arc::clone(stream_buf);
+                let live_peak_for_rt = shared.live_output_peak_handle();
                 let hit_track_end = Arc::new(AtomicBool::new(false));
                 let hit_end_cb = Arc::clone(&hit_track_end);
                 let play_res = sink.play_block_stream_with_recycler(
                     out_rate,
                     DacWireFormat::Int32,
-                    move || match buf_for_stream.try_pop_track_pcm_block(ep_for_stream) {
-                        PopBlockResult::Block(b) => ap_output_win::wdm_ks::StreamBlock::Ready(b),
-                        PopBlockResult::Underrun => ap_output_win::wdm_ks::StreamBlock::Underrun,
-                        PopBlockResult::TrackEnd | PopBlockResult::StaleOrClosed => {
+                    move || match buf_for_stream.try_pop_track_pcm_block_with_peak(ep_for_stream) {
+                        (PopBlockResult::Block(b), peak_u32) => {
+                            if peak_u32 > 0 {
+                                live_peak_for_rt.fetch_max(peak_u32, Ordering::Relaxed);
+                            }
+                            ap_output_win::wdm_ks::StreamBlock::Ready(b)
+                        }
+                        (PopBlockResult::Underrun, _) => ap_output_win::wdm_ks::StreamBlock::Underrun,
+                        (PopBlockResult::TrackEnd | PopBlockResult::StaleOrClosed, _) => {
                             hit_end_cb.store(true, Ordering::SeqCst);
                             ap_output_win::wdm_ks::StreamBlock::EndOfTrack
                         }

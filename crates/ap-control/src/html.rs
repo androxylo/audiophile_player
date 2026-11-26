@@ -46,6 +46,10 @@ pub fn render_control_page(snapshot: &ControlSnapshot, listing: &FolderListing) 
         Some(d) => html_escape(d),
         None => String::new(),
     };
+    let peak_html = match &snapshot.current_peak {
+        Some(p) => format!("Max Peak: {}", html_escape(p)),
+        None => String::new(),
+    };
 
     let mut items_html = String::new();
     if let Some(err) = &listing.error {
@@ -116,6 +120,7 @@ h1{{margin:0;font-size:1.15rem;letter-spacing:.02em;}}a{{color:var(--accent);tex
 .badge.playing{{background:rgba(63,185,80,.18);color:var(--ok);border:1px solid rgba(63,185,80,.4);}}\n\
 .badge.paused{{background:rgba(210,153,34,.18);color:var(--warn);border:1px solid rgba(210,153,34,.4);}}\n\
 .now{{margin-top:6px;font-size:.88rem;color:var(--muted);word-break:break-all;}}\n\
+.peak{{margin-top:4px;font-family:Consolas,monospace;font-size:.82rem;color:var(--ok);word-break:break-word;}}\n\
 .decision{{margin-top:4px;font-family:Consolas,monospace;font-size:.78rem;color:var(--accent);word-break:break-word;}}\n\
 .controls{{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;}}\n\
 button{{background:#272c36;color:var(--fg);border:1px solid var(--border);border-radius:5px;padding:7px 14px;cursor:pointer;font-size:.9rem;font-weight:600;}}\n\
@@ -142,6 +147,7 @@ pre#action-log{{margin:0;max-height:170px;overflow-y:auto;background:#0f1115;bor
     <span>DAC: <strong>{dac_html}</strong></span>\n\
   </div>\n\
   <div class=\"now\" id=\"now-playing\">{now_playing}</div>\n\
+  <div class=\"peak\" id=\"track-peak\">{peak_html}</div>\n\
   <div class=\"decision\" id=\"decision-report\">{decision_html}</div>\n\
 </section>\n\
 <section class=\"card\">\n\
@@ -179,9 +185,10 @@ pre#action-log{{margin:0;max-height:170px;overflow-y:auto;background:#0f1115;bor
 async function poll(){{try{{const r=await fetch('/api/status');if(!r.ok)return;const d=await r.json();\n\
 const b=document.getElementById('status-badge');b.innerHTML=d.playing?'<span class=\"badge playing\">'+d.mode+'</span>':'<span class=\"badge paused\">Paused (DAC released)</span>';\n\
 const n=document.getElementById('now-playing');n.textContent=d.track?(d.format?d.track+' — '+d.format:d.track):'Idle — DAC pin closed (available to Audirvana / other players)';\n\
+const pk=document.getElementById('track-peak');if(pk)pk.textContent=d.peak?'Max Peak: '+d.peak:'';\n\
 const dr=document.getElementById('decision-report');if(dr)dr.textContent=d.decision||'';\n\
 const l=document.getElementById('action-log');const atBottom=(l.scrollHeight-l.scrollTop-l.clientHeight)<24;l.textContent=d.log.join('\\n');if(atBottom)l.scrollTop=l.scrollHeight;}}catch(_){{}}}}\n\
-setInterval(poll,2000);\n\
+setInterval(poll,1000);\n\
 </script>\n\
 </body>\n\
 </html>\n"
@@ -202,13 +209,17 @@ pub fn render_status_json(snapshot: &ControlSnapshot) -> String {
         Some(d) => json_escape(d),
         None => "null".to_string(),
     };
+    let peak_json = match &snapshot.current_peak {
+        Some(p) => json_escape(p),
+        None => "null".to_string(),
+    };
     let log_items: Vec<String> = snapshot
         .recent_actions
         .iter()
         .map(|s| json_escape(s))
         .collect();
     format!(
-        "{{\"playing\":{},\"mode\":{},\"dac\":{},\"folder\":{},\"track\":{},\"format\":{},\"decision\":{},\"log\":[{}]}}",
+        "{{\"playing\":{},\"mode\":{},\"dac\":{},\"folder\":{},\"track\":{},\"format\":{},\"decision\":{},\"peak\":{},\"log\":[{}]}}",
         snapshot.is_playing,
         json_escape(snapshot.mode.as_str()),
         json_escape(&snapshot.dac_name),
@@ -216,6 +227,7 @@ pub fn render_status_json(snapshot: &ControlSnapshot) -> String {
         track_json,
         fmt_json,
         decision_json,
+        peak_json,
         log_items.join(",")
     )
 }
