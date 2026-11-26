@@ -1,10 +1,12 @@
 # 💎 Ultimate Mode
 
-[← Home](../README.md) · **Ultimate Mode** · [Sound Engine](SOUND_ENGINE.md) · [Getting Started](GETTING_STARTED.md)
+[🏠 Home](../README.md) · [🚀 Quick Start](QUICK_START.md) · [🧭 Getting Started](GETTING_STARTED.md) · **💎 Ultimate Mode** · [🎛️ Sound Engine](SOUND_ENGINE.md) · [⌨️ CLI](CLI.md)
 
 > **One idea:** before a track plays, *listen to it*. Ultimate mode takes the first 30 seconds of the recording, the FLAC tags, and anything it learned the last time it played the track. From those it chooses the filter, the de-emphasis and the gain that suit **this particular master**. Nothing in the chain is approximated to save CPU.
 
-Turn it on with `--ultimate`, or with `enabled = true` under `[ultimate]` in the config file.
+Turn it on for one session with `--ultimate`, or permanently with `audiophile-player config set ultimate.enabled true` (that's `enabled = true` under `[ultimate]` in the config file) followed by `audiophile-player restart`. With an AI agent connected over MCP, just say *"turn on ultimate mode"* ([how](QUICK_START.md#controlling-the-player-through-mcp)).
+
+It works the same on every DAC. All analysis, filter choice and rendering happen in the 8fS chain; on a DAC below 352.8 / 384 kHz the [last-stage downsampler](SOUND_ENGINE.md#lower-rate-dacs-below-8fs) is applied afterwards.
 
 ---
 
@@ -37,7 +39,7 @@ sequenceDiagram
 
     F->>L: First 30 s of audio + FLAC tags
     Note over L: Detectors analyse spectrum,<br/>transients, loudness, clipping
-    L->>B: Evidence (and the track DB entry, if any)
+    L->>B: Evidence (and the filter database entry, if any)
     B->>B: Choose filter, phase, de-emphasis
     B->>R: Render the 30 s once, at unity gain
     R->>B: True post-chain peak of those 30 s
@@ -98,7 +100,7 @@ Not every piece of evidence is equally trustworthy. Ultimate mode ranks it:
 
 ```mermaid
 flowchart LR
-    U["👤 <b>You</b><br/>track DB user: section<br/>or AP_* tags"]:::u --> C["💾 <b>Whole-track memory</b><br/>from a previous full play<br/>or offline scan"]:::c --> H["📄 <b>File header</b><br/>STREAMINFO, CUESHEET"]:::h --> W["👂 <b>30 s look-ahead</b>"]:::w --> T["🏷️ <b>Ordinary tags</b><br/>genre, year, ReplayGain"]:::t --> D["⚙️ <b>Defaults</b>"]:::d
+    U["👤 <b>You</b><br/>my-filters.yaml<br/>or AP_* tags"]:::u --> C["💾 <b>Whole-track memory</b><br/>from a previous full play<br/>or offline scan"]:::c --> H["📄 <b>File header</b><br/>STREAMINFO, CUESHEET"]:::h --> W["👂 <b>30 s look-ahead</b>"]:::w --> T["🏷️ <b>Ordinary tags</b><br/>genre, year, ReplayGain"]:::t --> D["⚙️ <b>Defaults</b>"]:::d
     classDef u fill:#2f9e44,stroke:#2b8a3e,color:#fff
     classDef c fill:#51cf66,stroke:#2f9e44,color:#000
     classDef h fill:#94d82d,stroke:#66a80f,color:#000
@@ -117,7 +119,7 @@ Stronger evidence (left) beats weaker evidence (right). Tags are never trusted b
 flowchart TD
     S([Track]) --> N{Native<br/>352.8 / 384 kHz?}
     N -- yes --> NULL["<b>null</b><br/>bit-exact pass-through"]:::keep
-    N -- no --> U{Your override?<br/>user.filter / AP_FILTER}
+    N -- no --> U{Your choice?<br/>my-filters.yaml / AP_FILTER}
     U -- yes --> UF["<b>Your filter</b>"]:::user
     U -- no --> A{"Rule A<br/>pre-ringing in master?"}
     A -- yes --> APOD["<b>gauss-apod-4m</b><br/>apodizing"]:::apod
@@ -140,7 +142,8 @@ flowchart TD
     classDef ext fill:#ffd8a8,stroke:#e8590c,color:#000
 ```
 
-- An `AP_PHASE` tag (`minimum` / `intermediate` / `linear`) switches to the **min-phase** or **intermediate-phase** member of the Gaussian family.
+- "Your choice" means `--filter` on the command line, an entry in `my-filters.yaml`, or an `AP_FILTER` tag. The last two are used in `mine` mode (the default whenever `my-filters.yaml` exists); `--filters suggested` skips them for an A/B comparison. See [Your overrides](#your-overrides-my-filtersyaml).
+- An `AP_PHASE` tag (or `phase:` in `my-filters.yaml`) with `minimum` / `intermediate` / `linear` switches to the **min-phase** or **intermediate-phase** member of the Gaussian family.
 - The genre rules are on by default. Turn them off with `--no-genre-rules` or `genre_rules = false` in `[ultimate]`.
 - On **streams** (UPnP and live exclusive Tidal capture), the 4M-class filters are replaced by their long Gaussian equivalents (`gauss-long-lp` / `gauss-hires-lp`). Live real-time capture starts with a short ~0.75 s cushion instead of waiting 30 s, while still keeping Ultimate mode's full-tail REW convolution and pure-`f64` 8fS path.
 
@@ -174,13 +177,13 @@ stateDiagram-v2
 Early-1980s CDs with pre-emphasis get exact IEC **50/15 µs de-emphasis** in f64, applied before room correction. It is applied only when there is a **fact** to go on:
 - the CUESHEET pre-emphasis flag,
 - an `AP_DEEMPHASIS` tag,
-- or your track DB `user:` entry.
+- or a `deemphasis: true` entry in your `my-filters.yaml`.
 
 A "sounds bright, 1982–1989" guess is only logged as a suggestion. It is never applied automatically.
 
 ---
 
-## Your overrides (`my-filters.yaml` & `--filters`)
+## Your overrides (my-filters.yaml)
 
 Ultimate mode cleanly separates **machine-managed analysis** from **your personal filter choices** (Schema 2):
 
@@ -214,7 +217,20 @@ tracks:
 - Whenever a user choice overrides the machine suggestion, both the console and the HTTP UI display them side by side:
   `playing: gauss-long-lp (mine: folder) | suggested: sinc-steep-4m (rule_G_classical)`.
 
-Manage overrides and inspect suggestions from the CLI (`audiophile-player filters show | diff | set | check | relink | migrate`) — see [Getting Started → Filter Database](GETTING_STARTED.md#filter-database). If you are upgrading from an earlier release that stored per-track YAML files in `%APPDATA%\audiophile-player\trackdb\`, run `audiophile-player filters migrate` once to import them into Schema 2 (legacy Schema-1 files are migration-only and are no longer read at runtime).
+You rarely need to edit the file by hand. The `filters` commands validate the filter name, keep your comments and save a `.bak` first:
+
+```powershell
+audiophile-player filters set "D:\Music\Jazz\Miles Davis - Kind of Blue" gauss-long-lp --note "prefer gauss-long-lp on this pressing"
+audiophile-player filters set "D:\Music\Classical\Mahler\01_Adagio.flac" sinc-steep-4m
+audiophile-player filters set "D:\Music" gauss-long-lp     # a default for the whole library root
+audiophile-player filters show "D:\Music\Jazz\Miles Davis - Kind of Blue"   # mine vs suggested, and why
+audiophile-player filters diff                               # every place you disagree with the machine
+audiophile-player filters check                              # catch typos and dead paths
+```
+
+Changes apply from the **next track**, with no restart. With an AI agent, *"use apodizing for this album"* does the same through the `filters_set` tool. The full command list is in [Getting Started → Filter database](GETTING_STARTED.md#filter-database).
+
+Upgrading from an older version? `audiophile-player filters migrate` imports your Schema-1 `trackdb\` entries and `user:` overrides into Schema 2 without deleting anything.
 
 ---
 
@@ -236,4 +252,4 @@ ultimate=[mode=[ultimate: cached] rule=rule_A_apodizing fired=[A(apod:cache(WT))
 | `G` | The fixed gain applied to the whole track |
 | `speed` | Render speed in multiples of real time. Below the required speed, a lighter **exact** filter is used |
 
-[← Home](../README.md) · Next: [🎛️ Sound Engine →](SOUND_ENGINE.md)
+[← Getting Started](GETTING_STARTED.md) · [🏠 Home](../README.md) · Next: [🎛️ Sound Engine →](SOUND_ENGINE.md)

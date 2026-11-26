@@ -57,14 +57,15 @@ This file is the authoritative runbook for AI assistants helping a user install,
 - `0`: success
 - `1`: runtime / I/O error
 - `2`: invalid CLI arguments (check `hint:` on stderr)
-- `3`: audio device missing / busy / does not support 32-bit 352.8 & 384 kHz
+- `3`: audio device missing / busy / no usable sample rate or format supported
 - `4`: invalid configuration (`config.toml` or `my-filters.yaml`)
 - `5`: instance state error (already running on play, or not running on `status`/`stop`)
 
 ## Key Documentation
 
-- `docs/CLI.md` — complete auto-generated CLI & config reference (single source of truth)
-- `docs/GETTING_STARTED.md` — installation, first play, UPnP, REW convolution, opt-in Tidal driver
+- `docs/QUICK_START.md` — installation (one-line source build, AI agent, prebuilt), first run, MCP control, troubleshooting
+- `docs/GETTING_STARTED.md` — everyday use, config file, web page, REW convolution, library scan, UPnP, opt-in Tidal driver
 - `docs/ULTIMATE_MODE.md` — 30 s look-ahead, detectors, exact headroom, Schema-2 Filter DB
-- `docs/SOUND_ENGINE.md` — upsampling filters, noise shapers, DAC bit depth, WDM-KS pipeline
+- `docs/SOUND_ENGINE.md` — upsampling filters, noise shapers, DAC bit depth, lower-rate DACs, WDM-KS pipeline
 - `docs/FILTER_PREFERENCES.md` — community listening notes and filter preset comparisons
+- `docs/CLI.md` — complete auto-generated CLI & config reference (single source of truth)

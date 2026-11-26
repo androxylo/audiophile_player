@@ -1,20 +1,26 @@
 # Audiophile Player
 
-**A headless, no-compromise upsampling player for Windows: every track is rendered in 64-bit float to 8fS (352.8 / 384 kHz), with REW room correction and a single noise-shaped quantizer, sent bit-exact to your DAC over kernel streaming.**
+**🏠 Home** · [🚀 Quick Start](docs/QUICK_START.md) · [🧭 Getting Started](docs/GETTING_STARTED.md) · [💎 Ultimate Mode](docs/ULTIMATE_MODE.md) · [🎛️ Sound Engine](docs/SOUND_ENGINE.md) · [⌨️ CLI](docs/CLI.md)
 
-![Output](https://img.shields.io/badge/output-352.8%20%2F%20384%20kHz-6f42c1)
+**A free, headless upsampling player for Windows. Every track is processed in 64-bit float at 8fS (352.8 / 384 kHz) with long filters, your REW room correction and a single noise-shaped quantizer, then sent to your DAC in WDM-KS exclusive mode.**
+
+![Output](https://img.shields.io/badge/DSP%20rate-352.8%20%2F%20384%20kHz-6f42c1)
+![DACs](https://img.shields.io/badge/DACs-44.1%E2%80%93384%20kHz-845ef7)
 ![Math](https://img.shields.io/badge/DSP-64--bit%20float-1f6feb)
 ![Filters](https://img.shields.io/badge/filters-up%20to%204M%20taps-d73a49)
 ![Transport](https://img.shields.io/badge/transport-WDM--KS%20exclusive-2da44e)
 ![UPnP](https://img.shields.io/badge/UPnP-renderer-fb8500)
 ![Tidal](https://img.shields.io/badge/Tidal%20Desktop-exclusive%20ACX%20(opt--in)-00b4d8)
+![AI](https://img.shields.io/badge/AI%20control-MCP%20(stdio)-7048e8)
 ![License](https://img.shields.io/badge/license-GPL--3.0--or--later-555)
 
-No GUI and no volume knob. There is no EQ beyond your REW filter, and no Windows mixer anywhere in the path. All the effort goes into the signal.
+It has no GUI and no volume knob. There's no EQ beyond your REW filter, and the Windows mixer is never in the path. All the effort goes into the signal.
+
+**Who it's for:** people who already think in terms of poly-sinc, apodizing and noise shapers (if you've used HQPlayer, you'll feel at home) and want a free, open-source, set-and-forget player for a dedicated Windows PC with a good DAC. You don't need to be a programmer: the installer builds it for you, or a free AI assistant can do the whole setup.
 
 > [!TIP]
 > **☕ Enjoying the music? Buy me a coffee!**
-> Audiophile Player is 100% free and open source — built out of pure obsession with clean sound. If it brings your DAC to life, consider supporting continued development:
+> Audiophile Player is 100% free and open source, built out of pure obsession with clean sound. If it brings your DAC to life, please consider supporting continued development:
 >
 > [![Buy Me a Coffee — GitHub Sponsors](https://img.shields.io/badge/%E2%98%95_Buy_Me_a_Coffee-Sponsor_%40androxylo-ea4aaa?style=for-the-badge&logo=githubsponsors&logoColor=white)](https://github.com/sponsors/androxylo)
 >
@@ -22,7 +28,25 @@ No GUI and no volume knob. There is no EQ beyond your REW filter, and no Windows
 
 ---
 
-## The signal path
+## ⏱️ Get started in 3 minutes
+
+Windows 10/11 x64 and a USB DAC. Pick **one** of the three ways in:
+
+| | Way in | You do | Good for |
+|---|---|---|---|
+| 1️⃣ | **Paste one line** | Open PowerShell, paste the line below, approve the Windows admin prompt(s), wait 10–30 min while it builds | Most people. Builds the newest code on your own PC from source you can read |
+| 2️⃣ | **Ask a free AI** | Install a free AI agent (Antigravity CLI or VS Code + Copilot Free), then type *"Install and set up https://github.com/androxylo/audiophile_player on this PC"* | People who'd rather ask than type commands. The AI can also control the player afterwards |
+| 3️⃣ | **Download prebuilt** | Run the installer with `-Binary`, or download the zip from [Releases](https://github.com/androxylo/audiophile_player/releases) and check its SHA-256 | No compiler, no admin prompt. The prebuilt version may be older than the newest source |
+
+```powershell
+irm https://github.com/androxylo/audiophile_player/releases/latest/download/bootstrap.ps1 | iex
+```
+
+Then press the **Audiophile Player** icon on your desktop. 👉 **[Step-by-step Quick Start, including all three ways →](docs/QUICK_START.md)**
+
+---
+
+## 🎚️ The signal path
 
 ```mermaid
 flowchart LR
@@ -30,10 +54,11 @@ flowchart LR
     UP["⬆️ Upsampling<br/>to 8fS<br/>Gaussian / sinc / apodizing<br/>up to 4M taps"]:::dsp
     DE["De-emphasis<br/>50/15 µs<br/><i>only when flagged</i>"]:::opt
     REW["🏠 REW room<br/>convolution<br/>up to 4M-tap IR"]:::dsp
+    DS["⬇️ Downsampling<br/>to your DAC's rate<br/><i>only for DACs below 8fS</i>"]:::opt
     Q["🎚️ One quantizer<br/>TPDF + noise shaping<br/>16 / 18 / 20 / 24 bit"]:::q
-    DAC["🔊 Your DAC<br/>WDM-KS exclusive<br/>352.8 / 384 kHz"]:::dac
+    DAC["🔊 Your DAC<br/>WDM-KS exclusive<br/>44.1 … 384 kHz"]:::dac
 
-    SRC --> UP --> DE --> REW --> Q --> DAC
+    SRC --> UP --> DE --> REW --> DS --> Q --> DAC
 
     classDef src fill:#fff3bf,stroke:#f08c00,color:#000
     classDef dsp fill:#d0ebff,stroke:#1c7ed6,color:#000
@@ -42,98 +67,59 @@ flowchart LR
     classDef dac fill:#d3f9d8,stroke:#2f9e44,color:#000
 ```
 
-Everything between source and DAC runs in **f64**. The DAC sees exactly **one** rounding operation in the whole chain: the final dithered, noise-shaped quantization. **Upsampling always comes before room correction**, so your REW filter works at the full 8fS rate and covers the whole spectrum.
+- Everything between the source and the DAC runs in **f64**. The DAC sees exactly **one** rounding step in the whole chain: the final dithered, noise-shaped quantization.
+- **Upsampling always comes before room correction**, so your REW filter works at the full 8fS rate and covers the whole spectrum.
+- **On a 352.8 / 384 kHz DAC there is no downsampling at all.** On a slower DAC, the whole chain still runs at 8fS. Only the very last stage, right before the quantizer, converts down to the highest rate the DAC accepts. [How that works →](docs/SOUND_ENGINE.md#lower-rate-dacs-below-8fs)
 
 ---
 
-## Two ways to play
+## ⚡ Two ways to play
 
-```mermaid
-flowchart TB
-    subgraph N["⚡ Normal mode (default)"]
-        direction LR
-        N1["Track arrives"] --> N2["Pick filter<br/>by sample rate"] --> N3["Play immediately"]
-    end
-    subgraph U["💎 Ultimate mode  (--ultimate)"]
-        direction LR
-        U1["Track arrives"] --> U2["Listen 30 s ahead<br/>+ read tags + track DB"] --> U3["Pick the best filter<br/>for <b>this</b> recording"] --> U4["One exact gain<br/>for the whole track"] --> U5["Remember it<br/>for next time"]
-    end
-    style N fill:#e7f5ff,stroke:#1c7ed6,color:#000
-    style U fill:#f3f0ff,stroke:#7048e8,color:#000
-```
-
-| | ⚡ Normal | 💎 Ultimate |
+| | ⚡ Normal (default) | 💎 Ultimate (`--ultimate`) |
 |---|---|---|
-| Filter choice | By sample rate: Gaussian long LP (1×) or hi-res LP | Per recording: apodizing, steep sinc, extended-sharp, min/intermediate phase… |
-| Detects fake hi-res, pre-ringing (apodizing need), loud & clipped masters | — | ✅ |
-| Uses FLAC tags (genre, original year, ReplayGain, pre-emphasis, your overrides) | Peak tags only | ✅ everything |
-| Headroom | −3 dB or 0 dB from peak tags | One exact gain per track, measured after the full chain |
-| REW impulse tail | Tail below −200 dB is trimmed on very long IRs | Full tail, never truncated |
-| Start-up | Instant | First 30 s are rendered before the first sample plays |
+| Filter choice | By sample rate: long Gaussian for 1×, hi-res Gaussian for 2×–4× | Per recording: apodizing, steep sinc, extended-sharp, min/intermediate phase… |
+| Detects fake hi-res, pre-ringing, loud & clipped masters | — | ✅ |
+| Uses your per-album / per-track filter choices (`my-filters.yaml`) | — | ✅ |
+| Headroom | −3 dB or 0 dB, from peak tags | One exact gain per track, measured after the full chain |
+| Start-up | Instant | The first 30 s are rendered before the first sample plays |
 
 👉 **[How Ultimate Mode thinks →](docs/ULTIMATE_MODE.md)**
 
 ---
 
-## Quick Start (Windows 10/11 x64)
+## ✨ What's new
 
-### Path A — One-line installer (builds from source by default)
-
-Open PowerShell and run:
-
-```powershell
-irm https://github.com/androxylo/audiophile_player/releases/latest/download/bootstrap.ps1 | iex
-```
-
-- **Builds locally from source** by default (installs Git, Rust, and VS Build Tools via WinGet if missing, compiles `audiophile-player.exe`, creates Start Menu/Desktop shortcuts, and runs `audiophile-player doctor`).
-- **Prefer to inspect first or use a verified pre-built binary?** Download `scripts/bootstrap.ps1`, read it, and run `.\bootstrap.ps1` (source build) or `.\bootstrap.ps1 -Binary` (opt-in SHA-256 + GitHub provenance verified release archive).
-
-### Path B — Let a free AI agent install & tune it for you
-
-Clone or point a free coding assistant (**Antigravity CLI** or **VS Code + GitHub Copilot Free**) at this repo — it reads [`AGENTS.md`](AGENTS.md), runs `audiophile-player doctor --json` / `devices --json`, configures your DAC and music folder, and can control playback through the built-in MCP server (`audiophile-player mcp`). See [Getting Started → Path B](docs/GETTING_STARTED.md#path-b--let-a-free-ai-agent-install-and-configure-it) for step-by-step instructions.
+| | |
+|---|---|
+| 🔽 **DACs below 352.8 / 384 kHz now work** | 192, 176.4, 96, 88.2, 48 and 44.1 kHz DACs, with 32-, 24- or 16-bit containers. The 8fS chain is untouched; a pure-f64 downsampler runs only at the very end. 176.4 / 192 kHz outputs get proper 4fS noise shapers. `--max-rate` caps the output rate by hand. |
+| 🤖 **Control it by asking** | A built-in MCP server (`audiophile-player mcp`) lets a free AI agent install, configure and run the player: *"turn on ultimate mode"*, *"use apodizing for this album"*, *"what's playing?"* |
+| 🩺 **Self-diagnosing** | `doctor`, `devices`, `config show/set`, `status`, `stop` and `restart`, each with `--json`. Restarts wait for the current track to finish by default. |
+| 📖 **Help that can't go out of date** | `help`, `help <option>` and `help --json` are generated from the same table as the parser, and so is [docs/CLI.md](docs/CLI.md). |
+| 🧰 **One-line installer** | `bootstrap.ps1` builds from source by default, with an optional verified prebuilt binary. |
 
 ---
 
-## Where to go next
+## 🧭 Where to go next
 
 | | Page | What you'll find |
 |---|---|---|
-| 🚀 | **[Getting Started](docs/GETTING_STARTED.md)** | Quick start (source, verified binary, or free AI agent), first play, web page, UPnP, Tidal Exclusive driver, REW config |
-| ⌨️ | **[CLI Reference](docs/CLI.md)** | Complete auto-generated command, flag, exit-code, and `config.toml` reference (`audiophile-player help --json`) |
-| 💎 | **[Ultimate Mode](docs/ULTIMATE_MODE.md)** | The 30-second look-ahead, the detectors, how a filter is chosen, exact headroom, learn-on-play, per-track overrides |
-| 🎛️ | **[Sound Engine](docs/SOUND_ENGINE.md)** | Every filter and noise shaper explained for HQPlayer users, DAC bits, headroom policy, REW convolution, gapless |
+| 🚀 | **[Quick Start](docs/QUICK_START.md)** | Install (one line, AI agent, or prebuilt), first run, AI/MCP control, updating, uninstalling, troubleshooting |
+| 🧭 | **[Getting Started](docs/GETTING_STARTED.md)** | Setup and everyday use: config file, web page, REW room correction, Ultimate mode, library scan, UPnP, Tidal driver |
+| 💎 | **[Ultimate Mode](docs/ULTIMATE_MODE.md)** | The 30-second look-ahead, the detectors, how a filter is chosen, exact headroom, `my-filters.yaml` |
+| 🎛️ | **[Sound Engine](docs/SOUND_ENGINE.md)** | Every filter and noise shaper explained for HQPlayer users, DAC bits, lower-rate DACs, headroom, REW, gapless |
+| 🎧 | **[Filter Preferences](docs/FILTER_PREFERENCES.md)** | Community listening notes mapped to this player's filters |
+| ⌨️ | **[CLI Reference](docs/CLI.md)** | Every command, flag, config key and exit code (generated from the code) |
 
 ---
 
-## At a glance
+## 🚦 Status and honest limits
 
-```mermaid
-mindmap
-  root((Audiophile<br/>Player))
-    Sources
-      Local FLAC library
-      UPnP / DLNA renderer
-      Tidal Desktop (opt-in exclusive ACX driver)
-    DSP
-      f64 throughout
-      8fS only
-      ≤ 4M taps
-      REW convolution
-    Output
-      WDM-KS kernel streaming
-      Exclusive only
-      Releases DAC on pause
-    Control
-      Tiny local web page
-      foobar2000 / BubbleUPnP
-      Command line
-```
-
-**Status and honest limits**
-- 🟢 **Works today:** local FLAC (random or sequential, gapless), UPnP renderer (gapless), **Tidal Desktop Exclusive Mode** via our opt-in Rust ACX virtual driver (zero Windows mixer), normal and ultimate modes, REW convolution, offline library scan, local web page.
-- 🟡 **Planned:** WASAPI exclusive output, per-channel delay.
+- 🟢 **Works today:** local FLAC (random or sequential, gapless); UPnP renderer (gapless); **Tidal Desktop Exclusive Mode** through the opt-in ACX virtual driver; normal and ultimate modes; REW convolution; offline library scan and filter database; local web page; DACs from 44.1 to 384 kHz; diagnostics; AI control over stdio MCP.
+- 🟡 **Planned:** WASAPI exclusive output, per-channel delay. An HTTP transport for MCP is deferred until someone asks for it.
 - 🔴 **Not supported, by design:** Windows shared mode, volume control, DSP effects, macOS / Linux playback.
-- Reference DAC: **Schiit Gungnir 2** (Unison USB, NOS, 352.8 / 384 kHz). The main DSP pipeline always operates at locked **8fS** (`352.8 / 384 kHz`, `f64`). DACs limited to lower rates (`192 / 176.4 / 96 / 88.2 / 48 / 44.1 kHz`, 32/24/16-bit) are supported automatically via a strictly last-stage pure-`f64` anti-aliasing downsampler right before the single quantizer.
+- 📦 **Prebuilt binaries** come with some release tags only and can lag behind the source. Building from source is the default.
+- 🧪 **Reference DAC:** Schiit Gungnir 2 (Unison USB, NOS, 352.8 / 384 kHz). A native 8fS DAC is still the best match. Lower-rate DACs are supported, but they hear the 8fS chain through one extra (very clean) conversion step.
+- 🐢 **Ultimate mode is CPU-hungry.** The 4M-tap filters take a while to start on a modest PC. A [library scan](docs/GETTING_STARTED.md#scan-your-library-optional) makes later plays faster and exact from the first second.
 
 ## License
 

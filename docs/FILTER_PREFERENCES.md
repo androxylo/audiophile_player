@@ -1,6 +1,6 @@
-# Community & Listener Filter Preferences
+# 🎧 Community & Listener Filter Preferences
 
-[← Back to Sound Engine](SOUND_ENGINE.md)
+[🏠 Home](../README.md) · [🚀 Quick Start](QUICK_START.md) · [🧭 Getting Started](GETTING_STARTED.md) · [💎 Ultimate Mode](ULTIMATE_MODE.md) · [🎛️ Sound Engine](SOUND_ENGINE.md) · [⌨️ CLI](CLI.md)
 
 > This is a living reference notebook collecting community opinions, forum posts, and listening guides on PCM upsampling filters — kept **outside the core manual** and updated as useful perspectives appear.
 >
@@ -19,6 +19,18 @@
 | **Loudness-war / clipped / pre-ringing cleanup** | `poly-sinc-xtr-short-lp`, `poly-sinc-gauss-xla`, `sinc-MGa` | `gauss-apod-4m` | Apodizing cutoff cleans mastering-stage ringing (auto-picked by Ultimate Rules A & L) |
 | **Concert hall / classical space & scale** | `poly-sinc-gauss-xla`, `sinc-L`, `sinc-M` | `sinc-steep-4m`, `gauss-apod-4m` | Very long linear-phase kernels emphasizing space & authority |
 | **Pure sample-preserving / halfband** | `poly-sinc-gauss-halfband` / `-s`, `closed-form` | *(not implemented — `null` for native 8fS only)* | No error correction; only for pristine masters |
+
+### Trying a taste in practice
+
+| To… | Do |
+|---|---|
+| Hear one filter on everything, this session | `audiophile-player restart --filter ext-sharp-lp` (back to automatic: `restart --filter auto`) |
+| Make it your permanent global choice | `audiophile-player config set filter ext-sharp-lp`, then `restart` |
+| Use it for one album or one track only (Ultimate mode) | `audiophile-player filters set "D:\Music\Artist\Album" ext-sharp-lp --note "why I like it"`; applies from the next track, no restart |
+| A/B your choices against the machine's | `audiophile-player restart --filters suggested`, then `restart --filters mine` |
+| Ask an AI agent | *"Use apodizing for this album"*, *"switch everything to the long sinc for tonight"* ([MCP control](QUICK_START.md#controlling-the-player-through-mcp)) |
+
+Filter choice comes **before** any last-stage downsampling, so these tastes apply unchanged on DACs below 352.8 / 384 kHz. Details: [Ultimate Mode → Your overrides](ULTIMATE_MODE.md#your-overrides-my-filtersyaml).
 
 ---
 
@@ -50,3 +62,5 @@
 ### 2. Earlier Cross-Forum Survey (Audiophile Style, Roon, Head-Fi, SBAF, ASR, Archimago)
 
 See [docs/research/02-audiophile-filter-survey.md](research/02-audiophile-filter-survey.md) for the broader Phase-0 consensus survey covering `poly-sinc-gauss-*`, `sinc-MGa`/`sinc-M`/`sinc-L`, `poly-sinc-ext2/3`, PGGB mega-tap Gaussian/Kaiser, and multibit/NOS `DAC Bits` + noise-shaper (`NS5` / `LNS15`) pairing.
+
+[← Sound Engine](SOUND_ENGINE.md) · [🏠 Home](../README.md)

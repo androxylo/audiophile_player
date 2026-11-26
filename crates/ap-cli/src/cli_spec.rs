@@ -1388,7 +1388,7 @@ pub fn render_help_markdown() -> String {
     out.push_str("<!-- GENERATED FILE: do not edit by hand! Regenerate with:\n");
     out.push_str("     cargo run --bin audiophile-player -- help --markdown > docs/CLI.md -->\n\n");
     out.push_str("# CLI & Configuration Reference\n\n");
-    out.push_str("[← Home](../README.md) · [Getting Started](GETTING_STARTED.md) · [Ultimate Mode](ULTIMATE_MODE.md) · [Sound Engine](SOUND_ENGINE.md)\n\n");
+    out.push_str("[🏠 Home](../README.md) · [🚀 Quick Start](QUICK_START.md) · [🧭 Getting Started](GETTING_STARTED.md) · [💎 Ultimate Mode](ULTIMATE_MODE.md) · [🎛️ Sound Engine](SOUND_ENGINE.md) · **⌨️ CLI**\n\n");
     out.push_str("> Generated directly from `crates/ap-cli/src/cli_spec.rs`. Machine-readable form: `audiophile-player help --json`.\n\n");
 
     out.push_str("## Commands\n\n");

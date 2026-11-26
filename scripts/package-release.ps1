@@ -92,7 +92,7 @@ Copy-Item -Force (Join-Path $repoRoot "audiophile-player.example.toml") $stageDi
 Copy-Item -Force (Join-Path $repoRoot "README.md") $stageDir
 Copy-Item -Force (Join-Path $repoRoot "LICENSE") $stageDir
 
-foreach ($doc in @("GETTING_STARTED.md", "SOUND_ENGINE.md", "ULTIMATE_MODE.md", "CLI.md", "FILTER_PREFERENCES.md")) {
+foreach ($doc in @("QUICK_START.md", "GETTING_STARTED.md", "SOUND_ENGINE.md", "ULTIMATE_MODE.md", "CLI.md", "FILTER_PREFERENCES.md")) {
     Copy-Item -Force (Join-Path $repoRoot "docs\$doc") (Join-Path $stageDir "docs\$doc")
 }
 Copy-Item -Force (Join-Path $repoRoot "assets\audiophile-player.ico") (Join-Path $stageDir "assets\audiophile-player.ico")
@@ -211,6 +211,7 @@ $allowedManifest = @(
     "LICENSE",
     "THIRD-PARTY-LICENSES.txt",
     "assets\audiophile-player.ico",
+    "docs\QUICK_START.md",
     "docs\GETTING_STARTED.md",
     "docs\SOUND_ENGINE.md",
     "docs\ULTIMATE_MODE.md",

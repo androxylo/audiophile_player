@@ -41,6 +41,7 @@ use crate::lifecycle::{
 
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
+const DOC_QUICK_START: &str = include_str!("../../../docs/QUICK_START.md");
 const DOC_GETTING_STARTED: &str = include_str!("../../../docs/GETTING_STARTED.md");
 const DOC_ULTIMATE_MODE: &str = include_str!("../../../docs/ULTIMATE_MODE.md");
 const DOC_SOUND_ENGINE: &str = include_str!("../../../docs/SOUND_ENGINE.md");
@@ -859,6 +860,11 @@ fn resource_definitions() -> Vec<JsonValue> {
             ("mimeType", JsonValue::from("application/json")),
         ]),
         JsonValue::obj(vec![
+            ("uri", JsonValue::from("ap://docs/quick-start")),
+            ("name", JsonValue::from("Quick Start Guide")),
+            ("mimeType", JsonValue::from("text/markdown")),
+        ]),
+        JsonValue::obj(vec![
             ("uri", JsonValue::from("ap://docs/getting-started")),
             ("name", JsonValue::from("Getting Started Guide")),
             ("mimeType", JsonValue::from("text/markdown")),
@@ -890,6 +896,7 @@ fn read_resource(uri: &str) -> Result<(&'static str, String), String> {
             };
             Ok(("application/json", val.to_pretty_string()))
         }
+        "ap://docs/quick-start" => Ok(("text/markdown", DOC_QUICK_START.to_string())),
         "ap://docs/getting-started" => Ok(("text/markdown", DOC_GETTING_STARTED.to_string())),
         "ap://docs/ultimate-mode" => Ok(("text/markdown", DOC_ULTIMATE_MODE.to_string())),
         "ap://docs/sound-engine" => Ok(("text/markdown", DOC_SOUND_ENGINE.to_string())),
@@ -1027,7 +1034,7 @@ mod tests {
             .unwrap();
         assert!(text.contains("filters.mode"));
 
-        // 5. resources/read ap://cli/spec
+        // 5. resources/read ap://cli/spec & ap://docs/quick-start
         let res_resp = srv
             .handle_json_line(
                 r#"{"jsonrpc":"2.0","id":4,"method":"resources/read","params":{"uri":"ap://cli/spec"}}"#,
@@ -1042,6 +1049,20 @@ mod tests {
             .and_then(JsonValue::as_str)
             .unwrap();
         assert!(spec_text.contains("ap.cli_spec/1"));
+        let qs_resp = srv
+            .handle_json_line(
+                r#"{"jsonrpc":"2.0","id":40,"method":"resources/read","params":{"uri":"ap://docs/quick-start"}}"#,
+            )
+            .unwrap();
+        let qs_text = qs_resp
+            .get("result")
+            .and_then(|r| r.get("contents"))
+            .and_then(JsonValue::as_array)
+            .and_then(|a| a.first())
+            .and_then(|c| c.get("text"))
+            .and_then(JsonValue::as_str)
+            .unwrap();
+        assert!(qs_text.contains("Quick Start"));
 
         // 6. prompts/get ap-setup
         let pr_resp = srv

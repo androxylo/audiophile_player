@@ -3,7 +3,7 @@
 
 # CLI & Configuration Reference
 
-[← Home](../README.md) · [Getting Started](GETTING_STARTED.md) · [Ultimate Mode](ULTIMATE_MODE.md) · [Sound Engine](SOUND_ENGINE.md)
+[🏠 Home](../README.md) · [🚀 Quick Start](QUICK_START.md) · [🧭 Getting Started](GETTING_STARTED.md) · [💎 Ultimate Mode](ULTIMATE_MODE.md) · [🎛️ Sound Engine](SOUND_ENGINE.md) · **⌨️ CLI**
 
 > Generated directly from `crates/ap-cli/src/cli_spec.rs`. Machine-readable form: `audiophile-player help --json`.
 
