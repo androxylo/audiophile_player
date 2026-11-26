@@ -152,8 +152,8 @@ impl DacOutputCapabilities {
         }
     }
 
-    /// Resolve the best per-family targets from a list of supported `(sample_rate_hz, wire_format)`
-    /// pairs and an optional `max_rate_hz` ceiling.
+    /// Generic capability prober shared by live WDM-KS hardware probing (`ap-output-win`) and
+    /// offline capability construction (Review #9 O5).
     ///
     /// Policy:
     /// 1. Always prefer the highest supported rate within the **same clock family** (`÷1`, `÷2`,
@@ -161,39 +161,50 @@ impl DacOutputCapabilities {
     /// 2. ONLY if a DAC rejects ALL rates in one family (e.g. 48/96/192-only HDMI/SPDIF), fall
     ///    back to the highest supported rate in the other family (exact `f64` rational polyphase
     ///    decimation).
-    pub fn from_supported_rates(
-        supported: &[(u32, DacWireFormat)],
-        max_rate_hz: Option<u32>,
-    ) -> Self {
+    pub fn from_probe<E, F>(max_rate_hz: Option<u32>, mut probe: F) -> Result<Self, E>
+    where
+        F: FnMut(u32, DacWireFormat) -> Result<bool, E>,
+    {
         let ceiling = max_rate_hz.unwrap_or(u32::MAX);
-        let pick_best = |candidates: &[u32]| -> Option<DacRateTarget> {
+        let mut pick_best = |candidates: &[u32]| -> Result<Option<DacRateTarget>, E> {
             for &rate in candidates {
                 if rate > ceiling {
                     continue;
                 }
                 for &fmt in &WIRE_FORMAT_PREFERENCE {
-                    if supported.iter().any(|&(r, f)| r == rate && f == fmt) {
-                        return Some(DacRateTarget {
+                    if probe(rate, fmt)? {
+                        return Ok(Some(DacRateTarget {
                             sample_rate_hz: rate,
                             wire_format: fmt,
-                        });
+                        }));
                     }
                 }
             }
-            None
+            Ok(None)
         };
 
-        let same_44 = pick_best(&STANDARD_DAC_RATES_44K);
-        let same_48 = pick_best(&STANDARD_DAC_RATES_48K);
+        let same_44 = pick_best(&STANDARD_DAC_RATES_44K)?;
+        let same_48 = pick_best(&STANDARD_DAC_RATES_48K)?;
 
-        let target_for_352800 = same_44.or(same_48);
-        let target_for_384000 = same_48.or(same_44);
-
-        Self {
-            target_for_352800,
-            target_for_384000,
+        Ok(Self {
+            target_for_352800: same_44.or(same_48),
+            target_for_384000: same_48.or(same_44),
             max_rate_hz,
-        }
+        })
+    }
+
+    /// Resolve the best per-family targets from a list of supported `(sample_rate_hz, wire_format)`
+    /// pairs and an optional `max_rate_hz` ceiling.
+    pub fn from_supported_rates(
+        supported: &[(u32, DacWireFormat)],
+        max_rate_hz: Option<u32>,
+    ) -> Self {
+        Self::from_probe(max_rate_hz, |rate, fmt| {
+            Ok::<bool, core::convert::Infallible>(
+                supported.iter().any(|&(r, f)| r == rate && f == fmt),
+            )
+        })
+        .unwrap()
     }
 
     /// True iff both `352,800 Hz` and `384,000 Hz` are supported directly without downsampling.

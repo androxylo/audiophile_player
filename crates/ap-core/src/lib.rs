@@ -13,6 +13,7 @@ pub mod config;
 pub mod filter_db;
 pub mod format;
 pub mod headroom;
+pub mod http1;
 pub mod json;
 pub mod metadata;
 pub mod track_db;

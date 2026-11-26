@@ -38,7 +38,7 @@ static MEMORY_LOCK_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn ks_pin_connect_blob_matches_exact_win32_abi_for_int32_384khz() {
-    let blob = KsPinConnectBlob::new_pcm(0, 384_000, 2, DacWireFormat::Int32, true);
+    let blob = KsPinConnectBlob::new_pcm(0, 384_000, 2, DacWireFormat::Int32);
     let bytes = blob.as_bytes();
 
     // KSPIN_CONNECT (72 B on x64) + KSDATAFORMAT (64 B) + WAVEFORMATEXTENSIBLE (40 B) = 176 B
@@ -53,17 +53,17 @@ fn ks_pin_connect_blob_matches_exact_win32_abi_for_int32_384khz() {
 
 #[test]
 fn ks_pin_connect_blob_supports_int24_in_32_int24_packed_and_int16() {
-    let b24_32 = KsPinConnectBlob::new_pcm(1, 352_800, 2, DacWireFormat::Int24In32, true);
+    let b24_32 = KsPinConnectBlob::new_pcm(1, 352_800, 2, DacWireFormat::Int24In32);
     assert_eq!(b24_32.bits_per_sample(), 32);
     assert_eq!(b24_32.valid_bits_per_sample(), 24);
     assert_eq!(b24_32.block_align(), 8);
 
-    let b24 = KsPinConnectBlob::new_pcm(1, 96_000, 2, DacWireFormat::Int24Packed, true);
+    let b24 = KsPinConnectBlob::new_pcm(1, 96_000, 2, DacWireFormat::Int24Packed);
     assert_eq!(b24.bits_per_sample(), 24);
     assert_eq!(b24.valid_bits_per_sample(), 24);
     assert_eq!(b24.block_align(), 6);
 
-    let b16 = KsPinConnectBlob::new_pcm(1, 44_100, 2, DacWireFormat::Int16, false);
+    let b16 = KsPinConnectBlob::new_pcm(1, 44_100, 2, DacWireFormat::Int16);
     assert_eq!(b16.bits_per_sample(), 16);
     assert_eq!(b16.valid_bits_per_sample(), 16);
     assert_eq!(b16.block_align(), 4);
@@ -234,15 +234,15 @@ fn memory_lock_guard_pins_and_releases_pcm_slice_cleanly() {
 
 #[test]
 fn ks_pin_connect_blob_padding_is_zeroed_and_channel_mask_handles_high_channels() {
-    let blob = KsPinConnectBlob::new_pcm(0, 384_000, 2, DacWireFormat::Int32, true);
+    let blob = KsPinConnectBlob::new_pcm(0, 384_000, 2, DacWireFormat::Int32);
     let bytes = blob.as_bytes();
     // Bytes 52..56 are the x64 alignment padding after KSPIN_CONNECT.PinId.
     assert_eq!(&bytes[52..56], &[0, 0, 0, 0]);
 
     // 32+ channels must not overflow shift.
-    let b32 = KsPinConnectBlob::new_pcm(0, 48_000, 32, DacWireFormat::Int32, true);
+    let b32 = KsPinConnectBlob::new_pcm(0, 48_000, 32, DacWireFormat::Int32);
     assert_eq!(b32.channel_mask(), u32::MAX);
-    let b0 = KsPinConnectBlob::new_pcm(0, 48_000, 0, DacWireFormat::Int32, true);
+    let b0 = KsPinConnectBlob::new_pcm(0, 48_000, 0, DacWireFormat::Int32);
     assert_eq!(b0.channel_mask(), 0);
 }
 

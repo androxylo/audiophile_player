@@ -21,10 +21,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use ap_core::buffer::InterleavedInt32Buffer;
-use ap_core::format::{
-    DacOutputCapabilities, DacRateTarget, DacWireFormat, STANDARD_DAC_RATES_44K,
-    STANDARD_DAC_RATES_48K, WIRE_FORMAT_PREFERENCE,
-};
+use ap_core::format::{DacOutputCapabilities, DacWireFormat};
 
 use crate::hygiene::{MemoryLockGuard, MmcssGuard, OptimizationLevel};
 use crate::sink::{OutputError, PlaybackStats, ZeroMixerAudioSink};
@@ -51,7 +48,7 @@ use windows_sys::Win32::Media::KernelStreaming::{
     IOCTL_KS_PROPERTY, KSAUDIO_POSITION, KSCATEGORY_AUDIO, KSDATAFORMAT, KSDATAFORMAT_0,
     KSDATAFORMAT_SPECIFIER_WAVEFORMATEX, KSDATAFORMAT_SUBTYPE_PCM, KSDATAFORMAT_TYPE_AUDIO,
     KSIDENTIFIER, KSIDENTIFIER_0, KSIDENTIFIER_0_0, KSINTERFACE_STANDARD_LOOPED_STREAMING,
-    KSINTERFACE_STANDARD_STREAMING, KSINTERFACESETID_Standard, KSMEDIUM_STANDARD_DEVIO,
+    KSINTERFACESETID_Standard, KSMEDIUM_STANDARD_DEVIO,
     KSMEDIUMSETID_Standard, KSMULTIPLE_ITEM, KSP_PIN, KSP_PIN_0, KSPIN_CINSTANCES,
     KSPIN_COMMUNICATION_BOTH, KSPIN_COMMUNICATION_SINK, KSPIN_CONNECT, KSPIN_DATAFLOW_IN,
     KSPRIORITY, KSPRIORITY_NORMAL, KSPROPERTY_AUDIO_POSITION, KSPROPERTY_CONNECTION_STATE,
@@ -92,7 +89,7 @@ pub fn probe_ks_device_format(
     wire_format: DacWireFormat,
 ) -> Result<(), OutputError> {
     let filter = open_ks_filter(&device.device_path)?;
-    let _pin = create_ks_render_pin(filter.raw(), device, sample_rate_hz, wire_format, true)?;
+    let _pin = create_ks_render_pin(filter.raw(), device, sample_rate_hz, wire_format)?;
     Ok(())
 }
 
@@ -110,49 +107,17 @@ pub fn probe_ks_device_format(
 
 /// Probe a WDM-KS render device to find its highest supported output `(sample_rate_hz, wire_format)`
 /// for both the 44.1 kHz (`352,800 Hz`) and 48 kHz (`384,000 Hz`) DSP clock families, honoring an
-/// optional user `max_rate_hz` ceiling.
-///
-/// Fast path for `8fS` DACs: when `max_rate_hz` allows `352,800` & `384,000 Hz` and both succeed
-/// with `Int32`, probing finishes in just 2 pin checks with zero extra driver probes.
-/// If any probe reports `DeviceBusy`, returns `Err(OutputError::DeviceBusy { .. })` immediately so
-/// a temporarily busy 384 kHz DAC is never misclassified as a lower-rate DAC.
+/// optional user `max_rate_hz` ceiling (Review #9 O5: delegates to `DacOutputCapabilities::from_probe`).
 pub fn probe_ks_device_capabilities(
     device: &KsRenderDevice,
     max_rate_hz: Option<u32>,
 ) -> Result<DacOutputCapabilities, OutputError> {
-    let ceiling = max_rate_hz.unwrap_or(u32::MAX);
-
-    let probe_family = |rates: &[u32]| -> Result<Option<DacRateTarget>, OutputError> {
-        for &rate in rates {
-            if rate > ceiling {
-                continue;
-            }
-            for &fmt in &WIRE_FORMAT_PREFERENCE {
-                match probe_ks_device_format(device, rate, fmt) {
-                    Ok(()) => {
-                        return Ok(Some(DacRateTarget {
-                            sample_rate_hz: rate,
-                            wire_format: fmt,
-                        }));
-                    }
-                    Err(e @ OutputError::DeviceBusy { .. }) => return Err(e),
-                    Err(_) => continue,
-                }
-            }
+    DacOutputCapabilities::from_probe(max_rate_hz, |rate, fmt| {
+        match probe_ks_device_format(device, rate, fmt) {
+            Ok(()) => Ok(true),
+            Err(e @ OutputError::DeviceBusy { .. }) => Err(e),
+            Err(_) => Ok(false),
         }
-        Ok(None)
-    };
-
-    let same_44 = probe_family(&STANDARD_DAC_RATES_44K)?;
-    let same_48 = probe_family(&STANDARD_DAC_RATES_48K)?;
-
-    let target_for_352800 = same_44.or(same_48);
-    let target_for_384000 = same_48.or(same_44);
-
-    Ok(DacOutputCapabilities {
-        target_for_352800,
-        target_for_384000,
-        max_rate_hz,
     })
 }
 
@@ -190,13 +155,12 @@ pub struct KsPinConnectBlob {
 
 #[cfg(windows)]
 impl KsPinConnectBlob {
-    /// Construct a Win32-ABI-exact PCM `KSPIN_CONNECT` + `KSDATAFORMAT_WAVEFORMATEXTENSIBLE` blob.
+    /// Construct a Win32-ABI-exact looped WaveRT PCM `KSPIN_CONNECT` + `KSDATAFORMAT_WAVEFORMATEXTENSIBLE` blob.
     pub fn new_pcm(
         pin_id: u32,
         sample_rate_hz: u32,
         channels: u16,
         wire_format: DacWireFormat,
-        looped_wavert: bool,
     ) -> Self {
         const _: () = assert!(
             core::mem::align_of::<KsPinConnectBlob>() >= core::mem::align_of::<KsPinConnectLayout>()
@@ -213,11 +177,7 @@ impl KsPinConnectBlob {
             (core::mem::size_of::<KSDATAFORMAT>() + core::mem::size_of::<WAVEFORMATEXTENSIBLE>())
                 as u32;
 
-        let iface_id = if looped_wavert {
-            KSINTERFACE_STANDARD_LOOPED_STREAMING
-        } else {
-            KSINTERFACE_STANDARD_STREAMING
-        };
+        let iface_id = KSINTERFACE_STANDARD_LOOPED_STREAMING;
 
         let channel_mask = if channels == 2 {
             SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT
@@ -377,52 +337,104 @@ impl WireDitherState {
         u1 - u2
     }
 
+    /// Evaluate per-block whether any sample in `frames` carries non-zero sub-LSB precision
+    /// below the wire format's target grid (Review #9 O14: resets per block so clean-grid blocks
+    /// later in a gapless run stay bit-perfect instead of latching dither permanently).
     #[inline]
-    fn quantize_to_top_24(&mut self, sample: i32, ch: usize) -> i32 {
-        if !self.active {
-            if (sample & 0xFF) == 0 {
-                return sample;
+    fn begin_block(&mut self, frames: &[[i32; 2]], wire_format: DacWireFormat) {
+        let mask: i32 = match wire_format {
+            DacWireFormat::Int32 => {
+                self.active = false;
+                return;
             }
-            self.active = true;
+            DacWireFormat::Int24In32 | DacWireFormat::Int24Packed => 0xFF,
+            DacWireFormat::Int16 => 0xFFFF,
+        };
+        let mut acc = 0_i32;
+        for &[l, r] in frames {
+            acc |= l | r;
         }
-        let dither = self.next_tpdf_lsb(ch);
-        let scaled = (sample as f64) / 256.0 + dither;
-        let q = scaled.round() as i64;
-        (q.clamp(-0x80_0000, 0x7F_FFFF) as i32) << 8
+        self.active = (acc & mask) != 0;
     }
 
+    /// Quantize an `f64` sample on the full signed `i32` scale to `32 - shift` significant bits
+    /// (shift=8 for 24-bit, shift=16 for 16-bit) with 1-LSB stereo-decorrelated TPDF dither
+    /// (Review #9 O4: single unified quantizer replacing 4 duplicate functions).
     #[inline]
-    fn quantize_to_top_16(&mut self, sample: i32, ch: usize) -> i16 {
-        if !self.active {
-            if (sample & 0xFFFF) == 0 {
-                return (sample >> 16) as i16;
-            }
-            self.active = true;
+    fn quantize_to_shift(&mut self, sample_i32_scale: f64, shift: u32, ch: usize) -> i32 {
+        let step = f64::from(1_u32 << shift);
+        let min_q = -(1_i64 << (31 - shift));
+        let max_q = (1_i64 << (31 - shift)) - 1;
+        let dither = self.next_tpdf_lsb(ch);
+        let q = (sample_i32_scale / step + dither).round() as i64;
+        (q.clamp(min_q, max_q) as i32) << shift
+    }
+}
+
+/// Pack one stereo frame (already scaled to full signed `i32` range in `f64`) into `dst` for
+/// `wire_format`. When `force_dither == false && !dither.active`, passes clean-grid integer
+/// samples through bit-identically with zero dither (Review #9 O4/O14).
+#[inline]
+fn pack_wire_frame(
+    dst: &mut [u8],
+    l_raw: i32,
+    r_raw: i32,
+    l_f64: f64,
+    r_f64: f64,
+    wire_format: DacWireFormat,
+    dither: &mut WireDitherState,
+    force_dither: bool,
+) {
+    let apply_dither = force_dither || dither.active;
+    match wire_format {
+        DacWireFormat::Int32 => {
+            let (l32, r32) = if force_dither {
+                (
+                    (l_f64.round() as i64).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+                    (r_f64.round() as i64).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+                )
+            } else {
+                (l_raw, r_raw)
+            };
+            dst[0..4].copy_from_slice(&l32.to_le_bytes());
+            dst[4..8].copy_from_slice(&r32.to_le_bytes());
         }
-        let dither = self.next_tpdf_lsb(ch);
-        let scaled = (sample as f64) / 65536.0 + dither;
-        let q = scaled.round() as i64;
-        q.clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16
-    }
-
-    /// Dither and quantize an `f64` sample (on the full signed `i32` scale, e.g., after applying
-    /// a stop fade-out gain ramp) directly into top-24-bit MSB-aligned `i32` in a single stage.
-    #[inline]
-    fn quantize_f64_to_top_24(&mut self, sample_i32_scale: f64, ch: usize) -> i32 {
-        self.active = true;
-        let dither = self.next_tpdf_lsb(ch);
-        let q = (sample_i32_scale / 256.0 + dither).round() as i64;
-        (q.clamp(-0x80_0000, 0x7F_FFFF) as i32) << 8
-    }
-
-    /// Dither and quantize an `f64` sample (on the full signed `i32` scale, e.g., after applying
-    /// a stop fade-out gain ramp) directly into signed `i16` in a single stage.
-    #[inline]
-    fn quantize_f64_to_top_16(&mut self, sample_i32_scale: f64, ch: usize) -> i16 {
-        self.active = true;
-        let dither = self.next_tpdf_lsb(ch);
-        let q = (sample_i32_scale / 65536.0 + dither).round() as i64;
-        q.clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16
+        DacWireFormat::Int24In32 => {
+            let (l24, r24) = if apply_dither {
+                (
+                    dither.quantize_to_shift(l_f64, 8, 0),
+                    dither.quantize_to_shift(r_f64, 8, 1),
+                )
+            } else {
+                (l_raw, r_raw)
+            };
+            dst[0..4].copy_from_slice(&l24.to_le_bytes());
+            dst[4..8].copy_from_slice(&r24.to_le_bytes());
+        }
+        DacWireFormat::Int24Packed => {
+            let (l24, r24) = if apply_dither {
+                (
+                    dither.quantize_to_shift(l_f64, 8, 0),
+                    dither.quantize_to_shift(r_f64, 8, 1),
+                )
+            } else {
+                (l_raw, r_raw)
+            };
+            dst[0..3].copy_from_slice(&l24.to_le_bytes()[1..4]);
+            dst[3..6].copy_from_slice(&r24.to_le_bytes()[1..4]);
+        }
+        DacWireFormat::Int16 => {
+            let (l16, r16) = if apply_dither {
+                (
+                    (dither.quantize_to_shift(l_f64, 16, 0) >> 16) as i16,
+                    (dither.quantize_to_shift(r_f64, 16, 1) >> 16) as i16,
+                )
+            } else {
+                ((l_raw >> 16) as i16, (r_raw >> 16) as i16)
+            };
+            dst[0..2].copy_from_slice(&l16.to_le_bytes());
+            dst[2..4].copy_from_slice(&r16.to_le_bytes());
+        }
     }
 }
 
@@ -434,10 +446,20 @@ fn encode_frames_into(
     wire_format: DacWireFormat,
     dither: &mut WireDitherState,
 ) -> usize {
+    dither.begin_block(frames, wire_format);
     let bpf = wire_format.bytes_per_frame();
     let mut offset = 0;
     for &[l, r] in frames {
-        encode_frame(&mut dst[offset..offset + bpf], l, r, wire_format, dither);
+        pack_wire_frame(
+            &mut dst[offset..offset + bpf],
+            l,
+            r,
+            f64::from(l),
+            f64::from(r),
+            wire_format,
+            dither,
+            false,
+        );
         offset += bpf;
     }
     offset
@@ -445,7 +467,7 @@ fn encode_frames_into(
 
 /// Apply a linear stop fade-out ramp (`1.0 -> 0.0`) directly to MSB-aligned `i32` source samples
 /// *before* wire encoding so reduced-depth `Int24*` and `Int16` formats run TPDF dither once
-/// after gain attenuation rather than re-rounding already-quantized wire bytes.
+/// after gain attenuation rather than re-rounding already-quantized wire bytes (Review #9 O4).
 fn encode_fade_out_frames_into(
     dst: &mut [u8],
     frames: &[[i32; 2]],
@@ -460,35 +482,16 @@ fn encode_fade_out_frames_into(
     let mut offset = 0;
     for (i, &[l, r]) in frames.iter().enumerate() {
         let gain = 1.0 - (i as f64) / (total as f64);
-        let lf = f64::from(l) * gain;
-        let rf = f64::from(r) * gain;
-        let slot = &mut dst[offset..offset + bpf];
-        match wire_format {
-            DacWireFormat::Int32 => {
-                let l32 = (lf.round() as i64).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
-                let r32 = (rf.round() as i64).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
-                slot[0..4].copy_from_slice(&l32.to_le_bytes());
-                slot[4..8].copy_from_slice(&r32.to_le_bytes());
-            }
-            DacWireFormat::Int24In32 => {
-                let l24 = dither.quantize_f64_to_top_24(lf, 0);
-                let r24 = dither.quantize_f64_to_top_24(rf, 1);
-                slot[0..4].copy_from_slice(&l24.to_le_bytes());
-                slot[4..8].copy_from_slice(&r24.to_le_bytes());
-            }
-            DacWireFormat::Int24Packed => {
-                let lb = dither.quantize_f64_to_top_24(lf, 0).to_le_bytes();
-                let rb = dither.quantize_f64_to_top_24(rf, 1).to_le_bytes();
-                slot[0..3].copy_from_slice(&lb[1..4]);
-                slot[3..6].copy_from_slice(&rb[1..4]);
-            }
-            DacWireFormat::Int16 => {
-                let l16 = dither.quantize_f64_to_top_16(lf, 0);
-                let r16 = dither.quantize_f64_to_top_16(rf, 1);
-                slot[0..2].copy_from_slice(&l16.to_le_bytes());
-                slot[2..4].copy_from_slice(&r16.to_le_bytes());
-            }
-        }
+        pack_wire_frame(
+            &mut dst[offset..offset + bpf],
+            l,
+            r,
+            f64::from(l) * gain,
+            f64::from(r) * gain,
+            wire_format,
+            dither,
+            true,
+        );
         offset += bpf;
     }
     offset
@@ -656,6 +659,9 @@ where
     expected_sample_rate_hz: u32,
     wire_format: DacWireFormat,
     dither: WireDitherState,
+    /// Pre-allocated scratch buffer for click-free stop fade-out so the MMCSS RT thread never
+    /// allocates on stop (Review #9 O9).
+    fade_scratch: Vec<[i32; 2]>,
     total_frames_written: usize,
     underrun_events: usize,
     eof: bool,
@@ -669,6 +675,7 @@ where
     B: Into<StreamBlock>,
 {
     pub fn new(expected_sample_rate_hz: u32, wire_format: DacWireFormat, next_block: F) -> Self {
+        let scratch_cap = ((expected_sample_rate_hz as usize) / 10).max(4096);
         Self {
             next_block,
             recycler: None,
@@ -677,6 +684,7 @@ where
             expected_sample_rate_hz,
             wire_format,
             dither: WireDitherState::default(),
+            fade_scratch: Vec::with_capacity(scratch_cap),
             total_frames_written: 0,
             underrun_events: 0,
             eof: false,
@@ -814,30 +822,32 @@ where
     fn fill_fade_out_slice(&mut self, dst: &mut [u8]) -> usize {
         let bpf = self.bytes_per_frame();
         let max_frames = dst.len() / bpf;
-        let mut raw_frames: Vec<[i32; 2]> = Vec::with_capacity(max_frames);
+        self.fade_scratch.clear();
+        let cap = max_frames.min(self.fade_scratch.capacity().max(max_frames));
 
-        while raw_frames.len() < max_frames {
+        while self.fade_scratch.len() < cap {
             if !self.ensure_current() {
                 break;
             }
             let buf = self.current.as_ref().unwrap();
             let remaining = buf.frames.len() - self.cursor;
-            let to_copy = (max_frames - raw_frames.len()).min(remaining);
-            raw_frames.extend_from_slice(&buf.frames[self.cursor..self.cursor + to_copy]);
+            let to_copy = (cap - self.fade_scratch.len()).min(remaining);
+            self.fade_scratch
+                .extend_from_slice(&buf.frames[self.cursor..self.cursor + to_copy]);
             self.cursor += to_copy;
             self.total_frames_written += to_copy;
         }
 
         let offset = encode_fade_out_frames_into(
             dst,
-            &raw_frames,
+            &self.fade_scratch,
             self.wire_format,
             &mut self.dither,
         );
         if offset < dst.len() {
             dst[offset..].fill(0);
         }
-        raw_frames.len()
+        self.fade_scratch.len()
     }
 
     fn take_error(&mut self) -> Option<OutputError> {
@@ -1179,6 +1189,7 @@ impl WaveRtLoopController {
     }
 
     /// Pre-fill both cyclic halves before transitioning the KS pin to `KSSTATE_RUN`.
+    /// Resets every controller field atomically via `Self::new` (Review #9 O8).
     pub fn prefill(
         &mut self,
         cyclic_slice: &mut [u8],
@@ -1194,34 +1205,14 @@ impl WaveRtLoopController {
         if let Some(err) = pump.take_error() {
             return Err(err);
         }
-        self.half_audio_frames = [w0, w1];
-        self.last_written_half = Some(1);
-        self.last_raw_pos = None;
-        self.last_unwrapped_pos = None;
-        self.last_boundary_idx = 0;
-        self.lag_bytes = 0;
-        self.lag_history = [0; LAG_HISTORY_WINDOW];
-        self.lag_history_len = 0;
-        self.lag_history_cursor = 0;
-        self.observed_wrap = false;
-        self.observed_intra_half_pos = false;
-        self.clock_ref_bidx = 0;
-        self.clock_ref_ns = 0;
-        self.effective_half_ns = self
-            .half_duration
-            .map_or(0, |d| d.as_nanos() as i128);
-        self.baseline_wake_latency_ns = None;
-        self.anchor_block_min_err_ns = 0;
-        self.anchor_block_min_wake = None;
-        self.anchor_block_count = 0;
-        self.anchor_blocks_completed = 0;
-        self.cadence_ref_min_wake = None;
-        self.wake_ring = [(0, 0); WAKE_RING_LEN];
-        self.wake_ring_len = 0;
-        self.wake_ring_cursor = 0;
-        self.last_wake_instant = Some(Duration::ZERO);
-        self.spurious_wakes = 0;
-        self.coalesced_wakes = 0;
+        let mut fresh = Self::new(self.layout).with_wrap_mode(self.wrap_mode);
+        if let Some(hd) = self.half_duration {
+            fresh = fresh.with_half_duration(hd);
+        }
+        fresh.half_audio_frames = [w0, w1];
+        fresh.last_written_half = Some(1);
+        fresh.last_wake_instant = Some(Duration::ZERO);
+        *self = fresh;
         Ok(())
     }
 
@@ -1417,147 +1408,10 @@ impl WaveRtLoopController {
         //    Gungnir 2 and jittered `Unavailable` streams like U(0, 10) ms, Review #6 #11).
         let min_cadence = (nom_half_ns * 88) / 100;
         let max_cadence = (nom_half_ns * 112) / 100;
-        let mut cadence_reanchored = false;
-
-        // Fast steady-cadence lock during initial warmup only (5 consecutive wakes with <= 2%
-        // 1-step spread and > 1.0% deviation from current effective_half_ns). Post-warmup, only
-        // long-horizon block-minimum slope refinement may adjust `effective_half_ns`, preventing
-        // a random 5-wake jitter ramp at wake 1800 from corrupting a locked period!
-        if self.anchor_blocks_completed == 0 {
-            if let Some(w) = self.recent_consecutive_wakes(5) {
-                let mut dts = [0i128; 4];
-                for i in 0..4 {
-                    dts[i] = w[i + 1].1 - w[i].1;
-                }
-                dts.sort_unstable();
-                let spread = dts[3] - dts[0];
-                let med_dt = (dts[1] + dts[2]) / 2;
-                if spread <= (nom_half_ns / 50).max(1)
-                    && med_dt >= min_cadence
-                    && med_dt <= max_cadence
-                    && (med_dt - eff_half_ns).abs() > (nom_half_ns / 100).max(1)
-                {
-                    let mut best = w[0];
-                    let mut best_res = best.1 - (best.0 as i128).saturating_mul(med_dt);
-                    for &cand in &w[1..5] {
-                        let res = cand.1 - (cand.0 as i128).saturating_mul(med_dt);
-                        if res < best_res {
-                            best_res = res;
-                            best = cand;
-                        }
-                    }
-                    let base_lat = self
-                        .baseline_wake_latency_ns
-                        .unwrap_or(0)
-                        .clamp(0, med_dt / 2);
-                    self.clock_ref_bidx = best.0;
-                    self.clock_ref_ns = best.1.saturating_sub(base_lat);
-                    self.effective_half_ns = med_dt;
-                    self.cadence_ref_min_wake = Some(best);
-                    self.anchor_block_count = 0;
-                    self.anchor_block_min_err_ns = 0;
-                    self.anchor_block_min_wake = None;
-                    cadence_reanchored = true;
-                }
-            }
-        }
-
-        // Jitter-tolerant warmup cadence lock (10 consecutive wakes):
-        // Use exact integer OLS slope over all 10 wakes plus both disjoint 5-wake halves
-        // (`ols5(w[0..5])`, `ols5(w[5..10])`) and max residual check. A genuine non-nominal
-        // cadence (±4..8%, even with U(0, 10) ms jitter) produces consistent slope in BOTH halves
-        // with bounded residuals, whereas pure U(0.1, 0.6*half) jitter fails the two-half/residual
-        // consistency check (fixes Review #6 Findings #6 & #11 simultaneously).
-        if !cadence_reanchored && self.anchor_blocks_completed == 0 {
-            if let Some(w) = self.recent_consecutive_wakes(10) {
-                let t0 = w[0].1;
-                let y = [
-                    w[0].1 - t0,
-                    w[1].1 - t0,
-                    w[2].1 - t0,
-                    w[3].1 - t0,
-                    w[4].1 - t0,
-                    w[5].1 - t0,
-                    w[6].1 - t0,
-                    w[7].1 - t0,
-                    w[8].1 - t0,
-                    w[9].1 - t0,
-                ];
-                let ols5_first = (-2 * y[0] - y[1] + y[3] + 2 * y[4]) / 10;
-                let ols5_second = (-2 * y[5] - y[6] + y[8] + 2 * y[9]) / 10;
-                // sum_{i=0..9} (2i - 9) * y_i / (2 * 82.5) = sum / 165
-                let ols10 = (-9 * y[0] - 7 * y[1] - 5 * y[2] - 3 * y[3] - y[4]
-                    + y[5]
-                    + 3 * y[6]
-                    + 5 * y[7]
-                    + 7 * y[8]
-                    + 9 * y[9])
-                    / 165;
-                let mean_y: i128 = y.iter().sum::<i128>() / 10;
-                // Intercept at i=0: mean_y - 4.5 * ols10
-                let intercept = mean_y - (9 * ols10) / 2;
-                let max_res = (0..10)
-                    .map(|i| (y[i] - (intercept + (i as i128) * ols10)).abs())
-                    .max()
-                    .unwrap_or(0);
-
-                let one_pct = nom_half_ns / 100; // 1.0%
-                let two_half_pct = nom_half_ns / 40; // 2.5%
-                let min_err_first = w[0..5]
-                    .iter()
-                    .map(|&(k, t)| t - (k as i128).saturating_mul(eff_half_ns))
-                    .min()
-                    .unwrap_or(0);
-                let min_err_second = w[5..10]
-                    .iter()
-                    .map(|&(k, t)| t - (k as i128).saturating_mul(eff_half_ns))
-                    .min()
-                    .unwrap_or(0);
-                let envelope_shift = min_err_second - min_err_first;
-                let min_envelope_shift = nom_half_ns / 6; // >= 16.7% shift between 5-wake minima
-                // For faster-than-nominal cadence (`both_below`), also require the latest wake to
-                // have actually arrived strictly before nominal `k * nom_half` so a simple drop
-                // from a late wake #1 to an on-time wake #10 under heavy jitter is never mistaken
-                // for a faster hardware clock.
-                let latest_ahead_of_nominal =
-                    w[9].1 < (w[9].0 as i128).saturating_mul(nom_half_ns) - (nom_half_ns / 8);
-                let both_above = ols5_first > eff_half_ns + one_pct
-                    && ols5_second > eff_half_ns + one_pct
-                    && envelope_shift >= min_envelope_shift;
-                let both_below = ols5_first < eff_half_ns - one_pct
-                    && ols5_second < eff_half_ns - one_pct
-                    && envelope_shift <= -min_envelope_shift
-                    && latest_ahead_of_nominal;
-
-                if (both_above || both_below)
-                    && (ols10 - eff_half_ns).abs() > two_half_pct
-                    && max_res <= (nom_half_ns * 16) / 100
-                    && ols10 >= min_cadence
-                    && ols10 <= max_cadence
-                {
-                    let mut best = w[0];
-                    let mut best_res = best.1 - (best.0 as i128).saturating_mul(ols10);
-                    for &cand in &w[1..10] {
-                        let res = cand.1 - (cand.0 as i128).saturating_mul(ols10);
-                        if res < best_res {
-                            best_res = res;
-                            best = cand;
-                        }
-                    }
-                    self.clock_ref_bidx = best.0;
-                    self.clock_ref_ns = best.1;
-                    self.effective_half_ns = ols10;
-                    self.baseline_wake_latency_ns = Some(0);
-                    self.cadence_ref_min_wake = Some(best);
-                    self.anchor_block_count = 0;
-                    self.anchor_block_min_err_ns = 0;
-                    self.anchor_block_min_wake = None;
-                    cadence_reanchored = true;
-                }
-            }
-        }
-
-        if cadence_reanchored {
+        if self.anchor_blocks_completed == 0
+            && (self.try_warmup_steady_cadence_lock(nom_half_ns, eff_half_ns, min_cadence, max_cadence)
+                || self.try_warmup_ols10_cadence_lock(nom_half_ns, eff_half_ns, min_cadence, max_cadence))
+        {
             return;
         }
 
@@ -1591,65 +1445,189 @@ impl WaveRtLoopController {
         self.anchor_block_count += 1;
 
         if self.anchor_block_count >= CLOCK_ANCHOR_BLOCK {
-            let block_min_err = self.anchor_block_min_err_ns;
-            let block_min_wake = self.anchor_block_min_wake;
-            self.anchor_block_count = 0;
-            self.anchor_block_min_err_ns = 0;
-            self.anchor_block_min_wake = None;
-            self.anchor_blocks_completed = self.anchor_blocks_completed.saturating_add(1);
+            self.on_anchor_block_complete(eff_half_ns, min_cadence, max_cadence);
+        }
+    }
 
-            // 3. Long-horizon block-minimum slope refinement (handles ±8% cadences under heavy
-            //    jitter AND converges sub-0.1% period accuracy without false triggers on U(0.1,30)).
-            if let (Some((ref_k, ref_t)), Some((cur_k, cur_t))) =
-                (self.cadence_ref_min_wake, block_min_wake)
-            {
-                let dk = cur_k.saturating_sub(ref_k);
-                if dk >= CLOCK_ANCHOR_BLOCK as u64 {
-                    let long_slope = (cur_t - ref_t) / (dk as i128);
-                    let total_drift = (long_slope - eff_half_ns)
-                        .abs()
-                        .saturating_mul(dk as i128);
-                    let refine_threshold = if dk >= 48 {
-                        eff_half_ns / 4
-                    } else {
-                        eff_half_ns / 2
-                    };
-                    if long_slope >= min_cadence
-                        && long_slope <= max_cadence
-                        && total_drift > refine_threshold
-                    {
-                        let base_lat = self
-                            .baseline_wake_latency_ns
-                            .unwrap_or(0)
-                            .clamp(0, long_slope / 4);
-                        self.effective_half_ns = long_slope;
-                        self.clock_ref_bidx = cur_k;
-                        self.clock_ref_ns = cur_t.saturating_sub(base_lat);
-                        return;
-                    }
+    fn try_warmup_steady_cadence_lock(
+        &mut self,
+        nom_half_ns: i128,
+        eff_half_ns: i128,
+        min_cadence: i128,
+        max_cadence: i128,
+    ) -> bool {
+        let Some(w) = self.recent_consecutive_wakes(5) else {
+            return false;
+        };
+        let mut dts = [0i128; 4];
+        for i in 0..4 {
+            dts[i] = w[i + 1].1 - w[i].1;
+        }
+        dts.sort_unstable();
+        let spread = dts[3] - dts[0];
+        let med_dt = (dts[1] + dts[2]) / 2;
+        if spread > (nom_half_ns / 50).max(1)
+            || med_dt < min_cadence
+            || med_dt > max_cadence
+            || (med_dt - eff_half_ns).abs() <= (nom_half_ns / 100).max(1)
+        {
+            return false;
+        }
+        let best = w[..5]
+            .iter()
+            .copied()
+            .min_by_key(|&(k, t)| t - (k as i128).saturating_mul(med_dt))
+            .unwrap();
+        let base_lat = self
+            .baseline_wake_latency_ns
+            .unwrap_or(0)
+            .clamp(0, med_dt / 2);
+        self.clock_ref_bidx = best.0;
+        self.clock_ref_ns = best.1.saturating_sub(base_lat);
+        self.effective_half_ns = med_dt;
+        self.cadence_ref_min_wake = Some(best);
+        self.anchor_block_count = 0;
+        self.anchor_block_min_err_ns = 0;
+        self.anchor_block_min_wake = None;
+        true
+    }
+
+    fn try_warmup_ols10_cadence_lock(
+        &mut self,
+        nom_half_ns: i128,
+        eff_half_ns: i128,
+        min_cadence: i128,
+        max_cadence: i128,
+    ) -> bool {
+        let Some(w) = self.recent_consecutive_wakes(10) else {
+            return false;
+        };
+        let t0 = w[0].1;
+        let y: [i128; 10] = core::array::from_fn(|i| w[i].1 - t0);
+        let ols5_first = (-2 * y[0] - y[1] + y[3] + 2 * y[4]) / 10;
+        let ols5_second = (-2 * y[5] - y[6] + y[8] + 2 * y[9]) / 10;
+        let ols10 = (-9 * y[0] - 7 * y[1] - 5 * y[2] - 3 * y[3] - y[4]
+            + y[5]
+            + 3 * y[6]
+            + 5 * y[7]
+            + 7 * y[8]
+            + 9 * y[9])
+            / 165;
+        let mean_y: i128 = y.iter().sum::<i128>() / 10;
+        let intercept = mean_y - (9 * ols10) / 2;
+        let max_res = (0..10)
+            .map(|i| (y[i] - (intercept + (i as i128) * ols10)).abs())
+            .max()
+            .unwrap_or(0);
+
+        let one_pct = nom_half_ns / 100;
+        let two_half_pct = nom_half_ns / 40;
+        let min_err = |slice: &[(u64, i128)]| {
+            slice
+                .iter()
+                .map(|&(k, t)| t - (k as i128).saturating_mul(eff_half_ns))
+                .min()
+                .unwrap_or(0)
+        };
+        let envelope_shift = min_err(&w[5..10]) - min_err(&w[0..5]);
+        let min_envelope_shift = nom_half_ns / 6;
+        let latest_ahead_of_nominal =
+            w[9].1 < (w[9].0 as i128).saturating_mul(nom_half_ns) - (nom_half_ns / 8);
+        let both_above = ols5_first > eff_half_ns + one_pct
+            && ols5_second > eff_half_ns + one_pct
+            && envelope_shift >= min_envelope_shift;
+        let both_below = ols5_first < eff_half_ns - one_pct
+            && ols5_second < eff_half_ns - one_pct
+            && envelope_shift <= -min_envelope_shift
+            && latest_ahead_of_nominal;
+
+        if !(both_above || both_below)
+            || (ols10 - eff_half_ns).abs() <= two_half_pct
+            || max_res > (nom_half_ns * 16) / 100
+            || ols10 < min_cadence
+            || ols10 > max_cadence
+        {
+            return false;
+        }
+        let best = w[..10]
+            .iter()
+            .copied()
+            .min_by_key(|&(k, t)| t - (k as i128).saturating_mul(ols10))
+            .unwrap();
+        self.clock_ref_bidx = best.0;
+        self.clock_ref_ns = best.1;
+        self.effective_half_ns = ols10;
+        self.baseline_wake_latency_ns = Some(0);
+        self.cadence_ref_min_wake = Some(best);
+        self.anchor_block_count = 0;
+        self.anchor_block_min_err_ns = 0;
+        self.anchor_block_min_wake = None;
+        true
+    }
+
+    fn on_anchor_block_complete(
+        &mut self,
+        eff_half_ns: i128,
+        min_cadence: i128,
+        max_cadence: i128,
+    ) {
+        let block_min_err = self.anchor_block_min_err_ns;
+        let block_min_wake = self.anchor_block_min_wake;
+        self.anchor_block_count = 0;
+        self.anchor_block_min_err_ns = 0;
+        self.anchor_block_min_wake = None;
+        self.anchor_blocks_completed = self.anchor_blocks_completed.saturating_add(1);
+
+        // 3. Long-horizon block-minimum slope refinement.
+        if let (Some((ref_k, ref_t)), Some((cur_k, cur_t))) =
+            (self.cadence_ref_min_wake, block_min_wake)
+        {
+            let dk = cur_k.saturating_sub(ref_k);
+            if dk >= CLOCK_ANCHOR_BLOCK as u64 {
+                let long_slope = (cur_t - ref_t) / (dk as i128);
+                let total_drift = (long_slope - eff_half_ns)
+                    .abs()
+                    .saturating_mul(dk as i128);
+                let refine_threshold = if dk >= 48 {
+                    eff_half_ns / 4
+                } else {
+                    eff_half_ns / 2
+                };
+                if long_slope >= min_cadence
+                    && long_slope <= max_cadence
+                    && total_drift > refine_threshold
+                {
+                    let base_lat = self
+                        .baseline_wake_latency_ns
+                        .unwrap_or(0)
+                        .clamp(0, long_slope / 4);
+                    self.effective_half_ns = long_slope;
+                    self.clock_ref_bidx = cur_k;
+                    self.clock_ref_ns = cur_t.saturating_sub(base_lat);
+                    return;
                 }
-            } else if block_min_wake.is_some() {
-                self.cadence_ref_min_wake = block_min_wake;
             }
+        } else if block_min_wake.is_some() {
+            self.cadence_ref_min_wake = block_min_wake;
+        }
 
-            // 4. Fine bidirectional crystal drift tracking (±600 ppm max per 16-wake block).
-            let base_lat = *self
-                .baseline_wake_latency_ns
-                .get_or_insert_with(|| block_min_err.clamp(0, eff_half_ns / 2));
-            let err = block_min_err - base_lat;
-            let max_drift_per_block =
-                (((CLOCK_ANCHOR_BLOCK as i128) * eff_half_ns) / 1666).max(1);
+        // 4. Fine bidirectional crystal drift tracking (±600 ppm max per 16-wake block).
+        let base_lat = *self
+            .baseline_wake_latency_ns
+            .get_or_insert_with(|| block_min_err.clamp(0, eff_half_ns / 2));
+        let err = block_min_err - base_lat;
+        let max_drift_per_block =
+            (((CLOCK_ANCHOR_BLOCK as i128) * eff_half_ns) / 1666).max(1);
 
-            if err >= -max_drift_per_block && err <= max_drift_per_block {
-                self.clock_ref_ns = self.clock_ref_ns.saturating_add(err);
-            } else if err > max_drift_per_block {
-                self.clock_ref_ns = self.clock_ref_ns.saturating_add(max_drift_per_block);
-            } else {
-                let new_base = block_min_err.max(0);
-                self.baseline_wake_latency_ns = Some(new_base);
-                if block_min_err < 0 {
-                    self.clock_ref_ns = self.clock_ref_ns.saturating_add(block_min_err);
-                }
+        if err >= -max_drift_per_block && err <= max_drift_per_block {
+            self.clock_ref_ns = self.clock_ref_ns.saturating_add(err);
+        } else if err > max_drift_per_block {
+            self.clock_ref_ns = self.clock_ref_ns.saturating_add(max_drift_per_block);
+        } else {
+            let new_base = block_min_err.max(0);
+            self.baseline_wake_latency_ns = Some(new_base);
+            if block_min_err < 0 {
+                self.clock_ref_ns = self.clock_ref_ns.saturating_add(block_min_err);
             }
         }
     }
@@ -2081,68 +2059,6 @@ impl WaveRtLoopController {
     }
 }
 
-/// Round an MSB-aligned signed 32-bit PCM sample to its top 24 bits (unbiased round-to-nearest-even)
-/// with the low 8 bits guaranteed zero and positive full-scale clamped cleanly without wraparound.
-/// Already-quantized 24-bit samples (low byte == 0) pass through bit-identically.
-#[cfg(test)]
-#[inline]
-fn round_i32_to_top_24(sample: i32) -> i32 {
-    let mut q = i64::from(sample) >> 8;
-    let rem = sample & 0xFF;
-    if rem > 0x80 || (rem == 0x80 && (q & 1) != 0) {
-        q += 1;
-    }
-    let clamped = q.clamp(-0x80_0000, 0x7F_FFFF) as i32;
-    clamped << 8
-}
-
-/// Round an MSB-aligned signed 32-bit PCM sample to signed 16-bit (unbiased round-to-nearest-even)
-/// with clean saturation. Already-quantized 16-bit samples (low 16 bits == 0) pass through bit-identically.
-#[cfg(test)]
-#[inline]
-fn round_i32_to_top_16(sample: i32) -> i16 {
-    let mut q = i64::from(sample) >> 16;
-    let rem = sample & 0xFFFF;
-    if rem > 0x8000 || (rem == 0x8000 && (q & 1) != 0) {
-        q += 1;
-    }
-    q.clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16
-}
-
-#[inline]
-fn encode_frame(
-    dst: &mut [u8],
-    l: i32,
-    r: i32,
-    wire_format: DacWireFormat,
-    dither: &mut WireDitherState,
-) {
-    match wire_format {
-        DacWireFormat::Int32 => {
-            dst[0..4].copy_from_slice(&l.to_le_bytes());
-            dst[4..8].copy_from_slice(&r.to_le_bytes());
-        }
-        DacWireFormat::Int24In32 => {
-            let l24 = dither.quantize_to_top_24(l, 0);
-            let r24 = dither.quantize_to_top_24(r, 1);
-            dst[0..4].copy_from_slice(&l24.to_le_bytes());
-            dst[4..8].copy_from_slice(&r24.to_le_bytes());
-        }
-        DacWireFormat::Int24Packed => {
-            let lb = dither.quantize_to_top_24(l, 0).to_le_bytes();
-            let rb = dither.quantize_to_top_24(r, 1).to_le_bytes();
-            dst[0..3].copy_from_slice(&lb[1..4]);
-            dst[3..6].copy_from_slice(&rb[1..4]);
-        }
-        DacWireFormat::Int16 => {
-            let l16 = dither.quantize_to_top_16(l, 0);
-            let r16 = dither.quantize_to_top_16(r, 1);
-            dst[0..2].copy_from_slice(&l16.to_le_bytes());
-            dst[2..4].copy_from_slice(&r16.to_le_bytes());
-        }
-    }
-}
-
 /// Classify a Win32 `KsCreatePin` failure code, highlighting busy/locked DACs (e.g. Audirvana).
 pub fn classify_ks_pin_error(
     os_error: u32,
@@ -2254,9 +2170,6 @@ pub fn select_wdm_ks_device(
         }
         if path.contains("msft_wave") {
             s += 30; // Microsoft UAC2 usbaudio2.sys WaveRT driver
-        }
-        if d.supports_looped_wavert {
-            s += 20;
         }
         if name.contains("hdmi") || name.contains("displayport") || name.contains("nvidia") {
             s -= 50;
@@ -2382,96 +2295,45 @@ impl WdmKsSink {
         sample_rate_hz: u32,
         wire_format: DacWireFormat,
     ) -> Result<WaveRtHardwareProbe, OutputError> {
-        let filter = open_ks_filter(&self.device.device_path)?;
-        let pin = create_ks_render_pin(
-            filter.raw(),
-            &self.device,
-            sample_rate_hz,
-            wire_format,
-            true,
-        )?;
-        let bpf = wire_format.bytes_per_frame() as u32;
-        let requested_bytes = ((sample_rate_hz / 10).max(256)) * bpf;
-        let rt_buf = allocate_wavert_buffer_with_notification(pin.raw(), requested_bytes, 2)?;
-        let layout = WaveRtRingLayout::new(rt_buf.ActualBufferSize as usize, bpf as usize)?;
+        let mut session = open_wavert_session(&self.device, sample_rate_hz, wire_format)?;
+        let (register_get_ok, unregister_get_ok) =
+            probe_notification_flag(session.pin.raw(), KSPROPERTY_TYPE_GET)?;
+        let (register_set_ok, unregister_set_ok) =
+            probe_notification_flag(session.pin.raw(), KSPROPERTY_TYPE_SET)?;
 
-        let ev_get = create_auto_reset_event()?;
-        let reg_get = register_notification_event_raw(pin.raw(), ev_get.raw(), KSPROPERTY_TYPE_GET);
-        let unreg_get = if reg_get.is_ok() {
-            unregister_notification_event_raw(pin.raw(), ev_get.raw(), KSPROPERTY_TYPE_GET)
-        } else {
-            Err(OutputError::Win32 {
-                operation: "UnregisterNotificationEvent(GET)",
-                code: 0,
-                detail: "skipped because REGISTER(GET) failed".to_string(),
-            })
-        };
+        let position_register_supported = query_position_register(session.pin.raw()).is_some();
+        let audio_position_supported = query_audio_position(session.pin.raw()).is_some();
 
-        let ev_set = create_auto_reset_event()?;
-        let reg_set = register_notification_event_raw(pin.raw(), ev_set.raw(), KSPROPERTY_TYPE_SET);
-        let unreg_set = if reg_set.is_ok() {
-            unregister_notification_event_raw(pin.raw(), ev_set.raw(), KSPROPERTY_TYPE_SET)
-        } else {
-            Err(OutputError::Win32 {
-                operation: "UnregisterNotificationEvent(SET)",
-                code: 0,
-                detail: "skipped because REGISTER(SET) failed".to_string(),
-            })
-        };
-
-        let position_register_supported = query_position_register(pin.raw()).is_some();
-        let audio_position_supported = query_audio_position(pin.raw()).is_some();
-
-        // Stream 4 silent notifications to observe live PlayOffset/WriteOffset % buf_len behavior.
-        // `allocate_wavert_buffer_with_notification` already guarantees `BufferAddress` is non-null.
-        let cyclic_slice = unsafe {
-            core::slice::from_raw_parts_mut(rt_buf.BufferAddress.cast::<u8>(), layout.buf_len())
-        };
-        cyclic_slice.fill(0);
-        if rt_buf.CallMemoryBarrier != 0 {
-            fence(Ordering::SeqCst);
-        }
-
-        let ev_run = create_auto_reset_event()?;
-        let _notif = WaveRtNotificationGuard::register(pin.raw(), ev_run.raw())?;
-        let mut pos_reader = WaveRtPositionReader::open(pin.raw());
-        let mut state_guard = KsPinStateGuard::new(pin.raw());
-        state_guard.set_state(KSSTATE_ACQUIRE)?;
-        state_guard.set_state(KSSTATE_PAUSE)?;
-        let run_start = Instant::now();
-        state_guard.set_state(KSSTATE_RUN)?;
+        session.cyclic_slice_mut().fill(0);
+        session.maybe_barrier();
+        let run_start = session.start_run()?;
         let ksstate_run_elapsed = run_start.elapsed();
 
-        // Stream 24 silent notifications (~1.25 s) so live probes cross both the 16-wake
-        // CLOCK_ANCHOR_BLOCK rollover and any cadence-drift threshold on real hardware.
         let mut sample_play_offsets = Vec::with_capacity(24);
         let mut sample_write_offsets = Vec::with_capacity(24);
         let mut sample_wake_elapsed = Vec::with_capacity(24);
         for _ in 0..24 {
-            let wait_res = unsafe { WaitForSingleObject(ev_run.raw(), 1500) };
+            let wait_res = unsafe { WaitForSingleObject(session.event.raw(), 1500) };
             if wait_res != WAIT_OBJECT_0 {
                 break;
             }
-            let elapsed = run_start.elapsed();
-            sample_wake_elapsed.push(elapsed);
-            if let Some(pos) = pos_reader.read_position_bytes() {
-                sample_play_offsets.push((pos, layout.safe_write_half_for_play_byte(pos)));
+            sample_wake_elapsed.push(run_start.elapsed());
+            if let Some(pos) = session.pos_reader.read_position_bytes() {
+                sample_play_offsets.push((pos, session.layout.safe_write_half_for_play_byte(pos)));
             }
-            if let Some(ap) = query_audio_position(pin.raw()) {
+            if let Some(ap) = query_audio_position(session.pin.raw()) {
                 sample_write_offsets.push((ap.PlayOffset, ap.WriteOffset));
             }
         }
-
-        let _ = state_guard.set_state(KSSTATE_PAUSE);
-        let _ = state_guard.set_state(KSSTATE_STOP);
+        session.stop_clean();
 
         Ok(WaveRtHardwareProbe {
-            buffer_bytes: layout.buf_len(),
-            half_bytes: layout.half_len(),
-            register_get_ok: reg_get.is_ok(),
-            unregister_get_ok: unreg_get.is_ok(),
-            register_set_ok: reg_set.is_ok(),
-            unregister_set_ok: unreg_set.is_ok(),
+            buffer_bytes: session.layout.buf_len(),
+            half_bytes: session.layout.half_len(),
+            register_get_ok,
+            unregister_get_ok,
+            register_set_ok,
+            unregister_set_ok,
             position_register_supported,
             audio_position_supported,
             ksstate_run_elapsed,
@@ -2488,8 +2350,6 @@ impl WdmKsSink {
         wire_format: DacWireFormat,
         pump: &mut dyn WaveRtPumpSource,
     ) -> Result<PlaybackStats, OutputError> {
-        // Never clear `stop_flag` here — the caller arms (clears) it before checking pending
-        // signals/commands so Ctrl+C, Pause, or Next arriving before open is never swallowed.
         if self.stop_flag.load(Ordering::SeqCst) {
             return Ok(PlaybackStats {
                 device_name: self.device.friendly_name.clone(),
@@ -2503,70 +2363,28 @@ impl WdmKsSink {
             });
         }
 
-        // 1. Elevate thread priority via MMCSS "Pro Audio" (reverted automatically via RAII).
         let mmcss = MmcssGuard::enter_pro_audio(self.optimization);
+        let mut session = open_wavert_session(&self.device, sample_rate_hz, wire_format)?;
 
-        // 2. Open KS filter and create WaveRT looped render pin directly via ksuser.dll.
-        let filter = open_ks_filter(&self.device.device_path)?;
-        let pin = create_ks_render_pin(
-            filter.raw(),
-            &self.device,
-            sample_rate_hz,
-            wire_format,
-            true,
-        )?;
-
-        // 3. Allocate WaveRT cyclic buffer (~100 ms total = two ~50 ms notification halves).
-        // `allocate_wavert_buffer_with_notification` verifies `BufferAddress` is non-null.
-        let bpf = pump.bytes_per_frame() as u32;
-        let requested_bytes = ((sample_rate_hz / 10).max(256)) * bpf;
-        let rt_buf = allocate_wavert_buffer_with_notification(pin.raw(), requested_bytes, 2)?;
-        let layout = WaveRtRingLayout::new(rt_buf.ActualBufferSize as usize, bpf as usize)?;
-        let call_barrier = rt_buf.CallMemoryBarrier != 0;
-
-        // 4. Create & register Win32 hardware notification event (RAII unregistered on drop).
-        let event_handle = create_auto_reset_event()?;
-        let _notif_guard = WaveRtNotificationGuard::register(pin.raw(), event_handle.raw())?;
-
-        // 5. Probe hardware play-cursor reader (POSITIONREGISTER -> AUDIO_POSITION -> wall-clock fallback).
-        let mut pos_reader = WaveRtPositionReader::open(pin.raw());
-
-        // 6. Ensure pin returns to KSSTATE_STOP even if an error occurs mid-stream.
-        let mut state_guard = KsPinStateGuard::new(pin.raw());
-
-        // 7. Pre-fill BOTH frame-aligned halves before starting hardware DMA.
-        let cyclic_slice = unsafe {
-            core::slice::from_raw_parts_mut(rt_buf.BufferAddress.cast::<u8>(), layout.buf_len())
-        };
-        let half_frames = layout.half_len() / layout.bytes_per_frame();
+        let half_frames = session.layout.half_len() / session.layout.bytes_per_frame();
         let half_duration =
             Duration::from_secs_f64(half_frames as f64 / f64::from(sample_rate_hz.max(1)));
-        let mut controller = WaveRtLoopController::new(layout)
+        let mut controller = WaveRtLoopController::new(session.layout)
             .with_half_duration(half_duration)
-            .with_wrap_mode(if pos_reader.is_modular() {
+            .with_wrap_mode(if session.pos_reader.is_modular() {
                 PositionWrapMode::Modular
             } else {
                 PositionWrapMode::Auto
             });
-        controller.prefill(cyclic_slice, pump)?;
-        if call_barrier {
-            fence(Ordering::SeqCst);
-        }
+        controller.prefill(session.cyclic_slice_mut(), pump)?;
+        session.maybe_barrier();
 
-        // 8. Transition pin: ACQUIRE -> PAUSE -> RUN.
-        // Capture `run_start` right before `KSSTATE_RUN` so DMA cannot start meaningfully before
-        // `run_start` (Review #5 #11).
-        state_guard.set_state(KSSTATE_ACQUIRE)?;
-        state_guard.set_state(KSSTATE_PAUSE)?;
-        let run_start = Instant::now();
-        state_guard.set_state(KSSTATE_RUN)?;
-
-        // 9. Event-driven WaveRT loop: each notification signals a completed half-buffer.
+        let run_start = session.start_run()?;
         let mut notifications: usize = 0;
         let mut pump_error: Option<OutputError> = None;
 
         loop {
-            let wait_res = unsafe { WaitForSingleObject(event_handle.raw(), 1500) };
+            let wait_res = unsafe { WaitForSingleObject(session.event.raw(), 1500) };
             if wait_res != WAIT_OBJECT_0 {
                 return Err(OutputError::Win32 {
                     operation: "WaitForSingleObject(WaveRT)",
@@ -2577,38 +2395,31 @@ impl WdmKsSink {
             notifications += 1;
 
             let stop_requested = self.stop_flag.load(Ordering::SeqCst);
-            let play_offset = pos_reader.read_position_bytes();
+            let play_offset = session.pos_reader.read_position_bytes();
             let now_since_run = run_start.elapsed();
 
             match controller.on_notification_at(
-                cyclic_slice,
+                session.cyclic_slice_mut(),
                 pump,
                 stop_requested,
                 play_offset,
                 Some(now_since_run),
             ) {
                 Ok((_, outcome)) => {
-                    if call_barrier {
-                        fence(Ordering::SeqCst);
-                    }
+                    session.maybe_barrier();
                     if outcome == WaveRtStepOutcome::Finished {
                         break;
                     }
                 }
                 Err(err) => {
-                    if call_barrier {
-                        fence(Ordering::SeqCst);
-                    }
+                    session.maybe_barrier();
                     pump_error = Some(err);
                     break;
                 }
             }
         }
 
-        // 10. Clean stop: PAUSE -> STOP (then RAII drops unregister event, close pin & filter).
-        let _ = state_guard.set_state(KSSTATE_PAUSE);
-        let _ = state_guard.set_state(KSSTATE_STOP);
-
+        session.stop_clean();
         if let Some(err) = pump_error {
             return Err(err);
         }
@@ -2618,7 +2429,7 @@ impl WdmKsSink {
             sample_rate_hz,
             wire_format,
             frames_played: controller.frames_played(),
-            wavert_buffer_bytes: rt_buf.ActualBufferSize,
+            wavert_buffer_bytes: session.actual_buffer_size,
             notifications,
             mmcss_pro_audio: mmcss.is_active(),
             underrun_halves: controller.underrun_halves().max(pump.underrun_events()),
@@ -3125,23 +2936,103 @@ fn resolve_ks_create_pin() -> Result<KsCreatePinFn, OutputError> {
     }
 }
 
+/// Active RAII WaveRT hardware session shared by `run_wavert_pump` and
+/// `probe_wavert_hardware_properties` (Review #9 O7).
+/// Field drop order is significant: `state_guard` -> `_notif` -> `event` -> `pin` -> `_filter`.
+#[cfg(windows)]
+struct WaveRtSession {
+    state_guard: KsPinStateGuard,
+    _notif: WaveRtNotificationGuard,
+    event: OwnedHandle,
+    pos_reader: WaveRtPositionReader,
+    layout: WaveRtRingLayout,
+    buffer_ptr: *mut u8,
+    actual_buffer_size: u32,
+    call_barrier: bool,
+    pin: OwnedHandle,
+    _filter: OwnedHandle,
+}
+
+#[cfg(windows)]
+impl WaveRtSession {
+    fn cyclic_slice_mut(&mut self) -> &mut [u8] {
+        // SAFETY: `allocate_wavert_buffer_with_notification` guarantees non-null `buffer_ptr`
+        // valid for `layout.buf_len()` bytes while `self.pin` is alive.
+        unsafe { core::slice::from_raw_parts_mut(self.buffer_ptr, self.layout.buf_len()) }
+    }
+
+    fn maybe_barrier(&self) {
+        if self.call_barrier {
+            fence(Ordering::SeqCst);
+        }
+    }
+
+    fn start_run(&mut self) -> Result<Instant, OutputError> {
+        self.state_guard.set_state(KSSTATE_ACQUIRE)?;
+        self.state_guard.set_state(KSSTATE_PAUSE)?;
+        let run_start = Instant::now();
+        self.state_guard.set_state(KSSTATE_RUN)?;
+        Ok(run_start)
+    }
+
+    fn stop_clean(&mut self) {
+        let _ = self.state_guard.set_state(KSSTATE_PAUSE);
+        let _ = self.state_guard.set_state(KSSTATE_STOP);
+    }
+}
+
+#[cfg(windows)]
+fn open_wavert_session(
+    device: &KsRenderDevice,
+    sample_rate_hz: u32,
+    wire_format: DacWireFormat,
+) -> Result<WaveRtSession, OutputError> {
+    let filter = open_ks_filter(&device.device_path)?;
+    let pin = create_ks_render_pin(filter.raw(), device, sample_rate_hz, wire_format)?;
+    let bpf = wire_format.bytes_per_frame() as u32;
+    let requested_bytes = ((sample_rate_hz / 10).max(256)) * bpf;
+    let rt_buf = allocate_wavert_buffer_with_notification(pin.raw(), requested_bytes, 2)?;
+    let layout = WaveRtRingLayout::new(rt_buf.ActualBufferSize as usize, bpf as usize)?;
+    let event = create_auto_reset_event()?;
+    let notif = WaveRtNotificationGuard::register(pin.raw(), event.raw())?;
+    let pos_reader = WaveRtPositionReader::open(pin.raw());
+    let state_guard = KsPinStateGuard::new(pin.raw());
+    Ok(WaveRtSession {
+        state_guard,
+        _notif: notif,
+        event,
+        pos_reader,
+        layout,
+        buffer_ptr: rt_buf.BufferAddress.cast::<u8>(),
+        actual_buffer_size: rt_buf.ActualBufferSize,
+        call_barrier: rt_buf.CallMemoryBarrier != 0,
+        pin,
+        _filter: filter,
+    })
+}
+
+#[cfg(windows)]
+fn probe_notification_flag(pin: HANDLE, flags: u32) -> Result<(bool, bool), OutputError> {
+    let ev = create_auto_reset_event()?;
+    let reg_ok = register_notification_event_raw(pin, ev.raw(), flags).is_ok();
+    let unreg_ok = if reg_ok {
+        unregister_notification_event_raw(pin, ev.raw(), flags).is_ok()
+    } else {
+        false
+    };
+    Ok((reg_ok, unreg_ok))
+}
+
 #[cfg(windows)]
 fn create_ks_render_pin(
     filter: HANDLE,
     device: &KsRenderDevice,
     sample_rate_hz: u32,
     wire_format: DacWireFormat,
-    looped_wavert: bool,
 ) -> Result<OwnedHandle, OutputError> {
     let ks_create_pin = resolve_ks_create_pin()?;
 
-    let blob = KsPinConnectBlob::new_pcm(
-        device.render_pin_id,
-        sample_rate_hz,
-        2,
-        wire_format,
-        looped_wavert,
-    );
+    let blob = KsPinConnectBlob::new_pcm(device.render_pin_id, sample_rate_hz, 2, wire_format);
 
     let mut pin_handle: HANDLE = core::ptr::null_mut();
     let status = unsafe {
@@ -3153,6 +3044,12 @@ fn create_ks_render_pin(
         )
     };
     if status != 0 || pin_handle.is_null() || pin_handle == INVALID_HANDLE_VALUE {
+        // Review #9 O17: close any handle written by a misbehaving driver on non-zero status.
+        if !pin_handle.is_null() && pin_handle != INVALID_HANDLE_VALUE {
+            unsafe {
+                let _ = CloseHandle(pin_handle);
+            }
+        }
         // Confirm via KSPROPERTY_PIN_CINSTANCES whether another exclusive/KS client holds the pin.
         if let Some(inst) = query_pin_cinstances(filter, device.render_pin_id) {
             if inst.CurrentCount >= inst.PossibleCount {
@@ -3266,10 +3163,9 @@ fn find_render_pin(filter: HANDLE) -> Option<(u32, bool)> {
         if comm != KSPIN_COMMUNICATION_SINK as u32 && comm != KSPIN_COMMUNICATION_BOTH as u32 {
             continue;
         }
-        let (_has_streaming, has_looped) = query_pin_streaming_interfaces(filter, pin_id);
         // Playback exclusively uses looped WaveRT streaming; skip non-WaveRT pins so a
         // WaveCyclic/WavePci pin never wins selection or probes OK then fails playback.
-        if has_looped {
+        if pin_supports_looped_wavert(filter, pin_id) {
             return Some((pin_id, true));
         }
     }
@@ -3296,7 +3192,7 @@ fn query_pin_u32(filter: HANDLE, pin_id: u32, prop_id: u32) -> Option<u32> {
 }
 
 #[cfg(windows)]
-fn query_pin_streaming_interfaces(filter: HANDLE, pin_id: u32) -> (bool, bool) {
+fn pin_supports_looped_wavert(filter: HANDLE, pin_id: u32) -> bool {
     const MAX_INTERFACES_BYTES: usize = 64 * 1024;
 
     let ksp = KSP_PIN {
@@ -3383,7 +3279,7 @@ fn query_pin_streaming_interfaces(filter: HANDLE, pin_id: u32) -> (bool, bool) {
 
     if ok == 0 || (bytes_returned as usize) < core::mem::size_of::<KSMULTIPLE_ITEM>() {
         // Never assume looped WaveRT support when the interface query fails.
-        return (false, false);
+        return false;
     }
 
     let valid_bytes = (bytes_returned as usize).min(buf.len() * 8);
@@ -3393,8 +3289,6 @@ fn query_pin_streaming_interfaces(filter: HANDLE, pin_id: u32) -> (bool, bool) {
     let item_size = core::mem::size_of::<KSIDENTIFIER>();
     let base = core::mem::size_of::<KSMULTIPLE_ITEM>();
 
-    let mut has_streaming = false;
-    let mut has_looped = false;
     for i in 0..count {
         let off = base.saturating_add(i.saturating_mul(item_size));
         if off.saturating_add(item_size) > valid_bytes {
@@ -3402,16 +3296,13 @@ fn query_pin_streaming_interfaces(filter: HANDLE, pin_id: u32) -> (bool, bool) {
         }
         let ident = unsafe { core::ptr::read_unaligned(raw_bytes.add(off).cast::<KSIDENTIFIER>()) };
         let (set, id) = unsafe { (ident.Anonymous.Anonymous.Set, ident.Anonymous.Anonymous.Id) };
-        if guid_eq(set, KSINTERFACESETID_Standard) {
-            if id == KSINTERFACE_STANDARD_STREAMING as u32 {
-                has_streaming = true;
-            }
-            if id == KSINTERFACE_STANDARD_LOOPED_STREAMING as u32 {
-                has_looped = true;
-            }
+        if guid_eq(set, KSINTERFACESETID_Standard)
+            && id == KSINTERFACE_STANDARD_LOOPED_STREAMING as u32
+        {
+            return true;
         }
     }
-    (has_streaming, has_looped)
+    false
 }
 
 #[cfg(windows)]
@@ -3565,8 +3456,8 @@ fn wide_slice_to_string(slice: &[u16]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        KsRenderDevice, is_own_virtual_endpoint, round_i32_to_top_16, round_i32_to_top_24,
-        select_wdm_ks_device, wide_slice_to_string,
+        DacWireFormat, KsRenderDevice, WireDitherState, encode_frames_into,
+        is_own_virtual_endpoint, select_wdm_ks_device, wide_slice_to_string,
     };
 
     #[test]
@@ -3603,31 +3494,16 @@ mod tests {
     }
 
     #[test]
-    fn reduced_depth_rounding_is_unbiased_and_saturating() {
-        // Exact multiples pass through bit-identically.
-        assert_eq!(round_i32_to_top_24(0x1234_5600), 0x1234_5600);
-        assert_eq!(round_i32_to_top_24(-0x0001_0000), -0x0001_0000);
-        assert_eq!(round_i32_to_top_16(0x1234_0000), 0x1234);
-        assert_eq!(round_i32_to_top_16(-0x0001_0000), -1);
-
-        // Halfway ties round to even (eliminating -0.5 LSB DC bias).
-        assert_eq!(round_i32_to_top_24(0x1234_5680), 0x1234_5600); // even stays
-        assert_eq!(round_i32_to_top_24(0x1234_5780), 0x1234_5800); // odd rounds up
-        assert_eq!(round_i32_to_top_24(0x1234_5681), 0x1234_5700);
-        assert_eq!(round_i32_to_top_24(-127), 0);
-        assert_eq!(round_i32_to_top_24(-128), 0); // -0.5 -> 0 (even)
-        assert_eq!(round_i32_to_top_24(-129), -256);
-
-        assert_eq!(round_i32_to_top_16(0x1234_8000), 0x1234);
-        assert_eq!(round_i32_to_top_16(0x1235_8000), 0x1236);
-        assert_eq!(round_i32_to_top_16(0x1234_8001), 0x1235);
-        assert_eq!(round_i32_to_top_16(-32767), 0);
-        assert_eq!(round_i32_to_top_16(-32769), -1);
-
-        // Full-scale saturation never wraps around.
-        assert_eq!(round_i32_to_top_24(i32::MAX), 0x7FFF_FF00);
-        assert_eq!(round_i32_to_top_24(i32::MIN), i32::MIN);
-        assert_eq!(round_i32_to_top_16(i32::MAX), i16::MAX);
-        assert_eq!(round_i32_to_top_16(i32::MIN), i16::MIN);
+    fn wire_dither_resets_per_block_so_clean_grid_blocks_stay_bit_perfect_o14() {
+        let mut dither = WireDitherState::default();
+        let mut dst = [0u8; 8];
+        // Block 1 has sub-LSB precision -> triggers dither.
+        encode_frames_into(&mut dst, &[[0x1234_5678, -0x1234_5678]], DacWireFormat::Int24In32, &mut dither);
+        assert!(dither.active);
+        // Block 2 is already on the 24-bit grid -> O14: resets inactive and passes bit-identically!
+        encode_frames_into(&mut dst, &[[0x1234_5600, -0x0001_0000]], DacWireFormat::Int24In32, &mut dither);
+        assert!(!dither.active);
+        assert_eq!(i32::from_le_bytes(dst[0..4].try_into().unwrap()), 0x1234_5600);
+        assert_eq!(i32::from_le_bytes(dst[4..8].try_into().unwrap()), -0x0001_0000);
     }
 }

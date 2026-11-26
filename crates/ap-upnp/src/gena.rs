@@ -419,13 +419,13 @@ fn send_gena_notify(job: &NotifyJob) -> bool {
         return false;
     }
     let _ = stream.flush();
-    // Read brief HTTP status line to detect 412/connection failure cleanly.
+    // Read brief HTTP status line to detect 412/404 failure cleanly via shared http1 parser (O2).
     let mut resp = [0u8; 64];
     match stream.read(&mut resp) {
         Ok(0) => true,
         Ok(n) => {
             let head = String::from_utf8_lossy(&resp[..n]);
-            !head.contains("412") && !head.contains("404")
+            ap_core::http1::parse_status_code(&head).is_none_or(|c| c != 412 && c != 404)
         }
         Err(_) => true, // Some control points close without reply; TCP write succeeded.
     }

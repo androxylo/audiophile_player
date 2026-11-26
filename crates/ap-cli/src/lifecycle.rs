@@ -518,20 +518,17 @@ pub fn api_v1_request(
     stream
         .read_to_end(&mut raw)
         .map_err(|e| format!("HTTP read failed: {e}"))?;
-    let text = String::from_utf8_lossy(&raw);
-    let Some((head, body)) = text.split_once("\r\n\r\n") else {
+    let Some(head_end) = ap_core::http1::find_header_end(&raw) else {
         return Err("malformed HTTP response (missing header separator)".to_string());
     };
-    let status_code = head
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|s| s.parse::<u16>().ok())
+    let head = String::from_utf8_lossy(&raw[..head_end]);
+    let body = String::from_utf8_lossy(&raw[head_end + 4..]);
+    let status_code = ap_core::http1::parse_status_code(&head)
         .ok_or_else(|| "malformed HTTP status line".to_string())?;
     let parsed = if body.trim().is_empty() {
         JsonValue::Object(Vec::new())
     } else {
-        JsonValue::parse(body)?
+        JsonValue::parse(&body)?
     };
     Ok((status_code, parsed))
 }

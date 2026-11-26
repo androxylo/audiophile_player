@@ -6,7 +6,7 @@
 //! Strictly separate from `ap-control` (which stays 127.0.0.1-only with CSRF/Origin checks).
 
 use std::collections::HashMap;
-use std::io::{ErrorKind, Read, Write};
+use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -14,6 +14,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use ap_control::state::SharedControl;
+use ap_core::http1::{HttpReadLimits, HttpRequest, read_http_request, write_all_bounded};
 
 use crate::gena::{GenaEventHub, GenaService, SubscribeError, is_private_or_loopback};
 use crate::services::{
@@ -122,7 +123,7 @@ impl UpnpRendererServer {
 
         let http_handle = thread::Builder::new()
             .name("ap-upnp-http".to_string())
-            .spawn(move || accept_loop(listener, state_bg, stop_bg, workers_bg))
+            .spawn(move || accept_loop(listener, port, state_bg, stop_bg, workers_bg))
             .map_err(|e| format!("failed spawning UPnP HTTP server thread: {e}"))?;
 
         let ssdp = if cfg.enable_ssdp {
@@ -251,6 +252,7 @@ fn try_acquire_worker(pool: &Arc<Mutex<WorkerPoolState>>, peer: IpAddr) -> Optio
 
 fn accept_loop(
     listener: TcpListener,
+    bound_port: u16,
     state: Arc<UpnpRendererState>,
     stop: Arc<AtomicBool>,
     workers: Arc<Mutex<WorkerPoolState>>,
@@ -289,7 +291,7 @@ fn accept_loop(
                     .name("ap-upnp-worker".to_string())
                     .spawn(move || {
                         let _g = guard;
-                        handle_connection(&mut stream, &state_w, &stop_w);
+                        handle_connection(&mut stream, bound_port, &state_w, &stop_w);
                     });
             }
             Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
@@ -302,24 +304,88 @@ fn accept_loop(
     }
 }
 
-struct UpnpHttpRequest {
-    method: String,
-    path: String,
-    headers: HashMap<String, String>,
-    body: String,
+/// Validate `Host` header against DNS rebinding on the LAN UPnP HTTP server (Review #9 O16).
+/// Accepts `localhost:<port>` or any loopback / RFC 1918 / link-local IP literal matching `bound_port`.
+fn is_valid_upnp_host(host: &str, bound_port: u16) -> bool {
+    let trimmed = host.trim();
+    let (host_part, port_part) = if let Some(rest) = trimmed.strip_prefix('[') {
+        let Some((ip6, tail)) = rest.split_once(']') else {
+            return false;
+        };
+        let p = match tail.strip_prefix(':') {
+            Some(ps) => ps.parse::<u16>().ok(),
+            None if tail.is_empty() => Some(80),
+            None => None,
+        };
+        (ip6, p)
+    } else if let Some((h, ps)) = trimmed.rsplit_once(':') {
+        (h, ps.parse::<u16>().ok())
+    } else {
+        (trimmed, Some(80))
+    };
+    if port_part != Some(bound_port) {
+        return false;
+    }
+    if host_part.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host_part
+        .parse::<IpAddr>()
+        .is_ok_and(is_private_or_loopback)
 }
 
-fn handle_connection(stream: &mut TcpStream, state: &UpnpRendererState, stop: &AtomicBool) {
-    let req = match read_upnp_http_request(stream, stop) {
+const UPNP_READ_LIMITS: HttpReadLimits = HttpReadLimits {
+    max_header_bytes: MAX_HEADER_BYTES,
+    max_body_bytes: MAX_BODY_BYTES,
+    first_byte_deadline: FIRST_BYTE_DEADLINE,
+    read_deadline: READ_DEADLINE,
+    allow_chunked: true,
+    honor_expect_100: true,
+};
+
+const SCPD_ROUTES: &[(&str, &str)] = &[
+    ("/scpd/AVTransport.xml", AVTRANSPORT_SCPD_XML),
+    ("/scpd/ConnectionManager.xml", CONNECTION_MANAGER_SCPD_XML),
+    ("/scpd/RenderingControl.xml", RENDERING_CONTROL_SCPD_XML),
+];
+
+const EVENT_ROUTES: &[(&str, GenaService)] = &[
+    ("/upnp/event/AVTransport", GenaService::AvTransport),
+    ("/upnp/event/ConnectionManager", GenaService::ConnectionManager),
+    ("/upnp/event/RenderingControl", GenaService::RenderingControl),
+];
+
+fn reply_412(stream: &mut TcpStream) {
+    let _ = write_http_reply(stream, "412 Precondition Failed", "text/plain", &[], b"", false);
+}
+
+fn reply_soap(stream: &mut TcpStream, resp: SoapResponse) {
+    let _ = write_http_reply(
+        stream,
+        resp.status,
+        "text/xml; charset=\"utf-8\"",
+        &[("EXT", "")],
+        resp.xml.as_bytes(),
+        false,
+    );
+}
+
+fn handle_connection(
+    stream: &mut TcpStream,
+    bound_port: u16,
+    state: &UpnpRendererState,
+    stop: &AtomicBool,
+) {
+    let req = match read_http_request(stream, &UPNP_READ_LIMITS, stop) {
         Ok(r) => r,
-        Err(status) => {
-            if !status.is_empty() {
+        Err(err) => {
+            if let Some((status, msg)) = err.http_status() {
                 let _ = write_http_reply(
                     stream,
                     status,
                     "text/plain; charset=\"utf-8\"",
                     &[],
-                    status.as_bytes(),
+                    msg.as_bytes(),
                     false,
                 );
             }
@@ -327,11 +393,29 @@ fn handle_connection(stream: &mut TcpStream, state: &UpnpRendererState, stop: &A
         }
     };
 
-    let path = req.path.split('?').next().unwrap_or(req.path.as_str());
+    // Review #9 O16: block DNS rebinding via Host header validation (must be loopback/LAN IP or localhost).
+    if req.has_duplicate_header("host")
+        || !req
+            .header("host")
+            .is_some_and(|h| is_valid_upnp_host(h, bound_port))
+    {
+        let _ = write_http_reply(
+            stream,
+            "403 Forbidden",
+            "text/plain; charset=\"utf-8\"",
+            &[],
+            b"Forbidden: invalid UPnP Host header",
+            false,
+        );
+        return;
+    }
+
+    let path = req.target.split('?').next().unwrap_or(req.target.as_str());
     let is_head = req.method == "HEAD";
 
-    match (req.method.as_str(), path) {
-        ("GET" | "HEAD", "/description.xml") => {
+    // Table-driven UPnP dispatch (Review #9 O13).
+    if matches!(req.method.as_str(), "GET" | "HEAD") {
+        if path == "/description.xml" {
             let xml = render_device_description_xml(
                 state.udn(),
                 state.friendly_name(),
@@ -345,142 +429,76 @@ fn handle_connection(stream: &mut TcpStream, state: &UpnpRendererState, stop: &A
                 xml.as_bytes(),
                 is_head,
             );
+            return;
         }
-        ("GET" | "HEAD", "/scpd/AVTransport.xml") => {
+        if let Some(&(_, scpd_xml)) = SCPD_ROUTES.iter().find(|&&(p, _)| p == path) {
             let _ = write_http_reply(
                 stream,
                 "200 OK",
                 "text/xml; charset=\"utf-8\"",
                 &[],
-                AVTRANSPORT_SCPD_XML.as_bytes(),
+                scpd_xml.as_bytes(),
                 is_head,
             );
-        }
-        ("GET" | "HEAD", "/scpd/ConnectionManager.xml") => {
-            let _ = write_http_reply(
-                stream,
-                "200 OK",
-                "text/xml; charset=\"utf-8\"",
-                &[],
-                CONNECTION_MANAGER_SCPD_XML.as_bytes(),
-                is_head,
-            );
-        }
-        ("GET" | "HEAD", "/scpd/RenderingControl.xml") => {
-            let _ = write_http_reply(
-                stream,
-                "200 OK",
-                "text/xml; charset=\"utf-8\"",
-                &[],
-                RENDERING_CONTROL_SCPD_XML.as_bytes(),
-                is_head,
-            );
-        }
-        ("POST", "/upnp/control/AVTransport") => {
-            let resp = match parse_soap_action_name(
-                req.headers.get("soapaction").map(String::as_str),
-            ) {
-                Some(action) => handle_av_transport(&action, &req.body, state),
-                None => SoapResponse::fault(401, "Missing SOAPACTION header"),
-            };
-            let _ = write_http_reply(
-                stream,
-                resp.status,
-                "text/xml; charset=\"utf-8\"",
-                &[("EXT", "")],
-                resp.xml.as_bytes(),
-                false,
-            );
-        }
-        ("POST", "/upnp/control/ConnectionManager") => {
-            let resp = match parse_soap_action_name(
-                req.headers.get("soapaction").map(String::as_str),
-            ) {
-                Some(action) => handle_connection_manager(&action, state),
-                None => SoapResponse::fault(401, "Missing SOAPACTION header"),
-            };
-            let _ = write_http_reply(
-                stream,
-                resp.status,
-                "text/xml; charset=\"utf-8\"",
-                &[("EXT", "")],
-                resp.xml.as_bytes(),
-                false,
-            );
-        }
-        ("POST", "/upnp/control/RenderingControl") => {
-            let resp = match parse_soap_action_name(
-                req.headers.get("soapaction").map(String::as_str),
-            ) {
-                Some(action) => handle_rendering_control(&action, state),
-                None => SoapResponse::fault(401, "Missing SOAPACTION header"),
-            };
-            let _ = write_http_reply(
-                stream,
-                resp.status,
-                "text/xml; charset=\"utf-8\"",
-                &[("EXT", "")],
-                resp.xml.as_bytes(),
-                false,
-            );
-        }
-        ("SUBSCRIBE", "/upnp/event/AVTransport") => {
-            handle_subscribe(stream, GenaService::AvTransport, &req, state);
-        }
-        ("SUBSCRIBE", "/upnp/event/ConnectionManager") => {
-            handle_subscribe(stream, GenaService::ConnectionManager, &req, state);
-        }
-        ("SUBSCRIBE", "/upnp/event/RenderingControl") => {
-            handle_subscribe(stream, GenaService::RenderingControl, &req, state);
-        }
-        ("UNSUBSCRIBE", "/upnp/event/AVTransport")
-        | ("UNSUBSCRIBE", "/upnp/event/ConnectionManager")
-        | ("UNSUBSCRIBE", "/upnp/event/RenderingControl") => {
-            if let Some(sid) = req.headers.get("sid") {
-                if state.gena().unsubscribe(sid) {
-                    let _ = write_http_reply(stream, "200 OK", "text/plain", &[], b"", false);
-                } else {
-                    let _ = write_http_reply(
-                        stream,
-                        "412 Precondition Failed",
-                        "text/plain",
-                        &[],
-                        b"",
-                        false,
-                    );
-                }
-            } else {
-                let _ = write_http_reply(
-                    stream,
-                    "412 Precondition Failed",
-                    "text/plain",
-                    &[],
-                    b"",
-                    false,
-                );
-            }
-        }
-        _ => {
-            let _ = write_http_reply(
-                stream,
-                "404 Not Found",
-                "text/plain; charset=\"utf-8\"",
-                &[],
-                b"Not Found",
-                is_head,
-            );
+            return;
         }
     }
+
+    if req.method == "POST" && path.starts_with("/upnp/control/") {
+        let body = req.body_lossy();
+        let soap_resp = match parse_soap_action_name(req.header("soapaction")) {
+            None => Some(SoapResponse::fault(401, "Missing SOAPACTION header")),
+            Some(action) => match path {
+                "/upnp/control/AVTransport" => Some(handle_av_transport(&action, &body, state)),
+                "/upnp/control/ConnectionManager" => {
+                    Some(handle_connection_manager(&action, state))
+                }
+                "/upnp/control/RenderingControl" => Some(handle_rendering_control(&action, state)),
+                _ => None,
+            },
+        };
+        if let Some(resp) = soap_resp {
+            reply_soap(stream, resp);
+            return;
+        }
+    }
+
+    if let Some(&(_, service)) = EVENT_ROUTES.iter().find(|&&(p, _)| p == path) {
+        match req.method.as_str() {
+            "SUBSCRIBE" => {
+                handle_subscribe(stream, service, &req, state);
+                return;
+            }
+            "UNSUBSCRIBE" => {
+                if req.header("sid").is_some_and(|sid| state.gena().unsubscribe(sid)) {
+                    let _ = write_http_reply(stream, "200 OK", "text/plain", &[], b"", false);
+                } else {
+                    reply_412(stream);
+                }
+                return;
+            }
+            _ => {}
+        }
+    }
+
+    let _ = write_http_reply(
+        stream,
+        "404 Not Found",
+        "text/plain; charset=\"utf-8\"",
+        &[],
+        b"Not Found",
+        is_head,
+    );
 }
 
 fn handle_subscribe(
     stream: &mut TcpStream,
     service: GenaService,
-    req: &UpnpHttpRequest,
+    req: &HttpRequest,
     state: &UpnpRendererState,
 ) {
-    let timeout_hdr = req.headers.get("timeout").map(String::as_str);
-    if let Some(sid) = req.headers.get("sid") {
+    let timeout_hdr = req.header("timeout");
+    if let Some(sid) = req.header("sid") {
         // Subscription renewal.
         match state.gena().renew(sid, timeout_hdr) {
             Ok(secs) => {
@@ -489,34 +507,18 @@ fn handle_subscribe(
                     stream,
                     "200 OK",
                     "text/plain",
-                    &[("SID", sid.as_str()), ("TIMEOUT", timeout_val.as_str())],
+                    &[("SID", sid), ("TIMEOUT", timeout_val.as_str())],
                     b"",
                     false,
                 );
             }
-            Err(_) => {
-                let _ = write_http_reply(
-                    stream,
-                    "412 Precondition Failed",
-                    "text/plain",
-                    &[],
-                    b"",
-                    false,
-                );
-            }
+            Err(_) => reply_412(stream),
         }
         return;
     }
 
-    let Some(cb) = req.headers.get("callback") else {
-        let _ = write_http_reply(
-            stream,
-            "412 Precondition Failed",
-            "text/plain",
-            &[],
-            b"",
-            false,
-        );
+    let Some(cb) = req.header("callback") else {
+        reply_412(stream);
         return;
     };
 
@@ -554,203 +556,8 @@ fn handle_subscribe(
                 false,
             );
         }
-        Err(SubscribeError::InvalidRequest(_)) => {
-            let _ = write_http_reply(
-                stream,
-                "412 Precondition Failed",
-                "text/plain",
-                &[],
-                b"",
-                false,
-            );
-        }
+        Err(SubscribeError::InvalidRequest(_)) => reply_412(stream),
     }
-}
-
-fn read_upnp_http_request(
-    stream: &mut TcpStream,
-    stop: &AtomicBool,
-) -> Result<UpnpHttpRequest, &'static str> {
-    let now = Instant::now();
-    let first_byte_deadline = now + FIRST_BYTE_DEADLINE;
-    let deadline = now + READ_DEADLINE;
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
-
-    let mut raw = Vec::with_capacity(2048);
-    let mut tmp = [0u8; 2048];
-    let header_end = loop {
-        if stop.load(Ordering::Acquire) {
-            return Err("");
-        }
-        let cur_now = Instant::now();
-        if (raw.is_empty() && cur_now >= first_byte_deadline) || cur_now >= deadline {
-            return Err("408 Request Timeout");
-        }
-        match stream.read(&mut tmp) {
-            Ok(0) => return Err(""),
-            Ok(n) => {
-                raw.extend_from_slice(&tmp[..n]);
-                if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
-                    break pos;
-                }
-                if raw.len() > MAX_HEADER_BYTES {
-                    return Err("431 Request Header Fields Too Large");
-                }
-            }
-            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
-                continue;
-            }
-            Err(_) => return Err(""),
-        }
-    };
-
-    let header_text = String::from_utf8_lossy(&raw[..header_end]);
-    let mut lines = header_text.split("\r\n");
-    let req_line = lines.next().ok_or("400 Bad Request")?;
-    let mut req_parts = req_line.split_whitespace();
-    let method = req_parts.next().ok_or("400 Bad Request")?.to_uppercase();
-    let path = req_parts.next().ok_or("400 Bad Request")?.to_string();
-
-    let mut headers = HashMap::new();
-    for line in lines {
-        if let Some((k, v)) = line.split_once(':') {
-            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
-        }
-    }
-
-    // Honor `Expect: 100-continue` before reading SOAP request bodies.
-    if headers
-        .get("expect")
-        .is_some_and(|v| v.to_ascii_lowercase().contains("100-continue"))
-    {
-        let _ = stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
-        let _ = stream.flush();
-    }
-
-    let body_start = header_end + 4;
-    let mut body_bytes = raw[body_start..].to_vec();
-
-    let is_chunked = headers
-        .get("transfer-encoding")
-        .is_some_and(|v| v.to_ascii_lowercase().contains("chunked"));
-
-    if is_chunked {
-        let decoded = read_chunked_body(stream, &mut body_bytes, deadline, stop)?;
-        return Ok(UpnpHttpRequest {
-            method,
-            path,
-            headers,
-            body: String::from_utf8_lossy(&decoded).into_owned(),
-        });
-    }
-
-    let content_len = match headers.get("content-length") {
-        Some(v) => {
-            let n = v.parse::<usize>().map_err(|_| "400 Bad Request")?;
-            if n > MAX_BODY_BYTES {
-                return Err("413 Payload Too Large");
-            }
-            n
-        }
-        None => 0,
-    };
-
-    while body_bytes.len() < content_len {
-        if stop.load(Ordering::Acquire) {
-            return Err("");
-        }
-        if Instant::now() >= deadline {
-            return Err("408 Request Timeout");
-        }
-        let want = (content_len - body_bytes.len()).min(tmp.len());
-        match stream.read(&mut tmp[..want]) {
-            Ok(0) => return Err("400 Bad Request"),
-            Ok(n) => body_bytes.extend_from_slice(&tmp[..n]),
-            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
-                continue;
-            }
-            Err(_) => return Err(""),
-        }
-    }
-    body_bytes.truncate(content_len);
-
-    Ok(UpnpHttpRequest {
-        method,
-        path,
-        headers,
-        body: String::from_utf8_lossy(&body_bytes).into_owned(),
-    })
-}
-
-fn read_chunked_body(
-    stream: &mut TcpStream,
-    buf: &mut Vec<u8>,
-    deadline: Instant,
-    stop: &AtomicBool,
-) -> Result<Vec<u8>, &'static str> {
-    let mut out = Vec::new();
-    let mut pos = 0usize;
-    let mut tmp = [0u8; 2048];
-
-    loop {
-        // Ensure we have a chunk-size line ending in `\r\n`.
-        let crlf_rel = loop {
-            if let Some(rel) = buf[pos..].windows(2).position(|w| w == b"\r\n") {
-                break rel;
-            }
-            if stop.load(Ordering::Acquire) {
-                return Err("");
-            }
-            if Instant::now() >= deadline {
-                return Err("408 Request Timeout");
-            }
-            if buf.len() > MAX_BODY_BYTES + 4096 {
-                return Err("413 Payload Too Large");
-            }
-            match stream.read(&mut tmp) {
-                Ok(0) => return Err("400 Bad Request"),
-                Ok(n) => buf.extend_from_slice(&tmp[..n]),
-                Err(e)
-                    if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
-                {
-                    continue;
-                }
-                Err(_) => return Err(""),
-            }
-        };
-        let line = String::from_utf8_lossy(&buf[pos..pos + crlf_rel]);
-        let hex_str = line.split(';').next().unwrap_or("").trim();
-        let chunk_len = usize::from_str_radix(hex_str, 16).map_err(|_| "400 Bad Request")?;
-        pos += crlf_rel + 2;
-        if chunk_len == 0 {
-            break;
-        }
-        if out.len().saturating_add(chunk_len) > MAX_BODY_BYTES {
-            return Err("413 Payload Too Large");
-        }
-        let need_end = pos + chunk_len + 2;
-        while buf.len() < need_end {
-            if stop.load(Ordering::Acquire) {
-                return Err("");
-            }
-            if Instant::now() >= deadline {
-                return Err("408 Request Timeout");
-            }
-            match stream.read(&mut tmp) {
-                Ok(0) => return Err("400 Bad Request"),
-                Ok(n) => buf.extend_from_slice(&tmp[..n]),
-                Err(e)
-                    if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
-                {
-                    continue;
-                }
-                Err(_) => return Err(""),
-            }
-        }
-        out.extend_from_slice(&buf[pos..pos + chunk_len]);
-        pos = need_end;
-    }
-    Ok(out)
 }
 
 fn write_http_reply(
@@ -779,40 +586,27 @@ fn write_http_reply(
     }
     head.push_str("\r\n");
 
-    write_all_bounded(stream, head.as_bytes(), deadline)?;
+    write_all_bounded(stream, head.as_bytes(), deadline, None, 16 * 1024)?;
     if !head_only && !body.is_empty() {
-        write_all_bounded(stream, body, deadline)?;
+        write_all_bounded(stream, body, deadline, None, 16 * 1024)?;
     }
-    let _ = stream.flush();
+    let _ = std::io::Write::flush(stream);
     Ok(())
 }
 
-fn write_all_bounded(
-    stream: &mut TcpStream,
-    data: &[u8],
-    deadline: Instant,
-) -> std::io::Result<()> {
-    let mut written = 0usize;
-    while written < data.len() {
-        if Instant::now() >= deadline {
-            return Err(std::io::Error::new(
-                ErrorKind::TimedOut,
-                "UPnP HTTP write deadline exceeded",
-            ));
-        }
-        match stream.write(&data[written..]) {
-            Ok(0) => {
-                return Err(std::io::Error::new(
-                    ErrorKind::WriteZero,
-                    "UPnP HTTP socket closed during write",
-                ));
-            }
-            Ok(n) => written += n,
-            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
-                continue;
-            }
-            Err(e) => return Err(e),
-        }
+#[cfg(test)]
+mod tests {
+    use super::is_valid_upnp_host;
+
+    #[test]
+    fn upnp_host_header_blocks_dns_rebinding_and_allows_lan_o16() {
+        assert!(is_valid_upnp_host("127.0.0.1:49152", 49152));
+        assert!(is_valid_upnp_host("localhost:49152", 49152));
+        assert!(is_valid_upnp_host("192.168.1.50:49152", 49152));
+        assert!(is_valid_upnp_host("10.0.0.5:49152", 49152));
+        assert!(is_valid_upnp_host("[::1]:49152", 49152));
+        assert!(!is_valid_upnp_host("evil.example.com:49152", 49152));
+        assert!(!is_valid_upnp_host("8.8.8.8:49152", 49152));
+        assert!(!is_valid_upnp_host("192.168.1.50:9999", 49152));
     }
-    Ok(())
 }

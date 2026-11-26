@@ -211,8 +211,15 @@ impl ParsedHttpUrl {
             let full = format!("http://{}{}", self.host_header, loc);
             return Self::parse(&full);
         }
-        let base_dir = match self.path_and_query.rfind('/') {
-            Some(pos) => &self.path_and_query[..=pos],
+        // Review #9 O15: strip `?query` / `#fragment` BEFORE `rfind('/')` so slashes inside
+        // query parameters never corrupt relative redirect resolution.
+        let path_only = self
+            .path_and_query
+            .split(['?', '#'])
+            .next()
+            .unwrap_or("/");
+        let base_dir = match path_only.rfind('/') {
+            Some(pos) => &path_only[..=pos],
             None => "/",
         };
         let full = format!("http://{}{}{}", self.host_header, base_dir, loc);
@@ -684,7 +691,7 @@ fn send_get_and_read_headers(
             return Err("HTTP server closed connection before completing headers".to_string());
         }
         raw.extend_from_slice(&tmp[..n]);
-        if let Some(pos) = find_crlf_crlf(&raw) {
+        if let Some(pos) = ap_core::http1::find_header_end(&raw) {
             break pos;
         }
         if raw.len() > MAX_HTTP_HEADER_BYTES {
@@ -693,18 +700,12 @@ fn send_get_and_read_headers(
     };
 
     let header_text = String::from_utf8_lossy(&raw[..header_end]);
+    let status_code = ap_core::http1::parse_status_code(&header_text).ok_or_else(|| {
+        let first = header_text.lines().next().unwrap_or("");
+        format!("invalid HTTP status line '{first}'")
+    })?;
     let mut lines = header_text.split("\r\n");
-    let status_line = lines
-        .next()
-        .ok_or_else(|| "empty HTTP response status line".to_string())?;
-    let mut parts = status_line.split_whitespace();
-    let _http_ver = parts
-        .next()
-        .ok_or_else(|| format!("malformed HTTP status line '{status_line}'"))?;
-    let status_code = parts
-        .next()
-        .and_then(|s| s.parse::<u16>().ok())
-        .ok_or_else(|| format!("invalid HTTP status code in '{status_line}'"))?;
+    let _status_line = lines.next();
 
     let mut content_type = None;
     let mut content_length = None;
@@ -767,10 +768,6 @@ fn send_get_and_read_headers(
         accept_ranges,
         location,
     })
-}
-
-fn find_crlf_crlf(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -1698,44 +1695,19 @@ impl HttpAudioSource {
                     {
                         if ranged_body.is_partial_content() {
                             let rem_len = ranged_body.content_length();
-                            let ranged_prefixed = PrefixedReader::new(&[], ranged_body);
-                            let dec =
-                                RawLpcmBeDecoder::new(ranged_prefixed, rate, ch, bits, rem_len)?;
-                            let format = if bits == 16 {
-                                StreamContainerFormat::Lpcm16Be
-                            } else {
-                                StreamContainerFormat::Lpcm24Be
-                            };
-                            return Ok(Self {
-                                format,
-                                spec: dec.spec,
-                                peak_meta: TrackPeakMetadata::default(),
-                                track_meta: TrackMetadata::default(),
-                                total_frames: content_length.map(|l| l / frame_bytes),
-                                streaminfo_md5: None,
-                                decoder: ActiveHttpDecoder::LpcmBe(dec),
-                                next_chained_segment: None,
-                            });
+                            return Self::from_lpcm(
+                                PrefixedReader::new(&[], ranged_body),
+                                rate,
+                                ch,
+                                bits,
+                                rem_len,
+                                content_length.map(|l| l / frame_bytes),
+                            );
                         }
                     }
                 }
             }
-            let dec = RawLpcmBeDecoder::new(prefixed, rate, ch, bits, content_length)?;
-            let format = if bits == 16 {
-                StreamContainerFormat::Lpcm16Be
-            } else {
-                StreamContainerFormat::Lpcm24Be
-            };
-            Self {
-                format,
-                spec: dec.spec,
-                peak_meta: TrackPeakMetadata::default(),
-                track_meta: TrackMetadata::default(),
-                total_frames: dec.total_frames,
-                streaminfo_md5: None,
-                decoder: ActiveHttpDecoder::LpcmBe(dec),
-                next_chained_segment: None,
-            }
+            Self::from_lpcm(prefixed, rate, ch, bits, content_length, None)?
         } else {
             let ct_disp = content_type.as_deref().unwrap_or("<none>");
             return Err(format!(
@@ -1761,6 +1733,32 @@ impl HttpAudioSource {
         }
 
         Ok(source)
+    }
+
+    fn from_lpcm(
+        reader: PrefixedReader<HttpBodyReader>,
+        rate: u32,
+        ch: u16,
+        bits: u16,
+        body_len: Option<u64>,
+        total_frames_override: Option<u64>,
+    ) -> Result<Self, String> {
+        let dec = RawLpcmBeDecoder::new(reader, rate, ch, bits, body_len)?;
+        let format = if bits == 16 {
+            StreamContainerFormat::Lpcm16Be
+        } else {
+            StreamContainerFormat::Lpcm24Be
+        };
+        Ok(Self {
+            format,
+            spec: dec.spec,
+            peak_meta: TrackPeakMetadata::default(),
+            track_meta: TrackMetadata::default(),
+            total_frames: total_frames_override.or(dec.total_frames),
+            streaminfo_md5: None,
+            decoder: ActiveHttpDecoder::LpcmBe(dec),
+            next_chained_segment: None,
+        })
     }
 
     pub fn container_format(&self) -> StreamContainerFormat {
@@ -1962,4 +1960,16 @@ pub fn parse_lpcm_params(
     let final_rate = rate.or(hints.sample_rate_hz).unwrap_or(44_100);
     let final_ch = channels.or(hints.channels).unwrap_or(2);
     Some((final_bits, final_rate, final_ch))
+}
+
+#[cfg(test)]
+mod redirect_tests {
+    use super::ParsedHttpUrl;
+
+    #[test]
+    fn resolve_redirect_strips_query_before_rfind_slash_o15() {
+        let base = ParsedHttpUrl::parse("http://127.0.0.1:8080/music/stream?cb=http://a/b/c").unwrap();
+        let next = base.resolve_redirect("track2.flac").unwrap();
+        assert_eq!(next.path_and_query, "/music/track2.flac");
+    }
 }

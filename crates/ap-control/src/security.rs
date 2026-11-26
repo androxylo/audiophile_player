@@ -29,14 +29,6 @@ const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
 #[cfg(windows)]
 const FILE_ATTRIBUTE_DEVICE: u32 = 0x0000_0040;
 
-/// Returns `true` only when `meta` represents an actual symlink or Windows NTFS mount
-/// point/junction (`meta.file_type().is_symlink()`, which checks `IsReparseTagNameSurrogate` on
-/// Windows — true for `IO_REPARSE_TAG_SYMLINK` and `IO_REPARSE_TAG_MOUNT_POINT`, false for
-/// non-link reparse points such as OneDrive cloud placeholders, WCI, and Data Deduplication).
-pub fn is_symlink_or_mount_point(_path: &Path, meta: &fs::Metadata) -> bool {
-    ap_source::library::is_symlink_or_mount_point(meta)
-}
-
 /// Windows reserved DOS device base names (case-insensitive, matched before the first `.` after
 /// trimming trailing spaces/dots).
 const RESERVED_DOS_DEVICES: &[&str] = &[
@@ -359,16 +351,11 @@ fn verify_no_unc_reparse_points(
             // Non-existent suffix is safe here; downstream read_dir/metadata will report NotFound.
             break;
         };
-        if is_symlink_or_mount_point(&cur, &meta) {
+        if ap_source::library::is_symlink_or_mount_point(&meta) {
             ap_source::library::verify_symlink_chain_is_allowed(&cur, allowed_unc_share)?;
         }
     }
     Ok(())
-}
-
-/// Check case-insensitively whether `path` has a `.flac` extension.
-pub fn is_flac_extension(path: &Path) -> bool {
-    ap_source::library::is_flac_path(path)
 }
 
 /// Validate a file path before submitting `PlayFile` or calling `FlacBlockReader::open`.
@@ -388,7 +375,7 @@ pub fn validate_playable_flac_path(
         }
     };
 
-    if !is_flac_extension(&norm) {
+    if !ap_source::library::is_flac_path(&norm) {
         return Err(format!(
             "file '{}' does not have a .flac extension",
             norm.display()

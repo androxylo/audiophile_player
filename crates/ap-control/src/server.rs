@@ -23,7 +23,7 @@
 //!   `/api/status` or `ControlServer::shutdown`.
 
 use std::collections::HashMap;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{ErrorKind, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::sync::mpsc;
@@ -32,6 +32,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use ap_core::http1::{HttpReadLimits, HttpRequest, read_http_request, write_all_bounded};
 use ap_core::json::JsonValue;
 
 use crate::browser::{
@@ -313,15 +314,6 @@ where
     rx.recv_timeout(timeout).map_err(|_| ())
 }
 
-/// Convenience wrapper around [`run_fs_op_bounded_for_key`] using the default bucket key.
-pub fn run_fs_op_bounded<T, F>(timeout: Duration, op: F) -> Result<T, ()>
-where
-    T: Send + 'static,
-    F: FnOnce() -> T + Send + 'static,
-{
-    run_fs_op_bounded_for_key("default", timeout, op)
-}
-
 /// Non-destructively check whether another service is already accepting TCP connections
 /// on localhost at `port` (catches services bound to `0.0.0.0:port`, `[::]:port`, or
 /// `127.0.0.1:port` so Windows' dual-bind quirk cannot hijack another process's traffic).
@@ -515,26 +507,80 @@ fn serve_loop(
     }
 }
 
-struct HttpRequest {
-    method: String,
-    target: String,
-    host: Option<String>,
-    duplicate_host: bool,
-    origin: Option<String>,
-    authorization: Option<String>,
-    sec_fetch_site: Option<String>,
-    sec_fetch_dest: Option<String>,
-    body: String,
+const CONTROL_READ_LIMITS: HttpReadLimits = HttpReadLimits {
+    max_header_bytes: MAX_HEADER_BYTES,
+    max_body_bytes: MAX_BODY_BYTES,
+    first_byte_deadline: REQUEST_READ_DEADLINE,
+    read_deadline: REQUEST_READ_DEADLINE,
+    allow_chunked: false,
+    honor_expect_100: false,
+};
+
+enum BoundedValidationError {
+    Rejected(String),
+    TimedOut,
 }
 
-enum ReadRequestError {
-    ClosedOrMalformed,
-    Timeout,
-    HeaderTooLarge,
-    BodyTooLarge,
-    BadContentLength,
-    TransferEncodingNotSupported,
-    TruncatedBody,
+fn text_err(
+    stream: &mut TcpStream,
+    status: &str,
+    msg: &str,
+    deadline: Instant,
+    stop: &AtomicBool,
+) {
+    write_response(
+        stream,
+        status,
+        "text/plain; charset=utf-8",
+        msg.as_bytes(),
+        None,
+        deadline,
+        stop,
+    );
+}
+
+fn json_err(
+    stream: &mut TcpStream,
+    status: &str,
+    msg: impl Into<String>,
+    deadline: Instant,
+    stop: &AtomicBool,
+) {
+    write_json_response(
+        stream,
+        status,
+        &JsonValue::obj(vec![
+            ("ok", JsonValue::from(false)),
+            ("error", JsonValue::from(msg.into())),
+        ]),
+        deadline,
+        stop,
+    );
+}
+
+/// Lexical pre-validation + per-volume bounded filesystem validation shared across HTML & `/api/v1`
+/// folder/file routes (Review #9 O1).
+fn validate_path_bounded(
+    raw: &Path,
+    allowed_root: &Path,
+    is_file: bool,
+) -> Result<PathBuf, BoundedValidationError> {
+    let prevalidated = prevalidate_lexical_path_for_root(raw, allowed_root)
+        .map_err(BoundedValidationError::Rejected)?;
+    let root_for_fs = allowed_root.to_path_buf();
+    let key = fs_volume_key(&prevalidated);
+    match run_fs_op_bounded_for_key(&key, FS_OP_DEADLINE, move || {
+        populate_reparse_volume_cache_bounded(&prevalidated);
+        if is_file {
+            validate_playable_flac_path(&prevalidated, Some(&root_for_fs))
+        } else {
+            validate_path_within_root(&prevalidated, &root_for_fs)
+        }
+    }) {
+        Ok(Ok(valid)) => Ok(valid),
+        Ok(Err(reason)) => Err(BoundedValidationError::Rejected(reason)),
+        Err(()) => Err(BoundedValidationError::TimedOut),
+    }
 }
 
 fn handle_connection(
@@ -544,96 +590,26 @@ fn handle_connection(
     stop: &AtomicBool,
 ) {
     let conn_deadline = Instant::now() + CONNECTION_TOTAL_DEADLINE;
-    let req = match read_http_request(stream, stop) {
+    let req = match read_http_request(stream, &CONTROL_READ_LIMITS, stop) {
         Ok(r) => r,
-        Err(ReadRequestError::ClosedOrMalformed) => return,
-        Err(ReadRequestError::Timeout) => {
-            write_response(
-                stream,
-                "408 Request Timeout",
-                "text/plain; charset=utf-8",
-                b"Request Timeout",
-                None,
-                conn_deadline,
-                stop,
-            );
-            return;
-        }
-        Err(ReadRequestError::HeaderTooLarge) => {
-            write_response(
-                stream,
-                "431 Request Header Fields Too Large",
-                "text/plain; charset=utf-8",
-                b"Request Header Fields Too Large",
-                None,
-                conn_deadline,
-                stop,
-            );
-            return;
-        }
-        Err(ReadRequestError::BodyTooLarge) => {
-            write_response(
-                stream,
-                "413 Payload Too Large",
-                "text/plain; charset=utf-8",
-                b"Payload Too Large",
-                None,
-                conn_deadline,
-                stop,
-            );
-            return;
-        }
-        Err(ReadRequestError::BadContentLength) => {
-            write_response(
-                stream,
-                "400 Bad Request",
-                "text/plain; charset=utf-8",
-                b"Invalid Content-Length",
-                None,
-                conn_deadline,
-                stop,
-            );
-            return;
-        }
-        Err(ReadRequestError::TransferEncodingNotSupported) => {
-            write_response(
-                stream,
-                "501 Not Implemented",
-                "text/plain; charset=utf-8",
-                b"Transfer-Encoding is not supported; send Content-Length",
-                None,
-                conn_deadline,
-                stop,
-            );
-            return;
-        }
-        Err(ReadRequestError::TruncatedBody) => {
-            write_response(
-                stream,
-                "400 Bad Request",
-                "text/plain; charset=utf-8",
-                b"Truncated request body",
-                None,
-                conn_deadline,
-                stop,
-            );
+        Err(err) => {
+            if let Some((status, msg)) = err.http_status() {
+                text_err(stream, status, msg, conn_deadline, stop);
+            }
             return;
         }
     };
 
     // Strict `Host` validation blocks DNS rebinding and cross-site GET/POST abuse.
-    let valid_host = !req.duplicate_host
+    let valid_host = !req.has_duplicate_header("host")
         && req
-            .host
-            .as_deref()
+            .header("host")
             .is_some_and(|h| is_valid_localhost_host(h, bound_port));
     if !valid_host {
-        write_response(
+        text_err(
             stream,
             "403 Forbidden",
-            "text/plain; charset=utf-8",
-            b"Forbidden: invalid Host header",
-            None,
+            "Forbidden: invalid Host header",
             conn_deadline,
             stop,
         );
@@ -641,19 +617,18 @@ fn handle_connection(
     }
 
     // Block framing / clickjacking attempts (iframe, frame, object, embed) on EVERY route.
-    if let Some(dest) = req.sec_fetch_dest.as_deref() {
-        if !is_allowed_fetch_dest(dest) {
-            write_response(
-                stream,
-                "403 Forbidden",
-                "text/plain; charset=utf-8",
-                b"Forbidden: embedded framing rejected",
-                None,
-                conn_deadline,
-                stop,
-            );
-            return;
-        }
+    if req
+        .header("sec-fetch-dest")
+        .is_some_and(|dest| !is_allowed_fetch_dest(dest))
+    {
+        text_err(
+            stream,
+            "403 Forbidden",
+            "Forbidden: embedded framing rejected",
+            conn_deadline,
+            stop,
+        );
+        return;
     }
 
     let (path, query) = req
@@ -663,33 +638,31 @@ fn handle_connection(
 
     // Enforce Origin / Sec-Fetch-Site checks on all state-changing POST routes.
     if req.method == "POST" {
-        if let Some(origin) = req.origin.as_deref() {
-            if !is_valid_localhost_origin(origin, bound_port) {
-                write_response(
-                    stream,
-                    "403 Forbidden",
-                    "text/plain; charset=utf-8",
-                    b"Forbidden: cross-origin POST rejected",
-                    None,
-                    conn_deadline,
-                    stop,
-                );
-                return;
-            }
+        if req
+            .header("origin")
+            .is_some_and(|origin| !is_valid_localhost_origin(origin, bound_port))
+        {
+            text_err(
+                stream,
+                "403 Forbidden",
+                "Forbidden: cross-origin POST rejected",
+                conn_deadline,
+                stop,
+            );
+            return;
         }
-        if let Some(site) = req.sec_fetch_site.as_deref() {
-            if !is_allowed_fetch_site(site) {
-                write_response(
-                    stream,
-                    "403 Forbidden",
-                    "text/plain; charset=utf-8",
-                    b"Forbidden: cross-site POST rejected",
-                    None,
-                    conn_deadline,
-                    stop,
-                );
-                return;
-            }
+        if req
+            .header("sec-fetch-site")
+            .is_some_and(|site| !is_allowed_fetch_site(site))
+        {
+            text_err(
+                stream,
+                "403 Forbidden",
+                "Forbidden: cross-site POST rejected",
+                conn_deadline,
+                stop,
+            );
+            return;
         }
     }
 
@@ -710,24 +683,23 @@ fn handle_connection(
         return;
     }
 
+    let body_str = req.body_lossy();
     match (req.method.as_str(), path) {
         ("GET", "/") => {
             let raw_dir_param = parse_form_param(query, "dir").filter(|s| !s.trim().is_empty());
-            if raw_dir_param.is_some() {
-                if let Some(site) = req.sec_fetch_site.as_deref() {
-                    if !is_allowed_fetch_site(site) {
-                        write_response(
-                            stream,
-                            "403 Forbidden",
-                            "text/plain; charset=utf-8",
-                            b"Forbidden: cross-site directory probe rejected",
-                            None,
-                            conn_deadline,
-                            stop,
-                        );
-                        return;
-                    }
-                }
+            if raw_dir_param.is_some()
+                && req
+                    .header("sec-fetch-site")
+                    .is_some_and(|site| !is_allowed_fetch_site(site))
+            {
+                text_err(
+                    stream,
+                    "403 Forbidden",
+                    "Forbidden: cross-site directory probe rejected",
+                    conn_deadline,
+                    stop,
+                );
+                return;
             }
 
             let snap = shared.snapshot();
@@ -739,12 +711,10 @@ fn handle_connection(
                 let decoded = match decode_path_token(raw) {
                     Ok(p) => p,
                     Err(reason) => {
-                        write_response(
+                        text_err(
                             stream,
                             "403 Forbidden",
-                            "text/plain; charset=utf-8",
-                            format!("Forbidden path: {reason}").as_bytes(),
-                            None,
+                            &format!("Forbidden path: {reason}"),
                             conn_deadline,
                             stop,
                         );
@@ -754,12 +724,10 @@ fn handle_connection(
                 match prevalidate_lexical_path_for_root(&decoded, &allowed_root) {
                     Ok(norm) => norm,
                     Err(reason) => {
-                        write_response(
+                        text_err(
                             stream,
                             "403 Forbidden",
-                            "text/plain; charset=utf-8",
-                            format!("Forbidden path: {reason}").as_bytes(),
-                            None,
+                            &format!("Forbidden path: {reason}"),
                             conn_deadline,
                             stop,
                         );
@@ -770,55 +738,41 @@ fn handle_connection(
                 fallback_dir.clone()
             };
             let fs_key = fs_volume_key(&display_dir_on_timeout);
+            let prevalidated_for_fs = display_dir_on_timeout.clone();
+            let has_raw_dir = raw_dir_param.is_some();
             let fs_res = run_fs_op_bounded_for_key(&fs_key, FS_OP_DEADLINE, move || {
-                let browse_dir = match raw_dir_param {
-                    Some(raw) => match decode_and_validate_dir(&raw, &root_for_fs) {
+                let browse_dir = if has_raw_dir {
+                    match validate_path_within_root(&prevalidated_for_fs, &root_for_fs) {
                         Ok(valid) => {
                             populate_reparse_volume_cache_bounded(&valid);
                             valid
                         }
                         Err(reason) => return Err(reason),
-                    },
-                    None => fallback_dir,
+                    }
+                } else {
+                    fallback_dir
                 };
                 Ok(list_folder_entries_in_root(&browse_dir, &root_for_fs))
             });
-            let listing = match fs_res {
-                Ok(Ok(l)) => l,
+            let html = match fs_res {
+                Ok(Ok(listing)) => render_control_page(&snap, &listing),
                 Ok(Err(reason)) => {
-                    write_response(
+                    text_err(
                         stream,
                         "403 Forbidden",
-                        "text/plain; charset=utf-8",
-                        format!("Forbidden path: {reason}").as_bytes(),
-                        None,
+                        &format!("Forbidden path: {reason}"),
                         conn_deadline,
                         stop,
                     );
                     return;
                 }
-                Err(()) => {
-                    // Review #4 Finding #3: NEVER strand the user on a bare 504 text page with no
-                    // Pause/Next buttons! Render the full HTML control page with an empty listing
-                    // and a clear error banner so Pause, Next, and other folders stay reachable.
-                    let norm_root = normalize_allowed_root(&allowed_root);
-                    let parent_dir = display_dir_on_timeout
-                        .parent()
-                        .map(Path::to_path_buf)
-                        .filter(|p| lexically_within_root(p, &norm_root));
-                    FolderListing {
-                        current_dir: display_dir_on_timeout,
-                        parent_dir,
-                        subdirs: Vec::new(),
-                        flac_files: Vec::new(),
-                        error: Some(
-                            "Storage timed out or is busy while reading this folder. Playback controls (Pause / Next / Play) and other folders remain available."
-                                .to_string(),
-                        ),
-                    }
-                }
+                Err(()) => render_timeout_control_html(
+                    &snap,
+                    display_dir_on_timeout,
+                    &allowed_root,
+                    "Storage timed out or is busy while reading this folder. Playback controls (Pause / Next / Play) and other folders remain available.",
+                ),
             };
-            let html = render_control_page(&snap, &listing);
             write_response(
                 stream,
                 "200 OK",
@@ -830,22 +784,20 @@ fn handle_connection(
             );
         }
         ("GET", "/api/status") => {
-            if let Some(site) = req.sec_fetch_site.as_deref() {
-                if !is_allowed_fetch_site(site) {
-                    write_response(
-                        stream,
-                        "403 Forbidden",
-                        "text/plain; charset=utf-8",
-                        b"Forbidden: cross-site status fetch rejected",
-                        None,
-                        conn_deadline,
-                        stop,
-                    );
-                    return;
-                }
+            if req
+                .header("sec-fetch-site")
+                .is_some_and(|site| !is_allowed_fetch_site(site))
+            {
+                text_err(
+                    stream,
+                    "403 Forbidden",
+                    "Forbidden: cross-site status fetch rejected",
+                    conn_deadline,
+                    stop,
+                );
+                return;
             }
-            let snap = shared.snapshot();
-            let json = render_status_json(&snap);
+            let json = render_status_json(&shared.snapshot());
             write_response(
                 stream,
                 "200 OK",
@@ -856,27 +808,25 @@ fn handle_connection(
                 stop,
             );
         }
-        ("POST", "/action/play-random") => {
-            let dir = match extract_validated_dir_bounded(&req.body, shared, &allowed_root) {
-                Ok(Ok(d)) => d,
-                Ok(Err(reason)) => {
-                    write_response(
+        ("POST", action_path @ ("/action/play-random" | "/action/play-sequential")) => {
+            let dir = match extract_validated_dir_bounded(&body_str, shared, &allowed_root) {
+                Ok(d) => d,
+                Err(BoundedValidationError::Rejected(reason)) => {
+                    text_err(
                         stream,
                         "403 Forbidden",
-                        "text/plain; charset=utf-8",
-                        format!("Forbidden folder: {reason}").as_bytes(),
-                        None,
+                        &format!("Forbidden folder: {reason}"),
                         conn_deadline,
                         stop,
                     );
                     return;
                 }
-                Err(()) => {
+                Err(BoundedValidationError::TimedOut) => {
                     write_storage_timeout_control_page(
                         stream,
                         shared,
                         &allowed_root,
-                        &req.body,
+                        &body_str,
                         "Storage timed out or is busy validating folder path. Playback controls (Pause / Next / Play) and other folders remain available.",
                         conn_deadline,
                         stop,
@@ -884,61 +834,33 @@ fn handle_connection(
                     return;
                 }
             };
-            shared.submit_command(ControlCommand::PlayRandom(dir.clone()));
-            redirect_to_dir(stream, &dir, conn_deadline, stop);
-        }
-        ("POST", "/action/play-sequential") => {
-            let dir = match extract_validated_dir_bounded(&req.body, shared, &allowed_root) {
-                Ok(Ok(d)) => d,
-                Ok(Err(reason)) => {
-                    write_response(
-                        stream,
-                        "403 Forbidden",
-                        "text/plain; charset=utf-8",
-                        format!("Forbidden folder: {reason}").as_bytes(),
-                        None,
-                        conn_deadline,
-                        stop,
-                    );
-                    return;
-                }
-                Err(()) => {
-                    write_storage_timeout_control_page(
-                        stream,
-                        shared,
-                        &allowed_root,
-                        &req.body,
-                        "Storage timed out or is busy validating folder path. Playback controls (Pause / Next / Play) and other folders remain available.",
-                        conn_deadline,
-                        stop,
-                    );
-                    return;
-                }
+            let cmd = if action_path == "/action/play-sequential" {
+                ControlCommand::PlaySequential(dir.clone())
+            } else {
+                ControlCommand::PlayRandom(dir.clone())
             };
-            shared.submit_command(ControlCommand::PlaySequential(dir.clone()));
+            shared.submit_command(cmd);
             redirect_to_dir(stream, &dir, conn_deadline, stop);
         }
         ("POST", "/action/play-file") => {
-            let dir = match extract_validated_dir_bounded(&req.body, shared, &allowed_root) {
-                Ok(Ok(d)) => d,
-                Ok(Err(reason)) => {
-                    write_response(
+            let dir = match extract_validated_dir_bounded(&body_str, shared, &allowed_root) {
+                Ok(d) => d,
+                Err(BoundedValidationError::Rejected(reason)) => {
+                    text_err(
                         stream,
                         "403 Forbidden",
-                        "text/plain; charset=utf-8",
-                        format!("Forbidden folder: {reason}").as_bytes(),
-                        None,
+                        &format!("Forbidden folder: {reason}"),
                         conn_deadline,
                         stop,
                     );
                     return;
                 }
-                Err(()) => {
+                Err(BoundedValidationError::TimedOut) => {
                     write_storage_timeout_control_page(
                         stream,
                         shared,
                         &allowed_root,
-                        &req.body,
+                        &body_str,
                         "Storage timed out or is busy validating folder path. Playback controls (Pause / Next / Play) and other folders remain available.",
                         conn_deadline,
                         stop,
@@ -947,81 +869,42 @@ fn handle_connection(
                 }
             };
             let Some(raw_path) =
-                parse_form_param(&req.body, "path").filter(|s| !s.trim().is_empty())
+                parse_form_param(&body_str, "path").filter(|s| !s.trim().is_empty())
             else {
-                write_response(
-                    stream,
-                    "400 Bad Request",
-                    "text/plain; charset=utf-8",
-                    b"Missing file path",
-                    None,
-                    conn_deadline,
-                    stop,
-                );
+                text_err(stream, "400 Bad Request", "Missing file path", conn_deadline, stop);
                 return;
             };
             let decoded = match decode_path_token(&raw_path) {
                 Ok(p) => p,
                 Err(reason) => {
-                    write_response(
+                    text_err(
                         stream,
                         "400 Bad Request",
-                        "text/plain; charset=utf-8",
-                        format!("Invalid path token: {reason}").as_bytes(),
-                        None,
+                        &format!("Invalid path token: {reason}"),
                         conn_deadline,
                         stop,
                     );
                     return;
                 }
             };
-            // Review #6 Finding #9: validate syntax and root containment lexically FIRST (zero
-            // syscalls on the HTTP thread) so raw DeviceNS / Verbatim / out-of-root paths never
-            // trigger any filesystem stat or SMB contact.
-            let prevalidated = match prevalidate_lexical_path_for_root(&decoded, &allowed_root) {
+            let valid_file = match validate_path_bounded(&decoded, &allowed_root, true) {
                 Ok(p) => p,
-                Err(reason) => {
-                    write_response(
+                Err(BoundedValidationError::Rejected(reason)) => {
+                    text_err(
                         stream,
                         "403 Forbidden",
-                        "text/plain; charset=utf-8",
-                        format!("Rejected file path: {reason}").as_bytes(),
-                        None,
+                        &format!("Rejected file path: {reason}"),
                         conn_deadline,
                         stop,
                     );
                     return;
                 }
-            };
-            let root_for_fs = allowed_root.clone();
-            let file_fs_key = fs_volume_key(&prevalidated);
-            let valid_file = match run_fs_op_bounded_for_key(
-                &file_fs_key,
-                FS_OP_DEADLINE,
-                move || {
-                    populate_reparse_volume_cache_bounded(&prevalidated);
-                    validate_playable_flac_path(&prevalidated, Some(&root_for_fs))
-                },
-            ) {
-                Ok(Ok(p)) => p,
-                Ok(Err(reason)) => {
-                    write_response(
-                        stream,
-                        "403 Forbidden",
-                        "text/plain; charset=utf-8",
-                        format!("Rejected file path: {reason}").as_bytes(),
-                        None,
-                        conn_deadline,
-                        stop,
-                    );
-                    return;
-                }
-                Err(()) => {
+                Err(BoundedValidationError::TimedOut) => {
                     write_storage_timeout_control_page(
                         stream,
                         shared,
                         &allowed_root,
-                        &req.body,
+                        &body_str,
                         "Storage timed out or is busy validating file path. Playback controls (Pause / Next / Play) and other folders remain available.",
                         conn_deadline,
                         stop,
@@ -1032,110 +915,54 @@ fn handle_connection(
             shared.submit_command(ControlCommand::PlayFile(valid_file));
             redirect_to_dir(stream, &dir, conn_deadline, stop);
         }
-        ("POST", "/action/next") => {
-            // Review #3 Finding #4: submit Next IMMEDIATELY with ZERO blocking filesystem I/O
-            // so a stalled NAS/USB drive can never delay or drop track skipping.
-            shared.submit_command(ControlCommand::Next);
-            let dir = extract_syntax_only_dir(&req.body, shared, &allowed_root);
+        ("POST", action_path @ ("/action/next" | "/action/pause" | "/action/resume")) => {
+            // Review #3 Finding #4: submit Next/Pause/Resume IMMEDIATELY with ZERO blocking FS I/O
+            // so a stalled NAS/USB drive can never delay skipping or releasing the exclusive DAC pin.
+            let cmd = match action_path {
+                "/action/next" => ControlCommand::Next,
+                "/action/pause" => ControlCommand::Pause,
+                _ => ControlCommand::Resume,
+            };
+            shared.submit_command(cmd);
+            let dir = extract_syntax_only_dir(&body_str, shared, &allowed_root);
             redirect_to_dir(stream, &dir, conn_deadline, stop);
         }
-        ("POST", "/action/pause") => {
-            // Review #3 Finding #4: submit Pause IMMEDIATELY with ZERO blocking filesystem I/O
-            // so releasing the exclusive DAC pin (for Audirvana / etc.) never blocks on a stalled NAS.
-            shared.submit_command(ControlCommand::Pause);
-            let dir = extract_syntax_only_dir(&req.body, shared, &allowed_root);
-            redirect_to_dir(stream, &dir, conn_deadline, stop);
-        }
-        ("POST", "/action/resume") => {
-            // Submit Resume immediately with zero blocking filesystem I/O (same as Pause / Next).
-            shared.submit_command(ControlCommand::Resume);
-            let dir = extract_syntax_only_dir(&req.body, shared, &allowed_root);
-            redirect_to_dir(stream, &dir, conn_deadline, stop);
-        }
-        _ => {
-            write_response(
-                stream,
-                "404 Not Found",
-                "text/plain; charset=utf-8",
-                b"Not Found",
-                None,
-                conn_deadline,
-                stop,
-            );
-        }
+        _ => text_err(stream, "404 Not Found", "Not Found", conn_deadline, stop),
     }
-}
-
-fn decode_and_validate_dir(raw: &str, allowed_root: &Path) -> Result<PathBuf, String> {
-    let decoded = decode_path_token(raw)?;
-    validate_path_within_root(&decoded, allowed_root)
 }
 
 fn extract_validated_dir_bounded(
     body: &str,
     shared: &SharedControl,
     allowed_root: &Path,
-) -> Result<Result<PathBuf, String>, ()> {
+) -> Result<PathBuf, BoundedValidationError> {
     match parse_form_param(body, "dir").filter(|s| !s.trim().is_empty()) {
         Some(raw) => {
-            // Review #6 Finding #9: decode + lexical syntax/root validation strictly BEFORE any
-            // bucket key or bounded worker spawn (zero syscalls on invalid / DeviceNS paths!).
-            let decoded = match decode_path_token(&raw) {
-                Ok(p) => p,
-                Err(reason) => return Ok(Err(reason)),
-            };
-            let prevalidated = match prevalidate_lexical_path_for_root(&decoded, allowed_root) {
-                Ok(p) => p,
-                Err(reason) => return Ok(Err(reason)),
-            };
-            let root = allowed_root.to_path_buf();
-            let fs_key = fs_volume_key(&prevalidated);
-            run_fs_op_bounded_for_key(&fs_key, FS_OP_DEADLINE, move || {
-                populate_reparse_volume_cache_bounded(&prevalidated);
-                validate_path_within_root(&prevalidated, &root)
-            })
+            let decoded = decode_path_token(&raw).map_err(BoundedValidationError::Rejected)?;
+            validate_path_bounded(&decoded, allowed_root, false)
         }
-        None => Ok(Ok(shared.snapshot().active_folder)),
+        None => Ok(shared.snapshot().active_folder),
     }
 }
 
-/// Pure-memory redirect folder extraction performing **zero** filesystem syscalls.
-/// Used by `POST /action/pause` and `POST /action/next` after command submission so a stalled NAS
-/// never blocks the redirect response. Any invalid/out-of-root `dir` falls back cleanly to
-/// `active_folder`, and the subsequent `GET /?dir=...` still performs full filesystem validation.
+/// Pure-memory redirect folder extraction performing **zero** filesystem syscalls (Review #9 O12:
+/// delegates directly to `prevalidate_lexical_path_for_root`).
 fn extract_syntax_only_dir(body: &str, shared: &SharedControl, allowed_root: &Path) -> PathBuf {
-    let Some(raw) = parse_form_param(body, "dir").filter(|s| !s.trim().is_empty()) else {
-        return shared.snapshot().active_folder;
-    };
-    let Ok(decoded) = decode_path_token(&raw) else {
-        return shared.snapshot().active_folder;
-    };
-    let norm_root = normalize_allowed_root(allowed_root);
-    let allowed_unc = extract_unc_share(&norm_root);
-    let share_ref = allowed_unc
-        .as_ref()
-        .map(|(s, sh)| (s.as_str(), sh.as_str()));
-    match validate_path_syntax_for_root(&decoded, share_ref) {
-        Ok(norm) if lexically_within_root(&norm, &norm_root) => norm,
-        _ => shared.snapshot().active_folder,
-    }
+    parse_form_param(body, "dir")
+        .filter(|s| !s.trim().is_empty())
+        .and_then(|raw| decode_path_token(&raw).ok())
+        .and_then(|decoded| prevalidate_lexical_path_for_root(&decoded, allowed_root).ok())
+        .unwrap_or_else(|| shared.snapshot().active_folder)
 }
 
-/// Render the full interactive HTML control page with an error banner when a `POST /action/play-*`
-/// storage validation times out or its per-volume helper bucket is saturated, so Pause / Next /
-/// parent-folder navigation stay clickable instead of stranding the user on a bare text 504 page
-/// (Review #5 follow-up to Review #4 #3).
-fn write_storage_timeout_control_page(
-    stream: &mut TcpStream,
-    shared: &SharedControl,
+/// Build the full interactive HTML control page with an error banner when storage times out
+/// (shared by `GET /` and `POST /action/play-*` timeouts, Review #9 O12).
+fn render_timeout_control_html(
+    snap: &crate::state::ControlSnapshot,
+    display_dir: PathBuf,
     allowed_root: &Path,
-    body: &str,
     error_message: &str,
-    deadline: Instant,
-    stop: &AtomicBool,
-) {
-    let snap = shared.snapshot();
-    let display_dir = extract_syntax_only_dir(body, shared, allowed_root);
+) -> String {
     let norm_root = normalize_allowed_root(allowed_root);
     let parent_dir = display_dir
         .parent()
@@ -1148,7 +975,21 @@ fn write_storage_timeout_control_page(
         flac_files: Vec::new(),
         error: Some(error_message.to_string()),
     };
-    let html = render_control_page(&snap, &listing);
+    render_control_page(snap, &listing)
+}
+
+fn write_storage_timeout_control_page(
+    stream: &mut TcpStream,
+    shared: &SharedControl,
+    allowed_root: &Path,
+    body: &str,
+    error_message: &str,
+    deadline: Instant,
+    stop: &AtomicBool,
+) {
+    let snap = shared.snapshot();
+    let display_dir = extract_syntax_only_dir(body, shared, allowed_root);
+    let html = render_timeout_control_html(&snap, display_dir, allowed_root, error_message);
     write_response(
         stream,
         "504 Gateway Timeout",
@@ -1171,140 +1012,6 @@ fn redirect_to_dir(stream: &mut TcpStream, dir: &Path, deadline: Instant, stop: 
         deadline,
         stop,
     );
-}
-
-fn read_chunk_with_deadline(
-    stream: &mut TcpStream,
-    buf: &mut [u8],
-    deadline: Instant,
-    stop: &AtomicBool,
-) -> Result<usize, ReadRequestError> {
-    loop {
-        if stop.load(Ordering::Relaxed) {
-            return Err(ReadRequestError::ClosedOrMalformed);
-        }
-        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            return Err(ReadRequestError::Timeout);
-        };
-        let slice_timeout = remaining.min(Duration::from_millis(250));
-        let _ = stream.set_read_timeout(Some(slice_timeout));
-        match stream.read(buf) {
-            Ok(n) => return Ok(n),
-            Err(ref e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                if Instant::now() >= deadline {
-                    return Err(ReadRequestError::Timeout);
-                }
-                continue;
-            }
-            Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(_) => return Err(ReadRequestError::ClosedOrMalformed),
-        }
-    }
-}
-
-fn read_http_request(
-    stream: &mut TcpStream,
-    stop: &AtomicBool,
-) -> Result<HttpRequest, ReadRequestError> {
-    let deadline = Instant::now() + REQUEST_READ_DEADLINE;
-    let mut buf = Vec::with_capacity(2048);
-    let mut chunk = [0u8; 1024];
-
-    let header_end = loop {
-        let n = read_chunk_with_deadline(stream, &mut chunk, deadline, stop)?;
-        if n == 0 {
-            return Err(ReadRequestError::ClosedOrMalformed);
-        }
-        buf.extend_from_slice(&chunk[..n]);
-        if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
-            let end = pos + 4;
-            if end > MAX_HEADER_BYTES {
-                return Err(ReadRequestError::HeaderTooLarge);
-            }
-            break end;
-        }
-        if buf.len() > MAX_HEADER_BYTES {
-            return Err(ReadRequestError::HeaderTooLarge);
-        }
-    };
-
-    let header_text = String::from_utf8_lossy(&buf[..header_end]);
-    let mut lines = header_text.lines();
-    let req_line = lines.next().ok_or(ReadRequestError::ClosedOrMalformed)?;
-    let mut parts = req_line.split_whitespace();
-    let method = parts
-        .next()
-        .ok_or(ReadRequestError::ClosedOrMalformed)?
-        .to_string();
-    let target = parts
-        .next()
-        .ok_or(ReadRequestError::ClosedOrMalformed)?
-        .to_string();
-
-    let mut content_length: usize = 0;
-    let mut host: Option<String> = None;
-    let mut duplicate_host = false;
-    let mut origin: Option<String> = None;
-    let mut authorization: Option<String> = None;
-    let mut sec_fetch_site: Option<String> = None;
-    let mut sec_fetch_dest: Option<String> = None;
-
-    for line in lines {
-        if let Some((k, v)) = line.split_once(':') {
-            let name = k.trim();
-            let val = v.trim();
-            if name.eq_ignore_ascii_case("transfer-encoding") {
-                return Err(ReadRequestError::TransferEncodingNotSupported);
-            } else if name.eq_ignore_ascii_case("content-length") {
-                let parsed = val
-                    .parse::<usize>()
-                    .map_err(|_| ReadRequestError::BadContentLength)?;
-                if parsed > MAX_BODY_BYTES {
-                    return Err(ReadRequestError::BodyTooLarge);
-                }
-                content_length = parsed;
-            } else if name.eq_ignore_ascii_case("host") {
-                if host.is_some() {
-                    duplicate_host = true;
-                } else {
-                    host = Some(val.to_string());
-                }
-            } else if name.eq_ignore_ascii_case("origin") {
-                origin = Some(val.to_string());
-            } else if name.eq_ignore_ascii_case("authorization") {
-                authorization = Some(val.to_string());
-            } else if name.eq_ignore_ascii_case("sec-fetch-site") {
-                sec_fetch_site = Some(val.to_string());
-            } else if name.eq_ignore_ascii_case("sec-fetch-dest") {
-                sec_fetch_dest = Some(val.to_string());
-            }
-        }
-    }
-
-    let total_needed = header_end + content_length;
-    while buf.len() < total_needed {
-        let n = read_chunk_with_deadline(stream, &mut chunk, deadline, stop)?;
-        if n == 0 {
-            return Err(ReadRequestError::TruncatedBody);
-        }
-        buf.extend_from_slice(&chunk[..n]);
-        if buf.len() > header_end + MAX_BODY_BYTES {
-            return Err(ReadRequestError::BodyTooLarge);
-        }
-    }
-
-    let body = String::from_utf8_lossy(&buf[header_end..total_needed]).into_owned();
-    Ok(HttpRequest {
-        method,
-        target,
-        host,
-        duplicate_host,
-        origin,
-        authorization,
-        sec_fetch_site,
-        sec_fetch_dest,
-        body,
-    })
 }
 
 fn write_json_response(
@@ -1337,83 +1044,50 @@ fn handle_api_v1(
     deadline: Instant,
     stop: &AtomicBool,
 ) {
-    if !shared.verify_bearer_token(req.authorization.as_deref()) {
-        write_json_response(
+    if !shared.verify_bearer_token(req.header("authorization")) {
+        json_err(
             stream,
             "401 Unauthorized",
-            &JsonValue::obj(vec![
-                ("ok", JsonValue::from(false)),
-                ("error", JsonValue::from("unauthorized: missing or invalid Bearer token")),
-            ]),
+            "unauthorized: missing or invalid Bearer token",
             deadline,
             stop,
         );
         return;
     }
 
+    let body_str = req.body_lossy();
     match (req.method.as_str(), path) {
         ("GET", "/api/v1/status") => {
-            let status_json = shared.api_v1_status_json();
-            write_json_response(stream, "200 OK", &status_json, deadline, stop);
+            write_json_response(stream, "200 OK", &shared.api_v1_status_json(), deadline, stop);
         }
-        ("POST", "/api/v1/pause") => {
-            shared.submit_command(ControlCommand::Pause);
+        ("POST", route @ ("/api/v1/pause" | "/api/v1/resume" | "/api/v1/next")) => {
+            let (cmd, action) = match route {
+                "/api/v1/pause" => (ControlCommand::Pause, "pause"),
+                "/api/v1/resume" => (ControlCommand::Resume, "resume"),
+                _ => (ControlCommand::Next, "next"),
+            };
+            shared.submit_command(cmd);
             write_json_response(
                 stream,
                 "200 OK",
                 &JsonValue::obj(vec![
                     ("ok", JsonValue::from(true)),
-                    ("action", JsonValue::from("pause")),
-                ]),
-                deadline,
-                stop,
-            );
-        }
-        ("POST", "/api/v1/resume") => {
-            shared.submit_command(ControlCommand::Resume);
-            write_json_response(
-                stream,
-                "200 OK",
-                &JsonValue::obj(vec![
-                    ("ok", JsonValue::from(true)),
-                    ("action", JsonValue::from("resume")),
-                ]),
-                deadline,
-                stop,
-            );
-        }
-        ("POST", "/api/v1/next") => {
-            shared.submit_command(ControlCommand::Next);
-            write_json_response(
-                stream,
-                "200 OK",
-                &JsonValue::obj(vec![
-                    ("ok", JsonValue::from(true)),
-                    ("action", JsonValue::from("next")),
+                    ("action", JsonValue::from(action)),
                 ]),
                 deadline,
                 stop,
             );
         }
         ("POST", "/api/v1/play") => {
-            let parsed = if req.body.trim().is_empty() {
+            let parsed = if body_str.trim().is_empty() {
                 Ok(JsonValue::Object(Vec::new()))
             } else {
-                JsonValue::parse(&req.body)
+                JsonValue::parse(&body_str)
             };
             let body_json = match parsed {
                 Ok(v) => v,
                 Err(err) => {
-                    write_json_response(
-                        stream,
-                        "400 Bad Request",
-                        &JsonValue::obj(vec![
-                            ("ok", JsonValue::from(false)),
-                            ("error", JsonValue::from(format!("invalid JSON body: {err}"))),
-                        ]),
-                        deadline,
-                        stop,
-                    );
+                    json_err(stream, "400 Bad Request", format!("invalid JSON body: {err}"), deadline, stop);
                     return;
                 }
             };
@@ -1428,53 +1102,14 @@ fn handle_api_v1(
                 .map(PathBuf::from)
                 .unwrap_or_else(|| shared.snapshot().active_folder);
 
-            let prevalidated = match prevalidate_lexical_path_for_root(&folder_raw, allowed_root) {
-                Ok(p) => p,
-                Err(reason) => {
-                    write_json_response(
-                        stream,
-                        "403 Forbidden",
-                        &JsonValue::obj(vec![
-                            ("ok", JsonValue::from(false)),
-                            ("error", JsonValue::from(format!("forbidden folder: {reason}"))),
-                        ]),
-                        deadline,
-                        stop,
-                    );
+            let valid_dir = match validate_path_bounded(&folder_raw, allowed_root, false) {
+                Ok(d) => d,
+                Err(BoundedValidationError::Rejected(reason)) => {
+                    json_err(stream, "403 Forbidden", format!("forbidden folder: {reason}"), deadline, stop);
                     return;
                 }
-            };
-            let root_for_fs = allowed_root.to_path_buf();
-            let key = fs_volume_key(&prevalidated);
-            let valid_dir = match run_fs_op_bounded_for_key(&key, FS_OP_DEADLINE, move || {
-                populate_reparse_volume_cache_bounded(&prevalidated);
-                validate_path_within_root(&prevalidated, &root_for_fs)
-            }) {
-                Ok(Ok(d)) => d,
-                Ok(Err(reason)) => {
-                    write_json_response(
-                        stream,
-                        "403 Forbidden",
-                        &JsonValue::obj(vec![
-                            ("ok", JsonValue::from(false)),
-                            ("error", JsonValue::from(format!("forbidden folder: {reason}"))),
-                        ]),
-                        deadline,
-                        stop,
-                    );
-                    return;
-                }
-                Err(()) => {
-                    write_json_response(
-                        stream,
-                        "504 Gateway Timeout",
-                        &JsonValue::obj(vec![
-                            ("ok", JsonValue::from(false)),
-                            ("error", JsonValue::from("storage timed out validating folder")),
-                        ]),
-                        deadline,
-                        stop,
-                    );
+                Err(BoundedValidationError::TimedOut) => {
+                    json_err(stream, "504 Gateway Timeout", "storage timed out validating folder", deadline, stop);
                     return;
                 }
             };
@@ -1482,13 +1117,10 @@ fn handle_api_v1(
                 "sequential" => shared.submit_command(ControlCommand::PlaySequential(valid_dir.clone())),
                 "random" => shared.submit_command(ControlCommand::PlayRandom(valid_dir.clone())),
                 other => {
-                    write_json_response(
+                    json_err(
                         stream,
                         "400 Bad Request",
-                        &JsonValue::obj(vec![
-                            ("ok", JsonValue::from(false)),
-                            ("error", JsonValue::from(format!("invalid order '{other}'; expected random or sequential"))),
-                        ]),
+                        format!("invalid order '{other}'; expected random or sequential"),
                         deadline,
                         stop,
                     );
@@ -1509,83 +1141,25 @@ fn handle_api_v1(
             );
         }
         ("POST", "/api/v1/play-file") => {
-            let body_json = match JsonValue::parse(&req.body) {
+            let body_json = match JsonValue::parse(&body_str) {
                 Ok(v) => v,
                 Err(err) => {
-                    write_json_response(
-                        stream,
-                        "400 Bad Request",
-                        &JsonValue::obj(vec![
-                            ("ok", JsonValue::from(false)),
-                            ("error", JsonValue::from(format!("invalid JSON body: {err}"))),
-                        ]),
-                        deadline,
-                        stop,
-                    );
+                    json_err(stream, "400 Bad Request", format!("invalid JSON body: {err}"), deadline, stop);
                     return;
                 }
             };
             let Some(path_str) = body_json.get("path").and_then(JsonValue::as_str) else {
-                write_json_response(
-                    stream,
-                    "400 Bad Request",
-                    &JsonValue::obj(vec![
-                        ("ok", JsonValue::from(false)),
-                        ("error", JsonValue::from("missing 'path' field")),
-                    ]),
-                    deadline,
-                    stop,
-                );
+                json_err(stream, "400 Bad Request", "missing 'path' field", deadline, stop);
                 return;
             };
-            let raw_path = PathBuf::from(path_str);
-            let prevalidated = match prevalidate_lexical_path_for_root(&raw_path, allowed_root) {
+            let valid_file = match validate_path_bounded(Path::new(path_str), allowed_root, true) {
                 Ok(p) => p,
-                Err(reason) => {
-                    write_json_response(
-                        stream,
-                        "403 Forbidden",
-                        &JsonValue::obj(vec![
-                            ("ok", JsonValue::from(false)),
-                            ("error", JsonValue::from(format!("rejected file path: {reason}"))),
-                        ]),
-                        deadline,
-                        stop,
-                    );
+                Err(BoundedValidationError::Rejected(reason)) => {
+                    json_err(stream, "403 Forbidden", format!("rejected file path: {reason}"), deadline, stop);
                     return;
                 }
-            };
-            let root_for_fs = allowed_root.to_path_buf();
-            let key = fs_volume_key(&prevalidated);
-            let valid_file = match run_fs_op_bounded_for_key(&key, FS_OP_DEADLINE, move || {
-                populate_reparse_volume_cache_bounded(&prevalidated);
-                validate_playable_flac_path(&prevalidated, Some(&root_for_fs))
-            }) {
-                Ok(Ok(p)) => p,
-                Ok(Err(reason)) => {
-                    write_json_response(
-                        stream,
-                        "403 Forbidden",
-                        &JsonValue::obj(vec![
-                            ("ok", JsonValue::from(false)),
-                            ("error", JsonValue::from(format!("rejected file path: {reason}"))),
-                        ]),
-                        deadline,
-                        stop,
-                    );
-                    return;
-                }
-                Err(()) => {
-                    write_json_response(
-                        stream,
-                        "504 Gateway Timeout",
-                        &JsonValue::obj(vec![
-                            ("ok", JsonValue::from(false)),
-                            ("error", JsonValue::from("storage timed out validating file")),
-                        ]),
-                        deadline,
-                        stop,
-                    );
+                Err(BoundedValidationError::TimedOut) => {
+                    json_err(stream, "504 Gateway Timeout", "storage timed out validating file", deadline, stop);
                     return;
                 }
             };
@@ -1604,8 +1178,8 @@ fn handle_api_v1(
         }
         ("POST", "/api/v1/shutdown") => {
             let mut when = parse_form_param(query, "when").unwrap_or_default();
-            if when.is_empty() && !req.body.trim().is_empty() {
-                if let Ok(v) = JsonValue::parse(&req.body) {
+            if when.is_empty() && !body_str.trim().is_empty() {
+                if let Ok(v) = JsonValue::parse(&body_str) {
                     if let Some(w) = v.get("when").and_then(JsonValue::as_str) {
                         when = w.to_string();
                     }
@@ -1614,13 +1188,10 @@ fn handle_api_v1(
             let norm_when = when.trim().to_ascii_lowercase();
             let after_track = matches!(norm_when.as_str(), "after_track" | "after-track");
             if !norm_when.is_empty() && norm_when != "now" && !after_track {
-                write_json_response(
+                json_err(
                     stream,
                     "400 Bad Request",
-                    &JsonValue::obj(vec![
-                        ("ok", JsonValue::from(false)),
-                        ("error", JsonValue::from(format!("invalid 'when' value '{when}'; expected 'now' or 'after_track'"))),
-                    ]),
+                    format!("invalid 'when' value '{when}'; expected 'now' or 'after_track'"),
                     deadline,
                     stop,
                 );
@@ -1648,55 +1219,14 @@ fn handle_api_v1(
                 stop,
             );
         }
-        _ => {
-            write_json_response(
-                stream,
-                "404 Not Found",
-                &JsonValue::obj(vec![
-                    ("ok", JsonValue::from(false)),
-                    ("error", JsonValue::from(format!("unknown API route {} {path}", req.method))),
-                ]),
-                deadline,
-                stop,
-            );
-        }
+        _ => json_err(
+            stream,
+            "404 Not Found",
+            format!("unknown API route {} {path}", req.method),
+            deadline,
+            stop,
+        ),
     }
-}
-
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
-}
-
-fn write_all_with_deadline(
-    stream: &mut TcpStream,
-    mut data: &[u8],
-    deadline: Instant,
-    stop: &AtomicBool,
-) -> bool {
-    while !data.is_empty() {
-        if stop.load(Ordering::Relaxed) {
-            return false;
-        }
-        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            return false;
-        };
-        let slice_timeout = remaining.min(Duration::from_millis(500));
-        let _ = stream.set_write_timeout(Some(slice_timeout));
-        let chunk_len = data.len().min(RESPONSE_WRITE_CHUNK_BYTES);
-        match stream.write(&data[..chunk_len]) {
-            Ok(0) => return false,
-            Ok(n) => data = &data[n..],
-            Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(ref e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                if Instant::now() >= deadline {
-                    return false;
-                }
-                continue;
-            }
-            Err(_) => return false,
-        }
-    }
-    true
 }
 
 fn write_response(
@@ -1723,8 +1253,10 @@ fn write_response(
         head.push_str(&format!("Location: {loc}\r\n"));
     }
     head.push_str("\r\n");
-    if write_all_with_deadline(stream, head.as_bytes(), deadline, stop) {
-        let _ = write_all_with_deadline(stream, body, deadline, stop);
+    if write_all_bounded(stream, head.as_bytes(), deadline, Some(stop), RESPONSE_WRITE_CHUNK_BYTES)
+        .is_ok()
+    {
+        let _ = write_all_bounded(stream, body, deadline, Some(stop), RESPONSE_WRITE_CHUNK_BYTES);
         let _ = stream.flush();
     }
 }

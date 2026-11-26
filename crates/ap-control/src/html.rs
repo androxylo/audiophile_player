@@ -10,8 +10,10 @@
 //! - Unified controls: **Play Random**, **Play Sequential**, and **Pause** (releases DAC driver).
 //! - Bounded bottom action log (auto-discards old history, live-updated via `/api/status`).
 
+use ap_core::json::JsonValue;
+
 use crate::GITHUB_MANUAL_URL;
-use crate::browser::{FolderListing, encode_path_token, html_escape, json_escape, url_encode};
+use crate::browser::{FolderListing, encode_path_token, html_escape, url_encode};
 use crate::state::ControlSnapshot;
 
 /// Strip a trailing `.flac` extension (ASCII case-insensitive) for cleaner HTTP browser display,
@@ -206,41 +208,38 @@ setInterval(poll,1000);\n\
     )
 }
 
-/// Serialize minimal status & bounded action log to JSON for `/api/status` (zero serde deps).
+/// Serialize minimal status & bounded action log to JSON for `/api/status` via `JsonValue` (O11).
 pub fn render_status_json(snapshot: &ControlSnapshot) -> String {
-    let track_json = match &snapshot.current_track {
-        Some(t) => json_escape(t),
-        None => "null".to_string(),
-    };
-    let fmt_json = match &snapshot.current_format {
-        Some(f) => json_escape(f),
-        None => "null".to_string(),
-    };
-    let decision_json = match &snapshot.current_decision {
-        Some(d) => json_escape(d),
-        None => "null".to_string(),
-    };
-    let peak_json = match &snapshot.current_peak {
-        Some(p) => json_escape(p),
-        None => "null".to_string(),
-    };
-    let log_items: Vec<String> = snapshot
-        .recent_actions
-        .iter()
-        .map(|s| json_escape(s))
-        .collect();
-    format!(
-        "{{\"playing\":{},\"mode\":{},\"dac\":{},\"folder\":{},\"track\":{},\"format\":{},\"decision\":{},\"peak\":{},\"log\":[{}]}}",
-        snapshot.is_playing,
-        json_escape(snapshot.mode.as_str()),
-        json_escape(&snapshot.dac_name),
-        json_escape(&snapshot.active_folder.to_string_lossy()),
-        track_json,
-        fmt_json,
-        decision_json,
-        peak_json,
-        log_items.join(",")
-    )
+    let payload = JsonValue::obj(vec![
+        ("playing", JsonValue::from(snapshot.is_playing)),
+        ("mode", JsonValue::from(snapshot.mode.as_str())),
+        ("dac", JsonValue::from(snapshot.dac_name.as_str())),
+        (
+            "folder",
+            JsonValue::from(snapshot.active_folder.to_string_lossy().into_owned()),
+        ),
+        ("track", JsonValue::opt_str(snapshot.current_track.as_deref())),
+        (
+            "format",
+            JsonValue::opt_str(snapshot.current_format.as_deref()),
+        ),
+        (
+            "decision",
+            JsonValue::opt_str(snapshot.current_decision.as_deref()),
+        ),
+        ("peak", JsonValue::opt_str(snapshot.current_peak.as_deref())),
+        (
+            "log",
+            JsonValue::Array(
+                snapshot
+                    .recent_actions
+                    .iter()
+                    .map(|s| JsonValue::from(s.as_str()))
+                    .collect(),
+            ),
+        ),
+    ]);
+    payload.to_compact_string()
 }
 
 #[cfg(test)]

@@ -74,8 +74,31 @@ pub fn xml_unescape(input: &str) -> String {
     out
 }
 
+/// Skip a `<!-- ... -->` comment, `<![CDATA[...]]>`, processing instruction `<?...?>`, or
+/// closing tag `</...>` starting at `lt` (`bytes[lt] == b'<'`), returning the next scan offset.
+fn skip_non_open_tag(xml: &str, lt: usize) -> usize {
+    let rest = &xml[lt..];
+    if rest.starts_with("<!--") {
+        return match rest[4..].find("-->") {
+            Some(end) => lt + 4 + end + 3,
+            None => xml.len(),
+        };
+    }
+    if rest.starts_with("<![CDATA[") {
+        return match rest[9..].find("]]>") {
+            Some(end) => lt + 9 + end + 3,
+            None => xml.len(),
+        };
+    }
+    match rest[1..].find('>') {
+        Some(end) => lt + 1 + end + 1,
+        None => xml.len(),
+    }
+}
+
 /// Extract the unescaped text content of the first XML element matching `local_name`
 /// (case-sensitive local name, ignoring any XML namespace prefix like `u:` or `dc:`).
+/// Properly skips `<!-- ... -->` comments and `<![CDATA[...]]>` blocks (Review #9 O16).
 pub fn extract_xml_element_text(xml: &str, local_name: &str) -> Option<String> {
     let bytes = xml.as_bytes();
     let mut i = 0usize;
@@ -88,9 +111,9 @@ pub fn extract_xml_element_text(xml: &str, local_name: &str) -> Option<String> {
         if after_lt >= bytes.len() {
             break;
         }
-        // Skip comments, processing instructions, CDATA, and closing tags.
+        // Skip comments, processing instructions, CDATA, and closing tags to their real closing delimiter.
         if bytes[after_lt] == b'/' || bytes[after_lt] == b'!' || bytes[after_lt] == b'?' {
-            i = after_lt;
+            i = skip_non_open_tag(xml, lt);
             continue;
         }
         let Some(rel_gt) = xml[after_lt..].find('>') else {
@@ -111,22 +134,31 @@ pub fn extract_xml_element_text(xml: &str, local_name: &str) -> Option<String> {
                 return Some(String::new());
             }
             let content_start = gt + 1;
-            // Find matching closing tag `</...local_name>`.
+            // Find matching closing tag `</...local_name>`, skipping nested comments/CDATA.
             let mut search = content_start;
             while search < bytes.len() {
-                let Some(rel_close) = xml[search..].find("</") else {
+                let Some(rel_next) = xml[search..].find('<') else {
                     return None;
                 };
-                let close_pos = search + rel_close;
-                let Some(rel_end) = xml[close_pos + 2..].find('>') else {
-                    return None;
-                };
-                let close_name = xml[close_pos + 2..close_pos + 2 + rel_end].trim();
-                let close_local = close_name.rsplit(':').next().unwrap_or(close_name);
-                if close_local == local_name {
-                    return Some(xml_unescape(&xml[content_start..close_pos]));
+                let pos = search + rel_next;
+                let rest = &xml[pos..];
+                if rest.starts_with("<!--") || rest.starts_with("<![CDATA[") {
+                    search = skip_non_open_tag(xml, pos);
+                    continue;
                 }
-                search = close_pos + 2 + rel_end + 1;
+                if rest.starts_with("</") {
+                    let Some(rel_end) = xml[pos + 2..].find('>') else {
+                        return None;
+                    };
+                    let close_name = xml[pos + 2..pos + 2 + rel_end].trim();
+                    let close_local = close_name.rsplit(':').next().unwrap_or(close_name);
+                    if close_local == local_name {
+                        return Some(xml_unescape(&xml[content_start..pos]));
+                    }
+                    search = pos + 2 + rel_end + 1;
+                } else {
+                    search = pos + 1;
+                }
             }
             return None;
         }
@@ -136,7 +168,7 @@ pub fn extract_xml_element_text(xml: &str, local_name: &str) -> Option<String> {
 }
 
 /// Extract an attribute value (case-insensitive attribute name) from the first opening tag
-/// whose local name matches `tag_local`.
+/// whose local name matches `tag_local`, skipping comments and CDATA (Review #9 O16).
 pub fn extract_xml_tag_attribute(
     xml: &str,
     tag_local: &str,
@@ -154,7 +186,7 @@ pub fn extract_xml_tag_attribute(
             break;
         }
         if bytes[after_lt] == b'/' || bytes[after_lt] == b'!' || bytes[after_lt] == b'?' {
-            i = after_lt;
+            i = skip_non_open_tag(xml, lt);
             continue;
         }
         let Some(rel_gt) = xml[after_lt..].find('>') else {
@@ -658,3 +690,27 @@ pub const RENDERING_CONTROL_SCPD_XML: &str = r#"<?xml version="1.0" encoding="ut
   </serviceStateTable>
 </scpd>
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_xml_element_text, extract_xml_tag_attribute};
+
+    #[test]
+    fn xml_extractors_skip_comments_and_cdata_o16() {
+        let xml = r#"<root>
+            <!-- <CurrentURI>http://commented.out/bad.flac</CurrentURI> -->
+            <desc><![CDATA[<CurrentURI>http://in-cdata/bad.flac</CurrentURI>]]></desc>
+            <u:CurrentURI>http://192.168.1.5/real.flac</u:CurrentURI>
+            <!-- <res protocolInfo="bad:info"/> -->
+            <res protocolInfo="http-get:*:audio/flac:*"/>
+        </root>"#;
+        assert_eq!(
+            extract_xml_element_text(xml, "CurrentURI").as_deref(),
+            Some("http://192.168.1.5/real.flac")
+        );
+        assert_eq!(
+            extract_xml_tag_attribute(xml, "res", "protocolInfo").as_deref(),
+            Some("http-get:*:audio/flac:*")
+        );
+    }
+}

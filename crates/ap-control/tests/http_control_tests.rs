@@ -809,7 +809,8 @@ fn anti_clickjacking_headers_and_sec_fetch_dest_block_framing() {
 #[cfg(windows)]
 #[test]
 fn reparse_tag_detector_identifies_ntfs_junctions_and_rejects_cyclic_link_chains() {
-    use ap_control::security::{is_symlink_or_mount_point, validate_path_within_root};
+    use ap_control::security::validate_path_within_root;
+    use ap_source::library::is_symlink_or_mount_point;
 
     let root = make_temp_music_dir("reparse_tag_check");
     let target = make_temp_music_dir("reparse_tag_target");
@@ -828,9 +829,9 @@ fn reparse_tag_detector_identifies_ntfs_junctions_and_rejects_cyclic_link_chains
 
     let root_meta = fs::symlink_metadata(&root).unwrap();
     let junc_meta = fs::symlink_metadata(&junction).unwrap();
-    assert!(!is_symlink_or_mount_point(&root, &root_meta));
+    assert!(!is_symlink_or_mount_point(&root_meta));
     assert!(
-        is_symlink_or_mount_point(&junction, &junc_meta),
+        is_symlink_or_mount_point(&junc_meta),
         "NTFS junction (IO_REPARSE_TAG_MOUNT_POINT) must be detected by FileType::is_symlink()"
     );
     assert!(validate_path_within_root(&junction, &root).is_ok());
@@ -862,7 +863,7 @@ fn reparse_tag_detector_identifies_ntfs_junctions_and_rejects_cyclic_link_chains
 
 #[test]
 fn pause_and_next_never_touch_filesystem_and_fs_ops_enforce_bounded_timeout() {
-    use ap_control::server::run_fs_op_bounded;
+    use ap_control::server::run_fs_op_bounded_for_key;
     use std::time::{Duration, Instant};
 
     // 1. Review #3 Finding #4: even with a blackhole UNC music root (`\\192.0.2.1\Music`, RFC 5737
@@ -907,7 +908,7 @@ fn pause_and_next_never_touch_filesystem_and_fs_ops_enforce_bounded_timeout() {
     // 2. Bounded FS helper returns Err(()) promptly when a storage call stalls past its deadline.
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     let t1 = Instant::now();
-    let timed_out = run_fs_op_bounded(Duration::from_millis(40), move || {
+    let timed_out = run_fs_op_bounded_for_key("test", Duration::from_millis(40), move || {
         let _ = rx.recv_timeout(Duration::from_secs(5));
         42_u32
     });
