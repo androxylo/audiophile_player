@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "audiophile-player": {
+      "command": "target/release/audiophile-player.exe",
+      "args": ["mcp"]
+    }
+  }
+}

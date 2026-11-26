@@ -19,7 +19,37 @@ use ap_dsp::MAX_FILTER_TAPS;
 use ap_dsp::selector::{FilterArchetype, NoiseShaperProfile, UpsamplerPolicy};
 use ap_output_win::hygiene::OptimizationLevel;
 
-pub const MANUAL_URL: &str = "https://github.com/androxylo/audiophile_player";
+use crate::cli_spec;
+
+/// Help output variants (`help`, `help <topic>`, `help --json`, `help --markdown`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HelpMode {
+    Summary,
+    Detail(String),
+    Json,
+    Markdown,
+}
+
+/// Subcommands under `audiophile-player config <show|set|unset>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigCommand {
+    Show {
+        config_path: Option<PathBuf>,
+        effective: bool,
+        as_json: bool,
+    },
+    Set {
+        key: String,
+        value: String,
+        config_path: Option<PathBuf>,
+        as_json: bool,
+    },
+    Unset {
+        key: String,
+        config_path: Option<PathBuf>,
+        as_json: bool,
+    },
+}
 
 /// Explicit CLI overrides for `[quantizer]` in `config.toml` (`--dac-bits`, `--shaper`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -140,12 +170,33 @@ pub enum RunMode {
     },
     /// Inspect, validate, edit, relink, or migrate the Schema-2 Filter Database (`audiophile-player filters ...`).
     Filters(FiltersCommand),
+    /// Run system/DAC/config health diagnostics (`audiophile-player doctor [--json]`).
+    Doctor {
+        config_path: Option<PathBuf>,
+        as_json: bool,
+    },
+    /// Enumerate WDM-KS render devices and probe 8fS support (`audiophile-player devices [--json]`).
+    Devices { as_json: bool },
+    /// Inspect or safely edit `config.toml` (`audiophile-player config <show|set|unset>`).
+    Config(ConfigCommand),
+    /// Query the running player instance (`audiophile-player status [--json]`).
+    Status { as_json: bool },
+    /// Gracefully stop the running player (`audiophile-player stop [--when now|after-track] [--json]`).
+    Stop { after_track: bool, as_json: bool },
+    /// Gracefully restart the running player with updated options (`audiophile-player restart ...`).
+    Restart {
+        flags: Vec<String>,
+        after_track: bool,
+        as_json: bool,
+    },
+    /// Run thin stdio MCP supervisor server (`audiophile-player mcp`).
+    Mcp,
     /// Explicit `--idle` mode: keep running without touching audio hardware (for signal tests).
     Idle,
-    /// Print concise help text and exit `0`.
-    Help,
-    /// Print version, copyright, and GNU GPLv3+ license/no-warranty notice and exit `0`.
-    Version,
+    /// Print summary, detail, JSON spec, or Markdown CLI docs and exit `0`.
+    Help(HelpMode),
+    /// Print version, copyright, and GNU GPLv3+ license/no-warranty notice (or `--json`) and exit `0`.
+    Version { as_json: bool },
 }
 
 fn require_utf8_arg(flag: &str, raw: OsString) -> Result<String, String> {
@@ -161,16 +212,49 @@ where
     let mut iter = args.into_iter().map(Into::into).peekable();
     let _program = iter.next(); // skip argv[0]
 
-    // Subcommand: `audiophile-player scan [FOLDER|ROOT] [--report] [--sidecar] [--post-chain] [--force] [--jobs N] ...`
-    if iter.peek().and_then(|s| s.to_str()) == Some("scan") {
-        iter.next();
-        return parse_scan_args(iter);
-    }
-
-    // Subcommand: `audiophile-player filters <show|diff|set|check|relink|migrate> ...`
-    if iter.peek().and_then(|s| s.to_str()) == Some("filters") {
-        iter.next();
-        return parse_filters_args(iter);
+    // Subcommands
+    match iter.peek().and_then(|s| s.to_str()) {
+        Some("scan") => {
+            iter.next();
+            return parse_scan_args(iter);
+        }
+        Some("filters") => {
+            iter.next();
+            return parse_filters_args(iter);
+        }
+        Some("help") => {
+            iter.next();
+            return parse_help_args(iter);
+        }
+        Some("doctor") => {
+            iter.next();
+            return parse_doctor_args(iter);
+        }
+        Some("devices") => {
+            iter.next();
+            return parse_devices_args(iter);
+        }
+        Some("config") => {
+            iter.next();
+            return parse_config_args(iter);
+        }
+        Some("status") => {
+            iter.next();
+            return parse_status_args(iter);
+        }
+        Some("stop") => {
+            iter.next();
+            return parse_stop_args(iter);
+        }
+        Some("restart") => {
+            iter.next();
+            return parse_restart_args(iter);
+        }
+        Some("mcp") => {
+            iter.next();
+            return parse_mcp_args(iter);
+        }
+        _ => {}
     }
 
     let mut config_path: Option<PathBuf> = None;
@@ -186,17 +270,20 @@ where
     let mut capture_disabled = false;
     let mut ultimate_override = UltimateCliOverride::default();
     let mut idle = false;
+    let mut show_version = false;
+    let mut as_json = false;
 
     while let Some(arg_raw) = iter.next() {
         let arg = arg_raw.to_str().ok_or_else(|| {
             format!(
-                "unknown non-UTF-8 option '{}' (run with --help for usage)",
+                "unknown non-UTF-8 option '{}' (run `audiophile-player help` for usage)",
                 arg_raw.to_string_lossy()
             )
         })?;
         match arg {
-            "-h" | "--help" => return Ok(RunMode::Help),
-            "-V" | "--version" => return Ok(RunMode::Version),
+            "-h" | "--help" => return Ok(RunMode::Help(HelpMode::Summary)),
+            "-V" | "--version" => show_version = true,
+            "--json" => as_json = true,
             "--idle" => idle = true,
             "--config" => {
                 let val = iter
@@ -398,11 +485,22 @@ where
                 optimization_explicit = true;
             }
             unknown => {
-                return Err(format!(
-                    "unknown option '{unknown}' (run with --help for usage)"
-                ));
+                let did_you_mean = cli_spec::suggest_nearest_option(unknown)
+                    .map(|s| format!("; did you mean '{s}'? Run `audiophile-player help {s}`"))
+                    .unwrap_or_else(|| " (run `audiophile-player help` for usage)".to_string());
+                return Err(format!("unknown option '{unknown}'{did_you_mean}"));
             }
         }
+    }
+
+    if show_version {
+        return Ok(RunMode::Version { as_json });
+    }
+    if as_json {
+        return Err(
+            "--json is only supported on inspection/lifecycle commands (e.g. `help --json`, `doctor --json`, `--version --json`)"
+                .to_string(),
+        );
     }
 
     if idle {
@@ -456,8 +554,8 @@ where
             ));
         };
         match arg {
-            "-h" | "--help" => return Ok(RunMode::Help),
-            "-V" | "--version" => return Ok(RunMode::Version),
+            "-h" | "--help" => return Ok(RunMode::Help(HelpMode::Detail("scan".to_string()))),
+            "-V" | "--version" => return Ok(RunMode::Version { as_json: false }),
             "--report" => report = true,
             "--sidecar" => sidecar = true,
             "--post-chain" => post_chain = true,
@@ -575,10 +673,10 @@ where
         )
     })?;
     if matches!(sub, "-h" | "--help") {
-        return Ok(RunMode::Help);
+        return Ok(RunMode::Help(HelpMode::Detail("filters".to_string())));
     }
     if matches!(sub, "-V" | "--version") {
-        return Ok(RunMode::Version);
+        return Ok(RunMode::Version { as_json: false });
     }
 
     let mut config_path: Option<PathBuf> = None;
@@ -596,8 +694,8 @@ where
             continue;
         };
         match arg {
-            "-h" | "--help" => return Ok(RunMode::Help),
-            "-V" | "--version" => return Ok(RunMode::Version),
+            "-h" | "--help" => return Ok(RunMode::Help(HelpMode::Detail("filters".to_string()))),
+            "-V" | "--version" => return Ok(RunMode::Version { as_json: false }),
             "--config" => {
                 let val = iter
                     .next()
@@ -635,6 +733,7 @@ where
                 note = Some(require_utf8_arg("--note", val)?);
             }
             "--apply" => apply = true,
+            "--yes" => {}
             other if other.starts_with('-') => {
                 return Err(format!(
                     "unknown filters {sub} option '{other}' (run with --help for usage)"
@@ -726,66 +825,282 @@ where
     }
 }
 
+fn parse_help_args<I>(mut iter: I) -> Result<RunMode, String>
+where
+    I: Iterator<Item = OsString>,
+{
+    let mut topic: Option<String> = None;
+    let mut as_json = false;
+    let mut as_markdown = false;
+    while let Some(raw) = iter.next() {
+        let arg = require_utf8_arg("help", raw)?;
+        match arg.as_str() {
+            "--json" => as_json = true,
+            "--markdown" => as_markdown = true,
+            "-h" | "--help" => return Ok(RunMode::Help(HelpMode::Summary)),
+            _ => {
+                if topic.is_none() {
+                    topic = Some(arg);
+                } else {
+                    return Err(format!("unexpected extra help argument '{arg}'"));
+                }
+            }
+        }
+    }
+    if as_json && as_markdown {
+        return Err("cannot combine --json and --markdown".to_string());
+    }
+    if as_json {
+        return Ok(RunMode::Help(HelpMode::Json));
+    }
+    if as_markdown {
+        return Ok(RunMode::Help(HelpMode::Markdown));
+    }
+    match topic {
+        Some(t) => Ok(RunMode::Help(HelpMode::Detail(t))),
+        None => Ok(RunMode::Help(HelpMode::Summary)),
+    }
+}
+
+fn parse_doctor_args<I>(mut iter: I) -> Result<RunMode, String>
+where
+    I: Iterator<Item = OsString>,
+{
+    let mut config_path = None;
+    let mut as_json = false;
+    while let Some(raw) = iter.next() {
+        let arg = require_utf8_arg("doctor", raw)?;
+        match arg.as_str() {
+            "-h" | "--help" => return Ok(RunMode::Help(HelpMode::Detail("doctor".to_string()))),
+            "--json" => as_json = true,
+            "--config" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| "--config requires a TOML config file path".to_string())?;
+                config_path = Some(PathBuf::from(val));
+            }
+            other => return Err(format!("unknown doctor option '{other}'")),
+        }
+    }
+    Ok(RunMode::Doctor {
+        config_path,
+        as_json,
+    })
+}
+
+fn parse_devices_args<I>(mut iter: I) -> Result<RunMode, String>
+where
+    I: Iterator<Item = OsString>,
+{
+    let mut as_json = false;
+    while let Some(raw) = iter.next() {
+        let arg = require_utf8_arg("devices", raw)?;
+        match arg.as_str() {
+            "-h" | "--help" => return Ok(RunMode::Help(HelpMode::Detail("devices".to_string()))),
+            "--json" => as_json = true,
+            other => return Err(format!("unknown devices option '{other}'")),
+        }
+    }
+    Ok(RunMode::Devices { as_json })
+}
+
+fn parse_config_args<I>(mut iter: I) -> Result<RunMode, String>
+where
+    I: Iterator<Item = OsString>,
+{
+    let Some(sub_raw) = iter.next() else {
+        return Err("config requires a subcommand: show | set | unset".to_string());
+    };
+    let sub = require_utf8_arg("config", sub_raw)?;
+    if matches!(sub.as_str(), "-h" | "--help") {
+        return Ok(RunMode::Help(HelpMode::Detail("config".to_string())));
+    }
+    let mut config_path = None;
+    let mut effective = false;
+    let mut as_json = false;
+    let mut positional: Vec<String> = Vec::new();
+    while let Some(raw) = iter.next() {
+        let arg = require_utf8_arg("config", raw)?;
+        match arg.as_str() {
+            "-h" | "--help" => return Ok(RunMode::Help(HelpMode::Detail("config".to_string()))),
+            "--config" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| "--config requires a TOML config file path".to_string())?;
+                config_path = Some(PathBuf::from(val));
+            }
+            "--effective" => effective = true,
+            "--json" => as_json = true,
+            "--yes" => {}
+            other if other.starts_with('-') => {
+                return Err(format!("unknown config {sub} option '{other}'"));
+            }
+            _ => positional.push(arg),
+        }
+    }
+    match sub.as_str() {
+        "show" => {
+            if !positional.is_empty() {
+                return Err("config show takes no positional arguments".to_string());
+            }
+            Ok(RunMode::Config(ConfigCommand::Show {
+                config_path,
+                effective,
+                as_json,
+            }))
+        }
+        "set" => {
+            if positional.len() != 2 {
+                return Err(
+                    "config set requires <KEY> <VALUE> (usage: audiophile-player config set <key> <value>)"
+                        .to_string(),
+                );
+            }
+            let key = positional.remove(0);
+            let value = positional.remove(0);
+            Ok(RunMode::Config(ConfigCommand::Set {
+                key,
+                value,
+                config_path,
+                as_json,
+            }))
+        }
+        "unset" => {
+            if positional.len() != 1 {
+                return Err(
+                    "config unset requires <KEY> (usage: audiophile-player config unset <key>)"
+                        .to_string(),
+                );
+            }
+            let key = positional.remove(0);
+            Ok(RunMode::Config(ConfigCommand::Unset {
+                key,
+                config_path,
+                as_json,
+            }))
+        }
+        other => Err(format!(
+            "unknown config subcommand '{other}' (expected: show | set | unset)"
+        )),
+    }
+}
+
+fn parse_status_args<I>(mut iter: I) -> Result<RunMode, String>
+where
+    I: Iterator<Item = OsString>,
+{
+    let mut as_json = false;
+    while let Some(raw) = iter.next() {
+        let arg = require_utf8_arg("status", raw)?;
+        match arg.as_str() {
+            "-h" | "--help" => return Ok(RunMode::Help(HelpMode::Detail("status".to_string()))),
+            "--json" => as_json = true,
+            other => return Err(format!("unknown status option '{other}'")),
+        }
+    }
+    Ok(RunMode::Status { as_json })
+}
+
+fn parse_stop_args<I>(mut iter: I) -> Result<RunMode, String>
+where
+    I: Iterator<Item = OsString>,
+{
+    let mut after_track = false;
+    let mut as_json = false;
+    while let Some(raw) = iter.next() {
+        let arg = require_utf8_arg("stop", raw)?;
+        match arg.as_str() {
+            "-h" | "--help" => return Ok(RunMode::Help(HelpMode::Detail("stop".to_string()))),
+            "--json" => as_json = true,
+            "--yes" => {}
+            "--when" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| "--when requires 'now' or 'after-track'".to_string())?;
+                let v = require_utf8_arg("--when", val)?;
+                match v.to_ascii_lowercase().as_str() {
+                    "now" => after_track = false,
+                    "after-track" | "after_track" => after_track = true,
+                    other => {
+                        return Err(format!(
+                            "invalid --when '{other}'; expected 'now' or 'after-track'"
+                        ));
+                    }
+                }
+            }
+            other => return Err(format!("unknown stop option '{other}'")),
+        }
+    }
+    Ok(RunMode::Stop {
+        after_track,
+        as_json,
+    })
+}
+
+fn parse_restart_args<I>(mut iter: I) -> Result<RunMode, String>
+where
+    I: Iterator<Item = OsString>,
+{
+    // Revision 2 decision: `restart` defaults to `after_track`!
+    let mut after_track = true;
+    let mut as_json = false;
+    let mut flags: Vec<String> = Vec::new();
+    while let Some(raw) = iter.next() {
+        let arg = require_utf8_arg("restart", raw)?;
+        match arg.as_str() {
+            "-h" | "--help" => return Ok(RunMode::Help(HelpMode::Detail("restart".to_string()))),
+            "--json" => as_json = true,
+            "--yes" => {}
+            "--when" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| "--when requires 'after-track' or 'now'".to_string())?;
+                let v = require_utf8_arg("--when", val)?;
+                match v.to_ascii_lowercase().as_str() {
+                    "now" => after_track = false,
+                    "after-track" | "after_track" => after_track = true,
+                    other => {
+                        return Err(format!(
+                            "invalid --when '{other}'; expected 'after-track' or 'now'"
+                        ));
+                    }
+                }
+            }
+            other => {
+                flags.push(other.to_string());
+            }
+        }
+    }
+    // Validate forwarded play flags immediately via `parse_args` so typos fail before stopping the player!
+    if !flags.is_empty() {
+        let mut check_argv = Vec::with_capacity(flags.len() + 1);
+        check_argv.push("audiophile-player".to_string());
+        check_argv.extend(flags.iter().cloned());
+        parse_args(check_argv.iter().map(String::as_str))?;
+    }
+    Ok(RunMode::Restart {
+        flags,
+        after_track,
+        as_json,
+    })
+}
+
+fn parse_mcp_args<I>(mut iter: I) -> Result<RunMode, String>
+where
+    I: Iterator<Item = OsString>,
+{
+    while let Some(raw) = iter.next() {
+        let arg = require_utf8_arg("mcp", raw)?;
+        match arg.as_str() {
+            "-h" | "--help" => return Ok(RunMode::Help(HelpMode::Detail("mcp".to_string()))),
+            other => return Err(format!("unknown mcp option '{other}'")),
+        }
+    }
+    Ok(RunMode::Mcp)
+}
+
 pub fn help_text() -> String {
-    format!(
-        "audiophile-player v{} — Headless Windows Kernel Streaming (WDM-KS) Player\n\
-         Manual: {MANUAL_URL}\n\n\
-         USAGE:\n\
-           audiophile-player                  Start immediately in highest-quality WDM-KS mode,\n\
-                                              playing random FLACs from ~/Music + local HTTP UI\n\
-                                              + UPnP AV MediaRenderer (for foobar2000 / BubbleUPnP).\n\
-           audiophile-player [OPTIONS]\n\
-           audiophile-player scan [FOLDER|ROOT] [--report] [--post-chain] [--force] [--jobs N]\n\
-                                              Offline whole-track library scanner (writes Schema-2\n\
-                                              album YAML under filterdb/; never modifies FLAC files).\n\
-           audiophile-player filters <show|diff|set|check|relink|migrate> [ARGS]\n\
-                                              Inspect, edit, validate, relink, or migrate your\n\
-                                              filter database and my-filters.yaml overrides.\n\n\
-         CONFIG FILE:\n\
-           Auto-loads .\\audiophile-player.toml or %APPDATA%\\audiophile-player\\config.toml\n\
-           (or pass --config <PATH>). Configures [convolution], [quantizer], [upnp], [capture], [ultimate], [trackdb], and [filters].\n\n\
-         OPTIONS:\n\
-           --config <PATH>      Path to TOML config file (default: auto-discover)\n\
-           --music-dir <PATH>   Root folder containing FLAC subfolders (default: ~/Music)\n\
-           --device <NAME>      WDM-KS DAC name filter (default: auto-select best USB DAC)\n\
-           --port <PORT>        Local HTTP UI port (default: auto-pick free port in 8085..8199)\n\
-           --upnp-name <NAME>   UPnP MediaRenderer display name (default: Audiophile Player)\n\
-           --upnp-port <PORT>   UPnP HTTP/SOAP port (default: auto-pick free port in 49152..49250)\n\
-           --upnp-bind <IPV4>   Bind/advertise UPnP renderer on a specific local IPv4 address\n\
-           --no-upnp            Disable the built-in UPnP AV MediaRenderer\n\
-           --no-capture         Disable the opt-in exclusive capture watcher (\\\\.\\ApExclusiveAudio)\n\
-           --filter <NAME>      Enforce upsampling filter: auto | gauss-long-lp | gauss-hires-lp |\n\
-                                null | simple-test | gauss-apod-4m | sinc-steep-4m | ext-sharp-lp |\n\
-                                minphase-long | intermediate-long | short-lp | short-mp\n\
-                                (default: auto -> gauss-long-lp 1x, gauss-hires-lp hi-res, null 8fS)\n\
-           --dac-bits <N>       Quantizer DAC bit depth: 16 | 18 | 20 | 24 (default: 24)\n\
-           --shaper <NAME>      Enforce 8fS shaper: auto | bypass | tpdf | ns-gentle-2 |\n\
-                                ns5 (clean-room ns5-class) | lns15 (clean-room lns15-class) |\n\
-                                pggb-optimal (clean-room wide40-9)\n\
-                                (default: auto -> ns-gentle-2 at 8fS, bypass native 32-bit, tpdf non-8fS)\n\
-           --max-taps <N>       Tap ceiling <= 4000000 (default: 4000000)\n\
-           --conv-dir <PATH>    Override config: REW stereo WAV folder (auto-picks newest\n\
-                                2-ch WAV matching 352.8 / 384 kHz)\n\
-           --conv-file <PATH>   Override config: explicit 2-ch REW WAV file\n\
-           --no-conv            Override config: disable REW stereo convolution\n\
-           --ultimate           Enable Ultimate Mode (30 s look-ahead, per-track H/A/L/B analysis,\n\
-                                full-tail REW, exact-M fixed gain, learn-on-play YAML DB)\n\
-           --no-ultimate        Force-disable Ultimate Mode even if enabled in config.toml\n\
-           --no-genre-rules     Disable Rule G genre-aware filter defaults in Ultimate Mode\n\
-           --no-learn-on-play   Disable YAML trackdb write-back at clean EOF in Ultimate Mode\n\
-           --filters <MODE>     Filter choice mode: auto | suggested | mine (default: auto)\n\
-           --filterdb-dir <DIR> Override Schema-2 machine-managed filterdb directory\n\
-           --choices-file <YML> Override user-owned my-filters.yaml path\n\
-           --trackdb-dir <PATH> Override legacy Schema-1 YAML trackdb folder\n\
-           --trackdb-sidecar    Persist `<track.flac>.ap.yaml` sidecars next to local files\n\
-           --opt <LEVEL>        KS priority tier: normal | high | extreme (default: high)\n\
-           --idle               Start idle without opening audio hardware (signal test mode)\n\
-           -V, --version        Show version, copyright, and GNU GPLv3+ license notice\n\
-           -h, --help           Show this help message\n\
-         \n\
-         Copyright (C) 2026 androxylo — License GPL-3.0-or-later (NO WARRANTY).\n",
-        env!("CARGO_PKG_VERSION")
-    )
+    cli_spec::render_summary_help()
 }
 
 /// Standard FSF GNU GPLv3+ `--version` notice.
@@ -929,7 +1244,20 @@ mod tests {
         );
         assert_eq!(
             parse_args(["audiophile-player", "--help"]).unwrap(),
-            RunMode::Help
+            RunMode::Help(HelpMode::Summary)
+        );
+        assert_eq!(
+            parse_args(["audiophile-player", "help", "--filters"]).unwrap(),
+            RunMode::Help(HelpMode::Detail("--filters".to_string()))
+        );
+        assert_eq!(
+            parse_args(["audiophile-player", "--version", "--json"]).unwrap(),
+            RunMode::Version { as_json: true }
+        );
+        assert!(
+            parse_args(["audiophile-player", "--filtr"])
+                .unwrap_err()
+                .contains("--filter")
         );
     }
 

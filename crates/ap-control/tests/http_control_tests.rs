@@ -1086,3 +1086,109 @@ fn review5_post_play_actions_render_html_control_page_on_timeout_and_volume_key_
     *lock.lock().unwrap() = true;
     cv.notify_all();
 }
+
+#[test]
+fn api_v1_requires_bearer_token_and_supports_status_playback_and_deferred_shutdown() {
+    let dir = make_temp_music_dir("api_v1_auth");
+    fs::write(dir.join("track01.flac"), b"").unwrap();
+
+    let shared = SharedControl::new(dir.clone(), "Test DAC");
+    shared.set_api_token("0123456789abcdef0123456789abcdef".to_string());
+    shared.set_effective_options(ap_core::json::JsonValue::obj(vec![
+        ("ultimate", ap_core::json::JsonValue::from(true)),
+        ("device", ap_core::json::JsonValue::from("Test DAC")),
+    ]));
+    let shutdown_fired = Arc::new(AtomicBool::new(false));
+    let sf = Arc::clone(&shutdown_fired);
+    shared.attach_shutdown_callback(Arc::new(move || {
+        sf.store(true, Ordering::SeqCst);
+    }));
+
+    let mut server = ControlServer::start(Arc::clone(&shared), None).unwrap();
+    let addr = server.addr();
+    let port = addr.port();
+    let token = "0123456789abcdef0123456789abcdef";
+
+    // 1. Missing or wrong Bearer token must be rejected with 401.
+    let no_auth = http_request(
+        addr,
+        &format!("GET /api/v1/status HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
+    );
+    assert!(no_auth.starts_with("HTTP/1.1 401 Unauthorized"), "got: {no_auth}");
+
+    let bad_auth = http_request(
+        addr,
+        &format!(
+            "GET /api/v1/status HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer wrongtoken\r\n\r\n"
+        ),
+    );
+    assert!(bad_auth.starts_with("HTTP/1.1 401 Unauthorized"), "got: {bad_auth}");
+
+    // 2. Valid Bearer token returns structured ap.status/1 JSON.
+    let ok_status = http_request(
+        addr,
+        &format!(
+            "GET /api/v1/status HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\n\r\n"
+        ),
+    );
+    assert!(ok_status.starts_with("HTTP/1.1 200 OK"), "got: {ok_status}");
+    assert!(ok_status.contains("\"schema\":\"ap.status/1\""));
+    assert!(ok_status.contains("\"dac\":\"Test DAC\""));
+    assert!(ok_status.contains("\"restart_pending\":false"));
+    assert!(ok_status.contains("\"ultimate\":true"));
+
+    // 3. Playback control routes require Bearer token and enqueue commands.
+    for (route, expected) in [
+        ("/api/v1/pause", ControlCommand::Pause),
+        ("/api/v1/resume", ControlCommand::Resume),
+        ("/api/v1/next", ControlCommand::Next),
+    ] {
+        let resp = http_request(
+            addr,
+            &format!(
+                "POST {route} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\n\r\n"
+            ),
+        );
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "{route} got: {resp}");
+        assert_eq!(shared.take_pending_command(), Some(expected));
+    }
+
+    // 4. Deferred shutdown (`when=after_track`) while playing returns 202 with immediate=false,
+    //    marks restart_pending, and does NOT trigger immediate shutdown yet.
+    shared.set_playing(
+        ap_control::state::PlayModeLabel::Random,
+        "track01.flac".to_string(),
+        "16/44100 Hz -> 352800 Hz f64".to_string(),
+    );
+    let deferred = http_request(
+        addr,
+        &format!(
+            "POST /api/v1/shutdown?when=after_track HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\n\r\n"
+        ),
+    );
+    assert!(deferred.starts_with("HTTP/1.1 202 Accepted"), "got: {deferred}");
+    assert!(deferred.contains("\"immediate\":false"), "got: {deferred}");
+    assert!(shared.is_shutdown_after_track());
+    assert!(!shutdown_fired.load(Ordering::SeqCst));
+
+    let status_after = http_request(
+        addr,
+        &format!(
+            "GET /api/v1/status HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\n\r\n"
+        ),
+    );
+    assert!(status_after.contains("\"restart_pending\":true"));
+
+    // 5. Immediate shutdown (`when=now`) returns 202 and invokes shutdown callback immediately.
+    let now_resp = http_request(
+        addr,
+        &format!(
+            "POST /api/v1/shutdown?when=now HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\n\r\n"
+        ),
+    );
+    assert!(now_resp.starts_with("HTTP/1.1 202 Accepted"), "got: {now_resp}");
+    assert!(shutdown_fired.load(Ordering::SeqCst));
+
+    server.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}

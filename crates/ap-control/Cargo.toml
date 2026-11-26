@@ -11,4 +11,5 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+ap-core.workspace = true
 ap-source.workspace = true

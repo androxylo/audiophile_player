@@ -21,6 +21,7 @@
 param(
     [switch]$SkipAppBuild,
     [switch]$SkipDriverBuild,
+    [switch]$WithoutDriver,
     [switch]$FetchWdk
 )
 $ErrorActionPreference = "Stop"
@@ -57,37 +58,41 @@ if (-not (Test-Path -LiteralPath $exeSrc)) {
     throw "Release binary not found: $exeSrc"
 }
 
-if (-not $SkipDriverBuild) {
-    Write-Host "`n=== 2. Building UNSIGNED ap_exclusive_audio.sys / .inf / .cat ===" -ForegroundColor Cyan
-    if (Test-Path $driverOut) { Remove-Item -Recurse -Force $driverOut }
-    $drvBuild = Join-Path $repoRoot "drivers\ap-exclusive-acx\scripts\build-and-sign.ps1"
-    $drvArgs = @{ Unsigned = $true; OutDir = $driverOut }
-    if ($FetchWdk) { $drvArgs.FetchWdk = $true }
-    & $drvBuild @drvArgs
-}
+if (-not $WithoutDriver) {
+    if (-not $SkipDriverBuild) {
+        Write-Host "`n=== 2. Building UNSIGNED ap_exclusive_audio.sys / .inf / .cat ===" -ForegroundColor Cyan
+        if (Test-Path $driverOut) { Remove-Item -Recurse -Force $driverOut }
+        $drvBuild = Join-Path $repoRoot "drivers\ap-exclusive-acx\scripts\build-and-sign.ps1"
+        $drvArgs = @{ Unsigned = $true; OutDir = $driverOut }
+        if ($FetchWdk) { $drvArgs.FetchWdk = $true }
+        & $drvBuild @drvArgs
+    }
 
-foreach ($f in @("ap_exclusive_audio.sys", "ap_exclusive_audio.inf", "ap_exclusive_audio.cat")) {
-    $p = Join-Path $driverOut $f
-    if (-not (Test-Path -LiteralPath $p)) {
-        throw "Unsigned driver artifact missing: $p"
+    foreach ($f in @("ap_exclusive_audio.sys", "ap_exclusive_audio.inf", "ap_exclusive_audio.cat")) {
+        $p = Join-Path $driverOut $f
+        if (-not (Test-Path -LiteralPath $p)) {
+            throw "Unsigned driver artifact missing: $p"
+        }
     }
 }
 
 Write-Host "`n=== 3. Staging release directory $stageDir ===" -ForegroundColor Cyan
 if (Test-Path $stageDir) { Remove-Item -Recurse -Force $stageDir }
-New-Item -ItemType Directory -Force -Path `
-    $stageDir, `
-    (Join-Path $stageDir "docs"), `
-    (Join-Path $stageDir "assets"), `
-    (Join-Path $stageDir "scripts"), `
-    (Join-Path $stageDir "driver") | Out-Null
+$stageDirs = @(
+    $stageDir,
+    (Join-Path $stageDir "docs"),
+    (Join-Path $stageDir "assets"),
+    (Join-Path $stageDir "scripts")
+)
+if (-not $WithoutDriver) { $stageDirs += (Join-Path $stageDir "driver") }
+New-Item -ItemType Directory -Force -Path $stageDirs | Out-Null
 
 Copy-Item -Force $exeSrc (Join-Path $stageDir "audiophile-player.exe")
 Copy-Item -Force (Join-Path $repoRoot "audiophile-player.example.toml") $stageDir
 Copy-Item -Force (Join-Path $repoRoot "README.md") $stageDir
 Copy-Item -Force (Join-Path $repoRoot "LICENSE") $stageDir
 
-foreach ($doc in @("GETTING_STARTED.md", "SOUND_ENGINE.md", "ULTIMATE_MODE.md")) {
+foreach ($doc in @("GETTING_STARTED.md", "SOUND_ENGINE.md", "ULTIMATE_MODE.md", "CLI.md", "FILTER_PREFERENCES.md")) {
     Copy-Item -Force (Join-Path $repoRoot "docs\$doc") (Join-Path $stageDir "docs\$doc")
 }
 Copy-Item -Force (Join-Path $repoRoot "assets\audiophile-player.ico") (Join-Path $stageDir "assets\audiophile-player.ico")
@@ -139,57 +144,54 @@ foreach ($pkg in $thirdParty) {
 }
 Set-Content -LiteralPath (Join-Path $stageDir "THIRD-PARTY-LICENSES.txt") -Value $sb.ToString() -Encoding UTF8
 
-# Opt-in Exclusive ACX virtual render driver (unsigned + self-contained per-machine installer)
-Copy-Item -Force (Join-Path $driverOut "ap_exclusive_audio.sys") (Join-Path $stageDir "driver\")
-Copy-Item -Force (Join-Path $driverOut "ap_exclusive_audio.inf") (Join-Path $stageDir "driver\")
-Copy-Item -Force (Join-Path $driverOut "ap_exclusive_audio.cat") (Join-Path $stageDir "driver\")
-Copy-Item -Force (Join-Path $repoRoot "drivers\ap-exclusive-acx\NOTICE") (Join-Path $stageDir "driver\")
-Copy-Item -Force (Join-Path $repoRoot "drivers\ap-exclusive-acx\README.md") (Join-Path $stageDir "driver\")
-Copy-Item -Force (Join-Path $repoRoot "drivers\ap-exclusive-acx\scripts\install-driver.ps1") (Join-Path $stageDir "driver\")
-Copy-Item -Force (Join-Path $repoRoot "drivers\ap-exclusive-acx\scripts\uninstall-driver.ps1") (Join-Path $stageDir "driver\")
-Copy-Item -Force (Join-Path $repoRoot "drivers\ap-exclusive-acx\scripts\update-driver.ps1") (Join-Path $stageDir "driver\")
+if (-not $WithoutDriver) {
+    # Opt-in Exclusive ACX virtual render driver (unsigned + self-contained per-machine installer)
+    Copy-Item -Force (Join-Path $driverOut "ap_exclusive_audio.sys") (Join-Path $stageDir "driver\")
+    Copy-Item -Force (Join-Path $driverOut "ap_exclusive_audio.inf") (Join-Path $stageDir "driver\")
+    Copy-Item -Force (Join-Path $driverOut "ap_exclusive_audio.cat") (Join-Path $stageDir "driver\")
+    Copy-Item -Force (Join-Path $repoRoot "drivers\ap-exclusive-acx\NOTICE") (Join-Path $stageDir "driver\")
+    Copy-Item -Force (Join-Path $repoRoot "drivers\ap-exclusive-acx\README.md") (Join-Path $stageDir "driver\")
+    Copy-Item -Force (Join-Path $repoRoot "drivers\ap-exclusive-acx\scripts\install-driver.ps1") (Join-Path $stageDir "driver\")
+    Copy-Item -Force (Join-Path $repoRoot "drivers\ap-exclusive-acx\scripts\uninstall-driver.ps1") (Join-Path $stageDir "driver\")
+    Copy-Item -Force (Join-Path $repoRoot "drivers\ap-exclusive-acx\scripts\update-driver.ps1") (Join-Path $stageDir "driver\")
 
-# Review #8 D2: Compute SHA-256 of unsigned driver artifacts, write driver\SHA256SUMS, and embed into install-driver.ps1
-$drvFiles = @("ap_exclusive_audio.sys", "ap_exclusive_audio.inf", "ap_exclusive_audio.cat")
-$shaLines = New-Object System.Collections.Generic.List[string]
-$embedEntries = New-Object System.Collections.Generic.List[string]
-foreach ($df in $drvFiles) {
-    $h = (Get-FileHash -Algorithm SHA256 -Path (Join-Path $stageDir "driver\$df")).Hash.ToLowerInvariant()
-    $shaLines.Add("$h  $df")
-    $embedEntries.Add("    `"$df`" = `"$h`"")
+    # Review #8 D2: Compute SHA-256 of unsigned driver artifacts, write driver\SHA256SUMS, and embed into install-driver.ps1
+    $drvFiles = @("ap_exclusive_audio.sys", "ap_exclusive_audio.inf", "ap_exclusive_audio.cat")
+    $shaLines = New-Object System.Collections.Generic.List[string]
+    $embedEntries = New-Object System.Collections.Generic.List[string]
+    foreach ($df in $drvFiles) {
+        $h = (Get-FileHash -Algorithm SHA256 -Path (Join-Path $stageDir "driver\$df")).Hash.ToLowerInvariant()
+        $shaLines.Add("$h  $df")
+        $embedEntries.Add("    `"$df`" = `"$h`"")
+    }
+    Set-Content -LiteralPath (Join-Path $stageDir "driver\SHA256SUMS") -Value ($shaLines -join "`r`n") -Encoding ASCII
+
+    $stagedInstallPath = Join-Path $stageDir "driver\install-driver.ps1"
+    $installRaw = Get-Content -LiteralPath $stagedInstallPath -Raw
+    $embedBlock = "# @EMBEDDED_SHA256SUMS_START@`r`n`$EmbeddedSha256Sums = @{`r`n" + ($embedEntries -join "`r`n") + "`r`n}`r`n# @EMBEDDED_SHA256SUMS_END@"
+    $installPatched = [regex]::Replace(
+        $installRaw,
+        '# @EMBEDDED_SHA256SUMS_START@.*?# @EMBEDDED_SHA256SUMS_END@',
+        $embedBlock,
+        [System.Text.RegularExpressions.RegexOptions]::Singleline
+    )
+    if ($installPatched -eq $installRaw) {
+        throw "Failed to embed SHA-256 hashes into staged driver\install-driver.ps1 (markers missing)"
+    }
+    Set-Content -LiteralPath $stagedInstallPath -Value $installPatched -Encoding UTF8
+
+    # Review #8 D12: Rewrite relative links in staged release docs so every link resolves cleanly inside the zip.
+    $stagedDrvReadme = Join-Path $stageDir "driver\README.md"
+    $drvReadmeRaw = Get-Content -LiteralPath $stagedDrvReadme -Raw
+    $drvReadmeRaw = $drvReadmeRaw.Replace("(../../LICENSE)", "(../LICENSE)")
+    Set-Content -LiteralPath $stagedDrvReadme -Value $drvReadmeRaw -Encoding UTF8
+
+    $stagedGettingStarted = Join-Path $stageDir "docs\GETTING_STARTED.md"
+    $gsRaw = Get-Content -LiteralPath $stagedGettingStarted -Raw
+    $gsRaw = $gsRaw.Replace("(../drivers/ap-exclusive-acx/README.md)", "(../driver/README.md)")
+    $gsRaw = $gsRaw.Replace("``drivers/ap-exclusive-acx/README.md``", "``driver/README.md``")
+    Set-Content -LiteralPath $stagedGettingStarted -Value $gsRaw -Encoding UTF8
 }
-Set-Content -LiteralPath (Join-Path $stageDir "driver\SHA256SUMS") -Value ($shaLines -join "`r`n") -Encoding ASCII
-
-$stagedInstallPath = Join-Path $stageDir "driver\install-driver.ps1"
-$installRaw = Get-Content -LiteralPath $stagedInstallPath -Raw
-$embedBlock = "# @EMBEDDED_SHA256SUMS_START@`r`n`$EmbeddedSha256Sums = @{`r`n" + ($embedEntries -join "`r`n") + "`r`n}`r`n# @EMBEDDED_SHA256SUMS_END@"
-$installPatched = [regex]::Replace(
-    $installRaw,
-    '# @EMBEDDED_SHA256SUMS_START@.*?# @EMBEDDED_SHA256SUMS_END@',
-    $embedBlock,
-    [System.Text.RegularExpressions.RegexOptions]::Singleline
-)
-if ($installPatched -eq $installRaw) {
-    throw "Failed to embed SHA-256 hashes into staged driver\install-driver.ps1 (markers missing)"
-}
-Set-Content -LiteralPath $stagedInstallPath -Value $installPatched -Encoding UTF8
-
-# Review #8 D12: Rewrite relative links in staged release docs so every link resolves cleanly inside the zip.
-$stagedDrvReadme = Join-Path $stageDir "driver\README.md"
-$drvReadmeRaw = Get-Content -LiteralPath $stagedDrvReadme -Raw
-$drvReadmeRaw = $drvReadmeRaw.Replace("(../../LICENSE)", "(../LICENSE)")
-Set-Content -LiteralPath $stagedDrvReadme -Value $drvReadmeRaw -Encoding UTF8
-
-$stagedGettingStarted = Join-Path $stageDir "docs\GETTING_STARTED.md"
-$gsRaw = Get-Content -LiteralPath $stagedGettingStarted -Raw
-$gsRaw = $gsRaw.Replace("(../drivers/ap-exclusive-acx/README.md)", "(../driver/README.md)")
-$gsRaw = $gsRaw.Replace("``drivers/ap-exclusive-acx/README.md``", "``driver/README.md``")
-Set-Content -LiteralPath $stagedGettingStarted -Value $gsRaw -Encoding UTF8
-
-$stagedSoundEngine = Join-Path $stageDir "docs\SOUND_ENGINE.md"
-$seRaw = Get-Content -LiteralPath $stagedSoundEngine -Raw
-$seRaw = $seRaw.Replace("(FILTER_PREFERENCES.md)", "(https://github.com/androxylo/audiophile_player/blob/main/docs/FILTER_PREFERENCES.md)")
-Set-Content -LiteralPath $stagedSoundEngine -Value $seRaw -Encoding UTF8
 
 Write-Host "`n=== 4. Verifying release hygiene (forbidden extensions, strict manifest allowlist, unsigned binaries) ===" -ForegroundColor Cyan
 $forbiddenExts = @(
@@ -212,18 +214,24 @@ $allowedManifest = @(
     "docs\GETTING_STARTED.md",
     "docs\SOUND_ENGINE.md",
     "docs\ULTIMATE_MODE.md",
+    "docs\CLI.md",
+    "docs\FILTER_PREFERENCES.md",
     "scripts\launch-audiophile-player.ps1",
-    "scripts\install-shortcuts.ps1",
-    "driver\ap_exclusive_audio.sys",
-    "driver\ap_exclusive_audio.inf",
-    "driver\ap_exclusive_audio.cat",
-    "driver\SHA256SUMS",
-    "driver\NOTICE",
-    "driver\README.md",
-    "driver\install-driver.ps1",
-    "driver\update-driver.ps1",
-    "driver\uninstall-driver.ps1"
+    "scripts\install-shortcuts.ps1"
 )
+if (-not $WithoutDriver) {
+    $allowedManifest += @(
+        "driver\ap_exclusive_audio.sys",
+        "driver\ap_exclusive_audio.inf",
+        "driver\ap_exclusive_audio.cat",
+        "driver\SHA256SUMS",
+        "driver\NOTICE",
+        "driver\README.md",
+        "driver\install-driver.ps1",
+        "driver\update-driver.ps1",
+        "driver\uninstall-driver.ps1"
+    )
+}
 $stagedFiles = @(Get-ChildItem -Recurse -File $stageDir | ForEach-Object {
     $_.FullName.Substring($stageDir.Length + 1)
 })
@@ -236,10 +244,12 @@ if ($missing.Count -gt 0) {
     throw "Expected release manifest file(s) missing from staging dir: $($missing -join ', ')"
 }
 
-foreach ($bin in @("driver\ap_exclusive_audio.sys", "driver\ap_exclusive_audio.cat")) {
-    $sig = Get-AuthenticodeSignature (Join-Path $stageDir $bin)
-    if ($sig.Status -ne "NotSigned") {
-        throw "Release driver file '$bin' must be UNSIGNED (got Status=$($sig.Status)). Never ship a personal test signature."
+if (-not $WithoutDriver) {
+    foreach ($bin in @("driver\ap_exclusive_audio.sys", "driver\ap_exclusive_audio.cat")) {
+        $sig = Get-AuthenticodeSignature (Join-Path $stageDir $bin)
+        if ($sig.Status -ne "NotSigned") {
+            throw "Release driver file '$bin' must be UNSIGNED (got Status=$($sig.Status)). Never ship a personal test signature."
+        }
     }
 }
 

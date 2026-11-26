@@ -32,6 +32,7 @@ pub enum ShutdownSignal {
     ConsoleClose,
     Logoff,
     Shutdown,
+    ApiShutdown,
     Other(u32),
 }
 
@@ -61,6 +62,7 @@ impl fmt::Display for ShutdownSignal {
             Self::ConsoleClose => write!(f, "CTRL_CLOSE_EVENT"),
             Self::Logoff => write!(f, "CTRL_LOGOFF_EVENT"),
             Self::Shutdown => write!(f, "CTRL_SHUTDOWN_EVENT"),
+            Self::ApiShutdown => write!(f, "API_SHUTDOWN"),
             Self::Other(code) => write!(f, "CTRL_EVENT({code})"),
         }
     }
@@ -225,6 +227,48 @@ pub fn install_signal_handlers() -> Result<&'static ShutdownController, String> 
     }
     Ok(controller)
 }
+
+/// Spawn a lightweight background thread waiting on the named fallback shutdown event
+/// `Local\AudiophilePlayer.Shutdown` so detached instances can always be stopped cleanly.
+#[cfg(windows)]
+pub fn spawn_named_shutdown_event_watcher(controller: &'static ShutdownController) {
+    let _ = std::thread::Builder::new()
+        .name("ap-shutdown-ev".to_string())
+        .spawn(move || {
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn CreateEventW(
+                    lp_event_attributes: *mut std::ffi::c_void,
+                    b_manual_reset: i32,
+                    b_initial_state: i32,
+                    lp_name: *const u16,
+                ) -> *mut std::ffi::c_void;
+                fn WaitForSingleObject(h_handle: *mut std::ffi::c_void, dw_milliseconds: u32) -> u32;
+                fn CloseHandle(h_object: *mut std::ffi::c_void) -> i32;
+            }
+            const WAIT_OBJECT_0: u32 = 0;
+            let name: Vec<u16> = crate::lifecycle::SHUTDOWN_EVENT_NAME
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            unsafe {
+                let h = CreateEventW(std::ptr::null_mut(), 1, 0, name.as_ptr());
+                if h.is_null() {
+                    return;
+                }
+                while controller.current_signal().is_none() {
+                    if WaitForSingleObject(h, 250) == WAIT_OBJECT_0 {
+                        controller.trigger(ShutdownSignal::ApiShutdown);
+                        break;
+                    }
+                }
+                CloseHandle(h);
+            }
+        });
+}
+
+#[cfg(not(windows))]
+pub fn spawn_named_shutdown_event_watcher(_controller: &'static ShutdownController) {}
 
 #[cfg(not(windows))]
 pub fn install_signal_handlers() -> Result<&'static ShutdownController, String> {

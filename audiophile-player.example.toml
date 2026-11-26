@@ -11,6 +11,16 @@
 # Upsampling and noise shaping have strong automatic defaults; only room-specific
 # REW stereo convolution needs to be configured here.
 
+[player]
+# Optional saved defaults (CLI flags always take precedence).
+# Set interactively via `audiophile-player config set device "Gungnir 2"` or `config set music_dir 'D:\Music'`.
+# device = 'Gungnir 2'
+# music_dir = 'D:\Music'
+# filter = 'auto'
+# max_taps = 4000000
+# port = 8085
+# opt = 'high'
+
 [convolution]
 # Master switch. Omit this line to auto-enable whenever `dir`, `file`, or `file_*` is set.
 # Set `enabled = false` explicitly to temporarily bypass convolution without deleting paths.

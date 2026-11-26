@@ -32,6 +32,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use ap_core::json::JsonValue;
+
 use crate::browser::{
     FolderListing, decode_path_token, encode_path_token, list_folder_entries_in_root,
     parse_form_param, url_encode,
@@ -567,6 +569,7 @@ struct HttpRequest {
     host: Option<String>,
     duplicate_host: bool,
     origin: Option<String>,
+    authorization: Option<String>,
     sec_fetch_site: Option<String>,
     sec_fetch_dest: Option<String>,
     body: String,
@@ -713,6 +716,21 @@ fn handle_connection(
     }
 
     let allowed_root = shared.allowed_root();
+
+    // Token-authenticated JSON API (`/api/v1/*`) used by CLI `status`/`stop`/`restart` & MCP supervisor.
+    if path.starts_with("/api/v1/") {
+        handle_api_v1(
+            stream,
+            &req,
+            path,
+            query,
+            shared,
+            &allowed_root,
+            conn_deadline,
+            stop,
+        );
+        return;
+    }
 
     match (req.method.as_str(), path) {
         ("GET", "/") => {
@@ -1249,6 +1267,7 @@ fn read_http_request(
     let mut host: Option<String> = None;
     let mut duplicate_host = false;
     let mut origin: Option<String> = None;
+    let mut authorization: Option<String> = None;
     let mut sec_fetch_site: Option<String> = None;
     let mut sec_fetch_dest: Option<String> = None;
 
@@ -1272,6 +1291,8 @@ fn read_http_request(
                 }
             } else if name.eq_ignore_ascii_case("origin") {
                 origin = Some(val.to_string());
+            } else if name.eq_ignore_ascii_case("authorization") {
+                authorization = Some(val.to_string());
             } else if name.eq_ignore_ascii_case("sec-fetch-site") {
                 sec_fetch_site = Some(val.to_string());
             } else if name.eq_ignore_ascii_case("sec-fetch-dest") {
@@ -1300,10 +1321,367 @@ fn read_http_request(
         host,
         duplicate_host,
         origin,
+        authorization,
         sec_fetch_site,
         sec_fetch_dest,
         body,
     })
+}
+
+fn write_json_response(
+    stream: &mut TcpStream,
+    status: &str,
+    payload: &JsonValue,
+    deadline: Instant,
+    stop: &AtomicBool,
+) {
+    let body = payload.to_compact_string();
+    write_response(
+        stream,
+        status,
+        "application/json; charset=utf-8",
+        body.as_bytes(),
+        None,
+        deadline,
+        stop,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_api_v1(
+    stream: &mut TcpStream,
+    req: &HttpRequest,
+    path: &str,
+    query: &str,
+    shared: &SharedControl,
+    allowed_root: &Path,
+    deadline: Instant,
+    stop: &AtomicBool,
+) {
+    if !shared.verify_bearer_token(req.authorization.as_deref()) {
+        write_json_response(
+            stream,
+            "401 Unauthorized",
+            &JsonValue::obj(vec![
+                ("ok", JsonValue::from(false)),
+                ("error", JsonValue::from("unauthorized: missing or invalid Bearer token")),
+            ]),
+            deadline,
+            stop,
+        );
+        return;
+    }
+
+    match (req.method.as_str(), path) {
+        ("GET", "/api/v1/status") => {
+            let status_json = shared.api_v1_status_json();
+            write_json_response(stream, "200 OK", &status_json, deadline, stop);
+        }
+        ("POST", "/api/v1/pause") => {
+            shared.submit_command(ControlCommand::Pause);
+            write_json_response(
+                stream,
+                "200 OK",
+                &JsonValue::obj(vec![
+                    ("ok", JsonValue::from(true)),
+                    ("action", JsonValue::from("pause")),
+                ]),
+                deadline,
+                stop,
+            );
+        }
+        ("POST", "/api/v1/resume") => {
+            shared.submit_command(ControlCommand::Resume);
+            write_json_response(
+                stream,
+                "200 OK",
+                &JsonValue::obj(vec![
+                    ("ok", JsonValue::from(true)),
+                    ("action", JsonValue::from("resume")),
+                ]),
+                deadline,
+                stop,
+            );
+        }
+        ("POST", "/api/v1/next") => {
+            shared.submit_command(ControlCommand::Next);
+            write_json_response(
+                stream,
+                "200 OK",
+                &JsonValue::obj(vec![
+                    ("ok", JsonValue::from(true)),
+                    ("action", JsonValue::from("next")),
+                ]),
+                deadline,
+                stop,
+            );
+        }
+        ("POST", "/api/v1/play") => {
+            let parsed = if req.body.trim().is_empty() {
+                Ok(JsonValue::Object(Vec::new()))
+            } else {
+                JsonValue::parse(&req.body)
+            };
+            let body_json = match parsed {
+                Ok(v) => v,
+                Err(err) => {
+                    write_json_response(
+                        stream,
+                        "400 Bad Request",
+                        &JsonValue::obj(vec![
+                            ("ok", JsonValue::from(false)),
+                            ("error", JsonValue::from(format!("invalid JSON body: {err}"))),
+                        ]),
+                        deadline,
+                        stop,
+                    );
+                    return;
+                }
+            };
+            let order = body_json
+                .get("order")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("random")
+                .to_ascii_lowercase();
+            let folder_raw = body_json
+                .get("folder")
+                .and_then(JsonValue::as_str)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| shared.snapshot().active_folder);
+
+            let prevalidated = match prevalidate_lexical_path_for_root(&folder_raw, allowed_root) {
+                Ok(p) => p,
+                Err(reason) => {
+                    write_json_response(
+                        stream,
+                        "403 Forbidden",
+                        &JsonValue::obj(vec![
+                            ("ok", JsonValue::from(false)),
+                            ("error", JsonValue::from(format!("forbidden folder: {reason}"))),
+                        ]),
+                        deadline,
+                        stop,
+                    );
+                    return;
+                }
+            };
+            let root_for_fs = allowed_root.to_path_buf();
+            let key = fs_volume_key(&prevalidated);
+            let valid_dir = match run_fs_op_bounded_for_key(&key, FS_OP_DEADLINE, move || {
+                populate_reparse_volume_cache_bounded(&prevalidated);
+                validate_path_within_root(&prevalidated, &root_for_fs)
+            }) {
+                Ok(Ok(d)) => d,
+                Ok(Err(reason)) => {
+                    write_json_response(
+                        stream,
+                        "403 Forbidden",
+                        &JsonValue::obj(vec![
+                            ("ok", JsonValue::from(false)),
+                            ("error", JsonValue::from(format!("forbidden folder: {reason}"))),
+                        ]),
+                        deadline,
+                        stop,
+                    );
+                    return;
+                }
+                Err(()) => {
+                    write_json_response(
+                        stream,
+                        "504 Gateway Timeout",
+                        &JsonValue::obj(vec![
+                            ("ok", JsonValue::from(false)),
+                            ("error", JsonValue::from("storage timed out validating folder")),
+                        ]),
+                        deadline,
+                        stop,
+                    );
+                    return;
+                }
+            };
+            match order.as_str() {
+                "sequential" => shared.submit_command(ControlCommand::PlaySequential(valid_dir.clone())),
+                "random" => shared.submit_command(ControlCommand::PlayRandom(valid_dir.clone())),
+                other => {
+                    write_json_response(
+                        stream,
+                        "400 Bad Request",
+                        &JsonValue::obj(vec![
+                            ("ok", JsonValue::from(false)),
+                            ("error", JsonValue::from(format!("invalid order '{other}'; expected random or sequential"))),
+                        ]),
+                        deadline,
+                        stop,
+                    );
+                    return;
+                }
+            }
+            write_json_response(
+                stream,
+                "200 OK",
+                &JsonValue::obj(vec![
+                    ("ok", JsonValue::from(true)),
+                    ("action", JsonValue::from("play")),
+                    ("order", JsonValue::from(order)),
+                    ("folder", JsonValue::from(valid_dir.to_string_lossy().into_owned())),
+                ]),
+                deadline,
+                stop,
+            );
+        }
+        ("POST", "/api/v1/play-file") => {
+            let body_json = match JsonValue::parse(&req.body) {
+                Ok(v) => v,
+                Err(err) => {
+                    write_json_response(
+                        stream,
+                        "400 Bad Request",
+                        &JsonValue::obj(vec![
+                            ("ok", JsonValue::from(false)),
+                            ("error", JsonValue::from(format!("invalid JSON body: {err}"))),
+                        ]),
+                        deadline,
+                        stop,
+                    );
+                    return;
+                }
+            };
+            let Some(path_str) = body_json.get("path").and_then(JsonValue::as_str) else {
+                write_json_response(
+                    stream,
+                    "400 Bad Request",
+                    &JsonValue::obj(vec![
+                        ("ok", JsonValue::from(false)),
+                        ("error", JsonValue::from("missing 'path' field")),
+                    ]),
+                    deadline,
+                    stop,
+                );
+                return;
+            };
+            let raw_path = PathBuf::from(path_str);
+            let prevalidated = match prevalidate_lexical_path_for_root(&raw_path, allowed_root) {
+                Ok(p) => p,
+                Err(reason) => {
+                    write_json_response(
+                        stream,
+                        "403 Forbidden",
+                        &JsonValue::obj(vec![
+                            ("ok", JsonValue::from(false)),
+                            ("error", JsonValue::from(format!("rejected file path: {reason}"))),
+                        ]),
+                        deadline,
+                        stop,
+                    );
+                    return;
+                }
+            };
+            let root_for_fs = allowed_root.to_path_buf();
+            let key = fs_volume_key(&prevalidated);
+            let valid_file = match run_fs_op_bounded_for_key(&key, FS_OP_DEADLINE, move || {
+                populate_reparse_volume_cache_bounded(&prevalidated);
+                validate_playable_flac_path(&prevalidated, Some(&root_for_fs))
+            }) {
+                Ok(Ok(p)) => p,
+                Ok(Err(reason)) => {
+                    write_json_response(
+                        stream,
+                        "403 Forbidden",
+                        &JsonValue::obj(vec![
+                            ("ok", JsonValue::from(false)),
+                            ("error", JsonValue::from(format!("rejected file path: {reason}"))),
+                        ]),
+                        deadline,
+                        stop,
+                    );
+                    return;
+                }
+                Err(()) => {
+                    write_json_response(
+                        stream,
+                        "504 Gateway Timeout",
+                        &JsonValue::obj(vec![
+                            ("ok", JsonValue::from(false)),
+                            ("error", JsonValue::from("storage timed out validating file")),
+                        ]),
+                        deadline,
+                        stop,
+                    );
+                    return;
+                }
+            };
+            shared.submit_command(ControlCommand::PlayFile(valid_file.clone()));
+            write_json_response(
+                stream,
+                "200 OK",
+                &JsonValue::obj(vec![
+                    ("ok", JsonValue::from(true)),
+                    ("action", JsonValue::from("play_file")),
+                    ("path", JsonValue::from(valid_file.to_string_lossy().into_owned())),
+                ]),
+                deadline,
+                stop,
+            );
+        }
+        ("POST", "/api/v1/shutdown") => {
+            let mut when = parse_form_param(query, "when").unwrap_or_default();
+            if when.is_empty() && !req.body.trim().is_empty() {
+                if let Ok(v) = JsonValue::parse(&req.body) {
+                    if let Some(w) = v.get("when").and_then(JsonValue::as_str) {
+                        when = w.to_string();
+                    }
+                }
+            }
+            let norm_when = when.trim().to_ascii_lowercase();
+            let after_track = matches!(norm_when.as_str(), "after_track" | "after-track");
+            if !norm_when.is_empty() && norm_when != "now" && !after_track {
+                write_json_response(
+                    stream,
+                    "400 Bad Request",
+                    &JsonValue::obj(vec![
+                        ("ok", JsonValue::from(false)),
+                        ("error", JsonValue::from(format!("invalid 'when' value '{when}'; expected 'now' or 'after_track'"))),
+                    ]),
+                    deadline,
+                    stop,
+                );
+                return;
+            }
+            let immediate = if after_track {
+                shared.request_shutdown_after_track()
+            } else {
+                shared.request_shutdown();
+                true
+            };
+            write_json_response(
+                stream,
+                "202 Accepted",
+                &JsonValue::obj(vec![
+                    ("ok", JsonValue::from(true)),
+                    ("accepted", JsonValue::from(true)),
+                    (
+                        "when",
+                        JsonValue::from(if after_track { "after_track" } else { "now" }),
+                    ),
+                    ("immediate", JsonValue::from(immediate)),
+                ]),
+                deadline,
+                stop,
+            );
+        }
+        _ => {
+            write_json_response(
+                stream,
+                "404 Not Found",
+                &JsonValue::obj(vec![
+                    ("ok", JsonValue::from(false)),
+                    ("error", JsonValue::from(format!("unknown API route {} {path}", req.method))),
+                ]),
+                deadline,
+                stop,
+            );
+        }
+    }
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {

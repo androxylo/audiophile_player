@@ -80,6 +80,31 @@ use windows_sys::Win32::System::Registry::{
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
+/// Probe whether a specific discovered WDM-KS render device accepts `(sample_rate_hz, wire_format)`
+/// via looped WaveRT `KsCreatePin`, immediately closing the kernel pin via RAII on return.
+#[cfg(windows)]
+pub fn probe_ks_device_format(
+    device: &KsRenderDevice,
+    sample_rate_hz: u32,
+    wire_format: DacWireFormat,
+) -> Result<(), OutputError> {
+    let filter = open_ks_filter(&device.device_path)?;
+    let _pin = create_ks_render_pin(filter.raw(), device, sample_rate_hz, wire_format, true)?;
+    Ok(())
+}
+
+/// Non-Windows stub for [`probe_ks_device_format`].
+#[cfg(not(windows))]
+pub fn probe_ks_device_format(
+    _device: &KsRenderDevice,
+    _sample_rate_hz: u32,
+    _wire_format: DacWireFormat,
+) -> Result<(), OutputError> {
+    Err(OutputError::Other(
+        "WDM-KS probing is only supported on Windows".to_string(),
+    ))
+}
+
 /// Discovered Windows WDM-KS audio render filter and pin.
 #[derive(Debug, Clone)]
 pub struct KsRenderDevice {
@@ -2254,16 +2279,7 @@ impl WdmKsSink {
         sample_rate_hz: u32,
         wire_format: DacWireFormat,
     ) -> Result<(), OutputError> {
-        let filter = open_ks_filter(&self.device.device_path)?;
-        // Probe with the exact same looped WaveRT interface used during playback.
-        let _pin = create_ks_render_pin(
-            filter.raw(),
-            &self.device,
-            sample_rate_hz,
-            wire_format,
-            true,
-        )?;
-        Ok(())
+        probe_ks_device_format(&self.device, sample_rate_hz, wire_format)
     }
     /// Stream bounded `InterleavedInt32Buffer` blocks from `next_block` directly to the DAC
     /// via Windows Kernel Streaming (`WDM-KS` WaveRT) without ever requiring the entire track

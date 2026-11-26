@@ -1,0 +1,65 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 androxylo
+
+name: Bootstrap & CLI Smoke Test
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/bootstrap.ps1'
+      - '.config/configuration.winget'
+      - '.vsconfig'
+      - 'crates/ap-cli/src/cli_spec.rs'
+      - 'docs/CLI.md'
+      - 'docs/GETTING_STARTED.md'
+  pull_request:
+    paths:
+      - 'scripts/bootstrap.ps1'
+      - '.config/configuration.winget'
+      - '.vsconfig'
+      - 'crates/ap-cli/src/cli_spec.rs'
+      - 'docs/CLI.md'
+      - 'docs/GETTING_STARTED.md'
+
+jobs:
+  windows-bootstrap:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Validate PowerShell syntax and bootstrap -WhatIf
+        shell: pwsh
+        run: |
+          foreach ($f in @("scripts\bootstrap.ps1", "scripts\package-release.ps1", "scripts\launch-audiophile-player.ps1")) {
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f).Path, [ref]$null, [ref]$errs)
+            if ($errs.Count -gt 0) { throw "Syntax error in $f : $($errs | Out-String)" }
+          }
+          powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1 -WhatIf -NonInteractive
+          if ($LASTEXITCODE -ne 0) { throw "bootstrap.ps1 -WhatIf failed with $LASTEXITCODE" }
+
+      - name: Build release binary and run drift-guard + workspace tests
+        shell: pwsh
+        run: |
+          cargo test --release --workspace -- --skip hardware_live --skip plays_random_flac_from_user_music
+          cargo build --release --bin audiophile-player
+
+      - name: Smoke test CLI JSON surfaces
+        shell: pwsh
+        run: |
+          .\target\release\audiophile-player.exe --version --json | ConvertFrom-Json | Out-Null
+          .\target\release\audiophile-player.exe help --json | ConvertFrom-Json | Out-Null
+          .\target\release\audiophile-player.exe config show --json | ConvertFrom-Json | Out-Null
+          .\target\release\audiophile-player.exe devices --json | ConvertFrom-Json | Out-Null
+          # doctor exits 0 or 3 on headless CI runners without a 352.8/384 kHz USB DAC
+          $doc = .\target\release\audiophile-player.exe doctor --json
+          $doc | ConvertFrom-Json | Out-Null
+          if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 3) {
+            throw "Unexpected doctor exit code on CI: $LASTEXITCODE"
+          }

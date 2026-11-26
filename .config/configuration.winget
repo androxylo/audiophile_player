@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 androxylo
+#
+# Declarative Windows build prerequisites for Audiophile Player.
+# Apply with:
+#   winget configure -f .config\configuration.winget --accept-configuration-agreements
+
+properties:
+  configurationVersion: 0.2.0
+  assertions:
+    - resource: Microsoft.Windows.Developer/OsVersion
+      directives:
+        description: Verify Windows 10/11 64-bit host
+        allowPrerelease: true
+      settings:
+        MinVersion: "10.0.19041"
+  resources:
+    - resource: Microsoft.WinGet.DSC/WinGetPackage
+      id: git
+      directives:
+        description: Install Git for Windows
+      settings:
+        id: Git.Git
+        source: winget
+    - resource: Microsoft.WinGet.DSC/WinGetPackage
+      id: rustup
+      directives:
+        description: Install Rustup (Rust toolchain manager)
+      settings:
+        id: Rustlang.Rustup
+        source: winget
+    - resource: Microsoft.WinGet.DSC/WinGetPackage
+      id: vsBuildTools
+      directives:
+        description: Install Visual Studio 2022 Build Tools
+      settings:
+        id: Microsoft.VisualStudio.2022.BuildTools
+        source: winget
+    - resource: Microsoft.VisualStudio.DSC/VSComponents
+      dependsOn:
+        - vsBuildTools
+      directives:
+        description: Install C++ x64 build tools and Windows SDK components
+        allowPrerelease: true
+      settings:
+        productId: Microsoft.VisualStudio.Product.BuildTools
+        channelId: VisualStudio.17.Release
+        vsConfigFile: "${WinGetConfigRoot}\\..\\.vsconfig"
+        includeRecommended: false

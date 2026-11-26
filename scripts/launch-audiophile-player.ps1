@@ -18,9 +18,20 @@
 $ErrorActionPreference = 'SilentlyContinue'
 
 $repoRoot    = Split-Path -Parent $PSScriptRoot
+$receiptPath = Join-Path $repoRoot 'install-receipt.yaml'
+$receiptExe  = $null
+if (Test-Path -LiteralPath $receiptPath) {
+    $receiptRaw = Get-Content -LiteralPath $receiptPath -Raw
+    if ($receiptRaw -match "(?m)^exe_path:\s*'?([^'`r`n]+)'?") {
+        $cand = $Matches[1].Trim()
+        if ($cand -and (Test-Path -LiteralPath $cand)) {
+            $receiptExe = $cand
+        }
+    }
+}
 $releaseExe  = Join-Path $repoRoot 'audiophile-player.exe'
 $cargoExe    = Join-Path $repoRoot 'target\release\audiophile-player.exe'
-$exePath     = if (Test-Path -LiteralPath $releaseExe) { $releaseExe } else { $cargoExe }
+$exePath     = if ($receiptExe) { $receiptExe } elseif (Test-Path -LiteralPath $releaseExe) { $releaseExe } else { $cargoExe }
 $urlFilePath = Join-Path $env:LOCALAPPDATA 'audiophile-player\server.url'
 
 function Show-PlayerWarning([string]$Message) {

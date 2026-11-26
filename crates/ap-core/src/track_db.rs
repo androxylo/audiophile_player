@@ -922,7 +922,7 @@ fn read_entry_if_exists(path: &Path) -> Option<TrackDbEntry> {
     }
 }
 
-pub(crate) fn atomic_write_yaml(target: &Path, yaml: &str) -> Result<(), String> {
+pub fn atomic_write_yaml(target: &Path, yaml: &str) -> Result<(), String> {
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent).map_err(|e| {
             format!(

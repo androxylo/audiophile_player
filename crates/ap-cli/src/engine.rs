@@ -32,9 +32,12 @@ use ap_core::config::{
 };
 use ap_core::filter_db::{FilterDbStore, LibraryManifest};
 use ap_core::format::DacWireFormat;
-use ap_core::track_db::TrackDbStore;
+use ap_core::json::JsonValue;
+use ap_core::track_db::{TrackDbStore, now_unix_secs};
 use ap_dsp::pipeline::{AudioPipeline, GaplessAttachOutcome, GaplessCarryover};
-use ap_dsp::selector::{NoiseShaperProfile, UNSUPPORTED_SAMPLE_RATE_PREFIX, UpsamplerPolicy};
+use ap_dsp::selector::{
+    FilterArchetype, NoiseShaperProfile, UNSUPPORTED_SAMPLE_RATE_PREFIX, UpsamplerPolicy,
+};
 use ap_output_win::hygiene::OptimizationLevel;
 use ap_output_win::sink::{OutputError, PlaybackStats};
 use ap_output_win::wdm_ks::WdmKsSink;
@@ -50,6 +53,10 @@ use ap_source::stream_capture::{
 use ap_upnp::{UpnpRendererConfig, UpnpRendererServer, UpnpRendererState};
 
 use crate::cli_args::{QuantizerCliOverride, UltimateCliOverride, UpnpCliOverride};
+use crate::exit_codes::CliError;
+use crate::lifecycle::{
+    RunStateFile, RunStateGuard, SingleInstanceGuard, generate_api_token_hex, run_state_file_path,
+};
 use crate::prefetch::{
     BoundedBlockStreamBuffer, DEFAULT_MAX_BUFFERED_FRAMES, PREBUFFER_SECONDS, PopBlockResult,
     StreamEvent, ULTIMATE_MAX_BUFFERED_FRAMES, ULTIMATE_MAX_BUFFERED_SECONDS,
@@ -880,16 +887,55 @@ pub fn run_random_music_player(
     upnp_override: UpnpCliOverride,
     capture_disabled: bool,
     ultimate_override: UltimateCliOverride,
-    controller: &ShutdownController,
-) -> Result<(), String> {
-    let loaded_cfg = PlayerConfig::discover_and_load(config_path.as_deref())?;
+    startup_argv: Vec<String>,
+    controller: &'static ShutdownController,
+) -> Result<(), CliError> {
+    // Enforce single running engine instance (`Local\AudiophilePlayer.Engine`, exit code 5).
+    let _instance_guard = SingleInstanceGuard::acquire()?;
+
+    let loaded_cfg = PlayerConfig::discover_and_load(config_path.as_deref())
+        .map_err(CliError::config)?;
     let effective_conv = rew_override.unwrap_or(loaded_cfg.config.convolution);
-    effective_conv.validate_paths()?;
+    effective_conv.validate_paths().map_err(CliError::config)?;
+
+    // Merge `[player]` saved defaults with explicit CLI flags (CLI always wins).
+    let mut merged_policy = upsampler_policy;
+    if merged_policy.filter_override.is_none() {
+        if let Some(ref cfg_f) = loaded_cfg.config.player.filter {
+            if !cfg_f.eq_ignore_ascii_case("auto") {
+                merged_policy.filter_override =
+                    Some(FilterArchetype::from_str(cfg_f).map_err(CliError::config)?);
+            }
+        }
+    }
+    if merged_policy.max_taps == ap_dsp::MAX_FILTER_TAPS {
+        if let Some(cfg_taps) = loaded_cfg.config.player.max_taps {
+            merged_policy.max_taps = cfg_taps;
+        }
+    }
     let effective_policy = resolve_upsampler_policy(
-        upsampler_policy,
+        merged_policy,
         quantizer_override,
         &loaded_cfg.config.quantizer,
-    )?;
+    )
+    .map_err(CliError::config)?;
+
+    let device_filter = device_filter.or(loaded_cfg.config.player.device);
+    let http_port = http_port.or(loaded_cfg.config.player.port);
+    let (optimization, optimization_explicit) = if !optimization_explicit {
+        if let Some(ref cfg_opt) = loaded_cfg.config.player.opt {
+            let lvl = match cfg_opt.to_ascii_lowercase().as_str() {
+                "normal" => OptimizationLevel::Normal,
+                "extreme" => OptimizationLevel::Extreme,
+                _ => OptimizationLevel::High,
+            };
+            (lvl, true)
+        } else {
+            (optimization, false)
+        }
+    } else {
+        (optimization, true)
+    };
 
     let effective_ultimate = UltimateConfig {
         enabled: ultimate_override
@@ -910,16 +956,16 @@ pub fn run_random_music_player(
             .trackdb_sidecar
             .unwrap_or(loaded_cfg.config.trackdb.sidecar),
     };
-    let music_dir = match music_dir_override {
+    let music_dir = match music_dir_override.or(loaded_cfg.config.player.music_dir) {
         Some(dir) => dir,
         None => default_user_music_dir()
-            .ok_or_else(|| "could not resolve default ~/Music directory".to_string())?,
+            .ok_or_else(|| CliError::config("could not resolve default ~/Music directory"))?,
     };
     if !music_dir.is_dir() {
-        return Err(format!(
+        return Err(CliError::config(format!(
             "music directory does not exist or is not a folder: '{}'",
             music_dir.display()
-        ));
+        )));
     }
 
     let optimization = if effective_ultimate.enabled && !optimization_explicit {
@@ -998,26 +1044,82 @@ pub fn run_random_music_player(
     )?;
 
     let mut sink = WdmKsSink::open_best(device_filter.as_deref(), optimization)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| CliError::device(e.to_string()))?;
     let dac_name = sink.device().friendly_name.clone();
     let stop_handle = sink.stop_handle();
 
+    let api_token = generate_api_token_hex();
+    let effective_options_json = JsonValue::obj(vec![
+        ("dac", JsonValue::from(dac_name.clone())),
+        ("music_dir", JsonValue::from(music_dir.to_string_lossy().into_owned())),
+        ("opt", JsonValue::from(format!("{optimization:?}").to_ascii_lowercase())),
+        (
+            "filter",
+            JsonValue::from(
+                effective_policy
+                    .filter_override
+                    .map(|f| f.to_string())
+                    .unwrap_or_else(|| "auto".to_string()),
+            ),
+        ),
+        (
+            "shaper",
+            JsonValue::from(
+                effective_policy
+                    .shaper_override
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "auto".to_string()),
+            ),
+        ),
+        ("dac_bits", JsonValue::from(u32::from(effective_policy.dac_bits))),
+        ("max_taps", JsonValue::from(effective_policy.max_taps)),
+        ("ultimate", JsonValue::from(effective_ultimate.enabled)),
+        (
+            "filters_mode",
+            JsonValue::from(
+                ultimate_ctx
+                    .as_ref()
+                    .map(|u| u.filter_mode.resolve(u.user_filters.path().is_file()).as_str())
+                    .unwrap_or("off"),
+            ),
+        ),
+        ("upnp_enabled", JsonValue::from(upnp_enabled)),
+        ("capture_enabled", JsonValue::from(loaded_cfg.config.capture.enabled && !capture_disabled)),
+    ]);
+
     let shared = SharedControl::new(music_dir.clone(), dac_name.clone());
+    shared.set_api_token(api_token.clone());
+    shared.set_effective_options(effective_options_json.clone());
+    shared.attach_shutdown_callback(Arc::new(move || {
+        controller.trigger(ShutdownSignal::ApiShutdown);
+    }));
     shared.attach_sink_stop_flag(stop_handle.clone());
     controller.attach_stop_flag(stop_handle.clone());
     controller.attach_shared_control(shared.clone());
+    crate::signals::spawn_named_shutdown_event_watcher(controller);
 
     let http_server = ControlServer::start(shared.clone(), http_port)?;
     let http_url = http_server.url();
     let url_file_path = runtime_url_file_path();
     let mut url_guard = RuntimeUrlGuard::write(url_file_path.clone(), http_url.clone());
 
+    let run_state = RunStateFile {
+        pid: std::process::id(),
+        url: http_url.clone(),
+        token: api_token,
+        argv: startup_argv,
+        effective_options: effective_options_json,
+        started_unix_s: now_unix_secs(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+    let mut run_state_guard = RunStateGuard::write(run_state_file_path(), &run_state);
+
     // Review #5 Finding #21: explicit UPnP port/bind failures abort cleanly (and RuntimeUrlGuard
     // removes server.url); default zero-config UPnP bind failure logs a warning and continues!
     let upnp_server = if upnp_enabled {
         match UpnpRendererServer::start(shared.clone(), effective_upnp_cfg) {
             Ok(srv) => Some(srv),
-            Err(err) if upnp_explicit => return Err(err),
+            Err(err) if upnp_explicit => return Err(err.into()),
             Err(err) => {
                 eprintln!("  [upnp warning] could not start UPnP renderer ({err}); continuing without UPnP");
                 shared.record_action(format!("UPnP renderer disabled after bind error: {err}"));
@@ -1175,6 +1277,7 @@ pub fn run_random_music_player(
     }
 
     url_guard.disarm();
+    run_state_guard.remove_now();
     if let Some(mon) = capture_monitor {
         mon.stop();
     }
@@ -1573,6 +1676,14 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
                             );
                             eprintln!("  [underrun warn] {warn_msg}");
                             shared.record_action(warn_msg);
+                        }
+                        if hit_track_end.load(Ordering::SeqCst)
+                            && shared.is_shutdown_after_track()
+                        {
+                            println!("  [shutdown] Current track finished — completing deferred graceful shutdown...");
+                            let _ = io::stdout().flush();
+                            controller.trigger(ShutdownSignal::ApiShutdown);
+                            return ConsumerStepResult::Exit;
                         }
                         if !hit_track_end.load(Ordering::SeqCst)
                             && controller.current_signal().is_none()

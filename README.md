@@ -75,13 +75,33 @@ flowchart TB
 
 ---
 
+## Quick Start (Windows 10/11 x64)
+
+### Path A — One-line installer (builds from source by default)
+
+Open PowerShell and run:
+
+```powershell
+irm https://github.com/androxylo/audiophile_player/releases/latest/download/bootstrap.ps1 | iex
+```
+
+- **Builds locally from source** by default (installs Git, Rust, and VS Build Tools via WinGet if missing, compiles `audiophile-player.exe`, creates Start Menu/Desktop shortcuts, and runs `audiophile-player doctor`).
+- **Prefer to inspect first or use a verified pre-built binary?** Download `scripts/bootstrap.ps1`, read it, and run `.\bootstrap.ps1` (source build) or `.\bootstrap.ps1 -Binary` (opt-in SHA-256 + GitHub provenance verified release archive).
+
+### Path B — Let a free AI agent install & tune it for you
+
+Clone or point a free coding assistant (**Antigravity CLI** or **VS Code + GitHub Copilot Free**) at this repo — it reads [`AGENTS.md`](AGENTS.md), runs `audiophile-player doctor --json` / `devices --json`, configures your DAC and music folder, and can control playback through the built-in MCP server (`audiophile-player mcp`). See [Getting Started → Path B](docs/GETTING_STARTED.md#path-b--let-a-free-ai-agent-install-and-configure-it) for step-by-step instructions.
+
+---
+
 ## Where to go next
 
 | | Page | What you'll find |
 |---|---|---|
+| 🚀 | **[Getting Started](docs/GETTING_STARTED.md)** | Quick start (source, verified binary, or free AI agent), first play, web page, UPnP, Tidal Exclusive driver, REW config |
+| ⌨️ | **[CLI Reference](docs/CLI.md)** | Complete auto-generated command, flag, exit-code, and `config.toml` reference (`audiophile-player help --json`) |
 | 💎 | **[Ultimate Mode](docs/ULTIMATE_MODE.md)** | The 30-second look-ahead, the detectors, how a filter is chosen, exact headroom, learn-on-play, per-track overrides |
 | 🎛️ | **[Sound Engine](docs/SOUND_ENGINE.md)** | Every filter and noise shaper explained for HQPlayer users, DAC bits, headroom policy, REW convolution, gapless |
-| 🚀 | **[Getting Started](docs/GETTING_STARTED.md)** | Install (release or source), first play, web page, UPnP, Tidal Desktop exclusive driver, config file, command-line options |
 
 ---
 

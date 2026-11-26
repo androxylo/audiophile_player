@@ -93,6 +93,13 @@ fn load_user_filters_if_present(path: &Path) -> Result<Option<UserFiltersFile>, 
 
 /// Dispatch entrypoint for `audiophile-player filters <SUBCOMMAND>`.
 pub fn run_filters_cli(cmd: FiltersCommand) -> Result<(), String> {
+    let out = run_filters_capture(cmd)?;
+    print!("{out}");
+    Ok(())
+}
+
+/// Run a `filters` subcommand and capture its human-readable output (shared by CLI & MCP).
+pub fn run_filters_capture(cmd: FiltersCommand) -> Result<String, String> {
     match cmd {
         FiltersCommand::Show {
             target,
@@ -106,9 +113,7 @@ pub fn run_filters_cli(cmd: FiltersCommand) -> Result<(), String> {
                 choices_file.as_deref(),
                 None,
             )?;
-            let out = cmd_show(&env, &target)?;
-            print!("{out}");
-            Ok(())
+            cmd_show(&env, &target)
         }
         FiltersCommand::Diff {
             config_path,
@@ -121,9 +126,7 @@ pub fn run_filters_cli(cmd: FiltersCommand) -> Result<(), String> {
                 choices_file.as_deref(),
                 None,
             )?;
-            let out = cmd_diff(&env)?;
-            print!("{out}");
-            Ok(())
+            cmd_diff(&env)
         }
         FiltersCommand::Set {
             target,
@@ -139,9 +142,7 @@ pub fn run_filters_cli(cmd: FiltersCommand) -> Result<(), String> {
                 choices_file.as_deref(),
                 None,
             )?;
-            let out = cmd_set(&env, &target, &filter, note.as_deref())?;
-            print!("{out}");
-            Ok(())
+            cmd_set(&env, &target, &filter, note.as_deref())
         }
         FiltersCommand::Check {
             config_path,
@@ -155,11 +156,10 @@ pub fn run_filters_cli(cmd: FiltersCommand) -> Result<(), String> {
                 None,
             )?;
             let (out, issues) = cmd_check(&env)?;
-            print!("{out}");
             if issues > 0 {
-                return Err(format!("my-filters.yaml check found {issues} issue(s)"));
+                return Err(format!("{out}my-filters.yaml check found {issues} issue(s)"));
             }
-            Ok(())
+            Ok(out)
         }
         FiltersCommand::Relink {
             apply,
@@ -173,9 +173,7 @@ pub fn run_filters_cli(cmd: FiltersCommand) -> Result<(), String> {
                 choices_file.as_deref(),
                 None,
             )?;
-            let out = cmd_relink(&env, apply)?;
-            print!("{out}");
-            Ok(())
+            cmd_relink(&env, apply)
         }
         FiltersCommand::Migrate {
             config_path,
@@ -190,9 +188,7 @@ pub fn run_filters_cli(cmd: FiltersCommand) -> Result<(), String> {
                 choices_file.as_deref(),
                 trackdb_dir.as_deref(),
             )?;
-            let out = cmd_migrate(&mut env, sidecar_root.as_deref())?;
-            print!("{out}");
-            Ok(())
+            cmd_migrate(&mut env, sidecar_root.as_deref())
         }
     }
 }

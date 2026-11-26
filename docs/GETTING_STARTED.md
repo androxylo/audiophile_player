@@ -1,6 +1,6 @@
 # 🚀 Getting Started
 
-[← Home](../README.md) · [Ultimate Mode](ULTIMATE_MODE.md) · [Sound Engine](SOUND_ENGINE.md) · **Getting Started**
+[← Home](../README.md) · [Ultimate Mode](ULTIMATE_MODE.md) · [Sound Engine](SOUND_ENGINE.md) · **Getting Started** · [CLI Reference](CLI.md)
 
 ```mermaid
 flowchart LR
@@ -27,25 +27,64 @@ flowchart LR
 
 ## Install or build
 
-### From a release archive
-Unpack `audiophile-player-vX.Y.Z-win-x64.zip` into a folder of your choice, then optionally create Desktop and Start Menu shortcuts:
+### Path A — One-line Windows installer (recommended)
+
+**Default (builds from source — transparent & auditable):**
+
+```powershell
+irm https://github.com/androxylo/audiophile_player/releases/latest/download/bootstrap.ps1 | iex
+```
+
+**Inspect first (security-conscious) or use an opt-in verified pre-built binary:**
+
+```powershell
+Invoke-WebRequest https://github.com/androxylo/audiophile_player/releases/latest/download/bootstrap.ps1 -OutFile bootstrap.ps1
+notepad bootstrap.ps1              # review the script before running
+.\bootstrap.ps1                    # builds from source (needs ~5-6 GB free disk for Rust + VS Build Tools)
+# or fast opt-in binary (no compiler needed, verified with SHA-256 + optional `gh attestation verify`):
+.\bootstrap.ps1 -Binary
+```
+
+What `bootstrap.ps1` does:
+- Installs missing prerequisites (`Git.Git`, `Rustlang.Rustup`, `Microsoft.VisualStudio.2022.BuildTools`) via WinGet in source mode (or skips compilers completely with `-Binary`).
+- Installs into `%LOCALAPPDATA%\AudiophilePlayer` with an `install-receipt.yaml` record, creates Start Menu and Desktop shortcuts (unless `-SkipShortcuts`), and runs `audiophile-player doctor` to verify your DAC and configuration.
+- Supports `-WhatIf` (dry run), `-RegisterMcp` (writes an MCP config snippet), `-Prune` (clean old versions), and `-Uninstall` (removes app & shortcuts without ever touching your music or `config.toml`).
+
+### Path B — Let a free AI agent install and configure it
+
+Prefer having an AI assistant guide the install, inspect your DACs (`devices --json`), configure `config.toml`, and manage filters or playback? Both options below have **free tiers** *(last checked 2026-11-26)* and work out of the box with this repository's [`AGENTS.md`](../AGENTS.md) runbook and built-in stdio MCP server (`audiophile-player mcp`):
+
+1. **Antigravity CLI (`agy`)** *(recommended #1 — terminal-native)*: Free tier available, reads `AGENTS.md` / `GEMINI.md` and `.agents/mcp_config.json` automatically.
+2. **VS Code + GitHub Copilot Free** *(recommended #2 — familiar GUI)*: Free tier available, reads `AGENTS.md` and `.vscode/mcp.json` automatically.
+
+> [!NOTE]
+> **Honest caveats:** Free tiers have monthly/rolling usage quotas, and you should review your chosen provider's privacy/training settings before pasting personal file paths. An AI agent cannot click Windows UAC elevation dialogs for you — if WinGet installs Visual Studio Build Tools, Windows will ask you to approve the prompt.
+
+Paste this prompt into your AI assistant:
+
+> *"Read `AGENTS.md` in `https://github.com/androxylo/audiophile_player` and guide me through installing, configuring, and verifying Audiophile Player on this Windows PC."*
+
+### Manual install (release archive or git clone)
+
+**From a release archive:** unpack `audiophile-player-vX.Y.Z-win-x64.zip` into a folder of your choice, then optionally create Desktop and Start Menu shortcuts:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\install-shortcuts.ps1
 ```
 
-### From source
+**Manual build from source** (or apply `.config\configuration.winget` via `winget configure -f .config\configuration.winget --accept-configuration-agreements`):
 
 ```powershell
 git clone https://github.com/androxylo/audiophile_player.git
 cd audiophile_player
 cargo build --release --bin audiophile-player
+.\target\release\audiophile-player.exe doctor
 
 # Optional: Desktop + Start Menu icon (starts the player and opens the web page)
 powershell -ExecutionPolicy Bypass -File scripts\install-shortcuts.ps1
 ```
 
-The icon is smart: if the player is already running, clicking it only re-opens the web page. It doesn't restart playback. To assemble a complete release archive yourself (including the unsigned opt-in driver), run `powershell -ExecutionPolicy Bypass -File scripts\package-release.ps1`.
+The icon is smart: if the player is already running, clicking it only re-opens the web page. It doesn't restart playback. To assemble a complete release archive yourself (including the unsigned opt-in driver), run `powershell -ExecutionPolicy Bypass -File scripts\package-release.ps1` (or add `-WithoutDriver` for an app-only zip).
 
 ---
 
@@ -194,14 +233,7 @@ A one-off, read-only pass that analyses each track ahead of time (sharded per al
 audiophile-player scan D:\Music --post-chain --report
 ```
 
-| Option | Effect |
-|---|---|
-| `[FOLDER\|ROOT]` | Folder path or configured root name (omit to scan all roots in `[filters.roots]` / `library.yaml`) |
-| `--post-chain` | Also renders each track through the real filter and REW chain to measure its exact peak (slower, recommended) |
-| `--report` | One line per track: peak, loudness, detector results, suggested filter |
-| `--force` | Re-analyse tracks that are already current |
-| `--jobs <N>` | Number of parallel folder workers (default: up to 4) |
-| `--sidecar` | Also write legacy `<track>.flac.ap.yaml` sidecars next to each file (off by default) |
+Omit the folder argument to scan all roots in `[filters.roots]` / `library.yaml`. Useful flags include `--post-chain` (measures exact peak through the real filter + REW chain — slower, recommended), `--report`, `--force`, `--jobs <N>`, and `--sidecar`. See [CLI Reference → `scan`](CLI.md#scan) for all options.
 
 The scan is incremental and resumable: unchanged files are skipped in microseconds, metadata-only edits (`GENRE` tags, artwork) reuse audio analysis without re-decoding, and moved files are detected automatically by `STREAMINFO.md5` (recording moves for `my-filters.yaml` in `filterdb\relink-report.yaml`). It never modifies FLAC files, and it refuses to cache a file whose audio checksum doesn't match its header.
 
@@ -233,6 +265,7 @@ Options on the command line always win over the file. Unknown sections or keys a
 
 | Section | Keys (default) |
 |---|---|
+| `[player]` | `device`, `music_dir`, `filter` (auto), `max_taps` (4000000), `port` (auto 8085..8199), `opt` (high) |
 | `[convolution]` | `enabled`, `dir`, `file`, `file_352800`, `file_384000` |
 | `[quantizer]` | `dac_bits` (24), `shaper` (auto) |
 | `[ultimate]` | `enabled` (false), `genre_rules` (true), `learn_on_play` (true) |
@@ -242,45 +275,27 @@ Options on the command line always win over the file. Unknown sections or keys a
 | `[upnp]` | `enabled` (true), `friendly_name` ("Audiophile Player"), `port` (auto), `bind_ip` |
 | `[capture]` | `enabled` (true) — opt-in exclusive capture watcher (`\\.\ApExclusiveAudio`) |
 
+You can view and edit keys safely (preserving comments + creating `.bak`) from the command line:
+
+```powershell
+audiophile-player config show
+audiophile-player config set device "Gungnir 2"
+audiophile-player config set music_dir "D:\Music"
+audiophile-player config set ultimate.enabled true
+```
+
 ---
 
 ## Command-line reference
 
-<details>
-<summary><b>Playback options</b> (click to expand)</summary>
+The complete, auto-generated list of commands, flags, defaults, exit codes, and `config.toml` keys lives in **[`docs/CLI.md`](CLI.md)**.
 
-| Option | Meaning |
-|---|---|
-| `--music-dir <path>` | Folder to play (default `~/Music`) |
-| `--device <name>` | Part of the DAC name, if auto-pick chooses the wrong one |
-| `--filter <auto\|name>` | Force an upsampling filter. [List](SOUND_ENGINE.md#upsampling-filters) |
-| `--shaper <auto\|name>` | Force a noise shaper. [List](SOUND_ENGINE.md#noise-shaping-and-dac-bits) |
-| `--dac-bits <16\|18\|20\|24>` | Dithered output resolution (default 24) |
-| `--max-taps <n>` | Upsampling filter length cap (default and maximum 4,000,000) |
-| `--conv-dir <path>` / `--conv-file <file>` / `--no-conv` | Room correction source, or off |
-| `--ultimate` / `--no-ultimate` | Ultimate mode on / off |
-| `--no-genre-rules`, `--no-learn-on-play` | Ultimate mode refinements |
-| `--filters <auto\|suggested\|mine>` | Filter choice mode (default `auto`) |
-| `--filterdb-dir <path>`, `--choices-file <file>` | Schema-2 Filter DB / `my-filters.yaml` location |
-| `--trackdb-dir <path>`, `--trackdb-sidecar` | Legacy Schema-1 Track DB / opt-in sidecar location |
-| `--no-upnp`, `--upnp-name <n>`, `--upnp-port <p>`, `--upnp-bind <ip>` | UPnP renderer |
-| `--no-capture` | Disable the opt-in exclusive capture watcher (`\\.\ApExclusiveAudio`) |
-| `--port <p>` | Web page port |
-| `--opt <normal\|high\|extreme>` | Audio thread and process priority (default high) |
-| `--config <file>` | Use this config file |
-| `--idle` | Start without audio hardware (testing) |
-| `-h`, `--help` | Show help |
-
-</details>
-
-<details>
-<summary><b>Scan &amp; filters options</b></summary>
-
-`audiophile-player scan [folder|root] [--report] [--post-chain] [--force] [--jobs <n>] [--sidecar] [--filterdb-dir <p>] [--choices-file <f>] [--trackdb-dir <p>] [--config <file>] [--filter <name>] [--conv-dir <p> | --conv-file <file> | --no-conv]`
-
-`audiophile-player filters <show <path> | diff | set <path> <filter> [--note "..."] | check | relink [--apply] | migrate>`
-
-</details>
+You can also inspect the same reference directly from the binary:
+- `audiophile-player help` — concise overview
+- `audiophile-player help --<topic>` — detailed options for a command or topic (e.g. `help --filters`, `help --scan`, `help --mcp`)
+- `audiophile-player help --json` — machine-readable CLI schema (`ap.cli_spec/1`)
+- `audiophile-player doctor` / `audiophile-player devices` — environment & DAC diagnostics
+- `audiophile-player status` / `stop` / `restart` — control a running player instance cleanly
 
 ---
 

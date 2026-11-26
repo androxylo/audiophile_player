@@ -12,6 +12,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
+use ap_core::json::JsonValue;
+
 use crate::log::ActionLog;
 use crate::security::normalize_allowed_root;
 
@@ -128,6 +130,12 @@ struct InnerState {
     log: ActionLog,
     sink_stop_flag: Option<Arc<AtomicBool>>,
     shutdown: bool,
+    shutdown_after_track: bool,
+    shutdown_callback: Option<Arc<dyn Fn() + Send + Sync>>,
+    api_token: Option<String>,
+    effective_options: JsonValue,
+    started_unix_s: u64,
+    version: String,
 }
 
 /// Thread-safe control hub decoupled from real-time audio pumping.
@@ -162,6 +170,12 @@ impl SharedControl {
                 log,
                 sink_stop_flag: None,
                 shutdown: false,
+                shutdown_after_track: false,
+                shutdown_callback: None,
+                api_token: None,
+                effective_options: JsonValue::Object(Vec::new()),
+                started_unix_s: ap_core::track_db::now_unix_secs(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
             }),
             cv: Condvar::new(),
             live_output_peak_u32: Arc::new(AtomicU32::new(0)),
@@ -280,12 +294,140 @@ impl SharedControl {
 
     /// Notify waiting engine threads that process shutdown was requested.
     pub fn request_shutdown(&self) {
-        let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        st.shutdown = true;
-        if let Some(flag) = st.sink_stop_flag.as_ref() {
-            flag.store(true, Ordering::SeqCst);
+        let cb = {
+            let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let first = !st.shutdown;
+            st.shutdown = true;
+            if let Some(flag) = st.sink_stop_flag.as_ref() {
+                flag.store(true, Ordering::SeqCst);
+            }
+            self.cv.notify_all();
+            if first {
+                st.shutdown_callback.clone()
+            } else {
+                None
+            }
+        };
+        if let Some(cb) = cb {
+            cb();
         }
-        self.cv.notify_all();
+    }
+
+    /// Attach a callback invoked when `/api/v1/shutdown` requests immediate or post-track teardown
+    /// (wired to `ShutdownController::trigger_api_shutdown` in `ap-cli`).
+    pub fn attach_shutdown_callback(&self, cb: Arc<dyn Fn() + Send + Sync>) {
+        let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        st.shutdown_callback = Some(cb);
+    }
+
+    /// Configure the random 256-bit Bearer token required by `/api/v1/*` JSON endpoints.
+    pub fn set_api_token(&self, token: String) {
+        let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        st.api_token = Some(token);
+    }
+
+    /// Record effective startup options JSON exposed in `GET /api/v1/status`.
+    pub fn set_effective_options(&self, opts: JsonValue) {
+        let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        st.effective_options = opts;
+    }
+
+    /// Verify an incoming `Authorization: Bearer <token>` header in constant time.
+    pub fn verify_bearer_token(&self, auth_header: Option<&str>) -> bool {
+        let expected = {
+            let st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            st.api_token.clone()
+        };
+        let Some(expected) = expected else {
+            return false;
+        };
+        let Some(raw) = auth_header else {
+            return false;
+        };
+        let Some(provided) = raw.strip_prefix("Bearer ").or_else(|| raw.strip_prefix("bearer ")) else {
+            return false;
+        };
+        constant_time_eq(expected.as_bytes(), provided.trim().as_bytes())
+    }
+
+    /// Arm graceful shutdown after the current track finishes (or immediately if currently paused).
+    /// Returns `true` if shutdown was triggered immediately, `false` if deferred until track end.
+    pub fn request_shutdown_after_track(&self) -> bool {
+        let should_stop_now = {
+            let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            st.shutdown_after_track = true;
+            st.log
+                .push("Command: Graceful shutdown armed (after current track)");
+            !st.is_playing
+        };
+        if should_stop_now {
+            self.request_shutdown();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Returns `true` when `/api/v1/shutdown?when=after_track` is armed.
+    pub fn is_shutdown_after_track(&self) -> bool {
+        let st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        st.shutdown_after_track
+    }
+
+    /// Build the structured `/api/v1/status` JSON payload (`schema: "ap.status/1"`).
+    pub fn api_v1_status_json(&self) -> JsonValue {
+        let snap = self.snapshot();
+        let (effective_options, restart_pending, started_unix_s, version) = {
+            let st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                st.effective_options.clone(),
+                st.shutdown_after_track,
+                st.started_unix_s,
+                st.version.clone(),
+            )
+        };
+        JsonValue::obj(vec![
+            ("schema", JsonValue::from("ap.status/1")),
+            ("running", JsonValue::from(true)),
+            ("pid", JsonValue::from(std::process::id())),
+            ("version", JsonValue::from(version)),
+            ("started_unix_s", JsonValue::from(started_unix_s)),
+            ("is_playing", JsonValue::from(snap.is_playing)),
+            ("dac_claimed", JsonValue::from(snap.is_playing)),
+            ("mode", JsonValue::from(snap.mode.as_str())),
+            ("dac", JsonValue::from(snap.dac_name)),
+            (
+                "active_folder",
+                JsonValue::from(snap.active_folder.to_string_lossy().into_owned()),
+            ),
+            (
+                "current_track",
+                JsonValue::opt_str(snap.current_track.as_deref()),
+            ),
+            (
+                "current_format",
+                JsonValue::opt_str(snap.current_format.as_deref()),
+            ),
+            (
+                "current_decision",
+                JsonValue::opt_str(snap.current_decision.as_deref()),
+            ),
+            (
+                "current_peak",
+                JsonValue::opt_str(snap.current_peak.as_deref()),
+            ),
+            ("restart_pending", JsonValue::from(restart_pending)),
+            ("effective_options", effective_options),
+            (
+                "recent_actions",
+                JsonValue::Array(
+                    snap.recent_actions
+                        .into_iter()
+                        .map(JsonValue::from)
+                        .collect(),
+                ),
+            ),
+        ])
     }
 
     pub fn set_playing(&self, mode: PlayModeLabel, track: String, format: String) {
@@ -377,6 +519,17 @@ impl SharedControl {
             recent_actions: st.log.snapshot(),
         }
     }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 #[cfg(test)]

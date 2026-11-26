@@ -378,3 +378,38 @@ classical = 'E:\Classical'
     );
     assert!(PlayerConfig::from_toml_str("[filters]\nunknown = 1\n").is_err());
 }
+
+#[test]
+fn parses_player_section_and_comment_preserving_config_editor_roundtrips() {
+    use ap_core::config::{
+        canonicalize_config_key, format_toml_value_for_key, unset_toml_key_preserving_comments,
+        upsert_toml_key_preserving_comments,
+    };
+
+    assert_eq!(canonicalize_config_key("device"), Some("player.device"));
+    assert_eq!(canonicalize_config_key("music_dir"), Some("player.music_dir"));
+    assert_eq!(canonicalize_config_key("ultimate.enabled"), Some("ultimate.enabled"));
+
+    let initial = "# User notes kept intact\n[player]\n# Preferred DAC\ndevice = 'Old DAC'\n";
+    let v_dev = format_toml_value_for_key("player.device", "Gungnir 2").unwrap();
+    let step1 = upsert_toml_key_preserving_comments(Some(initial), "player.device", &v_dev).unwrap();
+    assert!(step1.contains("# User notes kept intact"));
+    assert!(step1.contains("# Preferred DAC"));
+    assert!(step1.contains("device = 'Gungnir 2'"));
+
+    let v_dir = format_toml_value_for_key("player.music_dir", r"D:\Music\FLAC").unwrap();
+    let step2 = upsert_toml_key_preserving_comments(Some(&step1), "player.music_dir", &v_dir).unwrap();
+    let v_ult = format_toml_value_for_key("ultimate.enabled", "true").unwrap();
+    let step3 = upsert_toml_key_preserving_comments(Some(&step2), "ultimate.enabled", &v_ult).unwrap();
+
+    let parsed = PlayerConfig::from_toml_str(&step3).unwrap();
+    assert_eq!(parsed.player.device.as_deref(), Some("Gungnir 2"));
+    assert_eq!(parsed.player.music_dir, Some(PathBuf::from(r"D:\Music\FLAC")));
+    assert!(parsed.ultimate.enabled);
+
+    let (step4, removed) = unset_toml_key_preserving_comments(&step3, "player.device").unwrap();
+    assert!(removed);
+    let parsed2 = PlayerConfig::from_toml_str(&step4).unwrap();
+    assert_eq!(parsed2.player.device, None);
+    assert!(step4.contains("# Preferred DAC"));
+}

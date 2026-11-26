@@ -1,0 +1,19 @@
+# Audiophile Player
+
+> Headless Windows bit-exact 64-bit float 8fS (352.8/384 kHz) upsampling audio player with REW room correction, noise-shaped quantization, WDM-KS exclusive output, UPnP renderer, and built-in stdio MCP server.
+
+## Runbook & CLI Spec
+- [AGENTS.md](AGENTS.md): Authoritative AI assistant operating guide and safety rules
+- [docs/CLI.md](docs/CLI.md): Complete auto-generated CLI, subcommand, exit-code, and `config.toml` reference
+
+## Documentation
+- [README.md](README.md): Architecture overview, quick start, and signal path
+- [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md): Installation (source build & verified binary), free AI agent setup, first play, UPnP, REW, opt-in Tidal Exclusive ACX driver
+- [docs/ULTIMATE_MODE.md](docs/ULTIMATE_MODE.md): 30 s look-ahead analysis, detectors, exact post-chain headroom, Schema-2 Filter DB & `my-filters.yaml`
+- [docs/SOUND_ENGINE.md](docs/SOUND_ENGINE.md): Upsampling filters (up to 4M taps), noise shapers, DAC bit depth, WDM-KS exclusive pipeline
+- [docs/FILTER_PREFERENCES.md](docs/FILTER_PREFERENCES.md): Community listening notes and filter selection presets
+
+## Machine Interfaces
+- CLI introspection: `audiophile-player help --json` (`ap.cli_spec/1`)
+- Diagnostics: `audiophile-player doctor --json` (`ap.doctor/1`), `audiophile-player devices --json` (`ap.devices/1`)
+- MCP server (stdio JSON-RPC 2.0): `audiophile-player mcp` (workspace configs in `.agents/mcp_config.json` and `.vscode/mcp.json`)

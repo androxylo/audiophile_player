@@ -1,0 +1,9 @@
+{
+  "servers": {
+    "audiophile-player": {
+      "type": "stdio",
+      "command": "${workspaceFolder}/target/release/audiophile-player.exe",
+      "args": ["mcp"]
+    }
+  }
+}

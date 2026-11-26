@@ -1,0 +1,93 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 androxylo
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to attach assets to (defaults to Cargo.toml version as vX.Y.Z)'
+        required: false
+        default: ''
+      build_binary:
+        description: 'Build and attach opt-in verified Windows x64 app zip + SHA256SUMS + attestation'
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run workspace unit tests
+        shell: pwsh
+        run: |
+          cargo test --release --workspace -- --skip hardware_live --skip plays_random_flac_from_user_music
+
+      - name: Determine release tag and version
+        id: meta
+        shell: pwsh
+        run: |
+          $toml = Get-Content -LiteralPath Cargo.toml -Raw
+          if ($toml -notmatch '(?m)^version\s*=\s*"([^"]+)"') { throw "Missing version in Cargo.toml" }
+          $ver = $Matches[1]
+          $tag = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" }
+                 elseif ("${{ inputs.tag }}") { "${{ inputs.tag }}" }
+                 else { "v$ver" }
+          echo "version=$ver" >> $env:GITHUB_OUTPUT
+          echo "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Stage bootstrap.ps1 asset
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item -Force scripts\bootstrap.ps1 dist\bootstrap.ps1
+
+      - name: Build opt-in Windows x64 app zip (no kernel driver)
+        if: ${{ github.event_name == 'push' || inputs.build_binary }}
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File scripts\package-release.ps1 -WithoutDriver
+          $zip = Get-ChildItem dist\audiophile-player-v*-win-x64.zip | Select-Object -First 1
+          if (-not $zip) { throw "Release zip missing in dist\" }
+          $hash = (Get-FileHash -Algorithm SHA256 -Path $zip.FullName).Hash.ToLowerInvariant()
+          "$hash  $($zip.Name)" | Set-Content -LiteralPath dist\SHA256SUMS -Encoding ASCII
+          echo "ZIP_PATH=$($zip.FullName)" >> $env:GITHUB_ENV
+
+      - name: Attest build provenance
+        if: ${{ github.event_name == 'push' || inputs.build_binary }}
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ env.ZIP_PATH }}
+
+      - name: Create or update GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ steps.meta.outputs.tag }}"
+          $assets = @("dist\bootstrap.ps1")
+          if (Test-Path "dist\SHA256SUMS") {
+            $assets += @("dist\SHA256SUMS", $env:ZIP_PATH, ($env:ZIP_PATH + ".sha256"))
+          }
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag @assets --clobber
+          } else {
+            gh release create $tag @assets --title "Audiophile Player $tag" --generate-notes
+          }

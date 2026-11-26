@@ -19,7 +19,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::user_filters::FilterMode;
+use crate::track_db::atomic_write_yaml;
+use crate::user_filters::{FilterMode, is_known_filter_name};
 
 /// Standard local config filename (portable / current working directory).
 pub const LOCAL_CONFIG_FILENAME: &str = "audiophile-player.toml";
@@ -301,9 +302,63 @@ pub struct FiltersConfig {
     pub roots: BTreeMap<String, PathBuf>,
 }
 
+/// Allowed `[player] opt` priority tier names.
+pub const ALLOWED_OPT_LEVELS: [&str; 3] = ["normal", "high", "extreme"];
+
+/// Default/saved player runtime preferences loaded from `[player]` in `config.toml`
+/// (`device`, `music_dir`, `filter`, `max_taps`, `port`, `opt`). CLI flags always override these.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlayerSectionConfig {
+    /// Preferred WDM-KS DAC name substring (e.g. `"Gungnir 2"`).
+    pub device: Option<String>,
+    /// Default local music library folder (`None` -> `~/Music`).
+    pub music_dir: Option<PathBuf>,
+    /// Optional forced upsampling filter (`None` = `"auto"`).
+    pub filter: Option<String>,
+    /// Optional upsampling tap ceiling (`1..=4_000_000`; `None` = `4_000_000`).
+    pub max_taps: Option<usize>,
+    /// Optional local HTTP control UI port (`1..=65535`; `None` = auto `8085..=8199`).
+    pub port: Option<u16>,
+    /// Optional KS priority tier (`normal | high | extreme`).
+    pub opt: Option<String>,
+}
+
+impl PlayerSectionConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(ref f) = self.filter {
+            if !f.eq_ignore_ascii_case("auto") && !is_known_filter_name(f) {
+                return Err(format!(
+                    "[player] unknown 'filter' '{f}'; expected auto or a known filter name"
+                ));
+            }
+        }
+        if let Some(t) = self.max_taps {
+            if t == 0 || t > 4_000_000 {
+                return Err(format!(
+                    "[player] invalid 'max_taps' ({t}); expected 1..=4000000"
+                ));
+            }
+        }
+        if let Some(p) = self.port {
+            if p == 0 {
+                return Err("[player] 'port' must be in 1..=65535".to_string());
+            }
+        }
+        if let Some(ref o) = self.opt {
+            if !ALLOWED_OPT_LEVELS.iter().any(|a| a.eq_ignore_ascii_case(o)) {
+                return Err(format!(
+                    "[player] invalid 'opt' '{o}'; expected normal, high, or extreme"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Top-level user configuration file (`config.toml` / `audiophile-player.toml`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlayerConfig {
+    pub player: PlayerSectionConfig,
     pub convolution: ConvolutionConfig,
     pub quantizer: QuantizerConfig,
     pub upnp: UpnpConfig,
@@ -311,6 +366,62 @@ pub struct PlayerConfig {
     pub ultimate: UltimateConfig,
     pub trackdb: TrackDbConfig,
     pub filters: FiltersConfig,
+}
+
+/// Canonical dotted TOML keys supported by `PlayerConfig` (verified against `cli_spec.rs` in tests).
+pub const ALL_KNOWN_CONFIG_KEYS: &[&str] = &[
+    "player.device",
+    "player.music_dir",
+    "player.filter",
+    "player.max_taps",
+    "player.port",
+    "player.opt",
+    "convolution.enabled",
+    "convolution.dir",
+    "convolution.file",
+    "convolution.file_352800",
+    "convolution.file_384000",
+    "quantizer.dac_bits",
+    "quantizer.shaper",
+    "upnp.enabled",
+    "upnp.friendly_name",
+    "upnp.port",
+    "upnp.bind_ip",
+    "capture.enabled",
+    "ultimate.enabled",
+    "ultimate.genre_rules",
+    "ultimate.learn_on_play",
+    "trackdb.dir",
+    "trackdb.sidecar",
+    "filters.mode",
+    "filters.dir",
+    "filters.choices_file",
+];
+
+/// Map a canonical dotted key or convenient shorthand (e.g. `device`, `music_dir`, `filter`)
+/// to its canonical `section.key` name.
+pub fn canonicalize_config_key(raw: &str) -> Option<&'static str> {
+    let lower = raw.trim().to_ascii_lowercase();
+    for &k in ALL_KNOWN_CONFIG_KEYS {
+        if k == lower {
+            return Some(k);
+        }
+    }
+    match lower.as_str() {
+        "device" => Some("player.device"),
+        "music_dir" | "music-dir" => Some("player.music_dir"),
+        "filter" => Some("player.filter"),
+        "max_taps" | "max-taps" => Some("player.max_taps"),
+        "port" => Some("player.port"),
+        "opt" => Some("player.opt"),
+        "dac_bits" | "dac-bits" => Some("quantizer.dac_bits"),
+        "shaper" => Some("quantizer.shaper"),
+        "ultimate" => Some("ultimate.enabled"),
+        "genre_rules" | "genre-rules" => Some("ultimate.genre_rules"),
+        "learn_on_play" | "learn-on-play" => Some("ultimate.learn_on_play"),
+        "filters" => Some("filters.mode"),
+        _ => None,
+    }
 }
 
 /// Result of config file discovery + loading.
@@ -357,6 +468,7 @@ impl PlayerConfig {
         #[derive(Clone, Copy, PartialEq, Eq)]
         enum Section {
             None,
+            Player,
             Convolution,
             Quantizer,
             Upnp,
@@ -368,6 +480,7 @@ impl PlayerConfig {
         }
 
         let mut active_section = Section::None;
+        let mut seen_player_section = false;
         let mut seen_convolution_section = false;
         let mut seen_quantizer_section = false;
         let mut seen_upnp_section = false;
@@ -376,6 +489,7 @@ impl PlayerConfig {
         let mut seen_trackdb_section = false;
         let mut seen_filters_section = false;
         let mut seen_filters_roots_section = false;
+        let mut seen_player_keys: HashSet<&str> = HashSet::new();
         let mut seen_conv_keys: HashSet<&str> = HashSet::new();
         let mut seen_quant_keys: HashSet<&str> = HashSet::new();
         let mut seen_upnp_keys: HashSet<&str> = HashSet::new();
@@ -385,6 +499,7 @@ impl PlayerConfig {
         let mut seen_filters_keys: HashSet<String> = HashSet::new();
         let mut seen_filter_root_names: HashSet<String> = HashSet::new();
         let mut explicit_conv_enabled: Option<bool> = None;
+        let mut player = PlayerSectionConfig::default();
         let mut conv = ConvolutionConfig::default();
         let mut quantizer = QuantizerConfig::default();
         let mut upnp = UpnpConfig::default();
@@ -408,6 +523,15 @@ impl PlayerConfig {
                 }
                 let section = stripped[1..stripped.len() - 1].trim();
                 match section {
+                    "player" => {
+                        if seen_player_section {
+                            return Err(format!(
+                                "config line {line_no}: duplicate section '[player]'"
+                            ));
+                        }
+                        seen_player_section = true;
+                        active_section = Section::Player;
+                    }
                     "convolution" => {
                         if seen_convolution_section {
                             return Err(format!(
@@ -505,6 +629,81 @@ impl PlayerConfig {
 
             match active_section {
                 Section::None => unreachable!(),
+                Section::Player => {
+                    if !seen_player_keys.insert(key) {
+                        return Err(format!(
+                            "config line {line_no}: duplicate key '{key}' in [player]"
+                        ));
+                    }
+                    match key {
+                        "device" => {
+                            let s = parse_toml_string(val, line_no, "device")?;
+                            let trimmed = s.trim();
+                            player.device = (!trimmed.is_empty()).then(|| trimmed.to_string());
+                        }
+                        "music_dir" => {
+                            let s = parse_toml_string(val, line_no, "music_dir")?;
+                            player.music_dir = non_empty_path(s);
+                        }
+                        "filter" => {
+                            let s = parse_toml_string(val, line_no, "filter")?;
+                            let trimmed = s.trim();
+                            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
+                                player.filter = None;
+                            } else if is_known_filter_name(trimmed) {
+                                player.filter = Some(trimmed.to_ascii_lowercase());
+                            } else {
+                                return Err(format!(
+                                    "config line {line_no}: unknown 'filter' '{trimmed}' in [player]"
+                                ));
+                            }
+                        }
+                        "max_taps" => {
+                            let taps = val.parse::<usize>().map_err(|_| {
+                                format!(
+                                    "config line {line_no}: invalid integer for 'max_taps' in [player]: '{val}'"
+                                )
+                            })?;
+                            if taps == 0 || taps > 4_000_000 {
+                                return Err(format!(
+                                    "config line {line_no}: 'max_taps' in [player] must be in 1..=4000000"
+                                ));
+                            }
+                            player.max_taps = Some(taps);
+                        }
+                        "port" => {
+                            let port = val.parse::<u16>().map_err(|_| {
+                                format!(
+                                    "config line {line_no}: invalid integer for 'port' in [player]: '{val}'"
+                                )
+                            })?;
+                            if port == 0 {
+                                return Err(format!(
+                                    "config line {line_no}: 'port' in [player] must be in 1..=65535"
+                                ));
+                            }
+                            player.port = Some(port);
+                        }
+                        "opt" => {
+                            let s = parse_toml_string(val, line_no, "opt")?;
+                            let trimmed = s.trim().to_ascii_lowercase();
+                            if trimmed.is_empty() {
+                                player.opt = None;
+                            } else if ALLOWED_OPT_LEVELS.contains(&trimmed.as_str()) {
+                                player.opt = Some(trimmed);
+                            } else {
+                                return Err(format!(
+                                    "config line {line_no}: invalid 'opt' '{trimmed}' in [player] (expected normal, high, or extreme)"
+                                ));
+                            }
+                        }
+                        other => {
+                            return Err(format!(
+                                "config line {line_no}: unknown key '{other}' in [player] (allowed: device, music_dir, filter, max_taps, port, opt)"
+                            ));
+                        }
+                    }
+                }
                 Section::Convolution => {
                     if !seen_conv_keys.insert(key) {
                         return Err(format!(
@@ -778,10 +977,12 @@ impl PlayerConfig {
 
         // If `enabled` was omitted in [convolution], enable automatically iff at least one filter source was set.
         conv.enabled = explicit_conv_enabled.unwrap_or_else(|| conv.has_any_source());
+        player.validate()?;
         conv.validate()?;
         quantizer.validate()?;
 
         Ok(Self {
+            player,
             convolution: conv,
             quantizer,
             upnp,
@@ -951,4 +1152,338 @@ fn parse_toml_string(val: &str, line_no: usize, key: &str) -> Result<String, Str
     Err(format!(
         "config line {line_no}: expected quoted string for '{key}', got '{val}'"
     ))
+}
+
+impl PlayerConfig {
+    /// Read the current effective string value of any canonical dotted key in [`ALL_KNOWN_CONFIG_KEYS`].
+    pub fn get_value_str(&self, canonical_key: &str) -> Option<String> {
+        match canonical_key {
+            "player.device" => self.player.device.clone(),
+            "player.music_dir" => self
+                .player
+                .music_dir
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            "player.filter" => self.player.filter.clone(),
+            "player.max_taps" => self.player.max_taps.map(|n| n.to_string()),
+            "player.port" => self.player.port.map(|p| p.to_string()),
+            "player.opt" => self.player.opt.clone(),
+            "convolution.enabled" => Some(self.convolution.enabled.to_string()),
+            "convolution.dir" => self
+                .convolution
+                .dir
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            "convolution.file" => self
+                .convolution
+                .file
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            "convolution.file_352800" => self
+                .convolution
+                .file_352800
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            "convolution.file_384000" => self
+                .convolution
+                .file_384000
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            "quantizer.dac_bits" => Some(self.quantizer.dac_bits.to_string()),
+            "quantizer.shaper" => Some(
+                self.quantizer
+                    .shaper
+                    .clone()
+                    .unwrap_or_else(|| "auto".to_string()),
+            ),
+            "upnp.enabled" => Some(self.upnp.enabled.to_string()),
+            "upnp.friendly_name" => Some(self.upnp.friendly_name.clone()),
+            "upnp.port" => self.upnp.port.map(|p| p.to_string()),
+            "upnp.bind_ip" => self.upnp.bind_ip.clone(),
+            "capture.enabled" => Some(self.capture.enabled.to_string()),
+            "ultimate.enabled" => Some(self.ultimate.enabled.to_string()),
+            "ultimate.genre_rules" => Some(self.ultimate.genre_rules.to_string()),
+            "ultimate.learn_on_play" => Some(self.ultimate.learn_on_play.to_string()),
+            "trackdb.dir" => self
+                .trackdb
+                .dir
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            "trackdb.sidecar" => Some(self.trackdb.sidecar.to_string()),
+            "filters.mode" => Some(self.filters.mode.as_str().to_string()),
+            "filters.dir" => self
+                .filters
+                .dir
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            "filters.choices_file" => self
+                .filters
+                .choices_file
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            _ => None,
+        }
+    }
+}
+
+/// Format a raw CLI/MCP string value as a valid TOML literal for `canonical_key`, validating type/range.
+pub fn format_toml_value_for_key(canonical_key: &str, raw_value: &str) -> Result<String, String> {
+    let val = raw_value.trim();
+    match canonical_key {
+        // Boolean keys
+        "convolution.enabled"
+        | "upnp.enabled"
+        | "capture.enabled"
+        | "ultimate.enabled"
+        | "ultimate.genre_rules"
+        | "ultimate.learn_on_play"
+        | "trackdb.sidecar" => match val.to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Ok("true".to_string()),
+            "false" | "0" | "no" | "off" => Ok("false".to_string()),
+            _ => Err(format!(
+                "invalid boolean '{raw_value}' for '{canonical_key}' (expected true or false)"
+            )),
+        },
+        // Integer keys
+        "quantizer.dac_bits" => {
+            let bits = val.parse::<u8>().map_err(|_| {
+                format!("invalid dac_bits '{raw_value}' (expected 16, 18, 20, or 24)")
+            })?;
+            if !is_valid_dac_bits(bits) {
+                return Err(format!(
+                    "invalid dac_bits {bits} (expected 16, 18, 20, or 24)"
+                ));
+            }
+            Ok(bits.to_string())
+        }
+        "player.max_taps" => {
+            let taps = val
+                .parse::<usize>()
+                .map_err(|_| format!("invalid max_taps '{raw_value}' (expected 1..=4000000)"))?;
+            if taps == 0 || taps > 4_000_000 {
+                return Err(format!("max_taps must be in 1..=4000000, got {taps}"));
+            }
+            Ok(taps.to_string())
+        }
+        "player.port" | "upnp.port" => {
+            let port = val
+                .parse::<u16>()
+                .map_err(|_| format!("invalid port '{raw_value}' (expected 1..=65535)"))?;
+            if port == 0 {
+                return Err("port must be in 1..=65535".to_string());
+            }
+            Ok(port.to_string())
+        }
+        // Validated enum strings
+        "player.filter" => {
+            if !val.eq_ignore_ascii_case("auto") && !is_known_filter_name(val) {
+                return Err(format!(
+                    "unknown filter '{val}'; expected auto or one of: {}",
+                    crate::user_filters::KNOWN_FILTER_NAMES.join(", ")
+                ));
+            }
+            Ok(toml_quote_string(&val.to_ascii_lowercase()))
+        }
+        "player.opt" => {
+            let lower = val.to_ascii_lowercase();
+            if !ALLOWED_OPT_LEVELS.contains(&lower.as_str()) {
+                return Err(format!(
+                    "invalid opt '{val}'; expected normal, high, or extreme"
+                ));
+            }
+            Ok(toml_quote_string(&lower))
+        }
+        "quantizer.shaper" => {
+            if !is_valid_shaper_name(val) {
+                return Err(format!(
+                    "unknown shaper '{val}'; expected one of: {}",
+                    ALLOWED_SHAPER_NAMES.join(", ")
+                ));
+            }
+            Ok(toml_quote_string(&val.to_ascii_lowercase()))
+        }
+        "filters.mode" => {
+            let mode = FilterMode::parse(val)?;
+            Ok(toml_quote_string(mode.as_str()))
+        }
+        "upnp.bind_ip" => {
+            val.parse::<std::net::Ipv4Addr>()
+                .map_err(|_| format!("invalid IPv4 address '{val}' for upnp.bind_ip"))?;
+            Ok(toml_quote_string(val))
+        }
+        "upnp.friendly_name" => {
+            if val.is_empty() {
+                return Err("upnp.friendly_name cannot be empty".to_string());
+            }
+            Ok(toml_quote_string(val))
+        }
+        // General strings & filesystem paths
+        "player.device"
+        | "player.music_dir"
+        | "convolution.dir"
+        | "convolution.file"
+        | "convolution.file_352800"
+        | "convolution.file_384000"
+        | "trackdb.dir"
+        | "filters.dir"
+        | "filters.choices_file" => Ok(toml_quote_string(val)),
+        other => Err(format!("unknown config key '{other}'")),
+    }
+}
+
+/// Quote a TOML string cleanly: prefer single-quoted literal `'...'` when it contains no single
+/// quotes or control chars (ideal for Windows `C:\...` paths), otherwise double-quoted escaped.
+pub fn toml_quote_string(s: &str) -> String {
+    if !s.contains('\'') && !s.chars().any(|c| c.is_control()) {
+        format!("'{s}'")
+    } else {
+        let mut out = String::with_capacity(s.len() + 2);
+        out.push('"');
+        for ch in s.chars() {
+            match ch {
+                '\\' => out.push_str("\\\\"),
+                '"' => out.push_str("\\\""),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    }
+}
+
+/// Comment-preserving line-level TOML upsert for `section.key = <toml_value>`.
+/// Preserves all existing comments, blank lines, and ordering outside the replaced line.
+pub fn upsert_toml_key_preserving_comments(
+    existing_text: Option<&str>,
+    canonical_key: &str,
+    toml_value: &str,
+) -> Result<String, String> {
+    let Some((target_sec, target_key)) = canonical_key.split_once('.') else {
+        return Err(format!("invalid dotted config key '{canonical_key}'"));
+    };
+    let new_line = format!("{target_key} = {toml_value}");
+    let base = existing_text.unwrap_or("");
+    let mut lines: Vec<String> = if base.is_empty() {
+        vec![
+            "# Audiophile Player configuration (config.toml)".to_string(),
+            String::new(),
+        ]
+    } else {
+        base.lines().map(str::to_string).collect()
+    };
+
+    let mut sec_start: Option<usize> = None;
+    let mut sec_end: usize = lines.len();
+    for (i, line) in lines.iter().enumerate() {
+        let stripped = strip_toml_comment(line).trim();
+        if stripped.starts_with('[') && stripped.ends_with(']') {
+            let sec_name = stripped[1..stripped.len() - 1].trim();
+            if sec_start.is_some() {
+                sec_end = i;
+                break;
+            }
+            if sec_name == target_sec {
+                sec_start = Some(i);
+            }
+        }
+    }
+
+    if let Some(s_idx) = sec_start {
+        let mut replaced = false;
+        for line in &mut lines[s_idx + 1..sec_end] {
+            let stripped = strip_toml_comment(line);
+            let trimmed = stripped.trim();
+            if let Some((raw_k, _)) = trimmed.split_once('=') {
+                if raw_k.trim() == target_key {
+                    let trailing_comment = &line[stripped.len()..];
+                    *line = if trailing_comment.is_empty() {
+                        new_line.clone()
+                    } else {
+                        format!("{new_line} {trailing_comment}")
+                    };
+                    replaced = true;
+                    break;
+                }
+            }
+        }
+        if !replaced {
+            let mut insert_at = sec_end;
+            while insert_at > s_idx + 1 && lines[insert_at - 1].trim().is_empty() {
+                insert_at -= 1;
+            }
+            lines.insert(insert_at, new_line);
+        }
+    } else {
+        if !lines.last().is_some_and(|l| l.trim().is_empty()) {
+            lines.push(String::new());
+        }
+        lines.push(format!("[{target_sec}]"));
+        lines.push(new_line);
+    }
+
+    let mut out = lines.join("\n");
+    out.push('\n');
+    Ok(out)
+}
+
+/// Comment-preserving line-level TOML removal for `section.key`. Returns `(updated, removed)`.
+pub fn unset_toml_key_preserving_comments(
+    existing_text: &str,
+    canonical_key: &str,
+) -> Result<(String, bool), String> {
+    let Some((target_sec, target_key)) = canonical_key.split_once('.') else {
+        return Err(format!("invalid dotted config key '{canonical_key}'"));
+    };
+    let mut lines: Vec<String> = existing_text.lines().map(str::to_string).collect();
+    let mut in_sec = false;
+    let mut remove_idx: Option<usize> = None;
+
+    for (i, line) in lines.iter().enumerate() {
+        let stripped = strip_toml_comment(line).trim();
+        if stripped.starts_with('[') && stripped.ends_with(']') {
+            let sec_name = stripped[1..stripped.len() - 1].trim();
+            in_sec = sec_name == target_sec;
+            continue;
+        }
+        if in_sec {
+            if let Some((raw_k, _)) = stripped.split_once('=') {
+                if raw_k.trim() == target_key {
+                    remove_idx = Some(i);
+                    break;
+                }
+            }
+        }
+    }
+
+    if let Some(idx) = remove_idx {
+        lines.remove(idx);
+        let mut out = lines.join("\n");
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        Ok((out, true))
+    } else {
+        Ok((existing_text.to_string(), false))
+    }
+}
+
+/// Save `config.toml` atomically, creating `config.toml.bak` first if the file exists.
+pub fn write_config_with_backup(path: &Path, content: &str) -> Result<(), String> {
+    // Always validate before touching disk!
+    PlayerConfig::from_toml_str(content)?;
+    if path.exists() {
+        let mut bak_os = path.as_os_str().to_os_string();
+        bak_os.push(".bak");
+        let bak_path = PathBuf::from(bak_os);
+        fs::copy(path, &bak_path).map_err(|e| {
+            format!(
+                "failed creating config backup '{}': {e}",
+                bak_path.display()
+            )
+        })?;
+    }
+    atomic_write_yaml(path, content)
 }
