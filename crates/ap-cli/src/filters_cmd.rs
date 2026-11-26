@@ -92,10 +92,23 @@ fn load_user_filters_if_present(path: &Path) -> Result<Option<UserFiltersFile>, 
 }
 
 /// Dispatch entrypoint for `audiophile-player filters <SUBCOMMAND>`.
-pub fn run_filters_cli(cmd: FiltersCommand) -> Result<(), String> {
-    let out = run_filters_capture(cmd)?;
-    print!("{out}");
-    Ok(())
+pub fn run_filters_cli(cmd: FiltersCommand) -> Result<(), crate::exit_codes::CliError> {
+    let is_check = matches!(cmd, FiltersCommand::Check { .. });
+    match run_filters_capture(cmd) {
+        Ok(out) => {
+            print!("{out}");
+            Ok(())
+        }
+        Err(msg) => {
+            // Review #9 Q8: `filters check` failures (lint issues or invalid YAML/config) return
+            // documented exit code 4 (`EXIT_CONFIG_ERROR`), never guessed from text.
+            if is_check {
+                Err(crate::exit_codes::CliError::config(msg))
+            } else {
+                Err(crate::exit_codes::CliError::general(msg))
+            }
+        }
+    }
 }
 
 /// Run a `filters` subcommand and capture its human-readable output (shared by CLI & MCP).

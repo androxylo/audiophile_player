@@ -24,6 +24,10 @@ $RepoSlug = 'androxylo/audiophile_player'
 function Write-Step([string]$Msg) { Write-Host "==> $Msg" -ForegroundColor Cyan }
 function Write-Ok([string]$Msg)   { Write-Host "  [ok] $Msg" -ForegroundColor Green }
 function Write-Warn([string]$Msg) { Write-Host "  [warn] $Msg" -ForegroundColor Yellow }
+function Fail([string]$Msg, [int]$Code) {
+    Write-Host "error: $Msg" -ForegroundColor Red
+    exit $Code
+}
 
 function Refresh-ProcessPath {
     $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
@@ -34,14 +38,22 @@ function Refresh-ProcessPath {
 }
 
 function Test-ToolchainLinker {
-    $active = (& rustup show active-toolchain 2>$null | Out-String)
-    if ($active -match '-gnu\b') {
-        return $true
-    }
-    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-    if (Test-Path -LiteralPath $vswhere) {
-        $found = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
-        if ($found) { return $true }
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        if (Get-Command rustup -ErrorAction SilentlyContinue) {
+            $active = (& rustup show active-toolchain 2>$null | Out-String)
+            if ($LASTEXITCODE -eq 0 -and $active -match '-gnu\b') {
+                return $true
+            }
+        }
+        $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+        if (Test-Path -LiteralPath $vswhere) {
+            $found = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
+            if ($LASTEXITCODE -eq 0 -and $found) { return $true }
+        }
+    } finally {
+        $ErrorActionPreference = $prevEap
     }
     return [bool](Get-Command link.exe -ErrorAction SilentlyContinue)
 }
@@ -63,7 +75,15 @@ if ($Uninstall) {
         Write-Host "  [WhatIf] Would stop audiophile-player, remove Start Menu/Desktop shortcuts, and remove $Dir"
         exit 0
     }
-    Get-Process -Name 'audiophile-player' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    $installedExe = Join-Path $Dir 'audiophile-player.exe'
+    if (Test-Path -LiteralPath $installedExe) {
+        try { & $installedExe stop --when now 2>$null | Out-Null } catch {}
+    }
+    $still = Get-Process -Name 'audiophile-player' -ErrorAction SilentlyContinue
+    if ($still) {
+        Write-Warn 'Graceful stop did not exit; terminating remaining audiophile-player process.'
+        $still | Stop-Process -Force -ErrorAction SilentlyContinue
+    }
     foreach ($lnk in @(
         (Join-Path ([Environment]::GetFolderPath('Desktop')) 'Audiophile Player.lnk'),
         (Join-Path ([Environment]::GetFolderPath('Programs')) 'Audiophile Player.lnk')
@@ -91,8 +111,7 @@ if ($Prune) {
 
 # Step 0: OS and disk space check
 if (-not [Environment]::Is64BitOperatingSystem) {
-    Write-Error 'Audiophile Player requires 64-bit Windows 10/11.'
-    exit 10
+    Fail 'Audiophile Player requires 64-bit Windows 10/11.' 10
 }
 $driveRoot = Split-Path -Qualifier $Dir
 if (-not $driveRoot) { $driveRoot = $env:SystemDrive }
@@ -100,8 +119,7 @@ $driveLetter = $driveRoot.TrimEnd(':')
 $minGb = if ($Binary) { 0.5 } else { 5.0 }
 $psDrive = Get-PSDrive -Name $driveLetter -ErrorAction SilentlyContinue
 if ($psDrive -and ($psDrive.Free / 1GB) -lt $minGb) {
-    Write-Error ("Insufficient free disk space on {0}: need at least {1:N1} GB." -f $driveRoot, $minGb)
-    exit 10
+    Fail ("Insufficient free disk space on {0}: need at least {1:N1} GB." -f $driveRoot, $minGb) 10
 }
 
 $activeExe = ''
@@ -120,8 +138,7 @@ if (-not $Binary) {
     if (-not ($hasGit -and $hasCargo -and $hasLinker)) {
         $winget = Get-Command winget -ErrorAction SilentlyContinue
         if (-not $winget) {
-            Write-Error 'WinGet is required to install missing build tools. Install App Installer from Microsoft Store or install Git, Rustup, and VS 2022 Build Tools manually.'
-            exit 10
+            Fail 'WinGet is required to install missing build tools. Install App Installer from Microsoft Store or install Git, Rustup, and VS 2022 Build Tools manually.' 10
         }
         $missing = @()
         if (-not $hasGit)    { $missing += 'Git.Git' }
@@ -133,13 +150,15 @@ if (-not $Binary) {
         } else {
             foreach ($pkg in $missing) {
                 $wgArgs = @('install', '--exact', '--id', $pkg, '--source', 'winget', '--accept-package-agreements', '--accept-source-agreements')
+                if ($NonInteractive) {
+                    $wgArgs += @('--silent', '--disable-interactivity')
+                }
                 if ($pkg -eq 'Microsoft.VisualStudio.2022.BuildTools') {
                     $wgArgs += @('--override', '--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended')
                 }
                 & winget @wgArgs
                 if ($LASTEXITCODE -ne 0) {
-                    Write-Error "WinGet install failed for $pkg (exit $LASTEXITCODE)."
-                    exit 10
+                    Fail "WinGet install failed for $pkg (exit $LASTEXITCODE)." 10
                 }
             }
             Refresh-ProcessPath
@@ -218,14 +237,12 @@ if (-not $Binary) {
     try {
         $rel = Invoke-RestMethod -Uri $apiUrl -Headers @{ 'User-Agent' = 'audiophile-player-bootstrap' }
     } catch {
-        Write-Error "No published GitHub Release found at $apiUrl. Run without -Binary to build from source instead."
-        exit 40
+        Fail "No published GitHub Release found at $apiUrl. Run without -Binary to build from source instead." 40
     }
     $zipAsset = $rel.assets | Where-Object { $_.name -match '^audiophile-player-v.*-win-x64\.zip$' } | Select-Object -First 1
     $shaAsset = $rel.assets | Where-Object { $_.name -eq 'SHA256SUMS' -or $_.name -eq ($zipAsset.name + '.sha256') } | Select-Object -First 1
     if (-not $zipAsset -or -not $shaAsset) {
-        Write-Error 'Release is missing win-x64 zip or SHA-256 checksum asset. Run without -Binary to build from source.'
-        exit 40
+        Fail 'Release is missing win-x64 zip or SHA-256 checksum asset. Run without -Binary to build from source.' 40
     }
     $tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ("ap-bootstrap-" + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
@@ -239,8 +256,7 @@ if (-not $Binary) {
         $shaText = Get-Content -LiteralPath $shaFile -Raw
         $matchedLine = ($shaText -split "`r?`n") | Where-Object { $_ -match [regex]::Escape($zipAsset.name) } | Select-Object -First 1
         if (-not $matchedLine -or ($matchedLine.Trim().Split()[0].ToLowerInvariant() -ne $actualHash)) {
-            Write-Error "SHA-256 verification FAILED for $($zipAsset.name)!"
-            exit 40
+            Fail "SHA-256 verification FAILED for $($zipAsset.name)!" 40
         }
         $zipSha = $actualHash
         Write-Ok "SHA-256 verified: $zipSha"
@@ -248,8 +264,7 @@ if (-not $Binary) {
         if (Get-Command gh -ErrorAction SilentlyContinue) {
             & gh attestation verify $zipFile --repo $RepoSlug
             if ($LASTEXITCODE -ne 0) {
-                Write-Error 'GitHub build provenance attestation verification FAILED.'
-                exit 40
+                Fail 'GitHub build provenance attestation verification FAILED.' 40
             }
             Write-Ok 'GitHub build provenance attestation verified.'
         } else {
@@ -297,8 +312,7 @@ if ($RegisterMcp) {
 
 Write-Step 'Running post-install verification (audiophile-player doctor)'
 if (-not (Test-Path -LiteralPath $activeExe)) {
-    Write-Error "Installed binary missing: $activeExe"
-    exit 50
+    Fail "Installed binary missing: $activeExe" 50
 }
 & $activeExe --version
 if ($LASTEXITCODE -ne 0) { exit 50 }

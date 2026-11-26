@@ -32,7 +32,9 @@ flowchart LR
 **Default (builds from source — transparent & auditable):**
 
 ```powershell
-irm https://github.com/androxylo/audiophile_player/releases/latest/download/bootstrap.ps1 | iex
+$s = Join-Path $env:TEMP 'audiophile-player-bootstrap.ps1'
+irm https://github.com/androxylo/audiophile_player/releases/latest/download/bootstrap.ps1 -OutFile $s
+powershell -ExecutionPolicy Bypass -File $s
 ```
 
 **Inspect first (security-conscious) or use an opt-in verified pre-built binary:**

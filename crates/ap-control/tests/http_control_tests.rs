@@ -1189,6 +1189,37 @@ fn api_v1_requires_bearer_token_and_supports_status_playback_and_deferred_shutdo
     assert!(now_resp.starts_with("HTTP/1.1 202 Accepted"), "got: {now_resp}");
     assert!(shutdown_fired.load(Ordering::SeqCst));
 
+    // 6. Review #9 O3: Transfer-Encoding (chunked) MUST be rejected with 501 (never treated as
+    //    empty `{}` starting random playback!), and truncated bodies MUST be rejected with 400!
+    let chunked_resp = http_request(
+        addr,
+        &format!(
+            "POST /api/v1/play HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{{}}\r\n0\r\n\r\n"
+        ),
+    );
+    assert!(
+        chunked_resp.starts_with("HTTP/1.1 501 Not Implemented"),
+        "O3 expected 501 for chunked POST, got: {chunked_resp}"
+    );
+    assert_eq!(shared.take_pending_command(), None);
+
+    // Truncated body: Content-Length: 50 with only 5 bytes sent and write half closed.
+    {
+        let mut s = std::net::TcpStream::connect(addr).unwrap();
+        let req = format!(
+            "POST /api/v1/play HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nContent-Length: 50\r\n\r\n{{\"a\":"
+        );
+        std::io::Write::write_all(&mut s, req.as_bytes()).unwrap();
+        let _ = s.shutdown(std::net::Shutdown::Write);
+        let mut resp = String::new();
+        let _ = std::io::Read::read_to_string(&mut s, &mut resp);
+        assert!(
+            resp.starts_with("HTTP/1.1 400 Bad Request"),
+            "O3 expected 400 for truncated POST, got: {resp}"
+        );
+        assert_eq!(shared.take_pending_command(), None);
+    }
+
     server.shutdown();
     let _ = fs::remove_dir_all(&dir);
 }

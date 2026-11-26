@@ -741,27 +741,37 @@ fn drainer_loop(
         queue.1.notify_all();
     };
 
-    // 1. Drain any stashed first chunk for this generation (Review #8 B2) before issuing new IOCTLs.
-    if let Some((hdr, bytes)) = transport.take_stash_for(generation) {
+    let push_verified_chunk = |hdr: &ApPcmChunkHeader, bytes: Vec<u8>| -> Result<(), String> {
         if hdr.abi_version != AP_STREAM_ABI_VERSION {
-            finish(
-                CaptureEndReason::Error,
-                Some(format!("capture driver ABI mismatch: {}", hdr.abi_version)),
-            );
-            return;
+            return Err(format!("capture driver ABI mismatch: {}", hdr.abi_version));
         }
         if hdr.stream_running != 0 && (hdr.exclusive_verified == 0 || hdr.format.is_float != 0) {
-            finish(
-                CaptureEndReason::Error,
-                Some("Windows mixer or floating-point stream detected — exclusive capture aborted".to_string()),
+            return Err(
+                "Windows mixer or floating-point stream detected — exclusive capture aborted"
+                    .to_string(),
             );
-            return;
         }
         if !bytes.is_empty() {
+            // Review #9 O10: apply identical `sample_rate == 0 -> expected_fmt` fallback on BOTH
+            // the stashed first chunk and main drainer loop chunks.
+            let fmt = if hdr.format.sample_rate != 0 {
+                hdr.format
+            } else {
+                expected_fmt
+            };
             let mut q = queue.0.lock().unwrap_or_else(|e| e.into_inner());
             q.queued_bytes += bytes.len();
-            q.chunks.push_back((hdr.format, bytes));
+            q.chunks.push_back((fmt, bytes));
             queue.1.notify_all();
+        }
+        Ok(())
+    };
+
+    // 1. Drain any stashed first chunk for this generation (Review #8 B2) before issuing new IOCTLs.
+    if let Some((hdr, bytes)) = transport.take_stash_for(generation) {
+        if let Err(err) = push_verified_chunk(&hdr, bytes) {
+            finish(CaptureEndReason::Error, Some(err));
+            return;
         }
     }
 
@@ -824,30 +834,21 @@ fn drainer_loop(
             return;
         }
 
-        // Hard zero-mixer enforcement on every chunk.
-        if hdr.stream_running != 0 && (hdr.exclusive_verified == 0 || hdr.format.is_float != 0) {
-            finish(
-                CaptureEndReason::Error,
-                Some("Windows mixer or floating-point stream detected — exclusive capture aborted".to_string()),
-            );
-            return;
-        }
-
+        // Hard zero-mixer enforcement on every chunk & unified push (Review #9 O10).
         if payload_len > 0 {
             paused_since = None;
             // Review #8 B3: ALWAYS forward raw PCM bytes (never zero entire multi-packet read
             // when CHUNK_FLAG_SILENT_PACKET is set; the kernel already zero-filled silent packets).
             let bytes = io_buf[hdr_size..hdr_size + payload_len].to_vec();
-            let fmt = if hdr.format.sample_rate != 0 {
-                hdr.format
-            } else {
-                expected_fmt
-            };
-            let mut q = queue.0.lock().unwrap_or_else(|e| e.into_inner());
-            q.queued_bytes += bytes.len();
-            q.chunks.push_back((fmt, bytes));
-            queue.1.notify_all();
+            if let Err(err) = push_verified_chunk(&hdr, bytes) {
+                finish(CaptureEndReason::Error, Some(err));
+                return;
+            }
             continue;
+        }
+        if let Err(err) = push_verified_chunk(&hdr, Vec::new()) {
+            finish(CaptureEndReason::Error, Some(err));
+            return;
         }
 
         // No bytes available right now.

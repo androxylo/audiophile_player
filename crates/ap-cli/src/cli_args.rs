@@ -1027,6 +1027,56 @@ where
     Ok(RunMode::Status { as_json })
 }
 
+/// Single shared `--when` parser for CLI `stop`/`restart` and MCP `player_stop`/`player_restart`
+/// (Review #9 Q6). Returns `Ok(true)` for `after-track`, `Ok(false)` for `now`.
+pub fn parse_when(raw: &str) -> Result<bool, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "now" => Ok(false),
+        "after-track" | "after_track" => Ok(true),
+        other => Err(format!(
+            "invalid --when '{other}'; expected 'after-track' or 'now'"
+        )),
+    }
+}
+
+/// Validate that `flags` form a valid **play** invocation (`RunMode::PlayRandom`) before
+/// stopping a running player on `restart` or spawning from MCP (Review #9 Q1).
+/// Rejects non-play modes (`--version`, `help`, `scan`, `--idle`, etc.) and invalid option values
+/// such as `--dac-bits 17`.
+pub fn validate_play_argv(flags: &[String]) -> Result<(), String> {
+    let mut check_argv = Vec::with_capacity(flags.len() + 1);
+    check_argv.push("audiophile-player".to_string());
+    check_argv.extend(flags.iter().cloned());
+    let mode = parse_args(check_argv.iter().map(String::as_str))?;
+    match mode {
+        RunMode::PlayRandom { config_path, .. } => {
+            if let Some(ref cfg) = config_path {
+                ap_core::config::PlayerConfig::discover_and_load(Some(cfg))
+                    .map_err(|e| format!("invalid config '{}': {e}", cfg.display()))?;
+            }
+            Ok(())
+        }
+        other => Err(format!(
+            "restart/start options must resolve to playback mode, not '{}'",
+            match other {
+                RunMode::Help(_) => "help",
+                RunMode::Version { .. } => "--version",
+                RunMode::Idle => "--idle",
+                RunMode::Scan { .. } => "scan",
+                RunMode::Filters(_) => "filters",
+                RunMode::Doctor { .. } => "doctor",
+                RunMode::Devices { .. } => "devices",
+                RunMode::Config(_) => "config",
+                RunMode::Status { .. } => "status",
+                RunMode::Stop { .. } => "stop",
+                RunMode::Restart { .. } => "restart",
+                RunMode::Mcp => "mcp",
+                RunMode::PlayRandom { .. } => unreachable!(),
+            }
+        )),
+    }
+}
+
 fn parse_stop_args<I>(mut iter: I) -> Result<RunMode, String>
 where
     I: Iterator<Item = OsString>,
@@ -1044,15 +1094,7 @@ where
                     .next()
                     .ok_or_else(|| "--when requires 'now' or 'after-track'".to_string())?;
                 let v = require_utf8_arg("--when", val)?;
-                match v.to_ascii_lowercase().as_str() {
-                    "now" => after_track = false,
-                    "after-track" | "after_track" => after_track = true,
-                    other => {
-                        return Err(format!(
-                            "invalid --when '{other}'; expected 'now' or 'after-track'"
-                        ));
-                    }
-                }
+                after_track = parse_when(&v)?;
             }
             other => return Err(format!("unknown stop option '{other}'")),
         }
@@ -1071,9 +1113,15 @@ where
     let mut after_track = true;
     let mut as_json = false;
     let mut flags: Vec<String> = Vec::new();
+    let mut passthrough = false;
     while let Some(raw) = iter.next() {
         let arg = require_utf8_arg("restart", raw)?;
+        if passthrough {
+            flags.push(arg);
+            continue;
+        }
         match arg.as_str() {
+            "--" => passthrough = true,
             "-h" | "--help" => return Ok(RunMode::Help(HelpMode::Detail("restart".to_string()))),
             "--json" => as_json = true,
             "--yes" => {}
@@ -1082,27 +1130,17 @@ where
                     .next()
                     .ok_or_else(|| "--when requires 'after-track' or 'now'".to_string())?;
                 let v = require_utf8_arg("--when", val)?;
-                match v.to_ascii_lowercase().as_str() {
-                    "now" => after_track = false,
-                    "after-track" | "after_track" => after_track = true,
-                    other => {
-                        return Err(format!(
-                            "invalid --when '{other}'; expected 'after-track' or 'now'"
-                        ));
-                    }
-                }
+                after_track = parse_when(&v)?;
             }
             other => {
                 flags.push(other.to_string());
             }
         }
     }
-    // Validate forwarded play flags immediately via `parse_args` so typos fail before stopping the player!
+    // Validate forwarded play flags immediately via `validate_play_argv` so typos and non-play
+    // modes (`--version`, `scan`, `--idle`, etc.) fail BEFORE stopping the running player (Q1)!
     if !flags.is_empty() {
-        let mut check_argv = Vec::with_capacity(flags.len() + 1);
-        check_argv.push("audiophile-player".to_string());
-        check_argv.extend(flags.iter().cloned());
-        parse_args(check_argv.iter().map(String::as_str))?;
+        validate_play_argv(&flags)?;
     }
     Ok(RunMode::Restart {
         flags,

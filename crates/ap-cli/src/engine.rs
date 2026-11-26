@@ -1140,7 +1140,7 @@ pub fn run_random_music_player(
     )?
     .with_shared_dac_capabilities(Arc::clone(&shared_dac_caps));
 
-    let api_token = generate_api_token_hex();
+    let api_token = generate_api_token_hex()?;
     let effective_options_json = JsonValue::obj(vec![
         ("dac", JsonValue::from(dac_name.clone())),
         ("music_dir", JsonValue::from(music_dir.to_string_lossy().into_owned())),

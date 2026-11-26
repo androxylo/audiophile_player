@@ -1068,6 +1068,20 @@ pub static OPTIONS: &[OptSpec] = &[
     },
 ];
 
+/// Return the mutually exclusive / negated CLI flags that should be stripped from a previous
+/// argv when `flag` is passed on `restart` or via MCP (Review #9 Q7).
+pub fn negated_options(flag: &str) -> &'static [&'static str] {
+    match flag {
+        "--ultimate" => &["--no-ultimate"],
+        "--no-ultimate" => &["--ultimate"],
+        "--no-conv" => &["--conv-dir", "--conv-file"],
+        "--conv-dir" | "--conv-file" => &["--no-conv"],
+        "--no-upnp" => &["--upnp-name", "--upnp-port", "--upnp-ip"],
+        "--upnp-name" | "--upnp-port" | "--upnp-ip" => &["--no-upnp"],
+        _ => &[],
+    }
+}
+
 /// Look up an option by `--name` or `-short` (with or without leading dashes).
 pub fn find_option(query: &str) -> Option<&'static OptSpec> {
     let q = query.trim();

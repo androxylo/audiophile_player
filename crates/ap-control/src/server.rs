@@ -581,6 +581,8 @@ enum ReadRequestError {
     HeaderTooLarge,
     BodyTooLarge,
     BadContentLength,
+    TransferEncodingNotSupported,
+    TruncatedBody,
 }
 
 fn handle_connection(
@@ -635,6 +637,30 @@ fn handle_connection(
                 "400 Bad Request",
                 "text/plain; charset=utf-8",
                 b"Invalid Content-Length",
+                None,
+                conn_deadline,
+                stop,
+            );
+            return;
+        }
+        Err(ReadRequestError::TransferEncodingNotSupported) => {
+            write_response(
+                stream,
+                "501 Not Implemented",
+                "text/plain; charset=utf-8",
+                b"Transfer-Encoding is not supported; send Content-Length",
+                None,
+                conn_deadline,
+                stop,
+            );
+            return;
+        }
+        Err(ReadRequestError::TruncatedBody) => {
+            write_response(
+                stream,
+                "400 Bad Request",
+                "text/plain; charset=utf-8",
+                b"Truncated request body",
                 None,
                 conn_deadline,
                 stop,
@@ -1275,7 +1301,9 @@ fn read_http_request(
         if let Some((k, v)) = line.split_once(':') {
             let name = k.trim();
             let val = v.trim();
-            if name.eq_ignore_ascii_case("content-length") {
+            if name.eq_ignore_ascii_case("transfer-encoding") {
+                return Err(ReadRequestError::TransferEncodingNotSupported);
+            } else if name.eq_ignore_ascii_case("content-length") {
                 let parsed = val
                     .parse::<usize>()
                     .map_err(|_| ReadRequestError::BadContentLength)?;
@@ -1305,7 +1333,7 @@ fn read_http_request(
     while buf.len() < total_needed {
         let n = read_chunk_with_deadline(stream, &mut chunk, deadline, stop)?;
         if n == 0 {
-            break;
+            return Err(ReadRequestError::TruncatedBody);
         }
         buf.extend_from_slice(&chunk[..n]);
         if buf.len() > header_end + MAX_BODY_BYTES {
@@ -1313,8 +1341,7 @@ fn read_http_request(
         }
     }
 
-    let body_end = total_needed.min(buf.len());
-    let body = String::from_utf8_lossy(&buf[header_end..body_end]).into_owned();
+    let body = String::from_utf8_lossy(&buf[header_end..total_needed]).into_owned();
     Ok(HttpRequest {
         method,
         target,

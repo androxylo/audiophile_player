@@ -58,19 +58,37 @@ pub fn version_json() -> JsonValue {
 
 fn detect_install_kind() -> &'static str {
     if let Ok(exe) = std::env::current_exe() {
-        let lower = exe.to_string_lossy().to_ascii_lowercase();
-        if lower.contains("\\bin\\v") || lower.contains("/bin/v") {
-            return "binary";
+        // Review #9 Q14: check `install-receipt.yaml` FIRST (handling both quoted `'binary'`
+        // written by bootstrap.ps1 and unquoted values) in both exe's parent and grandparent
+        // (for `<root>\bin\vX.Y.Z\audiophile-player.exe` layouts).
+        for dir in [
+            exe.parent(),
+            exe.parent().and_then(Path::parent),
+            exe.parent().and_then(Path::parent).and_then(Path::parent),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Ok(text) = fs::read_to_string(dir.join("install-receipt.yaml")) {
+                for line in text.lines() {
+                    if let Some(rest) = line.trim().strip_prefix("install_kind:") {
+                        let val = rest.trim().trim_matches('\'').trim_matches('"');
+                        if val.eq_ignore_ascii_case("binary") {
+                            return "binary";
+                        }
+                        if val.eq_ignore_ascii_case("source") {
+                            return "source";
+                        }
+                    }
+                }
+            }
         }
+        let lower = exe.to_string_lossy().to_ascii_lowercase();
         if lower.contains("\\target\\release\\") || lower.contains("\\target\\debug\\") {
             return "source";
         }
-        if let Some(parent) = exe.parent() {
-            if let Ok(text) = fs::read_to_string(parent.join("install-receipt.yaml")) {
-                if text.contains("install_kind: binary") {
-                    return "binary";
-                }
-            }
+        if lower.contains("\\bin\\v") || lower.contains("/bin/v") {
+            return "binary";
         }
     }
     "source"
@@ -691,7 +709,7 @@ pub fn config_show_json(
         let cur = loaded.config.get_value_str(key);
         let def = defaults.get_value_str(key);
         let from_file = loaded.source_path.is_some() && cur != def;
-        if !include_defaults && !from_file && cur.is_none() {
+        if !include_defaults && !from_file {
             continue;
         }
         entries.push(JsonValue::obj(vec![

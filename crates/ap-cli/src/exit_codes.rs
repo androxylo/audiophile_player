@@ -69,29 +69,6 @@ impl CliError {
         }
     }
 
-    pub fn classify_from_string(msg: String) -> Self {
-        let lower = msg.to_ascii_lowercase();
-        if lower.contains("config file") || lower.contains("config line") || lower.contains("invalid config") {
-            Self::config(msg)
-        } else if lower.contains("wdm-ks")
-            || lower.contains("dac")
-            || lower.contains("audio device")
-            || lower.contains("no render")
-            || lower.contains("352.8")
-            || lower.contains("384 khz")
-        {
-            Self::device(msg)
-        } else if lower.contains("already running") || lower.contains("not running") {
-            Self {
-                code: EXIT_INSTANCE_STATE,
-                message: msg,
-                hint: Some("run `audiophile-player status`".to_string()),
-            }
-        } else {
-            Self::general(msg)
-        }
-    }
-
     pub fn exit_code(&self) -> ExitCode {
         ExitCode::from(self.code)
     }
@@ -106,6 +83,8 @@ impl CliError {
 
 impl From<String> for CliError {
     fn from(s: String) -> Self {
-        Self::classify_from_string(s)
+        // Review #9 Q8: never guess exit codes by substring matching error text!
+        // Callers with device/config/usage/instance errors must construct typed `CliError`s.
+        Self::general(s)
     }
 }

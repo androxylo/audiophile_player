@@ -16,7 +16,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use ap_core::json::JsonValue;
-use ap_core::track_db::{atomic_write_yaml, now_unix_secs};
+use ap_core::track_db::atomic_write_yaml;
 
 use crate::exit_codes::CliError;
 
@@ -135,19 +135,20 @@ impl RunStateFile {
 }
 
 /// Generate a cryptographically random 256-bit (64-hex-char) Bearer token.
-pub fn generate_api_token_hex() -> String {
+/// Review #9 Q16: fails closed if the OS CSPRNG fails (never falls back to weak xorshift).
+pub fn generate_api_token_hex() -> Result<String, CliError> {
     let mut bytes = [0u8; 32];
-    fill_random_bytes(&mut bytes);
+    fill_random_bytes(&mut bytes)?;
     let mut hex = String::with_capacity(64);
     for b in bytes {
         use std::fmt::Write as _;
         let _ = write!(&mut hex, "{b:02x}");
     }
-    hex
+    Ok(hex)
 }
 
 #[cfg(windows)]
-fn fill_random_bytes(dst: &mut [u8]) {
+fn fill_random_bytes(dst: &mut [u8]) -> Result<(), CliError> {
     #[link(name = "bcrypt")]
     unsafe extern "system" {
         fn BCryptGenRandom(
@@ -167,32 +168,21 @@ fn fill_random_bytes(dst: &mut [u8]) {
         )
     };
     if status != 0 {
-        // Fallback entropy only if BCryptGenRandom ever fails (should never happen on Win10/11).
-        let seed = now_unix_secs() ^ (u64::from(std::process::id()) << 32);
-        let mut x = seed | 1;
-        for b in dst.iter_mut() {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            *b = (x & 0xff) as u8;
-        }
+        return Err(CliError::general(format!(
+            "OS CSPRNG (BCryptGenRandom) failed with NTSTATUS 0x{:08x}; refusing to start with weak API token",
+            status as u32
+        )));
     }
+    Ok(())
 }
 
 #[cfg(not(windows))]
-fn fill_random_bytes(dst: &mut [u8]) {
-    if let Ok(mut f) = fs::File::open("/dev/urandom") {
-        if f.read_exact(dst).is_ok() {
-            return;
-        }
-    }
-    let mut x = now_unix_secs() ^ (u64::from(std::process::id()) << 32) | 1;
-    for b in dst.iter_mut() {
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        *b = (x & 0xff) as u8;
-    }
+fn fill_random_bytes(dst: &mut [u8]) -> Result<(), CliError> {
+    let mut f = fs::File::open("/dev/urandom")
+        .map_err(|e| CliError::general(format!("failed to open /dev/urandom: {e}")))?;
+    f.read_exact(dst)
+        .map_err(|e| CliError::general(format!("failed reading /dev/urandom: {e}")))?;
+    Ok(())
 }
 
 /// Restrict `run.json` NTFS permissions to the current user (`OWNER_RIGHTS` / current user only).
@@ -286,8 +276,34 @@ impl RunStateGuard {
     pub fn write(path: Option<PathBuf>, state: &RunStateFile) -> Self {
         if let Some(ref p) = path {
             let content = state.to_json().to_pretty_string();
-            if atomic_write_yaml(p, &content).is_ok() {
-                restrict_file_acl_to_current_user(p);
+            // Review #9 Q16: create a private temp file, restrict its NTFS ACL to the current user
+            // BEFORE writing the secret token or renaming into `run.json`, eliminating any
+            // post-rename exposure window.
+            if let Some(parent) = p.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let tmp = p.with_file_name(format!("run.json.tmp.{}", state.pid));
+            let wrote_privately = (|| -> std::io::Result<()> {
+                let _ = fs::remove_file(&tmp);
+                let mut f = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&tmp)?;
+                restrict_file_acl_to_current_user(&tmp);
+                f.write_all(content.as_bytes())?;
+                f.sync_all()?;
+                drop(f);
+                if fs::rename(&tmp, p).is_err() {
+                    let _ = fs::remove_file(p);
+                    fs::rename(&tmp, p)?;
+                }
+                Ok(())
+            })();
+            if wrote_privately.is_err() {
+                let _ = fs::remove_file(&tmp);
+                if atomic_write_yaml(p, &content).is_ok() {
+                    restrict_file_acl_to_current_user(p);
+                }
             }
         }
         Self {
@@ -588,8 +604,55 @@ pub fn run_status_cli(as_json: bool) -> Result<(), CliError> {
     }
 }
 
-/// Gracefully stop the running engine and wait up to `timeout` for process exit (never force-kills!).
-pub fn stop_running_instance(after_track: bool, timeout: Duration) -> Result<JsonValue, CliError> {
+/// Schedule deferred `after_track` shutdown without blocking the caller for the entire track
+/// (used by single-threaded MCP `player_stop(when="after_track")`, Review #9 Q5).
+pub fn request_deferred_stop() -> Result<JsonValue, CliError> {
+    let Some(rs) = RunStateFile::read_default() else {
+        return Err(CliError::instance(
+            "Audiophile Player is not running",
+            "nothing to stop",
+        ));
+    };
+    if !is_pid_alive(rs.pid) {
+        return Err(CliError::instance(
+            format!("Audiophile Player (PID {}) is already stopped", rs.pid),
+            "nothing to stop",
+        ));
+    }
+    match api_v1_request(
+        &rs.url,
+        &rs.token,
+        "POST",
+        "/api/v1/shutdown?when=after_track",
+        None,
+    ) {
+        Ok((code, body)) if code < 400 => {
+            let immediate = body
+                .get("immediate")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false);
+            Ok(JsonValue::obj(vec![
+                ("schema", JsonValue::from("ap.stop/1")),
+                ("ok", JsonValue::from(true)),
+                ("pid", JsonValue::from(rs.pid)),
+                ("when", JsonValue::from("after_track")),
+                ("pending", JsonValue::from(!immediate)),
+                ("exited", JsonValue::from(false)),
+            ]))
+        }
+        _ => stop_running_instance(false),
+    }
+}
+
+/// Gracefully stop the running engine and wait for process exit (never force-kills!).
+///
+/// Review #9 Q4 + Q5:
+/// - Falls back to the named shutdown event on ANY HTTP error OR HTTP status `>= 400`.
+/// - Centralizes timeout policy here: `when=now` waits up to 30 s; `when=after_track` polls
+///   `/api/v1/status` and continues waiting while the engine is alive and actively playing a track
+///   with `shutdown_after_track: true` (supporting tracks > 10 minutes cleanly!), timing out only
+///   if the process stops responding or stays idle without exiting for 30 s.
+pub fn stop_running_instance(after_track: bool) -> Result<JsonValue, CliError> {
     let Some(rs) = RunStateFile::read_default() else {
         return Err(CliError::instance(
             "Audiophile Player is not running",
@@ -604,14 +667,15 @@ pub fn stop_running_instance(after_track: bool, timeout: Duration) -> Result<Jso
     }
 
     let when_str = if after_track { "after_track" } else { "now" };
-    let api_ok = api_v1_request(
+    let api_res = api_v1_request(
         &rs.url,
         &rs.token,
         "POST",
         &format!("/api/v1/shutdown?when={when_str}"),
         None,
     );
-    if api_ok.is_err() {
+    let api_accepted = matches!(api_res, Ok((code, _)) if code < 400);
+    if !api_accepted {
         // Fallback: signal Local\AudiophilePlayer.Shutdown event directly.
         if !signal_named_shutdown_event() {
             return Err(CliError::general(format!(
@@ -621,8 +685,10 @@ pub fn stop_running_instance(after_track: bool, timeout: Duration) -> Result<Jso
         }
     }
 
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
+    let idle_grace = Duration::from_secs(30);
+    let mut idle_deadline = Instant::now() + idle_grace;
+    let mut last_poll = Instant::now() - Duration::from_secs(1);
+    loop {
         if !is_pid_alive(rs.pid) {
             return Ok(JsonValue::obj(vec![
                 ("schema", JsonValue::from("ap.stop/1")),
@@ -632,24 +698,40 @@ pub fn stop_running_instance(after_track: bool, timeout: Duration) -> Result<Jso
                 ("exited", JsonValue::from(true)),
             ]));
         }
+        if after_track && api_accepted && last_poll.elapsed() >= Duration::from_millis(500) {
+            last_poll = Instant::now();
+            if let Ok((200, status)) =
+                api_v1_request(&rs.url, &rs.token, "GET", "/api/v1/status", None)
+            {
+                let still_playing = status
+                    .get("is_playing")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false);
+                let still_pending = status
+                    .get("restart_pending")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false);
+                if still_playing && still_pending {
+                    idle_deadline = Instant::now() + idle_grace;
+                }
+            }
+        }
+        if Instant::now() >= idle_deadline {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(100));
     }
 
     // Never silently force-kill! Report clearly to caller/agent.
     Err(CliError::general(format!(
-        "PID {} did not exit within {} s (when={when_str}); refusing to force-kill silently",
+        "PID {} did not exit within {} s after becoming idle (when={when_str}); refusing to force-kill silently",
         rs.pid,
-        timeout.as_secs()
+        idle_grace.as_secs()
     )))
 }
 
 pub fn run_stop_cli(after_track: bool, as_json: bool) -> Result<(), CliError> {
-    let wait_budget = if after_track {
-        Duration::from_secs(600)
-    } else {
-        Duration::from_secs(30)
-    };
-    let res = stop_running_instance(after_track, wait_budget)?;
+    let res = stop_running_instance(after_track)?;
     if as_json {
         println!("{}", res.to_pretty_string());
     } else {
@@ -709,25 +791,28 @@ pub fn spawn_detached_player(args: &[String], ready_timeout: Duration) -> Result
     )))
 }
 
-/// Merge new CLI flags onto a previous argv slice (replacing conflicting flags cleanly).
+/// Merge new CLI flags onto a previous argv slice (replacing conflicting flags and applying
+/// spec-driven negations cleanly, plus optional `clear_flags` for undoing negative flags on
+/// restart — Review #9 Q7).
 pub fn merge_play_argv(prev_argv: &[String], new_flags: &[String]) -> Vec<String> {
-    // Strip flags in `prev_argv` that are explicitly overridden by `new_flags` (or negated pair).
-    let mut override_names: Vec<String> = Vec::new();
+    merge_play_argv_with_clears(prev_argv, new_flags, &[])
+}
+
+pub fn merge_play_argv_with_clears(
+    prev_argv: &[String],
+    new_flags: &[String],
+    clear_flags: &[String],
+) -> Vec<String> {
+    // Strip flags in `prev_argv` that are explicitly overridden by `new_flags`, negated via
+    // `cli_spec::negated_options`, or explicitly cleared via `clear_flags`.
+    let mut override_names: Vec<String> = clear_flags.to_vec();
     let mut i = 0usize;
     while i < new_flags.len() {
         let tok = &new_flags[i];
         if tok.starts_with("--") {
             override_names.push(tok.clone());
-            // Mutual exclusion pairs
-            match tok.as_str() {
-                "--ultimate" => override_names.push("--no-ultimate".to_string()),
-                "--no-ultimate" => override_names.push("--ultimate".to_string()),
-                "--no-conv" => {
-                    override_names.push("--conv-dir".to_string());
-                    override_names.push("--conv-file".to_string());
-                }
-                "--conv-dir" | "--conv-file" => override_names.push("--no-conv".to_string()),
-                _ => {}
+            for &neg in crate::cli_spec::negated_options(tok) {
+                override_names.push(neg.to_string());
             }
             if crate::cli_spec::find_option(tok)
                 .is_some_and(|o| o.value != crate::cli_spec::ValueKind::Flag)
@@ -765,7 +850,23 @@ pub fn restart_running_instance(
     new_flags: &[String],
     after_track: bool,
 ) -> Result<JsonValue, CliError> {
+    restart_running_instance_with_clears(new_flags, &[], after_track)
+}
+
+pub fn restart_running_instance_with_clears(
+    new_flags: &[String],
+    clear_flags: &[String],
+    after_track: bool,
+) -> Result<JsonValue, CliError> {
     let (old_rs, old_status) = query_running_status()?;
+
+    // Review #9 Q1: compute AND validate the merged playback argv BEFORE stopping the running
+    // player so invalid options (`--version`, `scan`, `--idle`, `--dac-bits 17`, bad config)
+    // NEVER leave the player stopped!
+    let merged_argv = merge_play_argv_with_clears(&old_rs.argv, new_flags, clear_flags);
+    crate::cli_args::validate_play_argv(&merged_argv)
+        .map_err(|e| CliError::usage(e, "run `audiophile-player help restart`"))?;
+
     let was_playing = old_status
         .get("is_playing")
         .and_then(JsonValue::as_bool)
@@ -784,14 +885,8 @@ pub fn restart_running_instance(
         .cloned()
         .unwrap_or_else(|| JsonValue::Object(Vec::new()));
 
-    let wait_budget = if after_track {
-        Duration::from_secs(600)
-    } else {
-        Duration::from_secs(30)
-    };
-    let _ = stop_running_instance(after_track, wait_budget)?;
+    let _ = stop_running_instance(after_track)?;
 
-    let merged_argv = merge_play_argv(&old_rs.argv, new_flags);
     let new_rs = spawn_detached_player(&merged_argv, Duration::from_secs(15))?;
 
     let mut resumed = false;
@@ -886,7 +981,7 @@ mod tests {
 
     #[test]
     fn run_state_roundtrips_json_and_token_is_64_hex() {
-        let tok = generate_api_token_hex();
+        let tok = generate_api_token_hex().unwrap();
         assert_eq!(tok.len(), 64);
         assert!(tok.bytes().all(|b| b.is_ascii_hexdigit()));
 
@@ -903,5 +998,61 @@ mod tests {
         assert_eq!(reparsed.pid, 12345);
         assert_eq!(reparsed.token, tok);
         assert_eq!(reparsed.argv, vec!["--ultimate"]);
+    }
+
+    #[test]
+    fn review9_q1_q6_q7_restart_validation_and_negative_flag_undo() {
+        // Q1: non-play modes and invalid dac_bits MUST be rejected before stopping the player!
+        for bad in &[
+            vec!["--version".to_string()],
+            vec!["help".to_string()],
+            vec!["scan".to_string()],
+            vec!["--idle".to_string()],
+            vec!["--dac-bits".to_string(), "17".to_string()],
+        ] {
+            assert!(
+                crate::cli_args::validate_play_argv(bad).is_err(),
+                "Q1: expected validate_play_argv to reject {bad:?}"
+            );
+        }
+        // Valid play argv passes (including `restart -- --ultimate`).
+        assert!(crate::cli_args::validate_play_argv(&[
+            "--ultimate".to_string(),
+            "--dac-bits".to_string(),
+            "20".to_string(),
+        ])
+        .is_ok());
+
+        // Q6: `restart -- --ultimate` parses cleanly and rejects unknown --when.
+        let parsed = crate::cli_args::parse_args([
+            "audiophile-player",
+            "restart",
+            "--when",
+            "now",
+            "--",
+            "--ultimate",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed,
+            crate::cli_args::RunMode::Restart {
+                after_track: false,
+                ..
+            }
+        ));
+        assert!(crate::cli_args::parse_when("later").is_err());
+
+        // Q7: clear_flags undoes `--no-upnp` / `--no-capture` cleanly across restarts!
+        let prev = vec![
+            "--no-upnp".to_string(),
+            "--no-capture".to_string(),
+            "--ultimate".to_string(),
+        ];
+        let merged = merge_play_argv_with_clears(
+            &prev,
+            &[],
+            &["--no-upnp".to_string(), "--no-capture".to_string()],
+        );
+        assert_eq!(merged, vec!["--ultimate"]);
     }
 }

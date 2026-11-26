@@ -18,7 +18,7 @@ This file is the authoritative runbook for AI assistants helping a user install,
    ```
    Or if starting without a local clone:
    ```powershell
-   irm https://github.com/androxylo/audiophile_player/releases/latest/download/bootstrap.ps1 | iex
+   $s = Join-Path $env:TEMP 'audiophile-player-bootstrap.ps1'; irm https://github.com/androxylo/audiophile_player/releases/latest/download/bootstrap.ps1 -OutFile $s; powershell -ExecutionPolicy Bypass -File $s -NonInteractive
    ```
 2. **Opt-in fast path — verified pre-built binary** (no compiler toolchain needed):
    ```powershell

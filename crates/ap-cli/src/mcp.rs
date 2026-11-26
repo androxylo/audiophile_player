@@ -36,7 +36,7 @@ use crate::diag::{config_set_value, config_show_json, devices_report_json, docto
 use crate::exit_codes::CliError;
 use crate::filters_cmd;
 use crate::lifecycle::{
-    api_v1_request, mcp_audit_log_path, query_running_status, restart_running_instance,
+    api_v1_request, mcp_audit_log_path, query_running_status,
     spawn_detached_player, stop_running_instance,
 };
 
@@ -247,16 +247,14 @@ impl McpServer {
                     .get("when")
                     .and_then(JsonValue::as_str)
                     .unwrap_or("now");
-                let after_track = matches!(
-                    when.trim().to_ascii_lowercase().as_str(),
-                    "after_track" | "after-track"
-                );
-                let timeout = if after_track {
-                    Duration::from_secs(600)
+                let after_track = crate::cli_args::parse_when(when)?;
+                if after_track {
+                    // Review #9 Q5: do not block the single-threaded MCP loop for 10+ minutes on
+                    // long tracks; schedule deferred shutdown and return immediately if still playing.
+                    crate::lifecycle::request_deferred_stop().map_err(|e| e.message)
                 } else {
-                    Duration::from_secs(30)
-                };
-                stop_running_instance(after_track, timeout).map_err(|e| e.message)
+                    stop_running_instance(false).map_err(|e| e.message)
+                }
             }
             "player_restart" => {
                 self.audit(name, args);
@@ -264,13 +262,18 @@ impl McpServer {
                     .get("when")
                     .and_then(JsonValue::as_str)
                     .unwrap_or("after_track");
-                let after_track = !when.trim().eq_ignore_ascii_case("now");
+                let after_track = crate::cli_args::parse_when(when)?;
                 let changes = args
                     .get("changes")
                     .cloned()
                     .unwrap_or_else(|| JsonValue::Object(Vec::new()));
-                let flags = options_json_to_argv(&changes)?;
-                restart_running_instance(&flags, after_track).map_err(|e| e.message)
+                let (flags, clear_flags) = options_json_to_argv_with_clears(&changes)?;
+                crate::lifecycle::restart_running_instance_with_clears(
+                    &flags,
+                    &clear_flags,
+                    after_track,
+                )
+                .map_err(|e| e.message)
             }
             "play" => {
                 self.audit(name, args);
@@ -595,10 +598,21 @@ impl McpServer {
 
 /// Convert a validated JSON options object (keys matching `cli_spec.rs` play options) into argv flags.
 pub fn options_json_to_argv(obj: &JsonValue) -> Result<Vec<String>, String> {
+    options_json_to_argv_with_clears(obj).map(|(flags, _)| flags)
+}
+
+/// Convert a validated JSON options object into `(add_flags, clear_flags)` so `false` booleans on
+/// negative flags (`--no-upnp`, `--no-capture`, `--no-conv`, etc.) cleanly undo them on restart
+/// (Review #9 Q1 + Q7), and run full `validate_play_argv` so parser constraints (e.g. `--dac-bits`
+/// in `{16, 18, 20, 24}`) are enforced upfront.
+pub fn options_json_to_argv_with_clears(
+    obj: &JsonValue,
+) -> Result<(Vec<String>, Vec<String>), String> {
     let Some(entries) = obj.as_object() else {
         return Err("options must be a JSON object".to_string());
     };
     let mut argv = Vec::new();
+    let mut clear_flags = Vec::new();
     for (raw_key, val) in entries {
         let flag_name = format!("--{}", raw_key.trim().replace('_', "-"));
         let Some(spec) = find_option(&flag_name) else {
@@ -607,7 +621,10 @@ pub fn options_json_to_argv(obj: &JsonValue) -> Result<Vec<String>, String> {
         if !spec.scope.contains(&cli_spec::Cmd::Play)
             || matches!(spec.name, "--help" | "--version" | "--json" | "--idle")
         {
-            return Err(format!("option '{}' is not allowed for player start/restart", spec.name));
+            return Err(format!(
+                "option '{}' is not allowed for player start/restart",
+                spec.name
+            ));
         }
         match spec.value {
             ValueKind::Flag => {
@@ -616,8 +633,12 @@ pub fn options_json_to_argv(obj: &JsonValue) -> Result<Vec<String>, String> {
                     .ok_or_else(|| format!("option '{raw_key}' expects a boolean"))?;
                 if b {
                     argv.push(spec.name.to_string());
-                } else if spec.name == "--ultimate" {
-                    argv.push("--no-ultimate".to_string());
+                } else {
+                    // Undo this flag from previous argv (and emit its inverse if one exists).
+                    clear_flags.push(spec.name.to_string());
+                    if spec.name == "--ultimate" {
+                        argv.push("--no-ultimate".to_string());
+                    }
                 }
             }
             ValueKind::Str(_) | ValueKind::Path(_) => {
@@ -654,7 +675,10 @@ pub fn options_json_to_argv(obj: &JsonValue) -> Result<Vec<String>, String> {
             }
         }
     }
-    Ok(argv)
+    if !argv.is_empty() {
+        crate::cli_args::validate_play_argv(&argv)?;
+    }
+    Ok((argv, clear_flags))
 }
 
 fn jsonrpc_ok(id: JsonValue, result: JsonValue) -> JsonValue {
@@ -1199,5 +1223,18 @@ mod tests {
             options_json_to_argv(&JsonValue::obj(vec![("bogus_flag", JsonValue::from(true))]))
                 .is_err()
         );
+        // Review #9 Q1: invalid dac_bits (17) must be caught upfront by validate_play_argv!
+        assert!(
+            options_json_to_argv(&JsonValue::obj(vec![("dac_bits", JsonValue::from(17_i64))]))
+                .is_err()
+        );
+        // Review #9 Q7: false on negative flag emits clear_flags so restart can undo it.
+        let (add_f, clear_f) = options_json_to_argv_with_clears(&JsonValue::obj(vec![
+            ("no_upnp", JsonValue::from(false)),
+            ("no_capture", JsonValue::from(false)),
+        ]))
+        .unwrap();
+        assert!(add_f.is_empty());
+        assert_eq!(clear_f, vec!["--no-upnp", "--no-capture"]);
     }
 }

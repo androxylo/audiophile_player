@@ -26,7 +26,11 @@ use cli_args::{HelpMode, RunMode, help_text, parse_args, version_text};
 use exit_codes::CliError;
 
 fn main() -> ExitCode {
-    let raw_argv: Vec<String> = std::env::args().skip(1).collect();
+    // Review #9 Q13: use `args_os()` so non-Unicode OS arguments never panic before `parse_args`.
+    let raw_argv: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|s| s.to_string_lossy().into_owned())
+        .collect();
     let mode = match parse_args(std::env::args_os()) {
         Ok(m) => m,
         Err(err) => {
@@ -97,7 +101,7 @@ fn main() -> ExitCode {
             return finish_cli(lifecycle::run_restart_cli(flags, after_track, as_json));
         }
         RunMode::Filters(cmd) => {
-            return finish_cli(filters_cmd::run_filters_cli(cmd).map_err(CliError::from));
+            return finish_cli(filters_cmd::run_filters_cli(cmd));
         }
         RunMode::Mcp => {
             return finish_cli(mcp::run_mcp_stdio());
