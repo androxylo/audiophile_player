@@ -12,6 +12,14 @@
 
 No GUI and no volume knob. There is no EQ beyond your REW filter, and no Windows mixer anywhere in the path. All the effort goes into the signal.
 
+> [!TIP]
+> **☕ Enjoying the music? Buy me a coffee!**
+> Audiophile Player is 100% free and open source — built out of pure obsession with clean sound. If it brings your DAC to life, consider supporting continued development:
+>
+> [![Buy Me a Coffee — GitHub Sponsors](https://img.shields.io/badge/%E2%98%95_Buy_Me_a_Coffee-Sponsor_%40androxylo-ea4aaa?style=for-the-badge&logo=githubsponsors&logoColor=white)](https://github.com/sponsors/androxylo)
+>
+> 👉 **[https://github.com/sponsors/androxylo](https://github.com/sponsors/androxylo)**
+
 ---
 
 ## The signal path
