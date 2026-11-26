@@ -77,7 +77,6 @@ pub struct UltimateCliOverride {
     pub genre_rules: Option<bool>,
     pub learn_on_play: Option<bool>,
     pub trackdb_dir: Option<PathBuf>,
-    pub trackdb_sidecar: Option<bool>,
     pub filter_mode: Option<FilterMode>,
     pub filterdb_dir: Option<PathBuf>,
     pub choices_file: Option<PathBuf>,
@@ -158,7 +157,6 @@ pub enum RunMode {
     Scan {
         folder: Option<PathBuf>,
         report: bool,
-        sidecar: bool,
         post_chain: bool,
         force: bool,
         jobs: Option<usize>,
@@ -470,9 +468,6 @@ where
                     .ok_or_else(|| "--trackdb-dir requires a directory path".to_string())?;
                 ultimate_override.trackdb_dir = Some(PathBuf::from(val));
             }
-            "--trackdb-sidecar" => {
-                ultimate_override.trackdb_sidecar = Some(true);
-            }
             "--filters" => {
                 let val = iter
                     .next()
@@ -557,7 +552,6 @@ where
 {
     let mut folder: Option<PathBuf> = None;
     let mut report = false;
-    let mut sidecar = false;
     let mut post_chain = false;
     let mut force = false;
     let mut jobs: Option<usize> = None;
@@ -583,7 +577,6 @@ where
             "-h" | "--help" => return Ok(RunMode::Help(HelpMode::Detail("scan".to_string()))),
             "-V" | "--version" => return Ok(RunMode::Version { as_json: false }),
             "--report" => report = true,
-            "--sidecar" => sidecar = true,
             "--post-chain" => post_chain = true,
             "--force" => force = true,
             "--jobs" | "-j" => {
@@ -669,7 +662,6 @@ where
     Ok(RunMode::Scan {
         folder,
         report,
-        sidecar,
         post_chain,
         force,
         jobs,
@@ -1240,7 +1232,6 @@ mod tests {
             "--no-genre-rules",
             "--trackdb-dir",
             r"C:\TrackDb",
-            "--trackdb-sidecar",
             "--opt",
             "extreme",
         ])
@@ -1280,7 +1271,6 @@ mod tests {
                     genre_rules: Some(false),
                     learn_on_play: None,
                     trackdb_dir: Some(PathBuf::from(r"C:\TrackDb")),
-                    trackdb_sidecar: Some(true),
                     filter_mode: None,
                     filterdb_dir: None,
                     choices_file: None,
@@ -1377,7 +1367,6 @@ mod tests {
             "scan",
             r"D:\Music",
             "--report",
-            "--sidecar",
             "--post-chain",
             "--force",
             "--jobs",
@@ -1394,7 +1383,6 @@ mod tests {
             RunMode::Scan {
                 folder: Some(PathBuf::from(r"D:\Music")),
                 report: true,
-                sidecar: true,
                 post_chain: true,
                 force: true,
                 jobs: Some(6),

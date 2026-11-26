@@ -155,7 +155,6 @@ fn main() -> ExitCode {
                 RunMode::Scan {
                     folder,
                     report,
-                    sidecar,
                     post_chain,
                     force,
                     jobs,
@@ -169,7 +168,6 @@ fn main() -> ExitCode {
                     scanner::ScanOptions {
                         folder,
                         report,
-                        sidecar,
                         post_chain,
                         force,
                         jobs,

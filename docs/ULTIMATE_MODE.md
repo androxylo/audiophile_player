@@ -214,7 +214,7 @@ tracks:
 - Whenever a user choice overrides the machine suggestion, both the console and the HTTP UI display them side by side:
   `playing: gauss-long-lp (mine: folder) | suggested: sinc-steep-4m (rule_G_classical)`.
 
-Manage overrides and inspect suggestions from the CLI (`audiophile-player filters show | diff | set | check | relink | migrate`) — see [Getting Started → Filter Database](GETTING_STARTED.md#filter-database).
+Manage overrides and inspect suggestions from the CLI (`audiophile-player filters show | diff | set | check | relink | migrate`) — see [Getting Started → Filter Database](GETTING_STARTED.md#filter-database). If you are upgrading from an earlier release that stored per-track YAML files in `%APPDATA%\audiophile-player\trackdb\`, run `audiophile-player filters migrate` once to import them into Schema 2 (legacy Schema-1 files are migration-only and are no longer read at runtime).
 
 ---
 

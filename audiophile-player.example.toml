@@ -101,9 +101,6 @@
 # classical = 'E:\Classical'
 
 [trackdb]
-# Legacy Schema-1 YAML Track Database (kept for read-only fallback and opt-in --trackdb-sidecar).
-# Run `audiophile-player filters migrate` to import existing Schema-1 entries into Schema 2.
+# Legacy Schema-1 YAML Track Database directory (migrate-only; read by `audiophile-player filters migrate`).
 # Default central location: %APPDATA%\audiophile-player\trackdb
 # dir = 'C:\Users\you\AppData\Roaming\audiophile-player\trackdb'
-# Set `sidecar = true` to write `<track.flac>.ap.yaml` next to local FLAC files instead.
-# sidecar = false

@@ -16,11 +16,10 @@ use std::path::{Path, PathBuf};
 
 use ap_core::config::PlayerConfig;
 use ap_core::filter_db::{
-    AlbumAnalysisFile, AlbumTrackAnalysis, FilterDbStore, LibraryManifest, file_head_4k_hash,
-    split_root_key, why_for_rule,
+    AlbumAnalysisFile, AlbumTrackAnalysis, DbEnv, file_head_4k_hash, split_root_key, why_for_rule,
 };
 use ap_core::metadata::TrackMetadata;
-use ap_core::track_db::{TrackDbEntry, TrackDbStore, now_unix_secs};
+use ap_core::track_db::{TrackDbEntry, now_unix_secs};
 use ap_core::user_filters::{
     UserFiltersFile, apply_relink_preserving_comments, format_root_rel_key, is_known_filter_name,
     upsert_entry_preserving_comments, write_user_filters_with_backup,
@@ -31,12 +30,7 @@ use ap_source::library::{default_user_music_dir, discover_flac_files};
 
 use crate::cli_args::FiltersCommand;
 
-struct FiltersEnv {
-    filter_db: FilterDbStore,
-    choices_path: PathBuf,
-    manifest: LibraryManifest,
-    legacy_trackdb_dir: PathBuf,
-}
+type FiltersEnv = DbEnv;
 
 fn load_env(
     config_path: Option<&Path>,
@@ -45,40 +39,15 @@ fn load_env(
     trackdb_dir: Option<&Path>,
 ) -> Result<FiltersEnv, String> {
     let loaded = PlayerConfig::discover_and_load(config_path)?;
-    let fdb_dir = filterdb_dir
-        .map(Path::to_path_buf)
-        .or_else(|| loaded.config.filters.dir.clone())
-        .unwrap_or_else(FilterDbStore::default_dir);
-    let c_path = choices_file
-        .map(Path::to_path_buf)
-        .or_else(|| loaded.config.filters.choices_file.clone())
-        .unwrap_or_else(FilterDbStore::default_choices_path);
-    let legacy_dir = trackdb_dir
-        .map(Path::to_path_buf)
-        .or_else(|| loaded.config.trackdb.dir.clone())
-        .unwrap_or_else(TrackDbStore::default_central_dir);
-
-    let filter_db = FilterDbStore::new(fdb_dir);
-    let mut manifest = filter_db
-        .load_manifest()
-        .unwrap_or_else(|| LibraryManifest::new(DETECTOR_VERSION));
-    for (name, path) in &loaded.config.filters.roots {
-        manifest.upsert_root(name, path);
-    }
-    if manifest.roots.is_empty() {
-        if let Some(def_music) = default_user_music_dir() {
-            if def_music.is_dir() {
-                manifest.upsert_root("main", &def_music);
-            }
-        }
-    }
-
-    Ok(FiltersEnv {
-        filter_db,
-        choices_path: c_path,
-        manifest,
-        legacy_trackdb_dir: legacy_dir,
-    })
+    let default_music = default_user_music_dir().filter(|p| p.is_dir());
+    Ok(DbEnv::resolve(
+        &loaded.config,
+        filterdb_dir,
+        choices_file,
+        trackdb_dir,
+        default_music.as_deref(),
+        DETECTOR_VERSION,
+    ))
 }
 
 fn load_user_filters_if_present(path: &Path) -> Result<Option<UserFiltersFile>, String> {
@@ -322,9 +291,10 @@ fn cmd_show(env: &FiltersEnv, target: &Path) -> Result<String, String> {
                     "  playing (mine): {f} ({}) [{detail}]\n",
                     prov.short_label()
                 ));
-            } else if let Some((p, ref detail)) = ov.phase {
+            } else if let Some((p, prov, ref detail)) = ov.phase {
                 out.push_str(&format!(
-                    "  playing (mine): phase={p:?} [{detail}]\n"
+                    "  playing (mine): phase={p:?} ({}) [{detail}]\n",
+                    prov.short_label()
                 ));
             } else {
                 out.push_str(&format!(
@@ -372,7 +342,7 @@ fn cmd_diff(env: &FiltersEnv) -> Result<String, String> {
                     }
                 } else if ov.phase.is_some() || ov.apodizing.is_some() || ov.deemphasis.is_some() {
                     let mut attrs = Vec::new();
-                    if let Some((p, _)) = ov.phase {
+                    if let Some((p, _, _)) = ov.phase {
                         attrs.push(format!("phase={p:?}"));
                     }
                     if let Some((a, _)) = ov.apodizing {
@@ -805,10 +775,6 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use ap_core::config::ConvolutionConfig;
-    use ap_core::track_db::{
-        TRACK_DB_SCHEMA_VERSION, TrackDbDecision, TrackDbFileInfo, TrackDbResults, TrackDbScanInfo,
-        TrackDbUserOverrides,
-    };
     use ap_dsp::selector::UpsamplerPolicy;
     use flac_codec::encode::{FlacSampleWriter, Options};
 
@@ -870,7 +836,6 @@ mod tests {
         let opts = ScanOptions {
             folder: Some(music_dir.clone()),
             report: false,
-            sidecar: false,
             post_chain: false,
             force: false,
             jobs: Some(1),
@@ -934,35 +899,54 @@ mod tests {
         // 8. `filters migrate` imports legacy Schema-1 trackdb entries + user overrides non-destructively.
         let leg_track = album2_dir.join("09_legacy.flac");
         write_flac(&leg_track, 44_100, 44_100, 0.3);
-        let legacy_store = TrackDbStore::new(legacy_dir.clone(), false);
-        let leg_entry = TrackDbEntry {
-            schema: TRACK_DB_SCHEMA_VERSION,
-            file: TrackDbFileInfo {
-                path: leg_track.to_string_lossy().into_owned(),
-                size: 1000,
-                mtime_unix_s: 1234,
-                streaminfo_md5: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
-                sample_rate: 44_100,
-                bits: 16,
-            },
-            scan: TrackDbScanInfo {
-                detector_version: DETECTOR_VERSION,
-                scanned_at_unix_s: 1234,
-                duration_s: 120.0,
-            },
-            results: TrackDbResults::default(),
-            decision: TrackDbDecision {
-                filter: "sinc-steep-4m".to_string(),
-                rule: "rule_G_classical".to_string(),
-            },
-            user: TrackDbUserOverrides {
-                filter: Some("gauss-long-lp".to_string()),
-                deemphasis: None,
-                apodizing: None,
-                note: "legacy note".to_string(),
-            },
-        };
-        let saved_legacy = legacy_store.save_preserving_user(Some(&leg_track), leg_entry).unwrap();
+        let legacy_path_dir = legacy_dir.join("path").join("00");
+        fs::create_dir_all(&legacy_path_dir).unwrap();
+        let saved_legacy = legacy_path_dir.join("09_legacy.yaml");
+        let escaped_path = leg_track.to_string_lossy().replace('\\', "\\\\");
+        fs::write(
+            &saved_legacy,
+            format!(
+                "\
+schema: 1
+file:
+  path: \"{escaped_path}\"
+  size: 1000
+  mtime_unix_s: 1234
+  streaminfo_md5: \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"
+  sample_rate: 44100
+  bits: 16
+scan:
+  detector_version: {DETECTOR_VERSION}
+  scanned_at_unix_s: 1234
+  duration_s: 120.000
+results:
+  effective_bandwidth_hz: 21000
+  upsampled_from_1x: \"negative\"
+  effective_nyquist_hz: null
+  ultrasonic_noise_detected: \"negative\"
+  lossy_origin_suspected: false
+  apod_events: 0
+  apodizing_needed: \"negative\"
+  integrated_lufs: -14.0
+  sample_peak: 0.5
+  true_peak_dbtp: -6.0
+  clipped_runs: 0
+  loud_and_clipped: \"negative\"
+  effective_bits: 16
+  deemphasis_flag: false
+  post_chain_peaks: []
+decision:
+  filter: \"sinc-steep-4m\"
+  rule: \"rule_G_classical\"
+user:
+  filter: \"gauss-long-lp\"
+  deemphasis: true
+  apodizing: false
+  note: \"legacy note\"
+"
+            ),
+        )
+        .unwrap();
         assert!(saved_legacy.is_file());
 
         let mut env_mut = load_env(None, Some(&filterdb_dir), Some(&choices_path), Some(&legacy_dir)).unwrap();
@@ -971,11 +955,18 @@ mod tests {
         assert!(mig_out.contains("user choices migrated to my-filters.yaml: 1"));
         // Legacy file untouched!
         assert!(saved_legacy.is_file());
-        // Schema-2 album & my-filters.yaml updated!
+        // Schema-2 album & my-filters.yaml updated (including U3 apodizing & deemphasis)!
         let alb2 = env_mut.filter_db.load_album("main", "Jazz/Album2").unwrap();
         assert!(alb2.tracks.contains_key("09_legacy.flac"));
         let uf_after = UserFiltersFile::from_yaml_str(&fs::read_to_string(&choices_path).unwrap()).unwrap();
-        assert!(uf_after.tracks.values().any(|(k, e)| k == "main:Jazz/Album2/09_legacy.flac" && e.filter.as_deref() == Some("gauss-long-lp")));
+        let (_, mig_entry) = uf_after
+            .tracks
+            .values()
+            .find(|(k, _)| k == "main:Jazz/Album2/09_legacy.flac")
+            .expect("migrated track in my-filters.yaml");
+        assert_eq!(mig_entry.filter.as_deref(), Some("gauss-long-lp"));
+        assert_eq!(mig_entry.deemphasis, Some(true));
+        assert_eq!(mig_entry.apodizing, Some(false));
 
         let _ = fs::remove_dir_all(&root);
     }

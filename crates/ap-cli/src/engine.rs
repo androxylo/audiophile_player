@@ -28,12 +28,11 @@ use ap_core::buffer::DEFAULT_SOURCE_BLOCK_FRAMES;
 use std::str::FromStr;
 
 use ap_core::config::{
-    ConvolutionConfig, PlayerConfig, QuantizerConfig, TrackDbConfig, UltimateConfig,
+    ConvolutionConfig, PlayerConfig, QuantizerConfig, UltimateConfig,
 };
-use ap_core::filter_db::{FilterDbStore, LibraryManifest};
 use ap_core::format::DacWireFormat;
 use ap_core::json::JsonValue;
-use ap_core::track_db::{TrackDbStore, now_unix_secs};
+use ap_core::track_db::now_unix_secs;
 use ap_dsp::pipeline::{AudioPipeline, GaplessAttachOutcome, GaplessCarryover};
 use ap_dsp::selector::{
     FilterArchetype, NoiseShaperProfile, UNSUPPORTED_SAMPLE_RATE_PREFIX, UpsamplerPolicy,
@@ -957,7 +956,7 @@ pub fn run_random_music_player(
 
     let loaded_cfg = PlayerConfig::discover_and_load(config_path.as_deref())
         .map_err(CliError::config)?;
-    let effective_conv = rew_override.unwrap_or(loaded_cfg.config.convolution);
+    let effective_conv = rew_override.unwrap_or_else(|| loaded_cfg.config.convolution.clone());
     effective_conv.validate_paths().map_err(CliError::config)?;
 
     // Merge `[player]` saved defaults with explicit CLI flags (CLI always wins).
@@ -982,7 +981,7 @@ pub fn run_random_music_player(
     )
     .map_err(CliError::config)?;
 
-    let device_filter = device_filter.or(loaded_cfg.config.player.device);
+    let device_filter = device_filter.or_else(|| loaded_cfg.config.player.device.clone());
     let effective_max_rate = max_rate_override.or(loaded_cfg.config.player.max_rate);
     let http_port = http_port.or(loaded_cfg.config.player.port);
     let (optimization, optimization_explicit) = if !optimization_explicit {
@@ -1011,15 +1010,7 @@ pub fn run_random_music_player(
             .learn_on_play
             .unwrap_or(loaded_cfg.config.ultimate.learn_on_play),
     };
-    let effective_trackdb = TrackDbConfig {
-        dir: ultimate_override
-            .trackdb_dir
-            .or(loaded_cfg.config.trackdb.dir),
-        sidecar: ultimate_override
-            .trackdb_sidecar
-            .unwrap_or(loaded_cfg.config.trackdb.sidecar),
-    };
-    let music_dir = match music_dir_override.or(loaded_cfg.config.player.music_dir) {
+    let music_dir = match music_dir_override.or(loaded_cfg.config.player.music_dir.clone()) {
         Some(dir) => dir,
         None => default_user_music_dir()
             .ok_or_else(|| CliError::config("could not resolve default ~/Music directory"))?,
@@ -1037,39 +1028,25 @@ pub fn run_random_music_player(
         optimization
     };
     let ultimate_ctx = if effective_ultimate.enabled {
-        let db_root = effective_trackdb
-            .dir
-            .clone()
-            .unwrap_or_else(TrackDbStore::default_central_dir);
-        let filterdb_dir = ultimate_override
-            .filterdb_dir
-            .clone()
-            .or_else(|| loaded_cfg.config.filters.dir.clone())
-            .unwrap_or_else(FilterDbStore::default_dir);
-        let choices_path = ultimate_override
-            .choices_file
-            .clone()
-            .or_else(|| loaded_cfg.config.filters.choices_file.clone())
-            .unwrap_or_else(FilterDbStore::default_choices_path);
+        let mut db_env = ap_core::filter_db::DbEnv::resolve(
+            &loaded_cfg.config,
+            ultimate_override.filterdb_dir.as_deref(),
+            ultimate_override.choices_file.as_deref(),
+            ultimate_override.trackdb_dir.as_deref(),
+            Some(&music_dir),
+            ap_dsp::analysis::DETECTOR_VERSION,
+        );
+        if db_env.manifest.resolve_folder_path(&music_dir).is_none() {
+            db_env.manifest.upsert_root("main", &music_dir);
+        }
         let filter_mode = ultimate_override
             .filter_mode
             .unwrap_or(loaded_cfg.config.filters.mode);
-        let filter_db = FilterDbStore::new(filterdb_dir);
-        let mut manifest = filter_db
-            .load_manifest()
-            .unwrap_or_else(|| LibraryManifest::new(ap_dsp::analysis::DETECTOR_VERSION));
-        for (name, path) in &loaded_cfg.config.filters.roots {
-            manifest.upsert_root(name, path);
-        }
-        if manifest.resolve_folder_path(&music_dir).is_none() {
-            manifest.upsert_root("main", &music_dir);
-        }
         Some(UltimateRuntimeContext::new(
             effective_ultimate,
-            TrackDbStore::new(db_root, effective_trackdb.sidecar),
-            filter_db,
-            manifest,
-            choices_path,
+            db_env.filter_db,
+            db_env.manifest,
+            db_env.choices_path,
             filter_mode,
         ))
     } else {
@@ -6055,7 +6032,6 @@ mod tests {
         use ap_core::format::StreamSpec;
         use ap_core::headroom::TrackPeakMetadata;
         use ap_core::metadata::TrackMetadata;
-        use ap_core::track_db::TrackDbStore;
         use ap_dsp::convolution::ConvolutionTail;
         use ap_dsp::pipeline::GaplessCarryover;
         use ap_dsp::selector::{FilterArchetype, NoiseShaperProfile, UpsamplerPolicy};
@@ -6120,13 +6096,13 @@ mod tests {
             true,
         )
         .unwrap();
-        let ult = UltimateRuntimeContext::from_legacy(
+        let ult = UltimateRuntimeContext::for_test(
             UltimateConfig {
                 enabled: true,
                 genre_rules: true,
                 learn_on_play: false,
             },
-            TrackDbStore::new(root.clone(), false),
+            root.clone(),
         );
         let buf = BoundedBlockStreamBuffer::new(384_000 * 10);
         let ep = buf.current_epoch();
@@ -6311,13 +6287,13 @@ mod tests {
                 }),
             );
             let q_shared = SharedControl::new(qdir.clone(), "Mock DAC".to_string());
-            let q_ult = UltimateRuntimeContext::from_legacy(
+            let q_ult = UltimateRuntimeContext::for_test(
                 UltimateConfig {
                     enabled: true,
                     genre_rules: false,
                     learn_on_play: false,
                 },
-                TrackDbStore::new(root.join("c5_db"), false),
+                root.join("c5_db"),
             );
 
             let target_b2 = qdir.join("02_track_b.flac").to_string_lossy().into_owned();

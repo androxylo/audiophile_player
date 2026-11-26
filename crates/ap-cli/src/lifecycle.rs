@@ -794,6 +794,7 @@ pub fn spawn_detached_player(args: &[String], ready_timeout: Duration) -> Result
 /// Merge new CLI flags onto a previous argv slice (replacing conflicting flags and applying
 /// spec-driven negations cleanly, plus optional `clear_flags` for undoing negative flags on
 /// restart — Review #9 Q7).
+#[cfg(test)]
 pub fn merge_play_argv(prev_argv: &[String], new_flags: &[String]) -> Vec<String> {
     merge_play_argv_with_clears(prev_argv, new_flags, &[])
 }

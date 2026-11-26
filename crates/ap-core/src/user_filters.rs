@@ -22,12 +22,11 @@ use std::sync::Mutex;
 
 use crate::filter_db::{
     FILTER_DB_SCHEMA_VERSION, LibraryManifest, RelinkEntry, normalize_rel_path, split_root_key,
-    split_yaml_key_val,
 };
 use crate::metadata::{PhaseTagOverride, TrackMetadata};
-use crate::track_db::{
-    atomic_write_yaml, contains_unquoted_yaml_special, file_size_and_mtime, parse_yaml_string,
-    strip_yaml_comment, yaml_quote,
+use crate::yaml_lite::{
+    atomic_write_yaml, check_yaml_line_safety, file_size_and_mtime, parse_yaml_string,
+    split_yaml_key_val, strip_yaml_comment, yaml_quote,
 };
 
 /// Hard maximum size for `my-filters.yaml` (512 KiB — thousands of hand-written overrides).
@@ -163,7 +162,7 @@ impl UserFilterProvenance {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResolvedUserOverrides {
     pub filter: Option<(String, UserFilterProvenance, String)>,
-    pub phase: Option<(PhaseTagOverride, String)>,
+    pub phase: Option<(PhaseTagOverride, UserFilterProvenance, String)>,
     pub apodizing: Option<(bool, String)>,
     pub deemphasis: Option<(bool, String)>,
     pub warnings: Vec<String>,
@@ -248,17 +247,7 @@ impl UserFiltersFile {
             if trimmed.is_empty() {
                 continue;
             }
-            if raw_line.starts_with('\t') {
-                return Err(format!("my-filters.yaml line {line_no}: tabs are forbidden"));
-            }
-            if trimmed.starts_with('%')
-                || trimmed.starts_with("<<:")
-                || contains_unquoted_yaml_special(trimmed)
-            {
-                return Err(format!(
-                    "my-filters.yaml line {line_no}: unsafe YAML tags, anchors, aliases, or directives are forbidden"
-                ));
-            }
+            check_yaml_line_safety(raw_line, trimmed, line_no, "my-filters.yaml")?;
 
             let indent = raw_line.len() - raw_line.trim_start_matches(' ').len();
             let Some((k_raw, v_raw)) = split_yaml_key_val(trimmed) else {
@@ -405,7 +394,7 @@ impl UserFiltersFile {
             }
             if res.phase.is_none() {
                 if let Some(p) = entry.phase {
-                    res.phase = Some((p, format!("{label}: phase={p:?}")));
+                    res.phase = Some((p, prov, format!("{label}: phase={p:?}")));
                 }
             }
             if res.apodizing.is_none() {
@@ -470,7 +459,7 @@ impl UserFiltersFile {
         }
         if res.phase.is_none() {
             if let Some(p) = track_meta.ap_phase {
-                res.phase = Some((p, format!("AP_PHASE={p:?}")));
+                res.phase = Some((p, UserFilterProvenance::Tag, format!("AP_PHASE={p:?}")));
             }
         }
         if res.apodizing.is_none() {
@@ -1036,7 +1025,7 @@ tracks:
         );
         assert_eq!(r_track.apodizing.as_ref().map(|(a, _)| *a), Some(false));
         assert_eq!(
-            r_track.phase.as_ref().map(|(p, _)| *p),
+            r_track.phase.as_ref().map(|(p, _, _)| *p),
             Some(PhaseTagOverride::Minimum)
         );
 
@@ -1068,7 +1057,7 @@ tracks:
         );
         assert_eq!(r_attr_tag.apodizing.as_ref().map(|(a, _)| *a), Some(false));
         assert_eq!(
-            r_attr_tag.phase.as_ref().map(|(p, _)| *p),
+            r_attr_tag.phase.as_ref().map(|(p, _, _)| *p),
             Some(PhaseTagOverride::Minimum)
         );
 

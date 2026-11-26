@@ -161,7 +161,7 @@ impl CachedWholeTrackEvidence {
             self.user_filter_provenance = Some(prov);
             self.user_filter_detail = Some(detail.clone());
         }
-        if let Some((p, ref detail)) = overrides.phase {
+        if let Some((p, _prov, ref detail)) = overrides.phase {
             self.user_phase = Some(p);
             self.user_phase_detail = Some(detail.clone());
         }
@@ -746,7 +746,11 @@ mod tests {
             UserFilterProvenance::Folder,
             "my-filters.yaml folders:main:Jazz".to_string(),
         ));
-        ov.phase = Some((PhaseTagOverride::Intermediate, "my-filters.yaml phase=ip".to_string()));
+        ov.phase = Some((
+            PhaseTagOverride::Intermediate,
+            UserFilterProvenance::Track,
+            "my-filters.yaml phase=ip".to_string(),
+        ));
 
         // Mine mode applies folder override and user phase
         let wt_mine = CachedWholeTrackEvidence::default().with_user_overrides(&ov);

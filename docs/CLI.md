@@ -57,7 +57,6 @@
 | `--filterdb-dir DIR` | `filters.dir` | `%APPDATA%\audiophile-player\filterdb` | play, scan, filters, restart | restart | Override Schema-2 machine-managed filterdb directory |
 | `--choices-file PATH` | `filters.choices_file` | `%APPDATA%\audiophile-player\my-filters.yaml` | play, scan, filters, restart | next-track | Override user-owned my-filters.yaml path |
 | `--trackdb-dir PATH` | `trackdb.dir` | `%APPDATA%\audiophile-player\trackdb` | play, scan, filters, restart | restart | Override legacy Schema-1 YAML trackdb folder |
-| `--trackdb-sidecar` | `trackdb.sidecar` | `false` | play, restart | restart | Persist legacy <track.flac>.ap.yaml sidecars next to local files |
 
 ### Library Scanning & Filter Overrides
 
@@ -68,7 +67,6 @@
 | `--post-chain` | — | `false` | scan | n/a | Also measure exact whole-track post-chain peak M during scan |
 | `--force` | — | `false` | scan | n/a | Re-analyse tracks even if already current in filterdb |
 | `-j, --jobs N` | — | `auto (up to 4)` | scan | n/a | Number of parallel folder workers for `scan` (1..=32) |
-| `--sidecar` | — | `false` | scan | n/a | Also write legacy <track.flac>.ap.yaml sidecars during `scan` |
 | `--note TEXT` | — | — | filters | n/a | Optional comment note attached by `filters set` |
 | `--apply` | — | `false` | filters | n/a | Apply pending moves in `filters relink` (creates .bak backup) |
 | `--sidecar-root DIR` | — | — | filters | n/a | Also import legacy *.ap.yaml sidecars under DIR during `filters migrate` |

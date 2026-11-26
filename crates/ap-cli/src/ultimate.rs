@@ -34,20 +34,18 @@ use ap_core::headroom::{
     HeadroomDecision, HeadroomMode, quantizer_margin_db, select_ultimate_headroom,
 };
 use ap_core::metadata::PhaseTagOverride;
-use ap_core::track_db::{TrackDbStore, file_size_and_mtime};
+use ap_core::track_db::file_size_and_mtime;
 use ap_core::user_filters::{
-    FilterMode, ResolvedUserOverrides, UserFilterProvenance, UserFiltersCache,
+    FilterMode, ResolvedUserOverrides, UserFiltersCache, UserFiltersFile,
 };
 use ap_dsp::analysis::{DETECTOR_VERSION, TrackAnalyzer};
 use ap_dsp::convolution::ConvolutionTail;
-use ap_dsp::fusion::{
-    CachedWholeTrackEvidence, EvidenceSource, build_track_db_entry, fuse_track_evidence,
-};
+use ap_dsp::fusion::{CachedWholeTrackEvidence, build_track_db_entry};
 use ap_dsp::pipeline::{AudioPipeline, GaplessCarryover, UltimateDecisionReport};
 use ap_dsp::selector::{
     FilterArchetype, NoiseShaperProfile, ULTIMATE_LOOKAHEAD_SECONDS, UpsamplerPicker,
     UpsamplerPolicy, build_post_chain_key, check_ultimate_throughput_with_buffer,
-    select_ultimate_plan,
+    resolve_active_selection, resolve_machine_suggestion,
 };
 use ap_source::flac::AudioBlockSource;
 use ap_source::md5::md5_to_hex;
@@ -59,8 +57,6 @@ use crate::prefetch::{BoundedBlockStreamBuffer, StreamEvent};
 #[derive(Debug, Clone)]
 pub struct UltimateRuntimeContext {
     pub config: UltimateConfig,
-    /// Legacy Schema-1 TrackDbStore (used for read-only fallback & opt-in `--trackdb-sidecar`).
-    pub store: TrackDbStore,
     /// Schema-2 album-folder mirror store (`%APPDATA%\audiophile-player\filterdb`).
     pub filter_db: FilterDbStore,
     /// Shared library manifest mapping named roots (`main`, `classical`, ...) to disk paths.
@@ -75,11 +71,9 @@ pub struct UltimateRuntimeContext {
 }
 
 impl UltimateRuntimeContext {
-    /// Production constructor wiring Schema-2 `FilterDbStore`, `LibraryManifest`, `UserFiltersCache`,
-    /// and legacy Schema-1 `TrackDbStore` fallback.
+    /// Production constructor wiring Schema-2 `FilterDbStore`, `LibraryManifest`, and `UserFiltersCache`.
     pub fn new(
         config: UltimateConfig,
-        store: TrackDbStore,
         filter_db: FilterDbStore,
         manifest: LibraryManifest,
         choices_path: std::path::PathBuf,
@@ -87,7 +81,6 @@ impl UltimateRuntimeContext {
     ) -> Self {
         Self {
             config,
-            store,
             filter_db,
             manifest: Arc::new(Mutex::new(manifest)),
             user_filters: Arc::new(UserFiltersCache::new(choices_path)),
@@ -96,15 +89,15 @@ impl UltimateRuntimeContext {
         }
     }
 
-    /// Backwards-compatible helper for legacy tests using only Schema-1 `TrackDbStore`.
+    /// Test helper creating an isolated Schema-2 context rooted at `base`.
     #[cfg(test)]
-    pub fn from_legacy(config: UltimateConfig, store: TrackDbStore) -> Self {
-        let base = store.root_dir().to_path_buf();
+    pub fn for_test(config: UltimateConfig, base: std::path::PathBuf) -> Self {
+        let mut manifest = LibraryManifest::new(DETECTOR_VERSION);
+        manifest.upsert_root("main", &base);
         Self::new(
             config,
-            store,
             FilterDbStore::new(base.join("_filterdb")),
-            LibraryManifest::default(),
+            manifest,
             base.join("_my-filters.yaml"),
             FilterMode::Auto,
         )
@@ -255,6 +248,671 @@ fn linear_to_dbfs(peak_linear: f64) -> f64 {
     }
 }
 
+/// Drain Track A's unconsumed carryover cleanly onto Track A before starting Track B
+/// when rates differ or when Track B fails before producing audio.
+fn flush_prev_on_incompatible(
+    pipeline: &AudioPipeline,
+    buf: &BoundedBlockStreamBuffer,
+    epoch: u64,
+    carry: &mut Option<GaplessCarryover>,
+    backup: &mut Option<GaplessCarryover>,
+    pending_end: &mut bool,
+) -> bool {
+    if let Some(tail) = carry.take() {
+        *backup = Some(tail.clone());
+        if let Ok(pcm) = pipeline.drain_gapless_carryover(tail) {
+            if !pcm.is_empty() && !buf.push_for_epoch(epoch, StreamEvent::PcmBlock(pcm)) {
+                *backup = None;
+                *pending_end = false;
+                return false;
+            }
+        }
+        *backup = None;
+    }
+    if *pending_end {
+        *pending_end = false;
+        if !buf.push_for_epoch(epoch, StreamEvent::TrackEnd) {
+            return false;
+        }
+    }
+    true
+}
+
+fn fail_flushing_prev(
+    pipeline: &AudioPipeline,
+    buf: &BoundedBlockStreamBuffer,
+    epoch: u64,
+    carry: &mut Option<GaplessCarryover>,
+    backup: &mut Option<GaplessCarryover>,
+    pending_end: &mut bool,
+    msg: String,
+) -> UltimateStreamResult {
+    if !flush_prev_on_incompatible(pipeline, buf, epoch, carry, backup, pending_end) {
+        UltimateStreamResult::Aborted
+    } else {
+        UltimateStreamResult::Failed(msg)
+    }
+}
+
+struct W0Window {
+    blocks: Vec<StereoF64Buffer>,
+    frames: u64,
+    hit_eof: bool,
+    analyzer: TrackAnalyzer,
+}
+
+enum W0Outcome {
+    Ready(W0Window),
+    Aborted,
+    Failed(String),
+}
+
+/// Phase W0: acquire strictly `<= 30 s` of source audio and feed `TrackAnalyzer`.
+fn acquire_w0_window<S, F>(
+    source: &mut S,
+    spec: ap_core::format::StreamSpec,
+    display_path: &Path,
+    buf: &BoundedBlockStreamBuffer,
+    epoch: u64,
+    is_aborted: &F,
+    src_block_frames: usize,
+) -> W0Outcome
+where
+    S: AudioBlockSource,
+    F: Fn() -> bool,
+{
+    let max_window_frames = u64::from(spec.sample_rate_hz) * u64::from(ULTIMATE_LOOKAHEAD_SECONDS);
+    let mut blocks: Vec<StereoF64Buffer> = Vec::new();
+    let mut frames: u64 = 0;
+    let mut hit_eof = false;
+    let mut analyzer = TrackAnalyzer::new(spec.sample_rate_hz, spec.bits_per_sample);
+
+    while frames < max_window_frames {
+        buf.drain_deferred_drops();
+        if is_aborted() || buf.current_epoch() != epoch {
+            return W0Outcome::Aborted;
+        }
+        let remaining = (max_window_frames - frames) as usize;
+        let ask = src_block_frames.min(remaining).max(1);
+        match source.read_next_block(ask) {
+            Ok(Some(b)) if b.is_empty() => continue,
+            Ok(Some(b)) => {
+                analyzer.push_block(&b);
+                frames += b.left.len() as u64;
+                blocks.push(b);
+            }
+            Ok(None) => {
+                hit_eof = true;
+                break;
+            }
+            Err(err) => {
+                return W0Outcome::Failed(format!(
+                    "FLAC/stream decode error during W0 on '{}': {err}",
+                    display_path.display()
+                ));
+            }
+        }
+    }
+
+    if blocks.is_empty() {
+        return W0Outcome::Failed(format!(
+            "Skipped empty (0-frame) track '{}'",
+            display_path.display()
+        ));
+    }
+
+    W0Outcome::Ready(W0Window {
+        blocks,
+        frames,
+        hit_eof,
+        analyzer,
+    })
+}
+
+enum W2Outcome {
+    Ready {
+        session: ap_dsp::pipeline::StreamingPipelineSession,
+        rendered: Vec<StereoF64Buffer>,
+        m30_linear: f64,
+        speed_x_rt: f64,
+    },
+    Aborted,
+    Failed(String),
+}
+
+/// Phase W2: single-pass unity-gain render of `W0` with startup-aware throughput guard + fallback.
+#[allow(clippy::too_many_arguments)]
+fn render_w2_with_throughput_guard<F>(
+    pipeline: &AudioPipeline,
+    ult: &UltimateRuntimeContext,
+    buf: &BoundedBlockStreamBuffer,
+    epoch: u64,
+    is_aborted: &F,
+    spec: ap_core::format::StreamSpec,
+    is_streaming: bool,
+    total_duration_s: Option<f64>,
+    display_path: &Path,
+    w0_blocks: &[StereoF64Buffer],
+    w0_frames: u64,
+    raw_peak_meta: &ap_core::headroom::TrackPeakMetadata,
+    track_meta: &ap_core::metadata::TrackMetadata,
+    w30_snapshot: &ap_dsp::analysis::AnalysisResult,
+    base_cached_wt: &CachedWholeTrackEvidence,
+    resolved_user_overrides: Option<&ResolvedUserOverrides>,
+    effective_filter_mode: FilterMode,
+    policy: &UpsamplerPolicy,
+    cached_current: bool,
+    selection: &mut ap_dsp::selector::UltimateSelection,
+) -> W2Outcome
+where
+    F: Fn() -> bool,
+{
+    let placeholder_hr = HeadroomDecision {
+        mode: HeadroomMode::ZeroDb,
+        peak_dbfs: None,
+        peak_kind: None,
+        convolution_scale_db: 0.0,
+        reason: "ultimate W2 unity-gain measurement".to_string(),
+    };
+
+    let w0_audio_s = w0_frames as f64 / f64::from(spec.sample_rate_hz.max(1));
+    let buffered_before_w2_s = buf.buffered_duration_seconds();
+    let buffered_opt = (buffered_before_w2_s > 0.0).then_some(buffered_before_w2_s);
+
+    enum W2RenderError {
+        Aborted,
+        SlowProbe(ap_dsp::selector::ThroughputCheckResult),
+        Dsp(String),
+    }
+
+    let render_w2 = |plan: &ap_dsp::selector::SelectedDspPlan,
+                     allow_early_abort: bool|
+     -> Result<
+        (
+            ap_dsp::pipeline::StreamingPipelineSession,
+            Vec<StereoF64Buffer>,
+            f64,
+            f64,
+        ),
+        W2RenderError,
+    > {
+        let mut sess = pipeline
+            .start_track_with_plan_and_headroom(spec, plan.clone(), placeholder_hr.clone())
+            .map_err(W2RenderError::Dsp)?;
+        let started = Instant::now();
+        let mut rendered = Vec::with_capacity(w0_blocks.len());
+        let mut peak = 0.0_f64;
+        let mut rendered_src_frames: u64 = 0;
+        let probe_min_s = 2.5_f64.min(w0_audio_s * 0.5);
+        for blk in w0_blocks {
+            buf.drain_deferred_drops();
+            if is_aborted() || buf.current_epoch() != epoch {
+                return Err(W2RenderError::Aborted);
+            }
+            #[cfg(test)]
+            {
+                TEST_W2_BLOCKS_RENDERED.with(|c| c.set(c.get() + 1));
+                if allow_early_abort {
+                    let delay_ms = TEST_W2_BLOCK_DELAY_MS.with(|c| c.get());
+                    if delay_ms > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    }
+                }
+            }
+            let blk_frames = blk.left.len() as u64;
+            let out = sess
+                .process_block_unity_f64(blk.clone())
+                .map_err(W2RenderError::Dsp)?;
+            if !out.is_empty() {
+                peak = peak.max(peak_linear_of_buffer(&out));
+                rendered.push(out);
+            }
+            rendered_src_frames += blk_frames;
+
+            // Review #7 F9: Early-abort probe after ~2.5 s of W0 so a too-slow mega-tap filter
+            // switches to its lossless fallback immediately instead of spending 20-30 s stalling!
+            if allow_early_abort && rendered_src_frames < w0_frames {
+                let rendered_src_s =
+                    rendered_src_frames as f64 / f64::from(spec.sample_rate_hz.max(1));
+                if rendered_src_s >= probe_min_s {
+                    let probe = check_ultimate_throughput_with_buffer(
+                        plan.filter,
+                        spec.sample_rate_hz,
+                        rendered_src_s,
+                        started.elapsed().as_secs_f64(),
+                        total_duration_s,
+                        w0_audio_s,
+                        buffered_opt,
+                        0.0,
+                    );
+                    if !probe.passed
+                        && probe.fallback_filter.is_some_and(|fb| fb != plan.filter)
+                    {
+                        return Err(W2RenderError::SlowProbe(probe));
+                    }
+                }
+            }
+        }
+        let wall_s = started.elapsed().as_secs_f64();
+        Ok((sess, rendered, peak, wall_s))
+    };
+
+    let (initial_result, early_slow_probe) = match render_w2(&selection.plan, true) {
+        Ok(v) => (Some(v), None),
+        Err(W2RenderError::Aborted) => return W2Outcome::Aborted,
+        Err(W2RenderError::SlowProbe(probe)) => (None, Some(probe)),
+        Err(W2RenderError::Dsp(err)) => {
+            return W2Outcome::Failed(format!(
+                "Ultimate W2 render error on '{}': {err}",
+                display_path.display()
+            ));
+        }
+    };
+
+    let tp_check = if let Some(probe) = early_slow_probe {
+        probe
+    } else {
+        let (_, _, _, w2_wall_s) = initial_result.as_ref().unwrap();
+        check_ultimate_throughput_with_buffer(
+            selection.plan.filter,
+            spec.sample_rate_hz,
+            w0_audio_s,
+            *w2_wall_s,
+            total_duration_s,
+            w0_audio_s,
+            buffered_opt,
+            0.0,
+        )
+    };
+
+    let (session, rendered, m30_linear, speed_x_rt) = if tp_check.passed {
+        let (s, r, p, _) = initial_result.unwrap();
+        (s, r, p, tp_check.measured_x_rt)
+    } else {
+        let mut fallback_applied = None;
+        let mut fallback_failure_reason: Option<String> = None;
+
+        if let Some(fb_arch) = tp_check.fallback_filter {
+            if fb_arch == selection.plan.filter {
+                fallback_failure_reason = Some(format!(
+                    "already on fallback filter {fb_arch}"
+                ));
+            } else {
+                eprintln!("  [ultimate throughput] {}", tp_check.detail);
+                selection.warnings.push(tp_check.detail.clone());
+                let fb_policy = UpsamplerPolicy {
+                    filter_override: Some(fb_arch),
+                    ..*policy
+                };
+                match resolve_active_selection(
+                    spec,
+                    is_streaming,
+                    total_duration_s,
+                    raw_peak_meta,
+                    track_meta,
+                    Some(w30_snapshot),
+                    base_cached_wt,
+                    resolved_user_overrides,
+                    effective_filter_mode,
+                    &fb_policy,
+                    ult.config.genre_rules,
+                    cached_current,
+                ) {
+                    Ok(fb_sel) => {
+                        let fb_buffered_s = buf.buffered_duration_seconds();
+                        let fb_buffered_opt = (fb_buffered_s > 0.0).then_some(fb_buffered_s);
+                        match render_w2(&fb_sel.plan, false) {
+                            Ok((s2, r2, p2, w2)) => {
+                                let fb_check = check_ultimate_throughput_with_buffer(
+                                    fb_sel.plan.filter,
+                                    spec.sample_rate_hz,
+                                    w0_audio_s,
+                                    w2,
+                                    total_duration_s,
+                                    w0_audio_s,
+                                    fb_buffered_opt,
+                                    0.0,
+                                );
+                                if !fb_check.passed {
+                                    let warn = format!(
+                                        "Fallback {} throughput {:.2}x RT still below {:.2}x RT post-probe cushion (underruns likely)",
+                                        fb_sel.plan.filter,
+                                        fb_check.measured_x_rt,
+                                        fb_check.required_x_rt
+                                    );
+                                    eprintln!("  [ultimate throughput warn] {warn}");
+                                    selection.warnings.push(warn);
+                                }
+                                let spd = w0_audio_s / w2.max(1e-9);
+                                selection.plan = fb_sel.plan;
+                                selection.winning_rule = format!("throughput_fallback({fb_arch})");
+                                fallback_applied = Some((s2, r2, p2, spd));
+                            }
+                            Err(W2RenderError::Aborted) => return W2Outcome::Aborted,
+                            Err(W2RenderError::Dsp(err)) => {
+                                fallback_failure_reason = Some(err);
+                            }
+                            Err(W2RenderError::SlowProbe(_)) => {}
+                        }
+                    }
+                    Err(err) => {
+                        fallback_failure_reason = Some(err);
+                    }
+                }
+            }
+        } else {
+            fallback_failure_reason = Some("no faster lossless fallback available".to_string());
+        }
+
+        if let Some(v) = fallback_applied {
+            v
+        } else {
+            let reason = fallback_failure_reason.unwrap_or_else(|| "unknown error".to_string());
+            let warn_msg = format!(
+                "fallback unavailable: {reason}; continuing at {:.2}x RT, underruns likely",
+                tp_check.measured_x_rt
+            );
+            eprintln!("  [ultimate throughput warn] {warn_msg}");
+            selection.warnings.push(warn_msg);
+
+            if let Some((s, r, p, _)) = initial_result {
+                (s, r, p, tp_check.measured_x_rt)
+            } else {
+                match render_w2(&selection.plan, false) {
+                    Ok((s, r, p, w)) => (s, r, p, w0_audio_s / w.max(1e-9)),
+                    Err(W2RenderError::Aborted) => return W2Outcome::Aborted,
+                    Err(W2RenderError::Dsp(err)) => {
+                        return W2Outcome::Failed(format!(
+                            "Ultimate W2 render error on '{}': {err}",
+                            display_path.display()
+                        ));
+                    }
+                    Err(W2RenderError::SlowProbe(_)) => unreachable!(),
+                }
+            }
+        }
+    };
+
+    W2Outcome::Ready {
+        session,
+        rendered,
+        m30_linear,
+        speed_x_rt,
+    }
+}
+
+/// Phase W3 helper: hand off compatible Track A gapless carryover (output-only additive tail +
+/// quantizer state) or drain incompatible carryover cleanly onto Track A before Track B starts.
+#[allow(clippy::too_many_arguments)]
+fn apply_incoming_carryover(
+    pipeline: &AudioPipeline,
+    session: &mut ap_dsp::pipeline::StreamingPipelineSession,
+    buf: &BoundedBlockStreamBuffer,
+    epoch: u64,
+    display_path: &Path,
+    incoming_carryover: &mut Option<GaplessCarryover>,
+    panic_backup_carry: &mut Option<GaplessCarryover>,
+    had_pending_prev_end: &mut bool,
+) -> Option<(Option<(ConvolutionTail, usize)>, bool)> {
+    let mut additive_tail: Option<(ConvolutionTail, usize)> = None;
+    let mut had_gapless_carryover = false;
+
+    if let Some(carry) = incoming_carryover.take() {
+        *panic_backup_carry = Some(carry.clone());
+        #[cfg(test)]
+        if take_test_panic_after_carry_take(display_path) {
+            panic!("injected F8 test panic after incoming_carryover.take()");
+        }
+        let _ = display_path;
+        let rate = session.report().output_rate_hz;
+        if carry.output_rate_hz == rate && carry.upsampler.is_none() {
+            if let Some(q_st) = carry.quantizer_state {
+                session.restore_quantizer_state_if_compatible(
+                    q_st,
+                    carry.effective_shaper,
+                    carry.output_bits,
+                );
+            }
+            if let Some(ct) = carry.convolver {
+                if !ct.left.is_empty() {
+                    additive_tail = Some((ct, 0));
+                    had_gapless_carryover = true;
+                }
+            }
+            if *had_pending_prev_end {
+                *had_pending_prev_end = false;
+                if !buf.push_for_epoch(epoch, StreamEvent::TrackEnd) {
+                    *panic_backup_carry = None;
+                    return None;
+                }
+            }
+        } else {
+            if let Ok(pcm) = pipeline.drain_gapless_carryover(carry) {
+                if !pcm.is_empty() && !buf.push_for_epoch(epoch, StreamEvent::PcmBlock(pcm)) {
+                    *panic_backup_carry = None;
+                    return None;
+                }
+            }
+            *panic_backup_carry = None;
+            if *had_pending_prev_end {
+                *had_pending_prev_end = false;
+                if !buf.push_for_epoch(epoch, StreamEvent::TrackEnd) {
+                    return None;
+                }
+            }
+        }
+    } else if *had_pending_prev_end {
+        *had_pending_prev_end = false;
+        if !buf.push_for_epoch(epoch, StreamEvent::TrackEnd) {
+            return None;
+        }
+    }
+
+    Some((additive_tail, had_gapless_carryover))
+}
+
+/// Quantize and push any residual `additive_tail` samples onto silence if the track ended
+/// (or errored) before Track A's carried REW tail finished decaying.
+fn drain_remaining_additive_tail(
+    sess: &mut ap_dsp::pipeline::StreamingPipelineSession,
+    buf: &BoundedBlockStreamBuffer,
+    epoch: u64,
+    display_path: &Path,
+    tail_opt: &mut Option<(ConvolutionTail, usize)>,
+    had_err: &mut bool,
+    err_warn: &mut Option<String>,
+) -> bool {
+    while let Some((ref tail, off)) = *tail_opt {
+        let rem = tail.left.len().saturating_sub(off);
+        if rem == 0 {
+            *tail_opt = None;
+            break;
+        }
+        let chunk = rem.min(65_536);
+        let silence = StereoF64Buffer {
+            sample_rate_hz: sess.report().output_rate_hz,
+            left: vec![0.0; chunk],
+            right: vec![0.0; chunk],
+        };
+        match sess.quantize_scaled_block(&silence, 0.0, tail_opt) {
+            Ok(pcm) if !pcm.is_empty() => {
+                if !buf.push_for_epoch(epoch, StreamEvent::PcmBlock(pcm)) {
+                    return false;
+                }
+            }
+            Ok(_) => {}
+            Err(err) => {
+                let msg = format!(
+                    "Ultimate additive-tail quantize error on '{}': {err}",
+                    display_path.display()
+                );
+                eprintln!("  [ultimate err] {msg}");
+                *had_err = true;
+                if err_warn.is_none() {
+                    *err_warn = Some(msg);
+                }
+                *tail_opt = None;
+                break;
+            }
+        }
+    }
+    true
+}
+
+/// Quantize and push an EOF ending unity buffer (shared by gapless & non-gapless EOF paths).
+#[allow(clippy::too_many_arguments)]
+fn quantize_and_push_eof_ending(
+    session: &mut ap_dsp::pipeline::StreamingPipelineSession,
+    buf: &BoundedBlockStreamBuffer,
+    epoch: u64,
+    display_path: &Path,
+    ending_unity: &StereoF64Buffer,
+    fixed_gain_db: f64,
+    additive_tail: &mut Option<(ConvolutionTail, usize)>,
+    had_error: &mut bool,
+    error_warning: &mut Option<String>,
+) -> bool {
+    if ending_unity.is_empty() {
+        return true;
+    }
+    let q_res = {
+        #[cfg(test)]
+        {
+            if TEST_FAIL_EOF_FLUSH_QUANTIZE.with(|c| c.replace(false)) {
+                Err("injected EOF flush quantize error".to_string())
+            } else {
+                session.quantize_scaled_block(ending_unity, fixed_gain_db, additive_tail)
+            }
+        }
+        #[cfg(not(test))]
+        {
+            session.quantize_scaled_block(ending_unity, fixed_gain_db, additive_tail)
+        }
+    };
+    match q_res {
+        Ok(pcm) if !pcm.is_empty() => buf.push_for_epoch(epoch, StreamEvent::PcmBlock(pcm)),
+        Ok(_) => true,
+        Err(err) => {
+            let msg = format!(
+                "Ultimate EOF flush quantize error on '{}': {err}",
+                display_path.display()
+            );
+            eprintln!("  [ultimate err] {msg}");
+            *had_error = true;
+            if error_warning.is_none() {
+                *error_warning = Some(msg);
+            }
+            true
+        }
+    }
+}
+
+/// Phase U5b Learn-on-Play: persist verified whole-track analysis + post-chain peak once at clean EOF.
+#[allow(clippy::too_many_arguments)]
+fn persist_learn_on_play<S: AudioBlockSource>(
+    ult: &UltimateRuntimeContext,
+    source: &S,
+    spec: ap_core::format::StreamSpec,
+    display_path: &Path,
+    local_path: Option<&Path>,
+    track_loc: Option<&(String, String, String)>,
+    file_size: u64,
+    file_mtime: u64,
+    header_md5: Option<[u8; 16]>,
+    header_md5_hex: Option<String>,
+    analyzer: &TrackAnalyzer,
+    early_digital: bool,
+    orig_below: bool,
+    raw_peak_meta: &ap_core::headroom::TrackPeakMetadata,
+    track_meta: &ap_core::metadata::TrackMetadata,
+    policy: &UpsamplerPolicy,
+    selection: &ap_dsp::selector::UltimateSelection,
+    post_key: ap_core::track_db::PostChainKey,
+    whole_track_m_linear: f64,
+) -> bool {
+    let computed_md5 = source.computed_md5();
+    let md5_ok = match (header_md5, computed_md5) {
+        (Some(expected), Some(actual)) => {
+            if expected != actual {
+                eprintln!(
+                    "  [ultimate learn-on-play] MD5 mismatch on '{}' (header={} computed={}); refusing to write YAML",
+                    display_path.display(),
+                    md5_to_hex(&expected),
+                    md5_to_hex(&actual),
+                );
+                false
+            } else {
+                true
+            }
+        }
+        (None, Some(_)) => true,
+        (_, None) => false,
+    };
+    if !md5_ok {
+        return false;
+    }
+
+    let wt_analysis = analyzer.snapshot(true, early_digital, orig_below, track_meta.is_dsd_hint);
+    let final_md5_hex = header_md5_hex.or_else(|| computed_md5.as_ref().map(md5_to_hex));
+    let wt_base = CachedWholeTrackEvidence::from_whole_track_analysis(&wt_analysis, None);
+    let (wt_sug_filter, wt_sug_rule) = resolve_machine_suggestion(
+        spec,
+        false,
+        Some(wt_analysis.duration_s),
+        raw_peak_meta,
+        track_meta,
+        Some(&wt_analysis),
+        &wt_base,
+        policy,
+        ult.config.genre_rules,
+        false,
+    )
+    .map(|s| (s.plan.filter.to_string(), s.winning_rule))
+    .unwrap_or_else(|_| {
+        (
+            selection.suggested_filter.to_string(),
+            selection.suggested_rule.clone(),
+        )
+    });
+
+    let mut entry = build_track_db_entry(
+        display_path.to_string_lossy().into_owned(),
+        file_size,
+        file_mtime,
+        final_md5_hex,
+        &wt_analysis,
+        selection.plan.deemphasis,
+        wt_sug_filter,
+        wt_sug_rule,
+    );
+    entry.upsert_post_chain_peak(post_key, linear_to_dbfs(whole_track_m_linear), false);
+
+    if let Some((root, rel_folder, file_name)) = track_loc {
+        let head_hash = local_path.and_then(file_head_4k_hash);
+        let album_track = AlbumTrackAnalysis::from_schema1(&entry, head_hash);
+        match ult.filter_db.upsert_track_nonblocking(
+            root,
+            rel_folder,
+            file_name,
+            DETECTOR_VERSION,
+            album_track,
+        ) {
+            Ok(Some(merged_track)) => {
+                ult.update_album_cache(root, rel_folder, file_name, merged_track);
+                return true;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                eprintln!(
+                    "  [ultimate learn-on-play warn] failed to save Schema-2 album YAML for '{}': {err}",
+                    display_path.display()
+                );
+            }
+        }
+    }
+    false
+}
+
 /// Execute the full `W0 -> W1 -> W2 -> W3 -> W4` Ultimate Mode track streaming lifecycle.
 ///
 /// Works identically for local `FlacBlockReader` (`local_path = Some(...)`) and streaming
@@ -296,33 +954,6 @@ where
             .map(|f| f as f64 / f64::from(spec.sample_rate_hz.max(1)))
     });
 
-    // Helper: drain Track A's unconsumed carryover cleanly onto Track A before starting Track B
-    // when rates differ or when Track B fails before producing audio.
-    let flush_prev_on_incompatible = |buf: &BoundedBlockStreamBuffer,
-                                      carry: &mut Option<GaplessCarryover>,
-                                      backup: &mut Option<GaplessCarryover>,
-                                      pending_end: &mut bool|
-     -> bool {
-        if let Some(tail) = carry.take() {
-            *backup = Some(tail.clone());
-            if let Ok(pcm) = pipeline.drain_gapless_carryover(tail) {
-                if !pcm.is_empty() && !buf.push_for_epoch(epoch, StreamEvent::PcmBlock(pcm)) {
-                    *backup = None;
-                    *pending_end = false;
-                    return false;
-                }
-            }
-            *backup = None;
-        }
-        if *pending_end {
-            *pending_end = false;
-            if !buf.push_for_epoch(epoch, StreamEvent::TrackEnd) {
-                return false;
-            }
-        }
-        true
-    };
-
     // --- Resolve Schema-2 User Choices (`my-filters.yaml` hot-reload) & Effective Filter Mode ---
     let mut user_warnings: Vec<String> = Vec::new();
     let (choices_exist, user_file, choices_err) = ult.user_filters.load_fresh();
@@ -341,15 +972,13 @@ where
         local_path.and_then(|p| ult.resolve_track_location(p))
     };
     let resolved_user_overrides = if effective_filter_mode == FilterMode::Mine {
-        if let Some(ref uf) = user_file {
+        user_file.as_ref().map(|uf| {
             if let Some((ref root, ref rel_folder, ref file_name)) = track_loc {
-                Some(uf.resolve_for_track(root, rel_folder, file_name, &track_meta))
+                uf.resolve_for_track(root, rel_folder, file_name, &track_meta)
             } else {
-                Some(uf.resolve_for_track("", "", "", &track_meta))
+                uf.resolve_for_track("", "", "", &track_meta)
             }
-        } else {
-            None
-        }
+        })
     } else {
         None
     };
@@ -383,63 +1012,37 @@ where
     }
 
     // --- W0: Bounded <= 30 s Window Acquisition (Mandates M1, M2, M4) ---
-    let max_window_frames = u64::from(spec.sample_rate_hz) * u64::from(ULTIMATE_LOOKAHEAD_SECONDS);
-    let mut w0_blocks: Vec<StereoF64Buffer> = Vec::new();
-    let mut w0_frames: u64 = 0;
-    let mut hit_eof_in_w0 = false;
-    let mut analyzer = TrackAnalyzer::new(spec.sample_rate_hz, spec.bits_per_sample);
-
-    while w0_frames < max_window_frames {
-        buf.drain_deferred_drops();
-        if is_aborted() || buf.current_epoch() != epoch {
-            return UltimateStreamResult::Aborted;
+    let W0Window {
+        blocks: w0_blocks,
+        frames: w0_frames,
+        hit_eof: hit_eof_in_w0,
+        mut analyzer,
+    } = match acquire_w0_window(
+        source,
+        spec,
+        display_path,
+        buf,
+        epoch,
+        &is_aborted,
+        src_block_frames,
+    ) {
+        W0Outcome::Ready(w) => w,
+        W0Outcome::Aborted => return UltimateStreamResult::Aborted,
+        W0Outcome::Failed(msg) => {
+            return fail_flushing_prev(
+                pipeline,
+                buf,
+                epoch,
+                incoming_carryover,
+                panic_backup_carry,
+                had_pending_prev_end,
+                msg,
+            );
         }
-        let remaining = (max_window_frames - w0_frames) as usize;
-        let ask = src_block_frames.min(remaining).max(1);
-        match source.read_next_block(ask) {
-            Ok(Some(b)) if b.is_empty() => continue,
-            Ok(Some(b)) => {
-                analyzer.push_block(&b);
-                w0_frames += b.left.len() as u64;
-                w0_blocks.push(b);
-            }
-            Ok(None) => {
-                hit_eof_in_w0 = true;
-                break;
-            }
-            Err(err) => {
-                if !flush_prev_on_incompatible(
-                    buf,
-                    incoming_carryover,
-                    panic_backup_carry,
-                    had_pending_prev_end,
-                ) {
-                    return UltimateStreamResult::Aborted;
-                }
-                return UltimateStreamResult::Failed(format!(
-                    "FLAC/stream decode error during W0 on '{}': {err}",
-                    display_path.display()
-                ));
-            }
-        }
-    }
-
-    if w0_blocks.is_empty() {
-        if !flush_prev_on_incompatible(
-            buf,
-            incoming_carryover,
-            panic_backup_carry,
-            had_pending_prev_end,
-        ) {
-            return UltimateStreamResult::Aborted;
-        }
-        return UltimateStreamResult::Failed(format!(
-            "Skipped empty (0-frame) track '{}'",
-            display_path.display()
-        ));
-    }
+    };
 
     // --- M3 Runtime Short-Track Check (e.g. total_samples == 0 header with < 30 s body) ---
+    let max_window_frames = u64::from(spec.sample_rate_hz) * u64::from(ULTIMATE_LOOKAHEAD_SECONDS);
     if hit_eof_in_w0 && w0_frames < max_window_frames {
         let actual_dur_s = w0_frames as f64 / f64::from(spec.sample_rate_hz.max(1));
         return stream_short_track_normal(
@@ -466,7 +1069,7 @@ where
         );
     }
 
-    // --- W1: Strict Per-Track Cache Lookup + Fusion + Selection (Schema 2 -> Schema 1 fallback) ---
+    // --- W1: Strict Per-Track Schema-2 Cache Lookup + Fusion + Selection (Review #9 U7, U10, U12) ---
     let (file_size, file_mtime) = local_path
         .and_then(file_size_and_mtime)
         .unwrap_or((0, 0));
@@ -488,39 +1091,11 @@ where
         None
     };
 
-    let cached_s1_entry = if is_streaming || cached_s2_track.as_ref().is_some_and(|(_, cur)| *cur) {
-        None
-    } else {
-        ult.store
-            .load_for_track(local_path, header_md5_hex.as_deref())
-    };
-    let cached_s1_current = cached_s1_entry.as_ref().is_some_and(|e| {
-        e.is_results_current(
-            DETECTOR_VERSION,
-            header_md5_hex.as_deref(),
-            local_path.map(|_| file_size),
-            local_path.map(|_| file_mtime),
-        )
-    });
-
-    let cached_current = cached_s2_track.as_ref().is_some_and(|(_, cur)| *cur) || cached_s1_current;
+    let cached_current = cached_s2_track.as_ref().is_some_and(|(_, cur)| *cur);
     let base_cached_wt = if let Some((ref t, cur)) = cached_s2_track {
         CachedWholeTrackEvidence::from_album_track(t, cur)
-    } else if let Some(ref e) = cached_s1_entry {
-        CachedWholeTrackEvidence::from_track_db_entry(e, cached_s1_current)
     } else {
         CachedWholeTrackEvidence::default()
-    };
-
-    let cached_wt = match effective_filter_mode {
-        FilterMode::Suggested => base_cached_wt.clone().suggested_only(),
-        FilterMode::Mine | FilterMode::Auto => {
-            if let Some(ref ov) = resolved_user_overrides {
-                base_cached_wt.clone().with_user_overrides(ov)
-            } else {
-                base_cached_wt.clone()
-            }
-        }
     };
 
     let early_digital = track_meta.is_early_digital_era();
@@ -534,315 +1109,79 @@ where
         track_meta.is_dsd_hint,
     );
 
-    let fused = fuse_track_evidence(
-        spec.sample_rate_hz,
-        spec.bits_per_sample,
-        &raw_peak_meta,
-        &track_meta,
-        Some(&w30_snapshot),
-        Some(&cached_wt),
-    );
-
     let policy = pipeline.policy();
-    let mut selection = match select_ultimate_plan(
+    let mut selection = match resolve_active_selection(
         spec,
         is_streaming,
         total_duration_s,
-        &fused,
+        &raw_peak_meta,
+        &track_meta,
+        Some(&w30_snapshot),
+        &base_cached_wt,
+        resolved_user_overrides.as_ref(),
+        effective_filter_mode,
         &policy,
         ult.config.genre_rules,
         cached_current,
     ) {
         Ok(sel) => sel,
         Err(err) => {
-            if !flush_prev_on_incompatible(
+            return fail_flushing_prev(
+                pipeline,
                 buf,
+                epoch,
                 incoming_carryover,
                 panic_backup_carry,
                 had_pending_prev_end,
-            ) {
-                return UltimateStreamResult::Aborted;
-            }
-            return UltimateStreamResult::Failed(format!(
-                "Ultimate selection error on '{}': {err}",
-                display_path.display()
-            ));
+                format!("Ultimate selection error on '{}': {err}", display_path.display()),
+            );
         }
     };
     selection.warnings.extend(user_warnings.iter().cloned());
 
-    // If user overrode `apodizing` (attribute-only override), compute pure machine suggestion too.
-    if fused.apodizing.source == EvidenceSource::User {
-        let sug_wt = base_cached_wt.clone().suggested_only();
-        let sug_fused = fuse_track_evidence(
-            spec.sample_rate_hz,
-            spec.bits_per_sample,
-            &raw_peak_meta,
-            &track_meta,
-            Some(&w30_snapshot),
-            Some(&sug_wt),
-        );
-        if let Ok(sug_sel) = select_ultimate_plan(
+    // --- W2: Single-Pass Unity-Gain Render of W0 + Startup-Aware Throughput Self-Check ---
+    let (mut session, w2_rendered, m30_linear, final_speed_x_rt) =
+        match render_w2_with_throughput_guard(
+            pipeline,
+            ult,
+            buf,
+            epoch,
+            &is_aborted,
             spec,
             is_streaming,
             total_duration_s,
-            &sug_fused,
-            &UpsamplerPolicy {
-                filter_override: None,
-                ..policy
-            },
-            ult.config.genre_rules,
+            display_path,
+            &w0_blocks,
+            w0_frames,
+            &raw_peak_meta,
+            &track_meta,
+            &w30_snapshot,
+            &base_cached_wt,
+            resolved_user_overrides.as_ref(),
+            effective_filter_mode,
+            &policy,
             cached_current,
+            &mut selection,
         ) {
-            selection.suggested_filter = sug_sel.plan.filter;
-            selection.suggested_rule = sug_sel.winning_rule;
-        }
-    }
-
-    // --- W2: Single-Pass Unity-Gain Render of W0 + Startup-Aware Throughput Self-Check (F9/F-B1) ---
-    let placeholder_hr = HeadroomDecision {
-        mode: HeadroomMode::ZeroDb,
-        peak_dbfs: None,
-        peak_kind: None,
-        convolution_scale_db: 0.0,
-        reason: "ultimate W2 unity-gain measurement".to_string(),
-    };
-
-    let w0_audio_s = w0_frames as f64 / f64::from(spec.sample_rate_hz.max(1));
-    let buffered_before_w2_s = buf.buffered_duration_seconds();
-    let buffered_opt = (buffered_before_w2_s > 0.0).then_some(buffered_before_w2_s);
-
-    enum W2RenderError {
-        Aborted,
-        SlowProbe(ap_dsp::selector::ThroughputCheckResult),
-        Dsp(String),
-    }
-
-    let render_w2 = |plan: &ap_dsp::selector::SelectedDspPlan,
-                     allow_early_abort: bool|
-     -> Result<
-        (
-            ap_dsp::pipeline::StreamingPipelineSession,
-            Vec<StereoF64Buffer>,
-            f64,
-            f64,
-        ),
-        W2RenderError,
-    > {
-        let mut sess = pipeline
-            .start_track_with_plan_and_headroom(spec, plan.clone(), placeholder_hr.clone())
-            .map_err(W2RenderError::Dsp)?;
-        let started = Instant::now();
-        let mut rendered = Vec::with_capacity(w0_blocks.len());
-        let mut peak = 0.0_f64;
-        let mut rendered_src_frames: u64 = 0;
-        let probe_min_s = 2.5_f64.min(w0_audio_s * 0.5);
-        for blk in &w0_blocks {
-            buf.drain_deferred_drops();
-            if is_aborted() || buf.current_epoch() != epoch {
-                return Err(W2RenderError::Aborted);
+            W2Outcome::Ready {
+                session,
+                rendered,
+                m30_linear,
+                speed_x_rt,
+            } => (session, rendered, m30_linear, speed_x_rt),
+            W2Outcome::Aborted => return UltimateStreamResult::Aborted,
+            W2Outcome::Failed(msg) => {
+                return fail_flushing_prev(
+                    pipeline,
+                    buf,
+                    epoch,
+                    incoming_carryover,
+                    panic_backup_carry,
+                    had_pending_prev_end,
+                    msg,
+                );
             }
-            #[cfg(test)]
-            {
-                TEST_W2_BLOCKS_RENDERED.with(|c| c.set(c.get() + 1));
-                if allow_early_abort {
-                    let delay_ms = TEST_W2_BLOCK_DELAY_MS.with(|c| c.get());
-                    if delay_ms > 0 {
-                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-                    }
-                }
-            }
-            let blk_frames = blk.left.len() as u64;
-            let out = sess
-                .process_block_unity_f64(blk.clone())
-                .map_err(W2RenderError::Dsp)?;
-            if !out.is_empty() {
-                peak = peak.max(peak_linear_of_buffer(&out));
-                rendered.push(out);
-            }
-            rendered_src_frames += blk_frames;
-
-            // Review #7 F9: Early-abort probe after ~2.5 s of W0 so a too-slow mega-tap filter
-            // switches to its lossless fallback immediately instead of spending 20-30 s stalling!
-            if allow_early_abort && rendered_src_frames < w0_frames {
-                let rendered_src_s =
-                    rendered_src_frames as f64 / f64::from(spec.sample_rate_hz.max(1));
-                if rendered_src_s >= probe_min_s {
-                    let probe = check_ultimate_throughput_with_buffer(
-                        plan.filter,
-                        spec.sample_rate_hz,
-                        rendered_src_s,
-                        started.elapsed().as_secs_f64(),
-                        total_duration_s,
-                        w0_audio_s,
-                        buffered_opt,
-                        // Review #7 re-review R2: `buffered_before_w2_s` was sampled AFTER W0
-                        // decode finished, so decode time is already reflected in `buffered_opt`!
-                        0.0,
-                    );
-                    if !probe.passed
-                        && probe.fallback_filter.is_some_and(|fb| fb != plan.filter)
-                    {
-                        return Err(W2RenderError::SlowProbe(probe));
-                    }
-                }
-            }
-        }
-        let wall_s = started.elapsed().as_secs_f64();
-        Ok((sess, rendered, peak, wall_s))
-    };
-
-    let (initial_result, early_slow_probe) = match render_w2(&selection.plan, true) {
-        Ok(v) => (Some(v), None),
-        Err(W2RenderError::Aborted) => return UltimateStreamResult::Aborted,
-        Err(W2RenderError::SlowProbe(probe)) => (None, Some(probe)),
-        Err(W2RenderError::Dsp(err)) => {
-            if !flush_prev_on_incompatible(
-                buf,
-                incoming_carryover,
-                panic_backup_carry,
-                had_pending_prev_end,
-            ) {
-                return UltimateStreamResult::Aborted;
-            }
-            return UltimateStreamResult::Failed(format!(
-                "Ultimate W2 render error on '{}': {err}",
-                display_path.display()
-            ));
-        }
-    };
-
-    let tp_check = if let Some(probe) = early_slow_probe {
-        probe
-    } else {
-        let (_, _, _, w2_wall_s) = initial_result.as_ref().unwrap();
-        check_ultimate_throughput_with_buffer(
-            selection.plan.filter,
-            spec.sample_rate_hz,
-            w0_audio_s,
-            *w2_wall_s,
-            total_duration_s,
-            w0_audio_s,
-            buffered_opt,
-            0.0,
-        )
-    };
-
-    let (mut session, w2_rendered, m30_linear, final_speed_x_rt) = if tp_check.passed {
-        let (s, r, p, _) = initial_result.unwrap();
-        (s, r, p, tp_check.measured_x_rt)
-    } else {
-        let mut fallback_applied = None;
-        let mut fallback_failure_reason: Option<String> = None;
-
-        if let Some(fb_arch) = tp_check.fallback_filter {
-            if fb_arch == selection.plan.filter {
-                fallback_failure_reason = Some(format!(
-                    "already on fallback filter {fb_arch}"
-                ));
-            } else {
-                eprintln!("  [ultimate throughput] {}", tp_check.detail);
-                selection.warnings.push(tp_check.detail.clone());
-                let fb_policy = UpsamplerPolicy {
-                    filter_override: Some(fb_arch),
-                    ..policy
-                };
-                match select_ultimate_plan(
-                    spec,
-                    is_streaming,
-                    total_duration_s,
-                    &fused,
-                    &fb_policy,
-                    ult.config.genre_rules,
-                    cached_current,
-                ) {
-                    Ok(fb_sel) => {
-                        // Review #8 C6: re-sample remaining buffer cushion right before fallback W2
-                        // render so we can warn if the fallback still exceeds remaining cushion.
-                        let fb_buffered_s = buf.buffered_duration_seconds();
-                        let fb_buffered_opt = (fb_buffered_s > 0.0).then_some(fb_buffered_s);
-                        match render_w2(&fb_sel.plan, false) {
-                            Ok((s2, r2, p2, w2)) => {
-                                let fb_check = check_ultimate_throughput_with_buffer(
-                                    fb_sel.plan.filter,
-                                    spec.sample_rate_hz,
-                                    w0_audio_s,
-                                    w2,
-                                    total_duration_s,
-                                    w0_audio_s,
-                                    fb_buffered_opt,
-                                    0.0,
-                                );
-                                if !fb_check.passed {
-                                    let warn = format!(
-                                        "Fallback {} throughput {:.2}x RT still below {:.2}x RT post-probe cushion (underruns likely)",
-                                        fb_sel.plan.filter,
-                                        fb_check.measured_x_rt,
-                                        fb_check.required_x_rt
-                                    );
-                                    eprintln!("  [ultimate throughput warn] {warn}");
-                                    selection.warnings.push(warn);
-                                }
-                                let spd = w0_audio_s / w2.max(1e-9);
-                                selection.plan = fb_sel.plan;
-                                selection.winning_rule = format!("throughput_fallback({fb_arch})");
-                                fallback_applied = Some((s2, r2, p2, spd));
-                            }
-                            Err(W2RenderError::Aborted) => return UltimateStreamResult::Aborted,
-                            Err(W2RenderError::Dsp(err)) => {
-                                fallback_failure_reason = Some(err);
-                            }
-                            Err(W2RenderError::SlowProbe(_)) => {}
-                        }
-                    }
-                    Err(err) => {
-                        fallback_failure_reason = Some(err);
-                    }
-                }
-            }
-        } else {
-            fallback_failure_reason = Some("no faster lossless fallback available".to_string());
-        }
-
-        if let Some(v) = fallback_applied {
-            v
-        } else {
-            // Review #7 F-B1: NEVER silently swallow fallback unavailability/errors!
-            let reason = fallback_failure_reason.unwrap_or_else(|| "unknown error".to_string());
-            let warn_msg = format!(
-                "fallback unavailable: {reason}; continuing at {:.2}x RT, underruns likely",
-                tp_check.measured_x_rt
-            );
-            eprintln!("  [ultimate throughput warn] {warn_msg}");
-            selection.warnings.push(warn_msg);
-
-            if let Some((s, r, p, _)) = initial_result {
-                (s, r, p, tp_check.measured_x_rt)
-            } else {
-                // Early probe aborted initial render and fallback failed -> render original plan
-                // cleanly (without early abort) or fail if it errors, never emit truncated audio.
-                match render_w2(&selection.plan, false) {
-                    Ok((s, r, p, w)) => (s, r, p, w0_audio_s / w.max(1e-9)),
-                    Err(W2RenderError::Aborted) => return UltimateStreamResult::Aborted,
-                    Err(W2RenderError::Dsp(err)) => {
-                        if !flush_prev_on_incompatible(
-                            buf,
-                            incoming_carryover,
-                            panic_backup_carry,
-                            had_pending_prev_end,
-                        ) {
-                            return UltimateStreamResult::Aborted;
-                        }
-                        return UltimateStreamResult::Failed(format!(
-                            "Ultimate W2 render error on '{}': {err}",
-                            display_path.display()
-                        ));
-                    }
-                    Err(W2RenderError::SlowProbe(_)) => unreachable!(),
-                }
-            }
-        }
-    };
+        };
     drop(w0_blocks);
 
     // Build exact PostChainKey matching this active linear chain (shared with `scanner.rs`, F6).
@@ -861,29 +1200,19 @@ where
             .as_ref()
             .filter(|(_, cur)| *cur)
             .and_then(|(t, _)| t.find_post_chain_peak(&post_key))
-            .or_else(|| {
-                cached_s1_entry
-                    .as_ref()
-                    .filter(|_| cached_s1_current)
-                    .and_then(|e| e.find_post_chain_peak(&post_key))
-            })
     };
 
     let m30_dbfs = linear_to_dbfs(m30_linear);
     let conv_boost_db = session.convolver_max_boost_db();
 
     // Compute MANDATORY FIXED WHOLE-TRACK GAIN `G` (OQ-33) — locked for the entire track!
-    // Review #7 F2: If W2 built a bit-perfect `Bypass` quantizer (for `Null` filter with placeholder
-    // 0 dB headroom), a bit-perfect 0 dB pass needs 0.0 dB quantizer margin; if the resulting fixed
-    // gain is negative (`G < 0`), immediately reconfigure the quantizer to its dithered/shaped
-    // profile at `dac_bits` and recompute `m_q_db` & `G` BEFORE quantizing any block!
     let mut m_q_db = if session.report().effective_shaper == NoiseShaperProfile::Bypass {
         0.0
     } else {
         quantizer_margin_db(session.report().output_bits, session.shaper_l1_sum())
     };
     let mut fixed_headroom = select_ultimate_headroom(
-        &fused.peak_meta,
+        &selection.peak_meta,
         spec.bits_per_sample,
         is_streaming,
         Some(conv_boost_db),
@@ -895,22 +1224,22 @@ where
         && session.report().effective_shaper == NoiseShaperProfile::Bypass
     {
         if let Err(err) = session.reconfigure_quantizer_for_headroom(&fixed_headroom) {
-            if !flush_prev_on_incompatible(
+            return fail_flushing_prev(
+                pipeline,
                 buf,
+                epoch,
                 incoming_carryover,
                 panic_backup_carry,
                 had_pending_prev_end,
-            ) {
-                return UltimateStreamResult::Aborted;
-            }
-            return UltimateStreamResult::Failed(format!(
-                "Ultimate quantizer reconfigure error on '{}': {err}",
-                display_path.display()
-            ));
+                format!(
+                    "Ultimate quantizer reconfigure error on '{}': {err}",
+                    display_path.display()
+                ),
+            );
         }
         m_q_db = quantizer_margin_db(session.report().output_bits, session.shaper_l1_sum());
         fixed_headroom = select_ultimate_headroom(
-            &fused.peak_meta,
+            &selection.peak_meta,
             spec.bits_per_sample,
             is_streaming,
             Some(conv_boost_db),
@@ -953,65 +1282,19 @@ where
     session.set_ultimate_report(decision_report);
 
     // --- W3: Strict Additive Gapless Tail Separation (`OQ-40`) + Quantize W2 & Emit TrackStart ---
-    let mut additive_tail: Option<(ConvolutionTail, usize)> = None;
-    let mut had_gapless_carryover = false;
+    let Some((mut additive_tail, had_gapless_carryover)) = apply_incoming_carryover(
+        pipeline,
+        &mut session,
+        buf,
+        epoch,
+        display_path,
+        incoming_carryover,
+        panic_backup_carry,
+        had_pending_prev_end,
+    ) else {
+        return UltimateStreamResult::Aborted;
+    };
 
-    if let Some(carry) = incoming_carryover.take() {
-        // Review #7 F8: Preserve backup of Track A's carryover across the window until Track B's
-        // first quantized PCM block (carrying `additive_tail`) is successfully pushed.
-        *panic_backup_carry = Some(carry.clone());
-        #[cfg(test)]
-        if take_test_panic_after_carry_take(display_path) {
-            panic!("injected F8 test panic after incoming_carryover.take()");
-        }
-        let rate = session.report().output_rate_hz;
-        if carry.output_rate_hz == rate && carry.upsampler.is_none() {
-            // Track A already flushed its upsampler and pre-scaled `conv_tail` by G_A.
-            if let Some(q_st) = carry.quantizer_state {
-                session.restore_quantizer_state_if_compatible(
-                    q_st,
-                    carry.effective_shaper,
-                    carry.output_bits,
-                );
-            }
-            if let Some(ct) = carry.convolver {
-                if !ct.left.is_empty() {
-                    additive_tail = Some((ct, 0));
-                    had_gapless_carryover = true;
-                }
-            }
-            if *had_pending_prev_end {
-                *had_pending_prev_end = false;
-                if !buf.push_for_epoch(epoch, StreamEvent::TrackEnd) {
-                    *panic_backup_carry = None;
-                    return UltimateStreamResult::Aborted;
-                }
-            }
-        } else {
-            // Incompatible rate or normal-mode carryover with un-flushed upsampler history:
-            // drain cleanly onto Track A first so Track B stays 100% independent.
-            if let Ok(pcm) = pipeline.drain_gapless_carryover(carry) {
-                if !pcm.is_empty() && !buf.push_for_epoch(epoch, StreamEvent::PcmBlock(pcm)) {
-                    *panic_backup_carry = None;
-                    return UltimateStreamResult::Aborted;
-                }
-            }
-            *panic_backup_carry = None;
-            if *had_pending_prev_end {
-                *had_pending_prev_end = false;
-                if !buf.push_for_epoch(epoch, StreamEvent::TrackEnd) {
-                    return UltimateStreamResult::Aborted;
-                }
-            }
-        }
-    } else if *had_pending_prev_end {
-        *had_pending_prev_end = false;
-        if !buf.push_for_epoch(epoch, StreamEvent::TrackEnd) {
-            return UltimateStreamResult::Aborted;
-        }
-    }
-
-    // Emit TrackStart carrying full UltimateDecisionReport.
     if !buf.push_for_epoch(
         epoch,
         StreamEvent::TrackStart {
@@ -1029,9 +1312,6 @@ where
     }
 
     // Quantize and push the already-rendered unity-gain W2 blocks (ZERO double-rendering!).
-    // Review #7 F7 & F-B2: After `TrackStart` has been emitted, any decode/DSP/quantize error logs
-    // a warning, sets `had_error = true` (disabling YAML learn-on-play and gapless carryover), and
-    // breaks cleanly into EOF flush + `TrackEnd` so single-file sessions and playlists stay intact.
     let mut had_error = false;
     let mut skip_session_flush = false;
     let mut error_warning: Option<String> = None;
@@ -1093,7 +1373,6 @@ where
         let mut w4_block_idx: usize = 0;
         loop {
             if is_aborted() || buf.current_epoch() != epoch {
-                // Mid-track skip: discard cleanly WITHOUT writing YAML!
                 return UltimateStreamResult::Aborted;
             }
             match source.read_next_block(src_block_frames) {
@@ -1181,102 +1460,27 @@ where
         }
     }
 
-    // Helper: quantize and push any residual `additive_tail` samples onto silence if the track
-    // ended (or errored) before Track A's carried REW tail finished decaying (Review #7 F7).
-    let drain_remaining_additive_tail =
-        |sess: &mut ap_dsp::pipeline::StreamingPipelineSession,
-         tail_opt: &mut Option<(ConvolutionTail, usize)>,
-         had_err: &mut bool,
-         err_warn: &mut Option<String>|
-         -> bool {
-            while let Some((ref tail, off)) = *tail_opt {
-                let rem = tail.left.len().saturating_sub(off);
-                if rem == 0 {
-                    *tail_opt = None;
-                    break;
-                }
-                let chunk = rem.min(65_536);
-                let silence = StereoF64Buffer {
-                    sample_rate_hz: sess.report().output_rate_hz,
-                    left: vec![0.0; chunk],
-                    right: vec![0.0; chunk],
-                };
-                match sess.quantize_scaled_block(&silence, 0.0, tail_opt) {
-                    Ok(pcm) if !pcm.is_empty() => {
-                        if !buf.push_for_epoch(epoch, StreamEvent::PcmBlock(pcm)) {
-                            return false;
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(err) => {
-                        let msg = format!(
-                            "Ultimate additive-tail quantize error on '{}': {err}",
-                            display_path.display()
-                        );
-                        eprintln!("  [ultimate err] {msg}");
-                        *had_err = true;
-                        if err_warn.is_none() {
-                            *err_warn = Some(msg);
-                        }
-                        *tail_opt = None;
-                        break;
-                    }
-                }
-            }
-            true
-        };
-
     // Clean EOF flush (unity-gain + pre-scaled gapless tail export; forced non-gapless on error).
     let use_gapless_eof = gapless_carryover && !had_error;
     let (next_carryover, next_pending_end) = if use_gapless_eof {
         match session.flush_for_gapless_unity_f64(fixed_gain_db) {
             Ok((ending_unity, tail_peak_unity, carry)) => {
                 whole_track_m_linear = whole_track_m_linear.max(tail_peak_unity);
-                if !ending_unity.is_empty() {
-                    let q_res = {
-                        #[cfg(test)]
-                        {
-                            if TEST_FAIL_EOF_FLUSH_QUANTIZE.with(|c| c.replace(false)) {
-                                Err("injected EOF flush quantize error".to_string())
-                            } else {
-                                session.quantize_scaled_block(
-                                    &ending_unity,
-                                    fixed_gain_db,
-                                    &mut additive_tail,
-                                )
-                            }
-                        }
-                        #[cfg(not(test))]
-                        {
-                            session.quantize_scaled_block(
-                                &ending_unity,
-                                fixed_gain_db,
-                                &mut additive_tail,
-                            )
-                        }
-                    };
-                    match q_res {
-                        Ok(pcm) if !pcm.is_empty() => {
-                            if !buf.push_for_epoch(epoch, StreamEvent::PcmBlock(pcm)) {
-                                return UltimateStreamResult::Aborted;
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(err) => {
-                            let msg = format!(
-                                "Ultimate EOF flush quantize error on '{}': {err}",
-                                display_path.display()
-                            );
-                            eprintln!("  [ultimate err] {msg}");
-                            had_error = true;
-                            if error_warning.is_none() {
-                                error_warning = Some(msg);
-                            }
-                        }
-                    }
-                }
-                if !drain_remaining_additive_tail(
+                if !quantize_and_push_eof_ending(
                     &mut session,
+                    buf,
+                    epoch,
+                    display_path,
+                    &ending_unity,
+                    fixed_gain_db,
+                    &mut additive_tail,
+                    &mut had_error,
+                    &mut error_warning,
+                ) || !drain_remaining_additive_tail(
+                    &mut session,
+                    buf,
+                    epoch,
+                    display_path,
                     &mut additive_tail,
                     &mut had_error,
                     &mut error_warning,
@@ -1304,32 +1508,30 @@ where
                 }
                 if !drain_remaining_additive_tail(
                     &mut session,
+                    buf,
+                    epoch,
+                    display_path,
                     &mut additive_tail,
                     &mut had_error,
                     &mut error_warning,
-                ) {
-                    return UltimateStreamResult::Aborted;
-                }
-                if !buf.push_for_epoch(epoch, StreamEvent::TrackEnd) {
+                ) || !buf.push_for_epoch(epoch, StreamEvent::TrackEnd)
+                {
                     return UltimateStreamResult::Aborted;
                 }
                 (None, false)
             }
         }
     } else if skip_session_flush {
-        // Review #7 re-review F7 + Review #8 C4: On a W3 quantize error, W4 quantize error, or W4
-        // DSP error, `session` has advanced past the last emitted PCM block (or is in an undefined
-        // DSP state), so flushing `session` would append a discontinuous tail (audible click).
-        // Drain only any remaining incoming `additive_tail` and emit `TrackEnd` cleanly.
         if !drain_remaining_additive_tail(
             &mut session,
+            buf,
+            epoch,
+            display_path,
             &mut additive_tail,
             &mut had_error,
             &mut error_warning,
-        ) {
-            return UltimateStreamResult::Aborted;
-        }
-        if !buf.push_for_epoch(epoch, StreamEvent::TrackEnd) {
+        ) || !buf.push_for_epoch(epoch, StreamEvent::TrackEnd)
+        {
             return UltimateStreamResult::Aborted;
         }
         (None, false)
@@ -1338,58 +1540,26 @@ where
             Ok(ending_unity) => {
                 whole_track_m_linear =
                     whole_track_m_linear.max(peak_linear_of_buffer(&ending_unity));
-                if !ending_unity.is_empty() {
-                    let q_res = {
-                        #[cfg(test)]
-                        {
-                            if TEST_FAIL_EOF_FLUSH_QUANTIZE.with(|c| c.replace(false)) {
-                                Err("injected EOF flush quantize error".to_string())
-                            } else {
-                                session.quantize_scaled_block(
-                                    &ending_unity,
-                                    fixed_gain_db,
-                                    &mut additive_tail,
-                                )
-                            }
-                        }
-                        #[cfg(not(test))]
-                        {
-                            session.quantize_scaled_block(
-                                &ending_unity,
-                                fixed_gain_db,
-                                &mut additive_tail,
-                            )
-                        }
-                    };
-                    match q_res {
-                        Ok(pcm) if !pcm.is_empty() => {
-                            if !buf.push_for_epoch(epoch, StreamEvent::PcmBlock(pcm)) {
-                                return UltimateStreamResult::Aborted;
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(err) => {
-                            let msg = format!(
-                                "Ultimate EOF flush quantize error on '{}': {err}",
-                                display_path.display()
-                            );
-                            eprintln!("  [ultimate err] {msg}");
-                            had_error = true;
-                            if error_warning.is_none() {
-                                error_warning = Some(msg);
-                            }
-                        }
-                    }
-                }
-                if !drain_remaining_additive_tail(
+                if !quantize_and_push_eof_ending(
                     &mut session,
+                    buf,
+                    epoch,
+                    display_path,
+                    &ending_unity,
+                    fixed_gain_db,
                     &mut additive_tail,
                     &mut had_error,
                     &mut error_warning,
-                ) {
-                    return UltimateStreamResult::Aborted;
-                }
-                if !buf.push_for_epoch(epoch, StreamEvent::TrackEnd) {
+                ) || !drain_remaining_additive_tail(
+                    &mut session,
+                    buf,
+                    epoch,
+                    display_path,
+                    &mut additive_tail,
+                    &mut had_error,
+                    &mut error_warning,
+                ) || !buf.push_for_epoch(epoch, StreamEvent::TrackEnd)
+                {
                     return UltimateStreamResult::Aborted;
                 }
                 (None, false)
@@ -1406,13 +1576,14 @@ where
                 }
                 if !drain_remaining_additive_tail(
                     &mut session,
+                    buf,
+                    epoch,
+                    display_path,
                     &mut additive_tail,
                     &mut had_error,
                     &mut error_warning,
-                ) {
-                    return UltimateStreamResult::Aborted;
-                }
-                if !buf.push_for_epoch(epoch, StreamEvent::TrackEnd) {
+                ) || !buf.push_for_epoch(epoch, StreamEvent::TrackEnd)
+                {
                     return UltimateStreamResult::Aborted;
                 }
                 (None, false)
@@ -1421,120 +1592,32 @@ where
     };
 
     // --- U5b Learn-on-Play: Persist Verified Whole-Track Results Atomically ONCE at Clean EOF ---
-    // Review #7 F7 & F-B2: Strictly gated on `!had_error` so partial/errored plays NEVER write YAML!
-    let mut wrote_yaml = false;
-    if !had_error && ult.config.learn_on_play && !is_streaming && local_path.is_some() {
-        let computed_md5 = source.computed_md5();
-        let md5_ok = match (header_md5, computed_md5) {
-            (Some(expected), Some(actual)) => {
-                if expected != actual {
-                    eprintln!(
-                        "  [ultimate learn-on-play] MD5 mismatch on '{}' (header={} computed={}); refusing to write YAML",
-                        display_path.display(),
-                        md5_to_hex(&expected),
-                        md5_to_hex(&actual),
-                    );
-                    false
-                } else {
-                    true
-                }
-            }
-            // If STREAMINFO.md5 is unset (0), allow persistence if computed_md5 succeeded cleanly.
-            (None, Some(_)) => true,
-            // Stream did not reach clean EOF with zero decode errors -> never write.
-            (_, None) => false,
-        };
-
-        if md5_ok {
-            let wt_analysis =
-                analyzer.snapshot(true, early_digital, orig_below, track_meta.is_dsd_hint);
-            let final_md5_hex = header_md5_hex.or_else(|| computed_md5.as_ref().map(md5_to_hex));
-            // Compute pure machine-suggested filter/rule from whole-track analysis so Schema-2
-            // album YAML always records the machine suggestion (never a user choice).
-            let wt_sug_ev =
-                CachedWholeTrackEvidence::from_whole_track_analysis(&wt_analysis, None)
-                    .suggested_only();
-            let wt_sug_fused = fuse_track_evidence(
-                spec.sample_rate_hz,
-                spec.bits_per_sample,
-                &raw_peak_meta,
-                &track_meta,
-                Some(&wt_analysis),
-                Some(&wt_sug_ev),
-            );
-            let (wt_sug_filter, wt_sug_rule) = select_ultimate_plan(
-                spec,
-                false,
-                Some(wt_analysis.duration_s),
-                &wt_sug_fused,
-                &UpsamplerPolicy {
-                    filter_override: None,
-                    ..policy
-                },
-                ult.config.genre_rules,
-                false,
-            )
-            .map(|s| (s.plan.filter.to_string(), s.winning_rule))
-            .unwrap_or_else(|_| {
-                (
-                    selection.suggested_filter.to_string(),
-                    selection.suggested_rule.clone(),
-                )
-            });
-
-            let mut entry = build_track_db_entry(
-                display_path.to_string_lossy().into_owned(),
-                file_size,
-                file_mtime,
-                final_md5_hex,
-                &wt_analysis,
-                selection.plan.deemphasis,
-                wt_sug_filter,
-                wt_sug_rule,
-            );
-            let whole_m_dbfs = linear_to_dbfs(whole_track_m_linear);
-            entry.upsert_post_chain_peak(post_key, whole_m_dbfs, false);
-
-            if let Some((ref root, ref rel_folder, ref file_name)) = track_loc {
-                let head_hash = local_path.and_then(file_head_4k_hash);
-                let album_track = AlbumTrackAnalysis::from_schema1(&entry, head_hash);
-                match ult.filter_db.upsert_track_nonblocking(
-                    root,
-                    rel_folder,
-                    file_name,
-                    DETECTOR_VERSION,
-                    album_track,
-                ) {
-                    Ok(Some(merged_track)) => {
-                        ult.update_album_cache(root, rel_folder, file_name, merged_track);
-                        wrote_yaml = true;
-                    }
-                    Ok(None) => {
-                        // Another writer (e.g. `scan`) holds this folder lock; skip cleanly!
-                    }
-                    Err(err) => {
-                        eprintln!(
-                            "  [ultimate learn-on-play warn] failed to save Schema-2 album YAML for '{}': {err}",
-                            display_path.display()
-                        );
-                    }
-                }
-                if ult.store.sidecar_enabled() {
-                    let _ = ult.store.save_preserving_user(local_path, entry);
-                }
-            } else {
-                match ult.store.save_preserving_user(local_path, entry) {
-                    Ok(_) => wrote_yaml = true,
-                    Err(err) => {
-                        eprintln!(
-                            "  [ultimate learn-on-play warn] failed to save YAML for '{}': {err}",
-                            display_path.display()
-                        );
-                    }
-                }
-            }
-        }
-    }
+    let wrote_yaml = if !had_error && ult.config.learn_on_play && !is_streaming && local_path.is_some()
+    {
+        persist_learn_on_play(
+            ult,
+            source,
+            spec,
+            display_path,
+            local_path,
+            track_loc.as_ref(),
+            file_size,
+            file_mtime,
+            header_md5,
+            header_md5_hex,
+            &analyzer,
+            early_digital,
+            orig_below,
+            &raw_peak_meta,
+            &track_meta,
+            &policy,
+            &selection,
+            post_key,
+            whole_track_m_linear,
+        )
+    } else {
+        false
+    };
 
     UltimateStreamResult::Played {
         next_carryover,
@@ -1578,21 +1661,32 @@ where
     let track_meta = source.track_meta();
     let is_streaming = source.is_streaming();
 
+    // Review #9 U12: always resolve short-track precedence through `UserFiltersFile` (using an
+    // empty default when no file exists) so track > folder > AP_* tag > defaults runs in ONE place
+    // and phase overrides report accurate provenance!
+    let fallback_ov;
+    let effective_ov: &ResolvedUserOverrides = match user_overrides {
+        Some(ov) => ov,
+        None => {
+            fallback_ov = UserFiltersFile::default().resolve_for_track("", "", "", &track_meta);
+            &fallback_ov
+        }
+    };
+
     let mut src_info = ap_dsp::selector::TrackSourceInfo::from_stream_spec(spec);
     src_info.is_streaming_source = is_streaming;
     src_info.deemphasis = if effective_filter_mode == FilterMode::Suggested {
         track_meta.cuesheet_pre_emphasis
     } else {
-        user_overrides
-            .and_then(|u| u.deemphasis.as_ref().map(|(d, _)| *d))
-            .or(track_meta.ap_deemphasis)
+        effective_ov
+            .deemphasis
+            .as_ref()
+            .map(|(d, _)| *d)
             .unwrap_or(track_meta.cuesheet_pre_emphasis)
     };
 
     let mut warnings: Vec<String> = user_warnings.to_vec();
-    if let Some(ov) = user_overrides {
-        warnings.extend(ov.warnings.iter().cloned());
-    }
+    warnings.extend(effective_ov.warnings.iter().cloned());
 
     let base_policy = pipeline.policy();
     let mut override_label: Option<String> = None;
@@ -1603,19 +1697,7 @@ where
         override_label = Some("cli".to_string());
         winning_rule = "cli_override".to_string();
     } else if effective_filter_mode == FilterMode::Mine {
-        let candidate_filter = user_overrides
-            .and_then(|u| {
-                u.filter
-                    .as_ref()
-                    .map(|(f, prov, _)| (f.as_str(), *prov))
-            })
-            .or_else(|| {
-                track_meta
-                    .ap_filter
-                    .as_deref()
-                    .map(|f| (f, UserFilterProvenance::Tag))
-            });
-        if let Some((fname, prov)) = candidate_filter {
+        if let Some((ref fname, prov, _)) = effective_ov.filter {
             match FilterArchetype::from_str(fname) {
                 Ok(arch) => {
                     if is_streaming && !arch.is_streaming_safe() {
@@ -1630,25 +1712,24 @@ where
                     }
                 }
                 Err(err) => {
-                    warnings.push(format!("ignoring unrecognized user filter override '{fname}': {err}"));
+                    warnings.push(format!(
+                        "ignoring unrecognized user filter override '{fname}': {err}"
+                    ));
                 }
             }
-        } else {
-            let phase_choice = user_overrides
-                .and_then(|u| u.phase.as_ref().map(|(p, _)| *p))
-                .or(track_meta.ap_phase);
+        } else if let Some((phase_choice, prov, _)) = effective_ov.phase {
             match phase_choice {
-                Some(PhaseTagOverride::Minimum) => {
+                PhaseTagOverride::Minimum => {
                     user_filter_override = Some(FilterArchetype::MinphaseLong);
-                    override_label = Some(UserFilterProvenance::Track.short_label().to_string());
+                    override_label = Some(prov.short_label().to_string());
                     winning_rule = "user_phase_min".to_string();
                 }
-                Some(PhaseTagOverride::Intermediate) => {
+                PhaseTagOverride::Intermediate => {
                     user_filter_override = Some(FilterArchetype::IntermediateLong);
-                    override_label = Some(UserFilterProvenance::Track.short_label().to_string());
+                    override_label = Some(prov.short_label().to_string());
                     winning_rule = "user_phase_ip".to_string();
                 }
-                _ => {}
+                PhaseTagOverride::Linear => {}
             }
         }
     }
@@ -2055,13 +2136,13 @@ mod tests {
     #[test]
     fn gate_m3_short_track_header_and_zero_total_samples_use_normal_mode() {
         let db_root = temp_dir("m3");
-        let ult = UltimateRuntimeContext::from_legacy(
+        let ult = UltimateRuntimeContext::for_test(
             UltimateConfig {
                 enabled: true,
                 genre_rules: true,
                 learn_on_play: true,
             },
-            TrackDbStore::new(db_root.clone(), false),
+            db_root.clone(),
         );
         let pipeline = make_fast_ultimate_pipeline();
 
@@ -2135,13 +2216,13 @@ mod tests {
         let db_root = temp_dir("exact_m");
         let track_path = db_root.join("track_32s.flac");
         fs::write(&track_path, b"dummy").unwrap();
-        let ult = UltimateRuntimeContext::from_legacy(
+        let ult = UltimateRuntimeContext::for_test(
             UltimateConfig {
                 enabled: true,
                 genre_rules: true,
                 learn_on_play: true,
             },
-            TrackDbStore::new(db_root.clone(), false),
+            db_root.clone(),
         );
         let pipeline = make_fast_ultimate_pipeline();
 
@@ -2265,7 +2346,7 @@ mod tests {
         );
         assert!(matches!(r3, UltimateStreamResult::Played { wrote_yaml: false, .. }));
         let _ = drain_h3.join().unwrap();
-        assert!(ult.store.load_for_track(Some(&corrupt_path), None).is_none());
+        assert!(ult.filter_db.load_album("main", "").and_then(|a| a.tracks.get("corrupt.flac").cloned()).is_none());
 
         // - Mid-window skip discards cleanly with ZERO YAML write!
         let skip_path = db_root.join("skip.flac");
@@ -2293,7 +2374,7 @@ mod tests {
             16_384,
         );
         assert!(matches!(r_skip, UltimateStreamResult::Aborted));
-        assert!(ult.store.load_for_track(Some(&skip_path), None).is_none());
+        assert!(ult.filter_db.load_album("main", "").and_then(|a| a.tracks.get("skip.flac").cloned()).is_none());
 
         let _ = pipeline;
         let _ = fs::remove_dir_all(&db_root);
@@ -2302,13 +2383,13 @@ mod tests {
     #[test]
     fn gate_streaming_m4_oq33_stale_tag_disproof_and_strict_per_track_independence_oq40() {
         let db_root = temp_dir("stream_oq40");
-        let ult = UltimateRuntimeContext::from_legacy(
+        let ult = UltimateRuntimeContext::for_test(
             UltimateConfig {
                 enabled: true,
                 genre_rules: true,
                 learn_on_play: true,
             },
-            TrackDbStore::new(db_root.clone(), false),
+            db_root.clone(),
         );
         let fast_policy = UpsamplerPolicy {
             filter_override: Some(FilterArchetype::Null),
@@ -2469,13 +2550,13 @@ mod tests {
     #[test]
     fn ultimate_null_filter_negative_gain_never_bypass_shaper_and_zero_gain_stays_bit_perfect() {
         let db_root = temp_dir("f2_quantizer");
-        let ult = UltimateRuntimeContext::from_legacy(
+        let ult = UltimateRuntimeContext::for_test(
             UltimateConfig {
                 enabled: true,
                 genre_rules: true,
                 learn_on_play: true,
             },
-            TrackDbStore::new(db_root.clone(), false),
+            db_root.clone(),
         );
         let fast_policy = UpsamplerPolicy {
             filter_override: Some(FilterArchetype::Null),
@@ -2634,13 +2715,13 @@ mod tests {
         let db_root = temp_dir("f7_f8");
         let track_path = db_root.join("corrupt_w4.flac");
         fs::write(&track_path, b"corrupt_w4").unwrap();
-        let ult = UltimateRuntimeContext::from_legacy(
+        let ult = UltimateRuntimeContext::for_test(
             UltimateConfig {
                 enabled: true,
                 genre_rules: true,
                 learn_on_play: true,
             },
-            TrackDbStore::new(db_root.clone(), false),
+            db_root.clone(),
         );
         let fast_policy = UpsamplerPolicy {
             filter_override: Some(FilterArchetype::Null),
@@ -2717,7 +2798,7 @@ mod tests {
         let (_, frames, max_abs) = h1.join().unwrap();
         assert_eq!(frames, 44_100 * 35);
         assert!(max_abs > 0);
-        assert!(ult.store.load_for_track(Some(&track_path), None).is_none());
+        assert!(ult.filter_db.load_album("main", "").is_none());
 
         // 2. F8: Panic injected right after incoming_carryover.take() preserves `panic_backup_carry`!
         let mut src_p = SyntheticSource::sine(44_100, 31.0, 0.5, false);
@@ -2777,13 +2858,13 @@ mod tests {
         let db_root = temp_dir("f9_fb1");
         let track_path = db_root.join("slow_probe.flac");
         fs::write(&track_path, b"slow").unwrap();
-        let ult = UltimateRuntimeContext::from_legacy(
+        let ult = UltimateRuntimeContext::for_test(
             UltimateConfig {
                 enabled: true,
                 genre_rules: true,
                 learn_on_play: false,
             },
-            TrackDbStore::new(db_root.clone(), false),
+            db_root.clone(),
         );
         // Use a slightly larger buffer ceiling in this test so the pre-populated 1 s cushion
         // stays buffered throughout W2 without racing a concurrent drainer thread.
@@ -2925,13 +3006,13 @@ mod tests {
         let db_root = temp_dir("f7_fb2_tail");
         let track_path = db_root.join("tail_and_eof.flac");
         fs::write(&track_path, b"tail_eof").unwrap();
-        let ult = UltimateRuntimeContext::from_legacy(
+        let ult = UltimateRuntimeContext::for_test(
             UltimateConfig {
                 enabled: true,
                 genre_rules: true,
                 learn_on_play: true,
             },
-            TrackDbStore::new(db_root.clone(), false),
+            db_root.clone(),
         );
         let fast_policy = UpsamplerPolicy {
             filter_override: Some(FilterArchetype::Null),
@@ -3091,7 +3172,7 @@ mod tests {
             other => panic!("F-B2: expected Played with warning, got {other:?}"),
         }
         assert!(
-            ult.store.load_for_track(Some(&eof_track), None).is_none(),
+            ult.filter_db.load_album("main", "").is_none(),
             "F-B2: YAML file must not be persisted after EOF flush quantize error"
         );
 
@@ -3104,13 +3185,13 @@ mod tests {
         // (no discontinuous filter tail appended after the last good block); only any remaining
         // incoming `additive_tail` is drained, followed by `TrackEnd`, and `wrote_yaml == false`.
         let db_root = temp_dir("c4_skip_flush");
-        let ult = UltimateRuntimeContext::from_legacy(
+        let ult = UltimateRuntimeContext::for_test(
             UltimateConfig {
                 enabled: true,
                 genre_rules: true,
                 learn_on_play: true,
             },
-            TrackDbStore::new(db_root.clone(), false),
+            db_root.clone(),
         );
         // ShortLp at 44.1 -> 352.8 kHz produces a non-empty filter flush tail if flushed!
         let lp_pipeline = AudioPipeline::with_rew_config_full_tail(
@@ -3273,7 +3354,6 @@ mod tests {
                     genre_rules: true,
                     learn_on_play: true,
                 },
-                TrackDbStore::new(root.join("legacy_trackdb"), false),
                 FilterDbStore::new(filterdb_dir.clone()),
                 manifest.clone(),
                 choices_path.clone(),

@@ -17,3 +17,4 @@ pub mod json;
 pub mod metadata;
 pub mod track_db;
 pub mod user_filters;
+pub mod yaml_lite;

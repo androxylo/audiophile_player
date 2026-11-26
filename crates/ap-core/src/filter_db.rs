@@ -26,11 +26,13 @@ use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::config::PlayerConfig;
-use crate::track_db::{
-    MTIME_TOLERANCE_SECS, PostChainKey, PostChainPeakEntry, TrackDbDecision, TrackDbEntry,
-    TrackDbFileInfo, TrackDbResults, TrackDbScanInfo, atomic_write_yaml,
-    contains_unquoted_yaml_special, fnv1a_128_hex, normalize_path_for_eq, now_unix_secs,
-    parse_yaml_string, strip_yaml_comment, yaml_quote,
+use crate::track_db::{PostChainKey, PostChainPeakEntry, TrackDbEntry, default_legacy_trackdb_dir};
+pub use crate::yaml_lite::split_yaml_key_val;
+use crate::yaml_lite::{
+    MTIME_TOLERANCE_SECS, atomic_write_yaml, check_yaml_line_safety, find_post_chain_peak,
+    fnv1a_128_hex, matches_track_identity, normalize_path_for_eq, now_unix_secs, parse_bool,
+    parse_f64, parse_opt_f64, parse_opt_str, parse_opt_u32, parse_u32, parse_u64,
+    parse_yaml_string, strip_yaml_comment, upsert_post_chain_peak, yaml_quote,
 };
 
 /// Schema version for per-album analysis files, `library.yaml`, and `relink-report.yaml`.
@@ -75,35 +77,6 @@ pub fn why_for_rule(rule: &str) -> &'static str {
         "throughput_fallback" => "CPU throughput fallback to lossless Gaussian",
         _ => "automatic filter selection",
     }
-}
-
-/// Split a YAML mapping line on the FIRST unquoted `:`, returning `(key_raw, val_raw)`.
-pub(crate) fn split_yaml_key_val(line: &str) -> Option<(&str, &str)> {
-    let mut in_double = false;
-    let mut in_single = false;
-    let mut escape = false;
-    for (i, ch) in line.char_indices() {
-        if escape {
-            escape = false;
-            continue;
-        }
-        if ch == '\\' && in_double {
-            escape = true;
-            continue;
-        }
-        if ch == '"' && !in_single {
-            in_double = !in_double;
-            continue;
-        }
-        if ch == '\'' && !in_double {
-            in_single = !in_single;
-            continue;
-        }
-        if ch == ':' && !in_double && !in_single {
-            return Some((&line[..i], &line[i + 1..]));
-        }
-    }
-    None
 }
 
 /// Parse a single-line YAML flow mapping `{ k1: v1, k2: "a, b: c" }` into `(key, raw_value)` pairs.
@@ -382,13 +355,7 @@ impl LibraryManifest {
             if trimmed.is_empty() {
                 continue;
             }
-            if raw_line.starts_with('\t')
-                || trimmed.starts_with('%')
-                || trimmed.starts_with("<<:")
-                || contains_unquoted_yaml_special(trimmed)
-            {
-                return Err(format!("library.yaml line {line_no}: unsafe YAML syntax"));
-            }
+            check_yaml_line_safety(raw_line, trimmed, line_no, "library.yaml")?;
             let indent = raw_line.len() - raw_line.trim_start_matches(' ').len();
             let Some((k_raw, v_raw)) = split_yaml_key_val(trimmed) else {
                 return Err(format!("library.yaml line {line_no}: expected 'key: value'"));
@@ -573,53 +540,6 @@ impl AlbumTrackAnalysis {
         }
     }
 
-    /// Project back into a [`TrackDbEntry`] (with empty `user:`) for seamless fusion/playback reuse.
-    pub fn to_track_db_entry(
-        &self,
-        abs_path: &str,
-        detector_version: u32,
-        scanned_unix_s: u64,
-    ) -> TrackDbEntry {
-        TrackDbEntry {
-            schema: crate::track_db::TRACK_DB_SCHEMA_VERSION,
-            file: TrackDbFileInfo {
-                path: abs_path.to_string(),
-                size: self.size,
-                mtime_unix_s: self.mtime_unix_s,
-                streaminfo_md5: self.md5.clone(),
-                sample_rate: self.sample_rate,
-                bits: self.bits,
-            },
-            scan: TrackDbScanInfo {
-                detector_version,
-                scanned_at_unix_s: scanned_unix_s,
-                duration_s: self.seconds,
-            },
-            results: TrackDbResults {
-                effective_bandwidth_hz: self.bandwidth_hz,
-                upsampled_from_1x: self.fake_hires.clone(),
-                effective_nyquist_hz: self.effective_nyquist_hz,
-                ultrasonic_noise_detected: self.hf_noise.clone(),
-                lossy_origin_suspected: self.lossy_origin,
-                apod_events: self.apod_events,
-                apodizing_needed: self.apodizing_needed.clone(),
-                integrated_lufs: self.lufs,
-                sample_peak: self.sample_peak,
-                true_peak_dbtp: self.true_peak_dbtp,
-                clipped_runs: self.clipped_runs,
-                loud_and_clipped: self.loud_and_clipped.clone(),
-                effective_bits: self.effective_bits,
-                deemphasis_flag: self.deemphasis,
-                post_chain_peaks: self.post_chain_peaks.clone(),
-            },
-            decision: TrackDbDecision {
-                filter: self.suggested.clone(),
-                rule: self.rule.clone(),
-            },
-            user: Default::default(),
-        }
-    }
-
     /// True if this track's identity matches current `(md5, size, mtime)`.
     pub fn matches_identity(
         &self,
@@ -627,13 +547,14 @@ impl AlbumTrackAnalysis {
         cur_size: Option<u64>,
         cur_mtime_unix_s: Option<u64>,
     ) -> bool {
-        if let (Some(stored_md5), Some(cur_md5)) = (self.md5.as_deref(), cur_md5_hex) {
-            return stored_md5.eq_ignore_ascii_case(cur_md5);
-        }
-        if let (Some(sz), Some(mt)) = (cur_size, cur_mtime_unix_s) {
-            return self.size == sz && self.mtime_unix_s.abs_diff(mt) <= MTIME_TOLERANCE_SECS;
-        }
-        false
+        matches_track_identity(
+            self.md5.as_deref(),
+            self.size,
+            self.mtime_unix_s,
+            cur_md5_hex,
+            cur_size,
+            cur_mtime_unix_s,
+        )
     }
 
     /// Fast filesystem unchanged check (`size + mtime ±2 s`) for resumable scans.
@@ -643,26 +564,12 @@ impl AlbumTrackAnalysis {
 
     /// Look up measured unity-gain post-chain peak `M` (dBFS) matching `key`.
     pub fn find_post_chain_peak(&self, key: &PostChainKey) -> Option<f64> {
-        self.post_chain_peaks
-            .iter()
-            .find(|e| &e.key == key && e.peak_dbfs.is_finite())
-            .map(|e| e.peak_dbfs)
+        find_post_chain_peak(&self.post_chain_peaks, key)
     }
 
     /// Monotonically insert or raise `peak_dbfs` for `key`.
     pub fn upsert_post_chain_peak(&mut self, key: PostChainKey, peak_dbfs: f64, monotonic: bool) {
-        if !peak_dbfs.is_finite() {
-            return;
-        }
-        if let Some(existing) = self.post_chain_peaks.iter_mut().find(|e| e.key == key) {
-            if monotonic {
-                existing.peak_dbfs = existing.peak_dbfs.max(peak_dbfs);
-            } else {
-                existing.peak_dbfs = peak_dbfs;
-            }
-        } else {
-            self.post_chain_peaks.push(PostChainPeakEntry { key, peak_dbfs });
-        }
+        upsert_post_chain_peak(&mut self.post_chain_peaks, key, peak_dbfs, monotonic);
     }
 }
 
@@ -895,17 +802,7 @@ impl AlbumAnalysisFile {
             if trimmed.is_empty() {
                 continue;
             }
-            if raw_line.starts_with('\t') {
-                return Err(format!("album YAML line {line_no}: tabs are forbidden"));
-            }
-            if trimmed.starts_with('%')
-                || trimmed.starts_with("<<:")
-                || contains_unquoted_yaml_special(trimmed)
-            {
-                return Err(format!(
-                    "album YAML line {line_no}: unsafe YAML tags, anchors, aliases, or directives are forbidden"
-                ));
-            }
+            check_yaml_line_safety(raw_line, trimmed, line_no, "album YAML")?;
             let indent = raw_line.len() - raw_line.trim_start_matches(' ').len();
 
             if indent == 0 {
@@ -1196,13 +1093,7 @@ impl RelinkReport {
             if trimmed.is_empty() {
                 continue;
             }
-            if raw_line.starts_with('\t')
-                || trimmed.starts_with('%')
-                || trimmed.starts_with("<<:")
-                || contains_unquoted_yaml_special(trimmed)
-            {
-                return Err(format!("relink-report.yaml line {line_no}: unsafe YAML syntax"));
-            }
+            check_yaml_line_safety(raw_line, trimmed, line_no, "relink-report.yaml")?;
             let indent = raw_line.len() - raw_line.trim_start_matches(' ').len();
             if indent == 0 {
                 in_moves = false;
@@ -1288,6 +1179,76 @@ impl FolderLockGuard {
 impl Drop for FolderLockGuard {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.lock_path);
+    }
+}
+
+/// Single authoritative Schema-2 DB & library-root environment shared by playback, `scan`, and
+/// `filters` subcommands (Review #9 U6).
+#[derive(Debug, Clone)]
+pub struct DbEnv {
+    pub filter_db: FilterDbStore,
+    pub choices_path: PathBuf,
+    pub manifest: LibraryManifest,
+    pub legacy_trackdb_dir: PathBuf,
+}
+
+impl DbEnv {
+    /// Resolve `filterdb` location, `my-filters.yaml` path, legacy `trackdb` directory, and named
+    /// library roots identically across playback, `scan`, and `filters`.
+    ///
+    /// Root `main` resolution precedence (never silently redefined by scanning a subfolder!):
+    /// 1. Explicit `[filters.roots]` in `config.toml`
+    /// 2. Persisted `library.yaml` roots
+    /// 3. `[player] music_dir` from `config.toml` (when `main` is not yet registered)
+    /// 4. `default_main_root` (e.g. CLI music dir or `~/Music`, when `main` is not yet registered)
+    pub fn resolve(
+        cfg: &PlayerConfig,
+        cli_filterdb: Option<&Path>,
+        cli_choices: Option<&Path>,
+        cli_trackdb: Option<&Path>,
+        default_main_root: Option<&Path>,
+        detector_version: u32,
+    ) -> Self {
+        let fdb_dir = cli_filterdb
+            .map(Path::to_path_buf)
+            .or_else(|| cfg.filters.dir.clone())
+            .unwrap_or_else(FilterDbStore::default_dir);
+        let choices_path = cli_choices
+            .map(Path::to_path_buf)
+            .or_else(|| cfg.filters.choices_file.clone())
+            .unwrap_or_else(FilterDbStore::default_choices_path);
+        let legacy_trackdb_dir = cli_trackdb
+            .map(Path::to_path_buf)
+            .or_else(|| cfg.trackdb.dir.clone())
+            .unwrap_or_else(default_legacy_trackdb_dir);
+
+        let filter_db = FilterDbStore::new(fdb_dir);
+        let mut manifest = filter_db
+            .load_manifest()
+            .unwrap_or_else(|| LibraryManifest::new(detector_version));
+        for (name, path) in &cfg.filters.roots {
+            manifest.upsert_root(name, path);
+        }
+        if !manifest.roots.contains_key("main") {
+            if cli_filterdb.is_some() {
+                // Explicit `--filterdb-dir` isolates this database from the global profile's
+                // `[player] music_dir` unless no caller-provided main root was given.
+                if let Some(def_music) = default_main_root {
+                    manifest.upsert_root("main", def_music);
+                }
+            } else if let Some(ref cfg_music) = cfg.player.music_dir {
+                manifest.upsert_root("main", cfg_music);
+            } else if let Some(def_music) = default_main_root {
+                manifest.upsert_root("main", def_music);
+            }
+        }
+
+        Self {
+            filter_db,
+            choices_path,
+            manifest,
+            legacy_trackdb_dir,
+        }
     }
 }
 
@@ -1712,64 +1673,6 @@ pub fn clean_root_path_string(path: &Path) -> String {
         format!("/{}", parts[1..].join("/"))
     } else {
         parts.join("/")
-    }
-}
-
-fn parse_opt_str(val: &str) -> Result<Option<String>, String> {
-    let t = val.trim();
-    if t.is_empty() || t.eq_ignore_ascii_case("null") || t == "~" {
-        Ok(None)
-    } else {
-        Ok(Some(parse_yaml_string(t)?))
-    }
-}
-
-fn parse_u32(val: &str, line_no: usize) -> Result<u32, String> {
-    val.trim()
-        .parse::<u32>()
-        .map_err(|_| format!("YAML line {line_no}: invalid u32 '{val}'"))
-}
-
-fn parse_u64(val: &str, line_no: usize) -> Result<u64, String> {
-    val.trim()
-        .parse::<u64>()
-        .map_err(|_| format!("YAML line {line_no}: invalid u64 '{val}'"))
-}
-
-fn parse_f64(val: &str, line_no: usize) -> Result<f64, String> {
-    let v = val
-        .trim()
-        .parse::<f64>()
-        .map_err(|_| format!("YAML line {line_no}: invalid f64 '{val}'"))?;
-    if !v.is_finite() {
-        return Err(format!("YAML line {line_no}: non-finite float '{val}'"));
-    }
-    Ok(v)
-}
-
-fn parse_bool(val: &str, line_no: usize) -> Result<bool, String> {
-    match val.trim().to_ascii_lowercase().as_str() {
-        "true" => Ok(true),
-        "false" => Ok(false),
-        _ => Err(format!("YAML line {line_no}: invalid bool '{val}'")),
-    }
-}
-
-fn parse_opt_u32(val: &str, line_no: usize) -> Result<Option<u32>, String> {
-    let t = val.trim();
-    if t.is_empty() || t.eq_ignore_ascii_case("null") || t == "~" {
-        Ok(None)
-    } else {
-        Ok(Some(parse_u32(t, line_no)?))
-    }
-}
-
-fn parse_opt_f64(val: &str, line_no: usize) -> Result<Option<f64>, String> {
-    let t = val.trim();
-    if t.is_empty() || t.eq_ignore_ascii_case("null") || t == "~" {
-        Ok(None)
-    } else {
-        Ok(Some(parse_f64(t, line_no)?))
     }
 }
 

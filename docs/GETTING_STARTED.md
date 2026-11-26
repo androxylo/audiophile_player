@@ -235,7 +235,7 @@ A one-off, read-only pass that analyses each track ahead of time (sharded per al
 audiophile-player scan D:\Music --post-chain --report
 ```
 
-Omit the folder argument to scan all roots in `[filters.roots]` / `library.yaml`. Useful flags include `--post-chain` (measures exact peak through the real filter + REW chain — slower, recommended), `--report`, `--force`, `--jobs <N>`, and `--sidecar`. See [CLI Reference → `scan`](CLI.md#scan) for all options.
+Omit the folder argument to scan all roots in `[filters.roots]` / `library.yaml`. Useful flags include `--post-chain` (measures exact peak through the real filter + REW chain — slower, recommended), `--report`, `--force`, and `--jobs <N>`. See [CLI Reference → `scan`](CLI.md#scan) for all options.
 
 The scan is incremental and resumable: unchanged files are skipped in microseconds, metadata-only edits (`GENRE` tags, artwork) reuse audio analysis without re-decoding, and moved files are detected automatically by `STREAMINFO.md5` (recording moves for `my-filters.yaml` in `filterdb\relink-report.yaml`). It never modifies FLAC files, and it refuses to cache a file whose audio checksum doesn't match its header.
 
@@ -250,7 +250,7 @@ The scan is incremental and resumable: unchanged files are skipped in microsecon
   - `filters check` — validate `my-filters.yaml` against `library.yaml` (unknown filters, missing paths, shadowed rules)
   - `filters relink [--apply]` — preview or apply moved-file path updates from `filterdb\relink-report.yaml`
   - `filters migrate` — non-destructively import legacy Schema-1 `trackdb\` entries and `user:` overrides into Schema 2
-- Legacy Schema-1 `[trackdb]` files remain readable as a fallback. See [Your overrides](ULTIMATE_MODE.md#your-overrides-my-filtersyaml--filters).
+- Legacy Schema-1 `[trackdb]` files are migration-only: run `audiophile-player filters migrate` once to import them into Schema 2 (`filterdb\` + `my-filters.yaml`). See [Your overrides](ULTIMATE_MODE.md#your-overrides-my-filtersyaml--filters).
 
 ---
 
@@ -273,7 +273,7 @@ Options on the command line always win over the file. Unknown sections or keys a
 | `[ultimate]` | `enabled` (false), `genre_rules` (true), `learn_on_play` (true) |
 | `[filters]` | `mode` (auto), `dir` (%APPDATA%\audiophile-player\filterdb), `choices_file` (%APPDATA%\audiophile-player\my-filters.yaml), `root.<name>` |
 | `[filters.roots]` | Named library roots (e.g. `main = 'D:\Music'`) |
-| `[trackdb]` | Legacy Schema-1 fallback: `dir` (%APPDATA%\audiophile-player\trackdb), `sidecar` (false) |
+| `[trackdb]` | Legacy Schema-1 migration source (`filters migrate`): `dir` (%APPDATA%\audiophile-player\trackdb) |
 | `[upnp]` | `enabled` (true), `friendly_name` ("Audiophile Player"), `port` (auto), `bind_ip` |
 | `[capture]` | `enabled` (true) — opt-in exclusive capture watcher (`\\.\ApExclusiveAudio`) |
 

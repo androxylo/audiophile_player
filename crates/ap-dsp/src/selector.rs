@@ -824,7 +824,7 @@ impl FilterArchetype {
 }
 
 /// Structured audit trail of how [`select_ultimate_plan`] resolved a single track (`U13`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct UltimateSelection {
     pub plan: SelectedDspPlan,
     /// Display mode label: `"ultimate: cached"`, `"ultimate: live"`, or `"normal (<30 s)"`.
@@ -841,6 +841,8 @@ pub struct UltimateSelection {
     pub fired_rules: Vec<String>,
     /// True when M3 bypassed ultimate analysis because the track is `< 30 s`.
     pub short_track_bypass: bool,
+    /// Fused peak metadata (with disproved stale peak tags removed) for headroom selection.
+    pub peak_meta: ap_core::headroom::TrackPeakMetadata,
     /// Optional non-fatal warnings (e.g. streaming guard overriding `gauss-apod-4m`, MQA, stale tags).
     pub warnings: Vec<String>,
 }
@@ -1131,23 +1133,75 @@ pub fn select_ultimate_plan(
 ) -> Result<UltimateSelection, String> {
     let mut warnings = fused.notices.clone();
 
-    // Mandate M3: tracks shorter than 30 s take the normal-mode path cleanly.
+    // Mandate M3: tracks shorter than 30 s take normal-mode defaults (bypassing automatic
+    // detectors) while still honoring explicit user overrides from `my-filters.yaml` / `AP_*` tags.
     if duration_s_hint.is_some_and(|d| d.is_finite() && d < f64::from(ULTIMATE_LOOKAHEAD_SECONDS)) {
         let mut src = TrackSourceInfo::from_stream_spec(spec);
         src.is_streaming_source = is_streaming_source;
         src.deemphasis = fused.deemphasis.value;
-        let picker = UpsamplerPicker::new(*policy)?;
-        let plan = picker.select(&src);
-        let suggested_filter = plan.target_audiophile_filter;
+        let base_plan = UpsamplerPicker::new(*policy)?.select(&src);
+        let suggested_filter = base_plan.target_audiophile_filter;
+
+        let mut eff_policy = *policy;
+        let mut winning_rule = "short_track_bypass".to_string();
+        let mut user_provenance = None;
+        if policy.filter_override.is_none() {
+            if let Some(ref uf) = fused.user_filter {
+                match FilterArchetype::from_str(&uf.value) {
+                    Ok(arch) => {
+                        let chosen = if is_streaming_source && !arch.is_streaming_safe() {
+                            let fb = streaming_safe_fallback(spec.sample_rate_hz <= 48_000);
+                            warnings.push(format!(
+                                "M4 streaming guard: user override '{}' is local-only; using '{}'",
+                                arch, fb
+                            ));
+                            fb
+                        } else {
+                            arch
+                        };
+                        eff_policy.filter_override = Some(chosen);
+                        let prov = fused
+                            .user_filter_provenance
+                            .unwrap_or(UserFilterProvenance::Track);
+                        winning_rule = prov.rule_name().to_string();
+                        user_provenance = Some(prov);
+                    }
+                    Err(err) => warnings.push(format!(
+                        "ignoring unrecognized user filter override '{}': {err}",
+                        uf.value
+                    )),
+                }
+            } else if let Some(ref ph) = fused.phase_override {
+                match ph.value {
+                    PhaseTagOverride::Minimum => {
+                        eff_policy.filter_override = Some(FilterArchetype::MinphaseLong);
+                        winning_rule = "user_phase_min".to_string();
+                        user_provenance = Some(UserFilterProvenance::Track);
+                    }
+                    PhaseTagOverride::Intermediate => {
+                        eff_policy.filter_override = Some(FilterArchetype::IntermediateLong);
+                        winning_rule = "user_phase_ip".to_string();
+                        user_provenance = Some(UserFilterProvenance::Track);
+                    }
+                    PhaseTagOverride::Linear => {}
+                }
+            }
+        }
+        let plan = if eff_policy.filter_override != policy.filter_override {
+            UpsamplerPicker::new(eff_policy)?.select(&src)
+        } else {
+            base_plan
+        };
         return Ok(UltimateSelection {
             plan,
             mode_label: "normal (<30 s)".to_string(),
-            winning_rule: "short_track_bypass".to_string(),
-            user_provenance: None,
+            winning_rule,
+            user_provenance,
             suggested_filter,
             suggested_rule: "short_track_bypass".to_string(),
             fired_rules: vec!["M3(<30 s)".to_string()],
             short_track_bypass: true,
+            peak_meta: fused.peak_meta.clone(),
             warnings,
         });
     }
@@ -1281,8 +1335,114 @@ pub fn select_ultimate_plan(
         suggested_rule,
         fired_rules,
         short_track_bypass: false,
+        peak_meta: fused.peak_meta.clone(),
         warnings,
     })
+}
+
+/// Review #9 U10: single shared machine-suggestion resolver used by `scan` (all paths) and
+/// Ultimate Mode playback (attribute-override & learn-on-play). ALWAYS strips CLI `filter_override`
+/// and user overrides (`suggested_only`), making U2 structurally impossible.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_machine_suggestion(
+    spec: StreamSpec,
+    is_streaming_source: bool,
+    duration_s_hint: Option<f64>,
+    raw_peak_meta: &ap_core::headroom::TrackPeakMetadata,
+    track_meta: &ap_core::metadata::TrackMetadata,
+    window: Option<&crate::analysis::AnalysisResult>,
+    base_wt: &crate::fusion::CachedWholeTrackEvidence,
+    policy: &UpsamplerPolicy,
+    genre_rules: bool,
+    used_cached_wt: bool,
+) -> Result<UltimateSelection, String> {
+    let sug_wt = base_wt.clone().suggested_only();
+    let sug_fused = crate::fusion::fuse_track_evidence(
+        spec.sample_rate_hz,
+        spec.bits_per_sample,
+        raw_peak_meta,
+        track_meta,
+        window,
+        Some(&sug_wt),
+    );
+    let sug_policy = UpsamplerPolicy {
+        filter_override: None,
+        ..*policy
+    };
+    select_ultimate_plan(
+        spec,
+        is_streaming_source,
+        duration_s_hint,
+        &sug_fused,
+        &sug_policy,
+        genre_rules,
+        used_cached_wt,
+    )
+}
+
+/// Review #9 U10 + U12: single shared active-selection resolver (fuses `base_wt` + resolved
+/// `UserFiltersFile` overrides according to `filter_mode`, selects the active plan, and computes
+/// the clean machine `suggested_filter` / `suggested_rule` whenever user overrode `apodizing`).
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_active_selection(
+    spec: StreamSpec,
+    is_streaming_source: bool,
+    duration_s_hint: Option<f64>,
+    raw_peak_meta: &ap_core::headroom::TrackPeakMetadata,
+    track_meta: &ap_core::metadata::TrackMetadata,
+    window: Option<&crate::analysis::AnalysisResult>,
+    base_wt: &crate::fusion::CachedWholeTrackEvidence,
+    user_overrides: Option<&ap_core::user_filters::ResolvedUserOverrides>,
+    filter_mode: ap_core::user_filters::FilterMode,
+    policy: &UpsamplerPolicy,
+    genre_rules: bool,
+    used_cached_wt: bool,
+) -> Result<UltimateSelection, String> {
+    let active_wt = match filter_mode {
+        ap_core::user_filters::FilterMode::Suggested => base_wt.clone().suggested_only(),
+        ap_core::user_filters::FilterMode::Mine | ap_core::user_filters::FilterMode::Auto => {
+            if let Some(ov) = user_overrides {
+                base_wt.clone().with_user_overrides(ov)
+            } else {
+                base_wt.clone()
+            }
+        }
+    };
+    let fused = crate::fusion::fuse_track_evidence(
+        spec.sample_rate_hz,
+        spec.bits_per_sample,
+        raw_peak_meta,
+        track_meta,
+        window,
+        Some(&active_wt),
+    );
+    let mut selection = select_ultimate_plan(
+        spec,
+        is_streaming_source,
+        duration_s_hint,
+        &fused,
+        policy,
+        genre_rules,
+        used_cached_wt,
+    )?;
+    if fused.apodizing.source == EvidenceSource::User {
+        if let Ok(sug_sel) = resolve_machine_suggestion(
+            spec,
+            is_streaming_source,
+            duration_s_hint,
+            raw_peak_meta,
+            track_meta,
+            window,
+            base_wt,
+            policy,
+            genre_rules,
+            used_cached_wt,
+        ) {
+            selection.suggested_filter = sug_sel.plan.filter;
+            selection.suggested_rule = sug_sel.winning_rule;
+        }
+    }
+    Ok(selection)
 }
 
 /// Build the canonical [`PostChainKey`] identifying an exact linear DSP chain configuration.

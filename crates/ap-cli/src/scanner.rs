@@ -25,25 +25,24 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ap_core::config::{ConvolutionConfig, PlayerConfig};
 use ap_core::filter_db::{
-    AlbumAnalysisFile, AlbumTrackAnalysis, FilterDbStore, LibraryManifest, RelinkEntry,
+    AlbumAnalysisFile, AlbumTrackAnalysis, DbEnv, FilterDbStore, LibraryManifest, RelinkEntry,
     RelinkReport, file_head_4k_hash,
 };
-use ap_core::track_db::{PostChainKey, TrackDbStore, file_size_and_mtime, now_unix_secs};
+use ap_core::track_db::{PostChainKey, file_size_and_mtime, now_unix_secs};
 use ap_core::user_filters::{
-    UserFiltersCache, UserFiltersFile, format_root_rel_key,
+    FilterMode, UserFiltersCache, UserFiltersFile, format_root_rel_key,
 };
 use ap_dsp::analysis::{DETECTOR_VERSION, TrackAnalyzer};
 use ap_dsp::convolution::{RewConvolverFactory, StereoConvolverFactory};
 use ap_dsp::deemphasis::StereoDeemphasis;
-use ap_dsp::fusion::{
-    CachedWholeTrackEvidence, build_track_db_entry, fuse_track_evidence,
-};
+use ap_dsp::fusion::{CachedWholeTrackEvidence, build_track_db_entry};
 use ap_dsp::selector::{
-    SelectedDspPlan, UpsamplerPolicy, build_post_chain_key, select_ultimate_plan,
+    SelectedDspPlan, UpsamplerPolicy, build_post_chain_key, resolve_active_selection,
+    resolve_machine_suggestion,
 };
 use ap_dsp::upsampler::build_upsampler;
 use ap_source::flac::{AudioBlockSource, FlacBlockReader};
-use ap_source::library::discover_flac_files;
+use ap_source::library::{default_user_music_dir, discover_flac_files};
 use ap_source::md5::md5_to_hex;
 
 use crate::signals::ShutdownController;
@@ -56,7 +55,6 @@ pub struct ScanOptions {
     /// all configured roots.
     pub folder: Option<PathBuf>,
     pub report: bool,
-    pub sidecar: bool,
     pub post_chain: bool,
     pub force: bool,
     pub jobs: Option<usize>,
@@ -239,35 +237,28 @@ pub fn scan_folder(
     let genre_rules = loaded_cfg.config.ultimate.genre_rules;
     let rew_factory = RewConvolverFactory::new(conv_cfg).with_full_tail(true);
 
-    let filterdb_root = opts
-        .filterdb_dir
-        .clone()
-        .or_else(|| loaded_cfg.config.filters.dir.clone())
-        .or_else(|| opts.trackdb_dir.as_ref().map(|d| d.join("filterdb")))
-        .unwrap_or_else(FilterDbStore::default_dir);
-    let filter_db = FilterDbStore::new(filterdb_root);
-
-    let legacy_db_root = opts
-        .trackdb_dir
-        .clone()
-        .or_else(|| loaded_cfg.config.trackdb.dir.clone())
-        .unwrap_or_else(TrackDbStore::default_central_dir);
-    let legacy_store = TrackDbStore::new(legacy_db_root, opts.sidecar);
-
-    let choices_path = opts
-        .choices_file
-        .clone()
-        .or_else(|| loaded_cfg.config.filters.choices_file.clone())
-        .unwrap_or_else(FilterDbStore::default_choices_path);
-    let (_, user_filters, _) = UserFiltersCache::new(choices_path).load_fresh();
-
+    // Review #9 U6: resolve filterdb, choices_path, and named library roots via the single shared
+    // `DbEnv::resolve` helper. When `--filterdb-dir` is unset, `music_dir` / `~/Music` anchors
+    // `"main"` so scanning a subfolder never redefines `"main"`. When `--filterdb-dir` isolates a
+    // brand-new DB and an explicit folder is given, let `ensure_root_for_folder` register that
+    // folder as `"main"` rather than pulling in `~/Music`.
+    let default_music = if opts.filterdb_dir.is_some() && opts.folder.is_some() {
+        None
+    } else {
+        default_user_music_dir().filter(|p| p.is_dir())
+    };
+    let db_env = DbEnv::resolve(
+        &loaded_cfg.config,
+        opts.filterdb_dir.as_deref(),
+        opts.choices_file.as_deref(),
+        opts.trackdb_dir.as_deref(),
+        default_music.as_deref(),
+        DETECTOR_VERSION,
+    );
+    let filter_db = db_env.filter_db;
+    let (_, user_filters, _) = UserFiltersCache::new(db_env.choices_path).load_fresh();
     let scan_started_unix_s = now_unix_secs();
-    let mut manifest = filter_db
-        .load_manifest()
-        .unwrap_or_else(|| LibraryManifest::new(DETECTOR_VERSION));
-    for (name, path) in &loaded_cfg.config.filters.roots {
-        manifest.upsert_root(name, path);
-    }
+    let mut manifest = db_env.manifest;
 
     // Resolve target folder(s) to scan.
     let target_dirs: Vec<PathBuf> = match &opts.folder {
@@ -414,14 +405,12 @@ pub fn scan_folder(
                     existing_album,
                     &move_index,
                     &filter_db,
-                    &legacy_store,
                     user_filters.as_ref(),
                     &opts.upsampler_policy,
                     &rew_factory,
                     genre_rules,
                     opts.post_chain,
                     opts.force,
-                    opts.sidecar,
                     controller,
                 );
                 if let Ok(mut guard) = unit_outcomes.lock() {
@@ -572,14 +561,12 @@ fn scan_album_folder(
     existing_album: Option<&AlbumAnalysisFile>,
     move_index: &MoveIndex,
     filter_db: &FilterDbStore,
-    legacy_store: &TrackDbStore,
     user_filters: Option<&UserFiltersFile>,
     policy: &UpsamplerPolicy,
     rew_factory: &RewConvolverFactory,
     genre_rules: bool,
     measure_post_chain: bool,
     force: bool,
-    write_sidecar: bool,
     controller: Option<&ShutdownController>,
 ) -> AlbumWorkOutcome {
     let mut out = AlbumWorkOutcome::default();
@@ -655,14 +642,12 @@ fn scan_album_folder(
                 &file_name,
                 old_track.as_ref(),
                 move_index,
-                legacy_store,
                 user_filters,
                 policy,
                 rew_factory,
                 genre_rules,
                 measure_post_chain,
                 force,
-                write_sidecar,
             )
         }));
 
@@ -793,14 +778,12 @@ fn scan_single_track_schema2(
     file_name: &str,
     old_track: Option<&AlbumTrackAnalysis>,
     move_index: &MoveIndex,
-    legacy_store: &TrackDbStore,
     user_filters: Option<&UserFiltersFile>,
     policy: &UpsamplerPolicy,
     rew_factory: &RewConvolverFactory,
     genre_rules: bool,
     measure_post_chain: bool,
     force: bool,
-    write_sidecar: bool,
 ) -> SingleTrackResult {
     #[cfg(test)]
     if file_name.contains("FORCE_PANIC_TEST") {
@@ -846,25 +829,16 @@ fn scan_single_track_schema2(
                     updated.size = file_size;
                     updated.mtime_unix_s = file_mtime;
                     updated.head_hash = file_head_4k_hash(path);
-                    let sug_wt = CachedWholeTrackEvidence::from_album_track(&updated, true)
-                        .suggested_only();
-                    let sug_fused = fuse_track_evidence(
-                        spec.sample_rate_hz,
-                        spec.bits_per_sample,
-                        &raw_peak_meta,
-                        &track_meta,
-                        None,
-                        Some(&sug_wt),
-                    );
-                    if let Ok(sel) = select_ultimate_plan(
+                    let base_wt = CachedWholeTrackEvidence::from_album_track(&updated, true);
+                    if let Ok(sel) = resolve_machine_suggestion(
                         spec,
                         false,
                         Some(updated.seconds),
-                        &sug_fused,
-                        &UpsamplerPolicy {
-                            filter_override: None,
-                            ..*policy
-                        },
+                        &raw_peak_meta,
+                        &track_meta,
+                        None,
+                        &base_wt,
+                        policy,
                         genre_rules,
                         true,
                     ) {
@@ -916,26 +890,17 @@ fn scan_single_track_schema2(
                 updated.size = file_size;
                 updated.mtime_unix_s = file_mtime;
                 updated.head_hash = head_hash_opt;
-                let sug_wt =
-                    CachedWholeTrackEvidence::from_album_track(&updated, true).suggested_only();
-                let sug_fused = fuse_track_evidence(
-                    spec.sample_rate_hz,
-                    spec.bits_per_sample,
-                    &raw_peak_meta,
-                    &track_meta,
-                    None,
-                    Some(&sug_wt),
-                );
+                let base_wt = CachedWholeTrackEvidence::from_album_track(&updated, true);
                 let mut changed = false;
-                if let Ok(sel) = select_ultimate_plan(
+                if let Ok(sel) = resolve_machine_suggestion(
                     spec,
                     false,
                     Some(updated.seconds),
-                    &sug_fused,
-                    &UpsamplerPolicy {
-                        filter_override: None,
-                        ..*policy
-                    },
+                    &raw_peak_meta,
+                    &track_meta,
+                    None,
+                    &base_wt,
+                    policy,
                     genre_rules,
                     true,
                 ) {
@@ -994,29 +959,17 @@ fn scan_single_track_schema2(
         .is_some_and(|r| r < spec.sample_rate_hz);
     let analysis = analyzer.snapshot(true, early_digital, orig_below, track_meta.is_dsd_hint);
 
-    // 1. Always compute pure machine-suggested filter & rule (stored in Schema-2 album YAML!).
-    //    Review #9 U2: strip any CLI `filter_override` just like Fast Paths 2 & 3 so
-    //    `scan --filter X` never overwrites machine `suggested` with `cli_override`!
-    let sug_policy = UpsamplerPolicy {
-        filter_override: None,
-        ..*policy
-    };
-    let sug_wt =
-        CachedWholeTrackEvidence::from_whole_track_analysis(&analysis, None).suggested_only();
-    let sug_fused = fuse_track_evidence(
-        spec.sample_rate_hz,
-        spec.bits_per_sample,
-        &raw_peak_meta,
-        &track_meta,
-        Some(&analysis),
-        Some(&sug_wt),
-    );
-    let sug_selection = match select_ultimate_plan(
+    // 1. Always compute pure machine-suggested filter & rule via shared helper (U10).
+    let base_wt = CachedWholeTrackEvidence::from_whole_track_analysis(&analysis, None);
+    let sug_selection = match resolve_machine_suggestion(
         spec,
         false,
         Some(analysis.duration_s),
-        &sug_fused,
-        &sug_policy,
+        &raw_peak_meta,
+        &track_meta,
+        Some(&analysis),
+        &base_wt,
+        policy,
         genre_rules,
         false,
     ) {
@@ -1031,36 +984,22 @@ fn scan_single_track_schema2(
     let suggested_rule = sug_selection.winning_rule.clone();
     let suggested_changed = old_track.is_some_and(|p| p.suggested != suggested_filter);
 
-    // 2. Also load legacy sidecar `user:` (if `--sidecar` enabled) or `my-filters.yaml` overrides
-    //    so `--post-chain` can measure the active user chain peak as well!
-    let legacy_existing = if write_sidecar {
-        legacy_store.load_for_track(Some(path), final_md5_hex.as_deref())
-    } else {
-        None
-    };
-
+    // 2. Also compute active user chain (`my-filters.yaml` + `AP_*` tags, U10/U12) so
+    //    `--post-chain` measures the active user chain peak as well!
     let active_selection = {
-        let mut active_wt = CachedWholeTrackEvidence::from_whole_track_analysis(
-            &analysis,
-            legacy_existing.as_ref().map(|e| &e.user),
-        );
-        if let Some(uf) = user_filters {
-            let ov = uf.resolve_for_track(root, rel_folder, file_name, &track_meta);
-            active_wt = active_wt.with_user_overrides(&ov);
-        }
-        let active_fused = fuse_track_evidence(
-            spec.sample_rate_hz,
-            spec.bits_per_sample,
-            &raw_peak_meta,
-            &track_meta,
-            Some(&analysis),
-            Some(&active_wt),
-        );
-        select_ultimate_plan(
+        let default_uf = UserFiltersFile::default();
+        let uf_ref = user_filters.unwrap_or(&default_uf);
+        let ov = uf_ref.resolve_for_track(root, rel_folder, file_name, &track_meta);
+        resolve_active_selection(
             spec,
             false,
             Some(analysis.duration_s),
-            &active_fused,
+            &raw_peak_meta,
+            &track_meta,
+            Some(&analysis),
+            &base_wt,
+            Some(&ov),
+            FilterMode::Mine,
             policy,
             genre_rules,
             false,
@@ -1068,7 +1007,7 @@ fn scan_single_track_schema2(
         .unwrap_or_else(|_| sug_selection.clone())
     };
 
-    let mut s1_entry = build_track_db_entry(
+    let s1_entry = build_track_db_entry(
         path.to_string_lossy().into_owned(),
         file_size,
         file_mtime,
@@ -1108,7 +1047,6 @@ fn scan_single_track_schema2(
                 Ok(Some((key, peak_dbfs))) => {
                     if idx == 0 {
                         peak_note = format!(" M={peak_dbfs:+.2}dBFS");
-                        s1_entry.upsert_post_chain_peak(key.clone(), peak_dbfs, false);
                     }
                     s2_track.upsert_post_chain_peak(key, peak_dbfs, false);
                 }
@@ -1120,13 +1058,6 @@ fn scan_single_track_schema2(
                     }
                 }
             }
-        }
-    }
-
-    // Opt-in legacy `--sidecar` write (backwards compatibility; default is false / read-only library).
-    if write_sidecar {
-        if let Err(err) = legacy_store.save_preserving_user(Some(path), s1_entry) {
-            return SingleTrackResult::Failed(format!("FAIL  {file_name}: sidecar save error: {err}"));
         }
     }
 
@@ -1304,6 +1235,7 @@ mod tests {
         let music_dir = root.join("music");
         let db_dir = root.join("trackdb");
         let filterdb_dir = root.join("filterdb");
+        let choices_path = root.join("my-filters.yaml");
         fs::create_dir_all(&music_dir).unwrap();
 
         let flac_path = music_dir.join("01_sine.flac");
@@ -1313,13 +1245,12 @@ mod tests {
         let opts = ScanOptions {
             folder: Some(music_dir.clone()),
             report: false,
-            sidecar: true,
             post_chain: true,
             force: false,
             jobs: None,
             trackdb_dir: Some(db_dir.clone()),
             filterdb_dir: Some(filterdb_dir.clone()),
-            choices_file: Some(root.join("my-filters.yaml")),
+            choices_file: Some(choices_path.clone()),
             config_path: None,
             rew_override: Some(ConvolutionConfig::disabled()),
             upsampler_policy: UpsamplerPolicy::default(),
@@ -1328,20 +1259,18 @@ mod tests {
         assert_eq!(s1.total_files, 1);
         assert_eq!(s1.scanned, 1);
         assert_eq!(s1.failed, 0);
-
-        let sidecar_path = TrackDbStore::sidecar_path_for(&flac_path);
-        assert!(sidecar_path.is_file(), "sidecar YAML must be created");
         assert_eq!(fs::read(&flac_path).unwrap(), flac_bytes_before);
 
-        let yaml_text = fs::read_to_string(&sidecar_path).unwrap();
-        let mut entry = ap_core::track_db::TrackDbEntry::from_yaml_str(&yaml_text).unwrap();
-        assert_eq!(entry.results.post_chain_peaks.len(), 1);
-        let measured_m = entry.results.post_chain_peaks[0].peak_dbfs;
+        let store = FilterDbStore::new(&filterdb_dir);
+        let alb = store.load_album("main", "").expect("Schema-2 album YAML must exist");
+        let t1 = &alb.tracks["01_sine.flac"];
+        assert_eq!(t1.post_chain_peaks.len(), 1);
+        let measured_m = t1.post_chain_peaks[0].peak_dbfs;
         assert!((measured_m - (-6.02)).abs() < 0.2);
 
-        entry.user.filter = Some("short-lp".to_string());
-        entry.user.note = "keep my custom filter".to_string();
-        fs::write(&sidecar_path, entry.to_yaml_string()).unwrap();
+        // Write user choice in `my-filters.yaml` — scanner must NEVER modify it!
+        let user_yaml = "schema: 2\n\ntracks:\n  \"main:01_sine.flac\":\n    filter: short-lp\n    note: \"keep my custom filter\"\n";
+        fs::write(&choices_path, user_yaml).unwrap();
 
         let mut opts_rescan = opts.clone();
         opts_rescan.post_chain = false;
@@ -1353,16 +1282,13 @@ mod tests {
         opts_rescan.force = true;
         let s3 = scan_folder(&opts_rescan, None).expect("forced rescan failed");
         assert_eq!(s3.scanned, 1);
+        assert_eq!(fs::read_to_string(&choices_path).unwrap(), user_yaml);
 
-        let reloaded =
-            ap_core::track_db::TrackDbEntry::from_yaml_str(&fs::read_to_string(&sidecar_path).unwrap())
-                .unwrap();
-        assert_eq!(reloaded.user.filter.as_deref(), Some("short-lp"));
-        assert_eq!(reloaded.user.note, "keep my custom filter");
-        assert_eq!(reloaded.results.post_chain_peaks.len(), 1);
+        let alb2 = store.load_album("main", "").unwrap();
+        assert_eq!(alb2.tracks["01_sine.flac"].post_chain_peaks.len(), 1);
         assert_eq!(
-            reloaded.decision.filter,
-            reloaded.results.post_chain_peaks[0].key.upsampler
+            alb2.tracks["01_sine.flac"].suggested,
+            alb2.tracks["01_sine.flac"].post_chain_peaks[0].key.upsampler
         );
 
         let _ = fs::remove_dir_all(&root);
@@ -1374,48 +1300,28 @@ mod tests {
         let music_dir = root.join("music");
         let db_dir = root.join("trackdb");
         let filterdb_dir = root.join("filterdb");
+        let choices_path = root.join("my-filters.yaml");
         fs::create_dir_all(&music_dir).unwrap();
 
         let flac_path = music_dir.join("01_override.flac");
         write_test_flac(&flac_path, 44_100, 44_100, 0.4);
 
-        let sidecar_path = TrackDbStore::sidecar_path_for(&flac_path);
-        let mut seed = ap_core::track_db::TrackDbEntry {
-            schema: ap_core::track_db::TRACK_DB_SCHEMA_VERSION,
-            file: ap_core::track_db::TrackDbFileInfo {
-                path: flac_path.to_string_lossy().into_owned(),
-                size: 0,
-                mtime_unix_s: 0,
-                streaminfo_md5: None,
-                sample_rate: 44_100,
-                bits: 16,
-            },
-            scan: ap_core::track_db::TrackDbScanInfo {
-                detector_version: 0,
-                scanned_at_unix_s: 0,
-                duration_s: 1.0,
-            },
-            results: ap_core::track_db::TrackDbResults::default(),
-            decision: ap_core::track_db::TrackDbDecision::default(),
-            user: ap_core::track_db::TrackDbUserOverrides {
-                filter: Some("short-lp".to_string()),
-                deemphasis: Some(true),
-                apodizing: None,
-                note: String::new(),
-            },
-        };
-        fs::write(&sidecar_path, seed.to_yaml_string()).unwrap();
+        // User overrides filter & deemphasis in `my-filters.yaml` (Schema-2).
+        fs::write(
+            &choices_path,
+            "schema: 2\n\ntracks:\n  \"main:01_override.flac\":\n    filter: short-lp\n    deemphasis: true\n",
+        )
+        .unwrap();
 
         let opts = ScanOptions {
             folder: Some(music_dir.clone()),
             report: false,
-            sidecar: true,
             post_chain: true,
             force: true,
             jobs: None,
             trackdb_dir: Some(db_dir.clone()),
             filterdb_dir: Some(filterdb_dir.clone()),
-            choices_file: Some(root.join("my-filters.yaml")),
+            choices_file: Some(choices_path),
             config_path: None,
             rew_override: Some(ConvolutionConfig::disabled()),
             upsampler_policy: UpsamplerPolicy::default(),
@@ -1424,12 +1330,16 @@ mod tests {
         assert_eq!(s.scanned, 1);
         assert_eq!(s.failed, 0);
 
-        seed = ap_core::track_db::TrackDbEntry::from_yaml_str(&fs::read_to_string(&sidecar_path).unwrap())
-            .unwrap();
-        assert_eq!(seed.results.post_chain_peaks.len(), 1);
-        let key = &seed.results.post_chain_peaks[0].key;
-        assert!(key.deemphasis);
-        assert_eq!(seed.decision.filter, key.upsampler);
+        let store = FilterDbStore::new(&filterdb_dir);
+        let alb = store.load_album("main", "").unwrap();
+        let tr = &alb.tracks["01_override.flac"];
+        assert!(
+            tr.post_chain_peaks
+                .iter()
+                .any(|p| p.key.upsampler == "short-lp" && p.key.deemphasis),
+            "expected post-chain peak for user override short-lp + deemphasis=true, got {:?}",
+            tr.post_chain_peaks
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1450,7 +1360,6 @@ mod tests {
         let opts = ScanOptions {
             folder: Some(music_dir.clone()),
             report: false,
-            sidecar: true,
             post_chain: false,
             force: true,
             jobs: Some(1),
@@ -1466,7 +1375,9 @@ mod tests {
         assert_eq!(summary.failed, 1);
         assert_eq!(summary.scanned, 1);
         assert!(summary.report_lines.iter().any(|l| l.contains("panic:")));
-        assert!(TrackDbStore::sidecar_path_for(&good_path).is_file());
+        let store = FilterDbStore::new(&filterdb_dir);
+        let alb = store.load_album("main", "").unwrap();
+        assert!(alb.tracks.contains_key("02_good.flac"));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1492,7 +1403,6 @@ mod tests {
         let opts = ScanOptions {
             folder: Some(music_dir.clone()),
             report: false,
-            sidecar: false,
             post_chain: false,
             force: false,
             jobs: Some(2),
@@ -1541,7 +1451,6 @@ mod tests {
         let opts = ScanOptions {
             folder: Some(music_dir.clone()),
             report: false,
-            sidecar: false,
             post_chain: false,
             force: false,
             jobs: Some(2),
@@ -1616,7 +1525,6 @@ mod tests {
         let opts_with_override = ScanOptions {
             folder: Some(music_dir.clone()),
             report: false,
-            sidecar: false,
             post_chain: false,
             force: false,
             jobs: Some(1),

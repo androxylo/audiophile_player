@@ -278,13 +278,12 @@ impl Default for CaptureConfig {
     }
 }
 
-/// Persistent Schema-1 YAML Track Database configuration loaded from `[trackdb]` in `config.toml`.
+/// Legacy Schema-1 Track Database directory configuration loaded from `[trackdb]` in `config.toml`
+/// (migrate-only since Review #9 U7 — read by `audiophile-player filters migrate`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TrackDbConfig {
-    /// Central trackdb directory (`None` -> default `%APPDATA%\audiophile-player\trackdb`).
+    /// Legacy trackdb directory (`None` -> default `%APPDATA%\audiophile-player\trackdb`).
     pub dir: Option<PathBuf>,
-    /// Opt-in sidecar persistence (`<track.flac>.ap.yaml` next to local music files; default `false`).
-    pub sidecar: bool,
 }
 
 /// Schema-2 Filter Database & User Choices configuration loaded from `[filters]` and
@@ -403,7 +402,6 @@ pub const ALL_KNOWN_CONFIG_KEYS: &[&str] = &[
     "ultimate.genre_rules",
     "ultimate.learn_on_play",
     "trackdb.dir",
-    "trackdb.sidecar",
     "filters.mode",
     "filters.dir",
     "filters.choices_file",
@@ -477,7 +475,7 @@ impl PlayerConfig {
         // Strip optional UTF-8 BOM (Windows editors such as Notepad may emit it).
         let text = input.strip_prefix('\u{feff}').unwrap_or(input);
 
-        #[derive(Clone, Copy, PartialEq, Eq)]
+        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
         enum Section {
             None,
             Player,
@@ -492,23 +490,8 @@ impl PlayerConfig {
         }
 
         let mut active_section = Section::None;
-        let mut seen_player_section = false;
-        let mut seen_convolution_section = false;
-        let mut seen_quantizer_section = false;
-        let mut seen_upnp_section = false;
-        let mut seen_capture_section = false;
-        let mut seen_ultimate_section = false;
-        let mut seen_trackdb_section = false;
-        let mut seen_filters_section = false;
-        let mut seen_filters_roots_section = false;
-        let mut seen_player_keys: HashSet<&str> = HashSet::new();
-        let mut seen_conv_keys: HashSet<&str> = HashSet::new();
-        let mut seen_quant_keys: HashSet<&str> = HashSet::new();
-        let mut seen_upnp_keys: HashSet<&str> = HashSet::new();
-        let mut seen_capture_keys: HashSet<&str> = HashSet::new();
-        let mut seen_ultimate_keys: HashSet<&str> = HashSet::new();
-        let mut seen_trackdb_keys: HashSet<&str> = HashSet::new();
-        let mut seen_filters_keys: HashSet<String> = HashSet::new();
+        let mut seen_sections: HashSet<Section> = HashSet::new();
+        let mut seen_keys: HashSet<(Section, &str)> = HashSet::new();
         let mut seen_filter_root_names: HashSet<String> = HashSet::new();
         let mut explicit_conv_enabled: Option<bool> = None;
         let mut player = PlayerSectionConfig::default();
@@ -534,100 +517,34 @@ impl PlayerConfig {
                     ));
                 }
                 let section = stripped[1..stripped.len() - 1].trim();
-                match section {
-                    "player" => {
-                        if seen_player_section {
-                            return Err(format!(
-                                "config line {line_no}: duplicate section '[player]'"
-                            ));
-                        }
-                        seen_player_section = true;
-                        active_section = Section::Player;
-                    }
-                    "convolution" => {
-                        if seen_convolution_section {
-                            return Err(format!(
-                                "config line {line_no}: duplicate section '[convolution]'"
-                            ));
-                        }
-                        seen_convolution_section = true;
-                        active_section = Section::Convolution;
-                    }
-                    "quantizer" => {
-                        if seen_quantizer_section {
-                            return Err(format!(
-                                "config line {line_no}: duplicate section '[quantizer]'"
-                            ));
-                        }
-                        seen_quantizer_section = true;
-                        active_section = Section::Quantizer;
-                    }
-                    "upnp" => {
-                        if seen_upnp_section {
-                            return Err(format!(
-                                "config line {line_no}: duplicate section '[upnp]'"
-                            ));
-                        }
-                        seen_upnp_section = true;
-                        active_section = Section::Upnp;
-                    }
-                    "capture" => {
-                        if seen_capture_section {
-                            return Err(format!(
-                                "config line {line_no}: duplicate section '[capture]'"
-                            ));
-                        }
-                        seen_capture_section = true;
-                        active_section = Section::Capture;
-                    }
-                    "ultimate" => {
-                        if seen_ultimate_section {
-                            return Err(format!(
-                                "config line {line_no}: duplicate section '[ultimate]'"
-                            ));
-                        }
-                        seen_ultimate_section = true;
-                        active_section = Section::Ultimate;
-                    }
-                    "trackdb" => {
-                        if seen_trackdb_section {
-                            return Err(format!(
-                                "config line {line_no}: duplicate section '[trackdb]'"
-                            ));
-                        }
-                        seen_trackdb_section = true;
-                        active_section = Section::TrackDb;
-                    }
-                    "filters" => {
-                        if seen_filters_section {
-                            return Err(format!(
-                                "config line {line_no}: duplicate section '[filters]'"
-                            ));
-                        }
-                        seen_filters_section = true;
-                        active_section = Section::Filters;
-                    }
-                    "filters.roots" => {
-                        if seen_filters_roots_section {
-                            return Err(format!(
-                                "config line {line_no}: duplicate section '[filters.roots]'"
-                            ));
-                        }
-                        seen_filters_roots_section = true;
-                        active_section = Section::FiltersRoots;
-                    }
+                let next_sec = match section {
+                    "player" => Section::Player,
+                    "convolution" => Section::Convolution,
+                    "quantizer" => Section::Quantizer,
+                    "upnp" => Section::Upnp,
+                    "capture" => Section::Capture,
+                    "ultimate" => Section::Ultimate,
+                    "trackdb" => Section::TrackDb,
+                    "filters" => Section::Filters,
+                    "filters.roots" => Section::FiltersRoots,
                     other => {
                         return Err(format!(
-                            "config line {line_no}: unknown section '[{other}]' (supported: [convolution], [quantizer], [upnp], [capture], [ultimate], [trackdb], [filters], [filters.roots])"
+                            "config line {line_no}: unknown section '[{other}]' (supported: [player], [convolution], [quantizer], [upnp], [capture], [ultimate], [trackdb], [filters], [filters.roots])"
                         ));
                     }
+                };
+                if !seen_sections.insert(next_sec) {
+                    return Err(format!(
+                        "config line {line_no}: duplicate section '[{section}]'"
+                    ));
                 }
+                active_section = next_sec;
                 continue;
             }
 
             if active_section == Section::None {
                 return Err(format!(
-                    "config line {line_no}: key-value entry outside a section (expected [convolution], [quantizer], [upnp], [capture], [ultimate], or [trackdb])"
+                    "config line {line_no}: key-value entry outside a section (expected [player], [convolution], [quantizer], [upnp], [capture], [ultimate], [trackdb], [filters], or [filters.roots])"
                 ));
             }
 
@@ -639,14 +556,16 @@ impl PlayerConfig {
             let key = raw_key.trim();
             let val = raw_val.trim();
 
+            if active_section != Section::FiltersRoots
+                && !(active_section == Section::Filters && key.starts_with("root."))
+                && !seen_keys.insert((active_section, key))
+            {
+                return Err(format!("config line {line_no}: duplicate key '{key}'"));
+            }
+
             match active_section {
                 Section::None => unreachable!(),
                 Section::Player => {
-                    if !seen_player_keys.insert(key) {
-                        return Err(format!(
-                            "config line {line_no}: duplicate key '{key}' in [player]"
-                        ));
-                    }
                     match key {
                         "device" => {
                             let s = parse_toml_string(val, line_no, "device")?;
@@ -749,11 +668,6 @@ impl PlayerConfig {
                     }
                 }
                 Section::Convolution => {
-                    if !seen_conv_keys.insert(key) {
-                        return Err(format!(
-                            "config line {line_no}: duplicate key '{key}' in [convolution]"
-                        ));
-                    }
                     match key {
                         "enabled" => {
                             let b = parse_toml_bool(val, line_no, "enabled")?;
@@ -783,11 +697,6 @@ impl PlayerConfig {
                     }
                 }
                 Section::Quantizer => {
-                    if !seen_quant_keys.insert(key) {
-                        return Err(format!(
-                            "config line {line_no}: duplicate key '{key}' in [quantizer]"
-                        ));
-                    }
                     match key {
                         "dac_bits" => {
                             let bits = val.parse::<u8>().map_err(|_| {
@@ -824,11 +733,6 @@ impl PlayerConfig {
                     }
                 }
                 Section::Upnp => {
-                    if !seen_upnp_keys.insert(key) {
-                        return Err(format!(
-                            "config line {line_no}: duplicate key '{key}' in [upnp]"
-                        ));
-                    }
                     match key {
                         "enabled" => {
                             upnp.enabled = parse_toml_bool(val, line_no, "enabled")?;
@@ -876,11 +780,6 @@ impl PlayerConfig {
                     }
                 }
                 Section::Capture => {
-                    if !seen_capture_keys.insert(key) {
-                        return Err(format!(
-                            "config line {line_no}: duplicate key '{key}' in [capture]"
-                        ));
-                    }
                     match key {
                         "enabled" => {
                             capture.enabled = parse_toml_bool(val, line_no, "enabled")?;
@@ -893,11 +792,6 @@ impl PlayerConfig {
                     }
                 }
                 Section::Ultimate => {
-                    if !seen_ultimate_keys.insert(key) {
-                        return Err(format!(
-                            "config line {line_no}: duplicate key '{key}' in [ultimate]"
-                        ));
-                    }
                     match key {
                         "enabled" => {
                             ultimate.enabled = parse_toml_bool(val, line_no, "enabled")?;
@@ -917,22 +811,14 @@ impl PlayerConfig {
                     }
                 }
                 Section::TrackDb => {
-                    if !seen_trackdb_keys.insert(key) {
-                        return Err(format!(
-                            "config line {line_no}: duplicate key '{key}' in [trackdb]"
-                        ));
-                    }
                     match key {
                         "dir" => {
                             let s = parse_toml_string(val, line_no, "dir")?;
                             trackdb.dir = non_empty_path(s);
                         }
-                        "sidecar" => {
-                            trackdb.sidecar = parse_toml_bool(val, line_no, "sidecar")?;
-                        }
                         other => {
                             return Err(format!(
-                                "config line {line_no}: unknown key '{other}' in [trackdb] (allowed: dir, sidecar)"
+                                "config line {line_no}: unknown key '{other}' in [trackdb] (allowed: dir)"
                             ));
                         }
                     }
@@ -963,11 +849,6 @@ impl PlayerConfig {
                         };
                         filters.roots.insert(root_name.to_string(), path);
                     } else {
-                        if !seen_filters_keys.insert(key.to_string()) {
-                            return Err(format!(
-                                "config line {line_no}: duplicate key '{key}' in [filters]"
-                            ));
-                        }
                         match key {
                             "mode" => {
                                 let s = parse_toml_string(val, line_no, "mode")?;
@@ -1254,7 +1135,6 @@ impl PlayerConfig {
                 .dir
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned()),
-            "trackdb.sidecar" => Some(self.trackdb.sidecar.to_string()),
             "filters.mode" => Some(self.filters.mode.as_str().to_string()),
             "filters.dir" => self
                 .filters
@@ -1281,8 +1161,7 @@ pub fn format_toml_value_for_key(canonical_key: &str, raw_value: &str) -> Result
         | "capture.enabled"
         | "ultimate.enabled"
         | "ultimate.genre_rules"
-        | "ultimate.learn_on_play"
-        | "trackdb.sidecar" => match val.to_ascii_lowercase().as_str() {
+        | "ultimate.learn_on_play" => match val.to_ascii_lowercase().as_str() {
             "true" | "1" | "yes" | "on" => Ok("true".to_string()),
             "false" | "0" | "no" | "off" => Ok("false".to_string()),
             _ => Err(format!(
