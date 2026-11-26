@@ -111,7 +111,6 @@ struct OldTrackSnapshot {
     root: String,
     rel_folder: String,
     file_name: String,
-    detector_version: u32,
     track: AlbumTrackAnalysis,
 }
 
@@ -328,7 +327,6 @@ pub fn scan_folder(
                 root: album.root.clone(),
                 rel_folder: album.folder.clone(),
                 file_name: fname.clone(),
-                detector_version: album.detector_version,
                 track: track.clone(),
             };
             if let Some(ref md5) = track.md5 {
@@ -562,7 +560,7 @@ fn path_is_prefix_of(prefix: &Path, candidate: &Path) -> bool {
 
 fn is_key_referenced_in_user_filters(uf: &UserFiltersFile, root_rel_track_key: &str) -> bool {
     #[cfg(windows)]
-    let needle = root_rel_track_key.to_ascii_lowercase();
+    let needle = root_rel_track_key.to_lowercase();
     #[cfg(not(windows))]
     let needle = root_rel_track_key.to_string();
     uf.tracks.contains_key(&needle)
@@ -611,17 +609,36 @@ fn scan_album_folder(
         }
     };
 
-    let album_was_current =
-        existing_album.is_some_and(|a| a.detector_version == DETECTOR_VERSION);
-    let mut album = existing_album.cloned().unwrap_or_else(|| {
+    // Review #9 U5 + U8: reload the album YAML INSIDE the folder lock so concurrent learn-on-play
+    // writes are never clobbered by a pre-lock snapshot, and never overwrite a corrupt existing
+    // album file with partial data.
+    let fresh_existing = match filter_db.try_load_album(&unit.root, &unit.rel_folder) {
+        Ok(loaded) => loaded,
+        Err(err) => {
+            out.report_lines.push((
+                true,
+                format!(
+                    "FAIL  {}:{}: refusing to overwrite unreadable album YAML: {err}",
+                    unit.root, unit.rel_folder
+                ),
+            ));
+            out.failed += unit.files.len();
+            return out;
+        }
+    };
+    let effective_existing = fresh_existing.as_ref().or(existing_album);
+    let mut album = effective_existing.cloned().unwrap_or_else(|| {
         AlbumAnalysisFile::new(unit.root.clone(), unit.rel_folder.clone(), DETECTOR_VERSION)
     });
-    let mut album_dirty = existing_album.is_none();
+    let mut album_dirty = effective_existing.is_none();
     let mut present_in_album: HashSet<String> = HashSet::with_capacity(unit.files.len());
 
     for file_path in &unit.files {
         if controller.is_some_and(|c| c.current_signal().is_some()) {
             break;
+        }
+        if let Some(ref lk) = lock {
+            lk.refresh();
         }
         let file_name = file_path
             .file_name()
@@ -629,7 +646,7 @@ fn scan_album_folder(
             .unwrap_or_else(|| file_path.to_string_lossy().into_owned());
         present_in_album.insert(file_name.clone());
 
-        let old_track = existing_album.and_then(|a| a.tracks.get(&file_name)).cloned();
+        let old_track = effective_existing.and_then(|a| a.get_track(&file_name)).cloned();
         let res = catch_unwind(AssertUnwindSafe(|| {
             scan_single_track_schema2(
                 file_path,
@@ -637,7 +654,6 @@ fn scan_album_folder(
                 &unit.rel_folder,
                 &file_name,
                 old_track.as_ref(),
-                album_was_current,
                 move_index,
                 legacy_store,
                 user_filters,
@@ -729,7 +745,7 @@ fn scan_album_folder(
     }
 
     if album_dirty {
-        album.detector_version = DETECTOR_VERSION;
+        album.recompute_header_detector_version(DETECTOR_VERSION);
         album.scanned_unix_s = now_unix_secs();
         if let Some(ref lk) = lock {
             if let Err(err) = filter_db.save_album_under_lock(&album, lk) {
@@ -776,7 +792,6 @@ fn scan_single_track_schema2(
     rel_folder: &str,
     file_name: &str,
     old_track: Option<&AlbumTrackAnalysis>,
-    album_was_current: bool,
     move_index: &MoveIndex,
     legacy_store: &TrackDbStore,
     user_filters: Option<&UserFiltersFile>,
@@ -808,9 +823,9 @@ fn scan_single_track_schema2(
         .filter(|&f| f > 0)
         .map(|f| f as f64 / f64::from(spec.sample_rate_hz.max(1)));
 
-    // --- Fast Path 1: Unchanged (size + mtime ±2 s + current detector version) ---
-    if !force && album_was_current && !measure_post_chain {
-        if let Some(prev) = old_track {
+    // --- Fast Path 1: Unchanged (size + mtime ±2 s + per-track current detector version, U1) ---
+    if !force && !measure_post_chain {
+        if let Some(prev) = old_track.filter(|p| p.detector_version == DETECTOR_VERSION) {
             let md5_matches = match (prev.md5.as_deref(), header_md5_hex.as_deref()) {
                 (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
                 // Zero-MD5 FLACs store computed MD5 in `prev.md5` while header MD5 is None:
@@ -893,7 +908,10 @@ fn scan_single_track_schema2(
                 new_key,
                 md5: header_md5_hex.clone().or_else(|| snap.track.md5.clone()),
             };
-            if !force && !measure_post_chain && snap.detector_version == DETECTOR_VERSION {
+            if !force
+                && !measure_post_chain
+                && snap.track.detector_version == DETECTOR_VERSION
+            {
                 let mut updated = snap.track.clone();
                 updated.size = file_size;
                 updated.mtime_unix_s = file_mtime;
@@ -977,6 +995,12 @@ fn scan_single_track_schema2(
     let analysis = analyzer.snapshot(true, early_digital, orig_below, track_meta.is_dsd_hint);
 
     // 1. Always compute pure machine-suggested filter & rule (stored in Schema-2 album YAML!).
+    //    Review #9 U2: strip any CLI `filter_override` just like Fast Paths 2 & 3 so
+    //    `scan --filter X` never overwrites machine `suggested` with `cli_override`!
+    let sug_policy = UpsamplerPolicy {
+        filter_override: None,
+        ..*policy
+    };
     let sug_wt =
         CachedWholeTrackEvidence::from_whole_track_analysis(&analysis, None).suggested_only();
     let sug_fused = fuse_track_evidence(
@@ -992,7 +1016,7 @@ fn scan_single_track_schema2(
         false,
         Some(analysis.duration_s),
         &sug_fused,
-        policy,
+        &sug_policy,
         genre_rules,
         false,
     ) {
@@ -1567,6 +1591,76 @@ mod tests {
         let alb_a = store.load_album("main", "AlbumA").unwrap();
         assert!(!alb_a.tracks.contains_key("01_alpha.flac"));
         assert!(alb_a.tracks.contains_key("02_beta.flac"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn review9_u1_per_track_detector_version_and_u2_cli_filter_does_not_overwrite_suggested() {
+        let root = std::env::temp_dir().join(format!(
+            "ap_scan_u1_u2_{}_{}",
+            std::process::id(),
+            ap_core::track_db::now_unix_secs()
+        ));
+        let music_dir = root.join("Music");
+        let album_dir = music_dir.join("Album1");
+        let filterdb_dir = root.join("filterdb");
+        fs::create_dir_all(&album_dir).unwrap();
+
+        let t1 = album_dir.join("01_one.flac");
+        let t2 = album_dir.join("02_two.flac");
+        write_test_flac(&t1, 44_100, 44_100, 0.35);
+        write_test_flac(&t2, 44_100, 44_100, 0.50);
+
+        // U2: Running `scan --filter short-mp` MUST NOT store `short-mp` / `cli_override` as `suggested`!
+        let opts_with_override = ScanOptions {
+            folder: Some(music_dir.clone()),
+            report: false,
+            sidecar: false,
+            post_chain: false,
+            force: false,
+            jobs: Some(1),
+            trackdb_dir: Some(root.join("trackdb")),
+            filterdb_dir: Some(filterdb_dir.clone()),
+            choices_file: Some(root.join("my-filters.yaml")),
+            config_path: None,
+            rew_override: Some(ConvolutionConfig::disabled()),
+            upsampler_policy: UpsamplerPolicy {
+                filter_override: Some(ap_dsp::selector::FilterArchetype::ShortMp),
+                ..UpsamplerPolicy::default()
+            },
+        };
+        let s1 = scan_folder(&opts_with_override, None).unwrap();
+        assert_eq!(s1.scanned, 2);
+
+        let store = FilterDbStore::new(&filterdb_dir);
+        let mut alb = store.load_album("main", "Album1").unwrap();
+        for (fname, tr) in &alb.tracks {
+            assert_ne!(
+                tr.rule, "cli_override",
+                "U2: track {fname} stored cli_override as machine suggested!"
+            );
+            assert_ne!(
+                tr.suggested, "short-mp",
+                "U2: track {fname} stored CLI --filter override as suggested!"
+            );
+            assert_eq!(tr.detector_version, DETECTOR_VERSION);
+        }
+
+        // U1: Simulate an album where track 1 has an old detector_version (e.g. DETECTOR_VERSION - 1)
+        // while track 2 was already updated to DETECTOR_VERSION (e.g. learn-on-play or partial scan).
+        // Even if the album header was bumped, rescanning MUST re-scan track 1 and skip track 2!
+        alb.detector_version = DETECTOR_VERSION;
+        alb.tracks.get_mut("01_one.flac").unwrap().detector_version = DETECTOR_VERSION - 1;
+        alb.tracks.get_mut("02_two.flac").unwrap().detector_version = DETECTOR_VERSION;
+        assert!(store.save_album_nonblocking(&alb).unwrap());
+
+        let s2 = scan_folder(&opts_with_override, None).unwrap();
+        assert_eq!(s2.scanned, 1, "U1: stale-detector track 1 must be re-scanned");
+        assert_eq!(s2.skipped_current, 1, "U1: current-detector track 2 must be skipped");
+        let alb2 = store.load_album("main", "Album1").unwrap();
+        assert_eq!(alb2.tracks["01_one.flac"].detector_version, DETECTOR_VERSION);
+        assert_eq!(alb2.tracks["02_two.flac"].detector_version, DETECTOR_VERSION);
 
         let _ = fs::remove_dir_all(&root);
     }

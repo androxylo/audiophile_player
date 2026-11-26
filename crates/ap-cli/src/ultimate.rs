@@ -142,8 +142,11 @@ impl UltimateRuntimeContext {
             Some((r, f, album))
                 if r.eq_ignore_ascii_case(root) && f.eq_ignore_ascii_case(rel_folder) =>
             {
-                album.detector_version = DETECTOR_VERSION;
-                album.tracks.insert(file_name.to_string(), track);
+                let key = album
+                    .find_track_key(file_name)
+                    .unwrap_or_else(|| file_name.to_string());
+                album.tracks.insert(key, track);
+                album.recompute_header_detector_version(DETECTOR_VERSION);
             }
             _ => {
                 let mut album = self
@@ -156,8 +159,11 @@ impl UltimateRuntimeContext {
                             DETECTOR_VERSION,
                         )
                     });
-                album.detector_version = DETECTOR_VERSION;
-                album.tracks.insert(file_name.to_string(), track);
+                let key = album
+                    .find_track_key(file_name)
+                    .unwrap_or_else(|| file_name.to_string());
+                album.tracks.insert(key, track);
+                album.recompute_header_detector_version(DETECTOR_VERSION);
                 *guard = Some((root.to_string(), rel_folder.to_string(), album));
             }
         }
@@ -469,8 +475,8 @@ where
         None
     } else if let Some((ref root, ref rel_folder, ref file_name)) = track_loc {
         ult.load_album_cached(root, rel_folder).and_then(|album| {
-            let track = album.tracks.get(file_name)?.clone();
-            let current = album.detector_version == DETECTOR_VERSION
+            let track = album.get_track(file_name)?.clone();
+            let current = track.detector_version == DETECTOR_VERSION
                 && track.matches_identity(
                     header_md5_hex.as_deref(),
                     Some(file_size),
@@ -1497,13 +1503,13 @@ where
                     rel_folder,
                     file_name,
                     DETECTOR_VERSION,
-                    album_track.clone(),
+                    album_track,
                 ) {
-                    Ok(true) => {
-                        ult.update_album_cache(root, rel_folder, file_name, album_track);
+                    Ok(Some(merged_track)) => {
+                        ult.update_album_cache(root, rel_folder, file_name, merged_track);
                         wrote_yaml = true;
                     }
-                    Ok(false) => {
+                    Ok(None) => {
                         // Another writer (e.g. `scan`) holds this folder lock; skip cleanly!
                     }
                     Err(err) => {

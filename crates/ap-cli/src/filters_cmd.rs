@@ -606,7 +606,14 @@ fn cmd_migrate(env: &mut FiltersEnv, sidecar_root: Option<&Path>) -> Result<Stri
 
     // Group migrated tracks by (root, rel_folder) -> AlbumAnalysisFile, and collect user choices.
     let mut albums: BTreeMap<(String, String), AlbumAnalysisFile> = BTreeMap::new();
-    let mut user_choices: Vec<(String, String, Option<String>, Option<String>)> = Vec::new();
+    let mut user_choices: Vec<(
+        String,
+        Option<String>,
+        Option<bool>,
+        Option<bool>,
+        Option<String>,
+        Option<String>,
+    )> = Vec::new();
     let mut migrated_tracks = 0usize;
 
     for entry in by_path.values() {
@@ -660,22 +667,28 @@ fn cmd_migrate(env: &mut FiltersEnv, sidecar_root: Option<&Path>) -> Result<Stri
         alb.tracks.insert(file_name.clone(), s2);
         migrated_tracks += 1;
 
-        if let Some(ref uf) = entry.user.filter {
-            let trimmed = uf.trim();
-            if !trimmed.is_empty() {
-                let note = if entry.user.note.trim().is_empty() {
-                    Some("migrated from schema 1".to_string())
-                } else {
-                    Some(entry.user.note.trim().to_string())
-                };
-                let key = format_root_rel_key(&root, &rel_folder, Some(&file_name));
-                user_choices.push((
-                    key,
-                    trimmed.to_string(),
-                    note,
-                    entry.file.streaminfo_md5.clone(),
-                ));
-            }
+        let uf_opt = entry
+            .user
+            .filter
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if uf_opt.is_some() || entry.user.apodizing.is_some() || entry.user.deemphasis.is_some() {
+            let note = if entry.user.note.trim().is_empty() {
+                Some("migrated from schema 1".to_string())
+            } else {
+                Some(entry.user.note.trim().to_string())
+            };
+            let key = format_root_rel_key(&root, &rel_folder, Some(&file_name));
+            user_choices.push((
+                key,
+                uf_opt,
+                entry.user.apodizing,
+                entry.user.deemphasis,
+                note,
+                entry.file.streaminfo_md5.clone(),
+            ));
         }
     }
 
@@ -693,7 +706,7 @@ fn cmd_migrate(env: &mut FiltersEnv, sidecar_root: Option<&Path>) -> Result<Stri
         } else {
             String::new()
         };
-        for (key, filter, note, md5) in user_choices {
+        for (key, filter, apodizing, deemphasis, note, md5) in user_choices {
             let prev = if text.is_empty() {
                 None
             } else {
@@ -703,9 +716,9 @@ fn cmd_migrate(env: &mut FiltersEnv, sidecar_root: Option<&Path>) -> Result<Stri
                 prev,
                 "tracks",
                 &key,
-                Some(&filter),
-                None,
-                None,
+                filter.as_deref(),
+                apodizing,
+                deemphasis,
                 md5.as_deref(),
                 note.as_deref(),
             );

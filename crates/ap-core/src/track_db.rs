@@ -956,16 +956,33 @@ pub fn atomic_write_yaml(target: &Path, yaml: &str) -> Result<(), String> {
     }
 
     if let Err(first_err) = fs::rename(&tmp_path, target) {
-        // On Windows, fs::rename may fail if `target` already exists; replace cleanly.
+        // On Windows, fs::rename may fail if `target` already exists. Move `target` aside to a
+        // unique sibling backup first so if the second rename fails we restore `target` cleanly
+        // with zero data loss (Review #9 U15).
         if target.exists() {
-            let _ = fs::remove_file(target);
-            if let Err(e2) = fs::rename(&tmp_path, target) {
+            let mut old_name = target
+                .file_name()
+                .map(|n| n.to_os_string())
+                .unwrap_or_else(|| "entry.yaml".into());
+            old_name.push(format!(".old.{pid}.{nanos}"));
+            let old_path = target.with_file_name(old_name);
+            if let Err(move_err) = fs::rename(target, &old_path) {
                 let _ = fs::remove_file(&tmp_path);
                 return Err(format!(
-                    "failed to atomically replace trackdb YAML '{}': {e2} (initial: {first_err})",
+                    "failed to stage existing YAML '{}' for replacement: {move_err} (initial: {first_err})",
                     target.display()
                 ));
             }
+            if let Err(e2) = fs::rename(&tmp_path, target) {
+                // Restore original file before reporting error.
+                let _ = fs::rename(&old_path, target);
+                let _ = fs::remove_file(&tmp_path);
+                return Err(format!(
+                    "failed to atomically replace YAML '{}': {e2} (initial: {first_err})",
+                    target.display()
+                ));
+            }
+            let _ = fs::remove_file(&old_path);
         } else {
             let _ = fs::remove_file(&tmp_path);
             return Err(format!(

@@ -477,6 +477,9 @@ pub struct AlbumTrackAnalysis {
     pub suggested: String,
     pub why: String,
     pub rule: String,
+    /// Per-track detector version (Review #9 U1). Older files that only stored an album-level
+    /// `detector_version` automatically inherit the album header value on parse.
+    pub detector_version: u32,
     pub md5: Option<String>,
     pub size: u64,
     pub mtime_unix_s: u64,
@@ -508,6 +511,7 @@ impl Default for AlbumTrackAnalysis {
             suggested: String::new(),
             why: String::new(),
             rule: String::new(),
+            detector_version: 0,
             md5: None,
             size: 0,
             mtime_unix_s: 0,
@@ -543,6 +547,7 @@ impl AlbumTrackAnalysis {
             suggested: entry.decision.filter.clone(),
             why,
             rule: entry.decision.rule.clone(),
+            detector_version: entry.scan.detector_version,
             md5: entry.file.streaminfo_md5.clone(),
             size: entry.file.size,
             mtime_unix_s: entry.file.mtime_unix_s,
@@ -685,6 +690,54 @@ impl AlbumAnalysisFile {
         }
     }
 
+    /// Look up a track by filename, falling back to Unicode case-insensitive match on Windows
+    /// (Review #9 U15).
+    pub fn get_track(&self, file_name: &str) -> Option<&AlbumTrackAnalysis> {
+        if let Some(t) = self.tracks.get(file_name) {
+            return Some(t);
+        }
+        #[cfg(windows)]
+        {
+            let needle = file_name.to_lowercase();
+            return self
+                .tracks
+                .iter()
+                .find(|(k, _)| k.to_lowercase() == needle)
+                .map(|(_, v)| v);
+        }
+        #[cfg(not(windows))]
+        None
+    }
+
+    /// Look up the canonical stored key for `file_name` (exact match, or Unicode case-insensitive
+    /// match on Windows).
+    pub fn find_track_key(&self, file_name: &str) -> Option<String> {
+        if self.tracks.contains_key(file_name) {
+            return Some(file_name.to_string());
+        }
+        #[cfg(windows)]
+        {
+            let needle = file_name.to_lowercase();
+            return self
+                .tracks
+                .keys()
+                .find(|k| k.to_lowercase() == needle)
+                .cloned();
+        }
+        #[cfg(not(windows))]
+        None
+    }
+
+    /// Recompute album header `detector_version` as the minimum across stored tracks (or fallback).
+    pub fn recompute_header_detector_version(&mut self, fallback: u32) {
+        self.detector_version = self
+            .tracks
+            .values()
+            .map(|t| t.detector_version)
+            .min()
+            .unwrap_or(fallback);
+    }
+
     /// Serialize to compact, human-readable Schema-2 YAML (flow maps keep ~15 lines/track).
     pub fn to_yaml_string(&self) -> String {
         let mut s = String::with_capacity(512 + self.tracks.len() * 512);
@@ -711,6 +764,7 @@ impl AlbumAnalysisFile {
             };
             s.push_str(&format!("    why: {}\n", yaml_quote(why)));
             s.push_str(&format!("    rule: {}\n", yaml_quote(&t.rule)));
+            s.push_str(&format!("    detector_version: {}\n", t.detector_version));
 
             let md5_s = t.md5.as_deref().map(yaml_quote).unwrap_or_else(|| "null".to_string());
             let head_part = match t.head_hash.as_deref() {
@@ -805,12 +859,19 @@ impl AlbumAnalysisFile {
         let mut in_tracks = false;
         let mut cur_track_name: Option<String> = None;
         let mut cur_track = AlbumTrackAnalysis::default();
+        let mut cur_track_saw_dv = false;
         let mut cur_subsection = "";
 
         let flush_track = |name: &mut Option<String>,
                            track: &mut AlbumTrackAnalysis,
+                           saw_dv: &mut bool,
+                           album_dv: u32,
                            map: &mut BTreeMap<String, AlbumTrackAnalysis>| {
             if let Some(n) = name.take() {
+                if !*saw_dv {
+                    track.detector_version = album_dv;
+                }
+                *saw_dv = false;
                 // Review #7 F11: sanitize out-of-range effective_nyquist_hz
                 if let Some(feff) = track.effective_nyquist_hz {
                     const MIN_VALID_FEFF_HZ: u32 = 19_380;
@@ -848,7 +909,13 @@ impl AlbumAnalysisFile {
             let indent = raw_line.len() - raw_line.trim_start_matches(' ').len();
 
             if indent == 0 {
-                flush_track(&mut cur_track_name, &mut cur_track, &mut out.tracks);
+                flush_track(
+                    &mut cur_track_name,
+                    &mut cur_track,
+                    &mut cur_track_saw_dv,
+                    out.detector_version,
+                    &mut out.tracks,
+                );
                 in_tracks = false;
                 cur_subsection = "";
                 let Some((k_raw, v_raw)) = split_yaml_key_val(trimmed) else {
@@ -896,7 +963,13 @@ impl AlbumAnalysisFile {
             }
 
             if indent == 2 {
-                flush_track(&mut cur_track_name, &mut cur_track, &mut out.tracks);
+                flush_track(
+                    &mut cur_track_name,
+                    &mut cur_track,
+                    &mut cur_track_saw_dv,
+                    out.detector_version,
+                    &mut out.tracks,
+                );
                 cur_subsection = "";
                 let Some((k_raw, _)) = split_yaml_key_val(trimmed) else {
                     return Err(format!("album YAML line {line_no}: expected track filename key"));
@@ -920,6 +993,14 @@ impl AlbumAnalysisFile {
                     "suggested" => cur_track.suggested = parse_yaml_string(val)?,
                     "why" => cur_track.why = parse_yaml_string(val)?,
                     "rule" => cur_track.rule = parse_yaml_string(val)?,
+                    "detector_version" => {
+                        cur_track.detector_version = val.parse().map_err(|_| {
+                            format!(
+                                "album YAML line {line_no}: invalid track detector_version '{val}'"
+                            )
+                        })?;
+                        cur_track_saw_dv = true;
+                    }
                     "id" => {
                         for (fk, fv) in parse_flow_map(val, line_no)? {
                             match fk.as_str() {
@@ -1031,7 +1112,13 @@ impl AlbumAnalysisFile {
             }
         }
 
-        flush_track(&mut cur_track_name, &mut cur_track, &mut out.tracks);
+        flush_track(
+            &mut cur_track_name,
+            &mut cur_track,
+            &mut cur_track_saw_dv,
+            out.detector_version,
+            &mut out.tracks,
+        );
         if !saw_schema {
             return Err("album YAML missing required 'schema: 2' header".to_string());
         }
@@ -1183,6 +1270,21 @@ pub struct FolderLockGuard {
     lock_path: PathBuf,
 }
 
+impl FolderLockGuard {
+    /// Touch/rewrite the lock file timestamp while holding it so long scans never look stale
+    /// (Review #9 U5).
+    pub fn refresh(&self) {
+        if let Ok(mut f) = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&self.lock_path)
+        {
+            let _ = writeln!(f, "pid={} ts={}", std::process::id(), now_unix_secs());
+            let _ = f.flush();
+        }
+    }
+}
+
 impl Drop for FolderLockGuard {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.lock_path);
@@ -1258,6 +1360,10 @@ impl FilterDbStore {
 
     pub fn load_manifest(&self) -> Option<LibraryManifest> {
         let path = extended_io_path(&self.library_manifest_path());
+        let meta = fs::metadata(&path).ok()?;
+        if !meta.is_file() || meta.len() > MAX_ALBUM_YAML_BYTES as u64 {
+            return None;
+        }
         let text = fs::read_to_string(&path).ok()?;
         match LibraryManifest::from_yaml_str(&text) {
             Ok(m) => Some(m),
@@ -1279,6 +1385,10 @@ impl FilterDbStore {
 
     pub fn load_relink_report(&self) -> Option<RelinkReport> {
         let path = extended_io_path(&self.relink_report_path());
+        let meta = fs::metadata(&path).ok()?;
+        if !meta.is_file() || meta.len() > MAX_ALBUM_YAML_BYTES as u64 {
+            return None;
+        }
         let text = fs::read_to_string(&path).ok()?;
         RelinkReport::from_yaml_str(&text).ok()
     }
@@ -1289,20 +1399,44 @@ impl FilterDbStore {
         Ok(path)
     }
 
-    pub fn load_album(&self, root_name: &str, rel_folder: &str) -> Option<AlbumAnalysisFile> {
+    /// Load an album YAML file, distinguishing missing (`Ok(None)`) from oversized/corrupt (`Err`).
+    /// Used by writers so an existing file that failed to parse is NEVER overwritten (Review #9 U8).
+    pub fn try_load_album(
+        &self,
+        root_name: &str,
+        rel_folder: &str,
+    ) -> Result<Option<AlbumAnalysisFile>, String> {
         let path = self.album_yaml_path(root_name, rel_folder);
-        let meta = fs::metadata(&path).ok()?;
-        if !meta.is_file() || meta.len() > MAX_ALBUM_YAML_BYTES as u64 {
-            return None;
-        }
-        let text = fs::read_to_string(&path).ok()?;
-        match AlbumAnalysisFile::from_yaml_str(&text) {
-            Ok(a) => Some(a),
-            Err(err) => {
-                eprintln!(
-                    "  [filterdb warn] ignoring invalid album YAML '{}': {err}",
+        let meta = match fs::metadata(&path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(format!(
+                    "failed to stat album YAML '{}': {e}",
                     path.display()
-                );
+                ));
+            }
+        };
+        if !meta.is_file() {
+            return Err(format!("album YAML path '{}' is not a file", path.display()));
+        }
+        if meta.len() > MAX_ALBUM_YAML_BYTES as u64 {
+            return Err(format!(
+                "album YAML '{}' exceeds {MAX_ALBUM_YAML_BYTES}-byte safety limit ({} bytes)",
+                path.display(),
+                meta.len()
+            ));
+        }
+        let text = fs::read_to_string(&path)
+            .map_err(|e| format!("failed to read album YAML '{}': {e}", path.display()))?;
+        AlbumAnalysisFile::from_yaml_str(&text).map(Some)
+    }
+
+    pub fn load_album(&self, root_name: &str, rel_folder: &str) -> Option<AlbumAnalysisFile> {
+        match self.try_load_album(root_name, rel_folder) {
+            Ok(opt) => opt,
+            Err(err) => {
+                eprintln!("  [filterdb warn] ignoring invalid album YAML: {err}");
                 None
             }
         }
@@ -1358,13 +1492,25 @@ impl FilterDbStore {
     }
 
     /// Atomically save an entire album analysis file while the caller already holds the folder lock.
+    /// Enforces `MAX_ALBUM_YAML_BYTES` on write so a file can never be written larger than readers
+    /// will accept (Review #9 U8).
     pub fn save_album_under_lock(
         &self,
         album: &AlbumAnalysisFile,
         _lock: &FolderLockGuard,
     ) -> Result<(), String> {
+        let yaml = album.to_yaml_string();
+        if yaml.len() > MAX_ALBUM_YAML_BYTES {
+            return Err(format!(
+                "album analysis YAML for '{}:{}' ({} tracks, {} bytes) exceeds {MAX_ALBUM_YAML_BYTES}-byte limit",
+                album.root,
+                album.folder,
+                album.tracks.len(),
+                yaml.len()
+            ));
+        }
         let path = self.album_yaml_path(&album.root, &album.folder);
-        atomic_write_yaml(&path, &album.to_yaml_string())
+        atomic_write_yaml(&path, &yaml)
     }
 
     /// Atomically save an entire album analysis file (holding the per-album lock).
@@ -1379,7 +1525,8 @@ impl FilterDbStore {
 
     /// Atomically upsert one track's analysis inside its album YAML file (used by learn-on-play).
     /// Merges existing `post_chain_peaks` when the underlying audio identity matches (Review #7 F5).
-    /// Returns `Ok(true)` if written, `Ok(false)` if skipped because `scan` currently holds the lock.
+    /// Returns `Ok(Some(merged_track))` if written, `Ok(None)` if skipped because `scan` holds the
+    /// lock, or `Err` if an existing album file is corrupt/oversized (Review #9 U1, U5, U8).
     pub fn upsert_track_nonblocking(
         &self,
         root_name: &str,
@@ -1387,19 +1534,22 @@ impl FilterDbStore {
         file_name: &str,
         detector_version: u32,
         mut track: AlbumTrackAnalysis,
-    ) -> Result<bool, String> {
-        let Some(_lock) = self.try_lock_album(root_name, rel_folder)? else {
-            return Ok(false);
+    ) -> Result<Option<AlbumTrackAnalysis>, String> {
+        let Some(lock) = self.try_lock_album(root_name, rel_folder)? else {
+            return Ok(None);
         };
         let mut album = self
-            .load_album(root_name, rel_folder)
+            .try_load_album(root_name, rel_folder)?
             .unwrap_or_else(|| AlbumAnalysisFile::new(root_name, rel_folder, detector_version));
         album.root = root_name.to_string();
         album.folder = normalize_rel_path(rel_folder);
-        album.detector_version = detector_version;
         album.scanned_unix_s = now_unix_secs();
+        track.detector_version = detector_version;
 
-        if let Some(prev) = album.tracks.get(file_name) {
+        let target_key = album
+            .find_track_key(file_name)
+            .unwrap_or_else(|| file_name.to_string());
+        if let Some(prev) = album.tracks.get(&target_key) {
             let same_audio = prev.matches_identity(
                 track.md5.as_deref(),
                 Some(track.size),
@@ -1417,10 +1567,10 @@ impl FilterDbStore {
                 }
             }
         }
-        album.tracks.insert(file_name.to_string(), track);
-        let path = self.album_yaml_path(root_name, rel_folder);
-        atomic_write_yaml(&path, &album.to_yaml_string())?;
-        Ok(true)
+        album.tracks.insert(target_key, track.clone());
+        album.recompute_header_detector_version(detector_version);
+        self.save_album_under_lock(&album, &lock)?;
+        Ok(Some(track))
     }
 
     /// Recursively load all valid Schema-2 album YAML files under `analysis/` (used by `scan`
@@ -1478,29 +1628,29 @@ fn is_stale_lock(lock_path: &Path) -> bool {
     let Ok(meta) = fs::metadata(lock_path) else {
         return false;
     };
-    let age_s = meta
-        .modified()
-        .ok()
-        .and_then(|m| SystemTime::now().duration_since(m).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    if age_s >= STALE_LOCK_MAX_AGE_SECS {
-        return true;
-    }
-    // Check recorded PID if written on Windows/Unix: if timestamp is > 2 s old and PID is clearly dead.
+    // Review #9 U5: check owner PID FIRST — a live process holding a lock during a long scan is
+    // NEVER stale even past 600 s! Only purge when the recorded PID is dead, or when no valid PID
+    // exists and the lock mtime exceeds `STALE_LOCK_MAX_AGE_SECS`.
     if let Ok(txt) = fs::read_to_string(lock_path) {
         if let Some(pid_s) = txt
             .split_whitespace()
             .find_map(|tok| tok.strip_prefix("pid="))
         {
             if let Ok(pid) = pid_s.parse::<u32>() {
-                if pid != std::process::id() && !is_process_alive(pid) {
-                    return true;
+                if pid == std::process::id() || is_process_alive(pid) {
+                    return false;
                 }
+                return true;
             }
         }
     }
-    false
+    let age_s = meta
+        .modified()
+        .ok()
+        .and_then(|m| SystemTime::now().duration_since(m).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    age_s >= STALE_LOCK_MAX_AGE_SECS
 }
 
 #[cfg(windows)]
@@ -1651,6 +1801,7 @@ mod tests {
             suggested: "gauss-apod-4m".to_string(),
             why: why_for_rule("rule_A_apodizing").to_string(),
             rule: "rule_A_apodizing".to_string(),
+            detector_version: 7,
             md5: Some("3b1f0c9e5a7d4e21b8c6f0a1d2e3f4a5".to_string()),
             size: 61_834_211,
             mtime_unix_s: 1_700_000_001,
@@ -1760,7 +1911,7 @@ mod tests {
                 AlbumTrackAnalysis::default(),
             )
             .unwrap();
-        assert!(!wrote, "busy lock must skip learn-on-play non-blockingly");
+        assert!(wrote.is_none(), "busy lock must skip learn-on-play non-blockingly");
 
         // Drop lock -> upsert succeeds and writes valid album YAML!
         drop(guard);
@@ -1770,12 +1921,26 @@ mod tests {
         let wrote2 = store
             .upsert_track_nonblocking("main", "Jazz/Album", "01.flac", 7, track)
             .unwrap();
-        assert!(wrote2);
+        assert!(wrote2.is_some());
         let loaded = store.load_album("main", "Jazz/Album").unwrap();
         assert_eq!(loaded.tracks["01.flac"].suggested, "sinc-steep-4m");
+        assert_eq!(loaded.tracks["01.flac"].detector_version, 7);
+
+        // U8: Corrupt existing album YAML must NEVER be overwritten with a single track!
+        let album_path = store.album_yaml_path("main", "Jazz/Album");
+        let corrupt = "schema: 2\nnot valid : : yaml !bad\n";
+        fs::write(&album_path, corrupt).unwrap();
+        let err = store.upsert_track_nonblocking(
+            "main",
+            "Jazz/Album",
+            "02.flac",
+            7,
+            AlbumTrackAnalysis::default(),
+        );
+        assert!(err.is_err(), "U8: must refuse to overwrite corrupt album YAML");
+        assert_eq!(fs::read_to_string(&album_path).unwrap(), corrupt);
 
         // Dead-PID stale lock is automatically purged!
-        let album_path = store.album_yaml_path("main", "Jazz/Album");
         let mut lock_os = album_path.as_os_str().to_os_string();
         lock_os.push(".lock");
         let lock_path = PathBuf::from(lock_os);

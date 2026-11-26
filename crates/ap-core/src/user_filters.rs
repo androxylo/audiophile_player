@@ -186,7 +186,7 @@ fn canonical_lookup_key(raw_key: &str) -> String {
     let (root, rel) = split_root_key(raw_key);
     #[cfg(windows)]
     {
-        format!("{}:{}", root.to_ascii_lowercase(), rel.to_ascii_lowercase())
+        format!("{}:{}", root.to_lowercase(), rel.to_lowercase())
     }
     #[cfg(not(windows))]
     {
@@ -195,10 +195,11 @@ fn canonical_lookup_key(raw_key: &str) -> String {
 }
 
 /// Format canonical `"root:rel/path"` display key (preserving original case).
+/// Root-level keys use `"root:"` so lookup canonicalization matches `resolve_for_track` (Review #9 U4).
 pub fn format_root_rel_key(root: &str, rel_folder: &str, file_name: Option<&str>) -> String {
     let norm_folder = normalize_rel_path(rel_folder);
     match (norm_folder.is_empty(), file_name) {
-        (true, None) => root.to_string(),
+        (true, None) => format!("{root}:"),
         (true, Some(f)) => format!("{root}:{f}"),
         (false, None) => format!("{root}:{norm_folder}"),
         (false, Some(f)) => format!("{root}:{norm_folder}/{f}"),
@@ -285,13 +286,28 @@ impl UserFiltersFile {
                         section = "";
                     }
                     "defaults" => {
+                        if !val.is_empty() && val != "{}" {
+                            return Err(format!(
+                                "my-filters.yaml line {line_no}: inline value '{val}' on 'defaults:' is not supported; put fields on indented lines below"
+                            ));
+                        }
                         section = if val == "{}" { "" } else { "defaults" };
                         out.defaults.line_no = line_no;
                     }
                     "folders" => {
+                        if !val.is_empty() && val != "{}" {
+                            return Err(format!(
+                                "my-filters.yaml line {line_no}: inline value '{val}' on 'folders:' is not supported; put entries on indented lines below"
+                            ));
+                        }
                         section = if val == "{}" { "" } else { "folders" };
                     }
                     "tracks" => {
+                        if !val.is_empty() && val != "{}" {
+                            return Err(format!(
+                                "my-filters.yaml line {line_no}: inline value '{val}' on 'tracks:' is not supported; put entries on indented lines below"
+                            ));
+                        }
                         section = if val == "{}" { "" } else { "tracks" };
                     }
                     other => {
@@ -304,6 +320,11 @@ impl UserFiltersFile {
             }
 
             if section == "defaults" {
+                if indent < 2 {
+                    return Err(format!(
+                        "my-filters.yaml line {line_no}: invalid indentation ({indent} spaces) under defaults; expected 2 spaces"
+                    ));
+                }
                 apply_entry_field(
                     &mut out.defaults,
                     &key,
@@ -315,6 +336,11 @@ impl UserFiltersFile {
             }
 
             if (section == "folders" || section == "tracks") && indent == 2 {
+                if !val.is_empty() {
+                    return Err(format!(
+                        "my-filters.yaml line {line_no}: inline value '{val}' on key '{key}:' is not supported; put fields (filter, phase, apodizing, deemphasis, note) on 4-space indented lines below"
+                    ));
+                }
                 flush_entry(section, &mut cur_entry_key, &mut cur_entry, &mut out);
                 cur_entry_key = Some(key);
                 cur_entry = UserFilterEntry {
@@ -331,7 +357,12 @@ impl UserFiltersFile {
                     ));
                 }
                 apply_entry_field(&mut cur_entry, &key, val, line_no, &mut out.parse_warnings)?;
+                continue;
             }
+
+            return Err(format!(
+                "my-filters.yaml line {line_no}: unexpected indentation ({indent} spaces) for '{key}'"
+            ));
         }
 
         flush_entry(section, &mut cur_entry_key, &mut cur_entry, &mut out);
@@ -684,6 +715,16 @@ impl UserFiltersCache {
             return (true, st.file.clone(), st.last_error.clone());
         }
         st.stamp = Some(stamp);
+        if stamp.0 > MAX_USER_FILTERS_BYTES as u64 {
+            let msg = format!(
+                "my-filters.yaml exceeds {MAX_USER_FILTERS_BYTES}-byte limit ({} bytes); falling back to suggested mode",
+                stamp.0
+            );
+            eprintln!("  [filters warn] {msg}");
+            st.file = None;
+            st.last_error = Some(msg.clone());
+            return (true, None, Some(msg));
+        }
         match fs::read_to_string(&self.path) {
             Ok(text) => match UserFiltersFile::from_yaml_str(&text) {
                 Ok(parsed) => {
@@ -818,7 +859,60 @@ pub fn upsert_entry_preserving_comments(
         }
 
         if let Some((start, end)) = match_range {
-            out_lines.splice(start..end, new_block);
+            // Review #9 U3: update existing block IN PLACE so unspecified fields (`phase`,
+            // `apodizing`, `deemphasis`, `md5`, `note`) and inline/standalone comments stay intact!
+            let mut updates: Vec<(&str, String)> = Vec::new();
+            if let Some(f) = filter {
+                updates.push(("filter", format!("    filter: {f}")));
+            }
+            if let Some(a) = apodizing {
+                updates.push(("apodizing", format!("    apodizing: {a}")));
+            }
+            if let Some(d) = deemphasis {
+                updates.push(("deemphasis", format!("    deemphasis: {d}")));
+            }
+            if let Some(m) = md5 {
+                updates.push(("md5", format!("    md5: {m}")));
+            }
+            if let Some(n) = note {
+                if !n.is_empty() {
+                    updates.push(("note", format!("    note: {}", yaml_quote(n))));
+                }
+            }
+
+            let mut block_lines: Vec<String> = out_lines[start..end].to_vec();
+            for (field_name, new_line) in updates {
+                let mut replaced = false;
+                for bl in block_lines.iter_mut().skip(1) {
+                    let ind = bl.len() - bl.trim_start_matches(' ').len();
+                    let stripped = strip_yaml_comment(bl);
+                    let tr = stripped.trim();
+                    if ind >= 4 && !tr.is_empty() {
+                        if let Some((k_raw, _)) = split_yaml_key_val(tr) {
+                            if parse_yaml_string(k_raw).ok().as_deref() == Some(field_name) {
+                                // Preserve any trailing inline comment on this field line.
+                                let suffix = &bl[stripped.len()..];
+                                *bl = if suffix.is_empty() {
+                                    new_line.clone()
+                                } else {
+                                    format!("{new_line} {}", suffix.trim_start())
+                                };
+                                replaced = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if !replaced {
+                    // Insert right before any trailing blank lines in the block.
+                    let mut ins = block_lines.len();
+                    while ins > 1 && block_lines[ins - 1].trim().is_empty() {
+                        ins -= 1;
+                    }
+                    block_lines.insert(ins, new_line);
+                }
+            }
+            out_lines.splice(start..end, block_lines);
         } else {
             // Insert before trailing blank lines at `sec_end`.
             let mut insert_at = sec_end;
@@ -1029,5 +1123,67 @@ tracks:
         assert!(relinked.contains("# My filter choices"));
         assert!(relinked.contains("Kind of Blue (1959) [Remaster]/04 All Blues.flac"));
         assert!(UserFiltersFile::from_yaml_str(&relinked).is_ok());
+    }
+
+    #[test]
+    fn review9_u3_u4_u9_inplace_upsert_root_key_and_strict_parser() {
+        // U3: Updating `filter:` on an existing entry MUST preserve `phase`, `apodizing`,
+        //     `deemphasis`, and comments inside the block!
+        let initial = "\
+schema: 2
+
+tracks:
+  \"main:Jazz/01.flac\":
+    # User listening comment
+    filter: gauss-long-lp # old inline comment
+    phase: min
+    apodizing: false
+    deemphasis: true
+    note: \"keep me\"
+";
+        let updated = upsert_entry_preserving_comments(
+            Some(initial),
+            "tracks",
+            "main:Jazz/01.flac",
+            Some("sinc-steep-4m"),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(updated.contains("# User listening comment"));
+        let parsed = UserFiltersFile::from_yaml_str(&updated).unwrap();
+        let entry = &parsed.tracks[&canonical_lookup_key("main:Jazz/01.flac")].1;
+        assert_eq!(entry.filter.as_deref(), Some("sinc-steep-4m"));
+        assert_eq!(entry.phase, Some(PhaseTagOverride::Minimum));
+        assert_eq!(entry.apodizing, Some(false));
+        assert_eq!(entry.deemphasis, Some(true));
+        assert_eq!(entry.note.as_deref(), Some("keep me"));
+
+        // U4: Root-level key formats as `"main:"` and matches tracks anywhere under `main`.
+        let root_key = format_root_rel_key("main", "", None);
+        assert_eq!(root_key, "main:");
+        let with_root = upsert_entry_preserving_comments(
+            None,
+            "folders",
+            &root_key,
+            Some("ext-sharp-lp"),
+            None,
+            None,
+            None,
+            None,
+        );
+        let parsed_root = UserFiltersFile::from_yaml_str(&with_root).unwrap();
+        let res = parsed_root.resolve_for_track("main", "Sub/Album", "01.flac", &TrackMetadata::default());
+        assert_eq!(
+            res.filter.as_ref().map(|(f, p, _)| (f.as_str(), *p)),
+            Some(("ext-sharp-lp", UserFilterProvenance::Folder))
+        );
+
+        // U9: Inline value on key line and malformed indentation (1 or 3 spaces) MUST error!
+        let inline_val = "schema: 2\ntracks:\n  \"main:A/b.flac\": { filter: gauss-long-lp }\n";
+        assert!(UserFiltersFile::from_yaml_str(inline_val).is_err());
+        let bad_indent = "schema: 2\ntracks:\n  \"main:A/b.flac\":\n   filter: gauss-long-lp\n";
+        assert!(UserFiltersFile::from_yaml_str(bad_indent).is_err());
     }
 }
