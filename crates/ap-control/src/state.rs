@@ -67,6 +67,8 @@ pub enum ControlCommand {
     Next,
     /// Unified Pause/Stop: fade out cleanly and release the WDM-KS DAC pin immediately.
     Pause,
+    /// Resume playback after Pause / EndOfQueue in the last active mode (no-op if already playing).
+    Resume,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,7 +226,11 @@ impl SharedControl {
                 st.log
                     .push("Command: Pause (stopping playback & releasing DAC driver)");
             }
+            ControlCommand::Resume => {
+                st.log.push("Command: Resume");
+            }
         }
+        let trip_sink_stop = !matches!(cmd, ControlCommand::Resume);
         match cmd {
             // `Next` is a relative command: append it behind any pending `Play*` or earlier
             // `Next` so rapid clicks advance multiple tracks and never drop a just-clicked
@@ -235,14 +241,16 @@ impl SharedControl {
                     st.pending_commands.push_back(ControlCommand::Next);
                 }
             }
-            // Absolute commands (`Play*`, `Pause`) supersede earlier unconsumed commands.
+            // Absolute commands (`Play*`, `Pause`, `Resume`) supersede earlier unconsumed commands.
             other => {
                 st.pending_commands.clear();
                 st.pending_commands.push_back(other);
             }
         }
-        if let Some(flag) = st.sink_stop_flag.as_ref() {
-            flag.store(true, Ordering::SeqCst);
+        if trip_sink_stop {
+            if let Some(flag) = st.sink_stop_flag.as_ref() {
+                flag.store(true, Ordering::SeqCst);
+            }
         }
         self.cv.notify_all();
     }

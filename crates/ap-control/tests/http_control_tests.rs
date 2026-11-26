@@ -109,7 +109,9 @@ fn http_server_serves_scrollable_no_volume_ui_and_routes_play_pause_commands() {
     assert!(page.contains("Play Sequential"));
     assert!(page.contains("/action/next"));
     assert!(page.contains(">Next<"));
-    assert!(page.contains("Pause (Release DAC)"));
+    // When paused (not playing), the pause button renders as Resume -> /action/resume!
+    assert!(page.contains("action=\"/action/resume\""));
+    assert!(page.contains(">Resume<"));
     assert!(page.contains("overflow-y:auto")); // scrollable folder & action log
     assert!(page.contains("AlbumOne"));
     assert!(page.contains("&#9835; sample</button>"));
@@ -163,6 +165,18 @@ fn http_server_serves_scrollable_no_volume_ui_and_routes_play_pause_commands() {
     assert_eq!(shared.take_pending_command(), Some(ControlCommand::Pause));
     assert!(stop_flag.load(Ordering::SeqCst));
 
+    // 4b. POST /action/resume dispatches Resume cleanly without tripping stop_flag
+    stop_flag.store(false, Ordering::SeqCst);
+    let post_resume = format!(
+        "POST /action/resume HTTP/1.1\r\nHost: localhost:{port}\r\nOrigin: http://localhost:{port}\r\nSec-Fetch-Site: same-origin\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let resp_resume = http_request(server.addr(), &post_resume);
+    assert!(resp_resume.starts_with("HTTP/1.1 303 See Other"));
+    assert_eq!(shared.take_pending_command(), Some(ControlCommand::Resume));
+    assert!(!stop_flag.load(Ordering::SeqCst));
+
     // 5. GET /api/status returns valid JSON including recent bounded action log, decision & peak
     shared.set_playing_with_decision_and_peak(
         ap_control::state::PlayModeLabel::Random,
@@ -187,6 +201,9 @@ fn http_server_serves_scrollable_no_volume_ui_and_routes_play_pause_commands() {
         &format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
     );
     assert!(page_with_peak.contains("Max Peak: -0.85 dBFS (whole-track) · Live DAC: -6.02 dBFS"));
+    // When actively playing, the button becomes Pause (Release DAC) -> /action/pause!
+    assert!(page_with_peak.contains("action=\"/action/pause\""));
+    assert!(page_with_peak.contains(">Pause (Release DAC)<"));
 
     server.shutdown();
     // Port should be cleanly released once shutdown finishes
@@ -948,11 +965,11 @@ fn stalled_root_renders_full_control_html_with_pause_and_never_starves_other_vol
         local_resp.starts_with("HTTP/1.1 200 OK"),
         "local drive must NOT be starved by stalled NAS helpers, got: {local_resp:?}"
     );
-    assert!(local_resp.contains("/action/pause"));
+    assert!(local_resp.contains("/action/resume") || local_resp.contains("/action/pause"));
     local_server.shutdown();
 
-    // (b) GET / on the saturated stalled NAS MUST return full HTML with Pause/Next buttons and
-    // an error banner (NOT a bare text 504 page!).
+    // (b) GET / on the saturated stalled NAS MUST return full HTML with Pause/Resume & Next
+    // buttons and an error banner (NOT a bare text 504 page!).
     let stalled_shared = SharedControl::new(stalled_root, "Test DAC");
     let mut stalled_server = ControlServer::start(Arc::clone(&stalled_shared), None).unwrap();
     let stalled_port = stalled_server.addr().port();
@@ -969,8 +986,9 @@ fn stalled_root_renders_full_control_html_with_pause_and_never_starves_other_vol
         "expected text/html content-type: {stalled_resp:?}"
     );
     assert!(
-        stalled_resp.contains("/action/pause") && stalled_resp.contains("/action/next"),
-        "fallback page must keep Pause and Next buttons reachable!"
+        (stalled_resp.contains("/action/pause") || stalled_resp.contains("/action/resume"))
+            && stalled_resp.contains("/action/next"),
+        "fallback page must keep Pause/Resume and Next buttons reachable!"
     );
     assert!(
         stalled_resp.contains("Storage timed out or is busy"),
@@ -1049,8 +1067,9 @@ fn review5_post_play_actions_render_html_control_page_on_timeout_and_volume_key_
             "{endpoint}: expected text/html control page on timeout, got: {resp:?}"
         );
         assert!(
-            resp.contains("/action/pause") && resp.contains("/action/next"),
-            "{endpoint}: timeout HTML page must keep Pause and Next controls clickable!"
+            (resp.contains("/action/pause") || resp.contains("/action/resume"))
+                && resp.contains("/action/next"),
+            "{endpoint}: timeout HTML page must keep Pause/Resume and Next controls clickable!"
         );
         assert!(
             resp.contains("Storage timed out or is busy"),

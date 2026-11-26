@@ -96,6 +96,12 @@ pub fn render_control_page(snapshot: &ControlSnapshot, listing: &FolderListing) 
         items_html.push_str("<div class=\"row empty\">(No subfolders or .flac files here)</div>");
     }
 
+    let (pause_action, pause_class, pause_label) = if snapshot.is_playing {
+        ("/action/pause", "pause", "Pause (Release DAC)")
+    } else {
+        ("/action/resume", "resume", "Resume")
+    };
+
     let mut log_html = String::new();
     for line in &snapshot.recent_actions {
         log_html.push_str(&html_escape(line));
@@ -124,7 +130,7 @@ h1{{margin:0;font-size:1.15rem;letter-spacing:.02em;}}a{{color:var(--accent);tex
 .decision{{margin-top:4px;font-family:Consolas,monospace;font-size:.78rem;color:var(--accent);word-break:break-word;}}\n\
 .controls{{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;}}\n\
 button{{background:#272c36;color:var(--fg);border:1px solid var(--border);border-radius:5px;padding:7px 14px;cursor:pointer;font-size:.9rem;font-weight:600;}}\n\
-button:hover{{background:#323946;}}button.primary{{border-color:var(--accent);}}button.pause{{border-color:var(--warn);}}\n\
+button:hover{{background:#323946;}}button.primary{{border-color:var(--accent);}}button.pause{{border-color:var(--warn);}}button.resume{{border-color:var(--ok);color:var(--ok);}}\n\
 .path-bar{{display:flex;gap:6px;margin-bottom:8px;}}\n\
 .path-bar input{{flex:1;background:#0f1115;color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:6px 8px;font-family:Consolas,monospace;font-size:.86rem;}}\n\
 .browser{{max-height:44vh;overflow-y:auto;border:1px solid var(--border);border-radius:4px;background:#0f1115;padding:4px 0;}}\n\
@@ -164,9 +170,9 @@ pre#action-log{{margin:0;max-height:170px;overflow-y:auto;background:#0f1115;bor
       <input type=\"hidden\" name=\"dir\" value=\"{dir_token_html}\">\n\
       <button type=\"submit\" class=\"primary\">Next</button>\n\
     </form>\n\
-    <form method=\"POST\" action=\"/action/pause\">\n\
+    <form id=\"pause-resume-form\" method=\"POST\" action=\"{pause_action}\">\n\
       <input type=\"hidden\" name=\"dir\" value=\"{dir_token_html}\">\n\
-      <button type=\"submit\" class=\"pause\">Pause (Release DAC)</button>\n\
+      <button id=\"pause-resume-btn\" type=\"submit\" class=\"{pause_class}\">{pause_label}</button>\n\
     </form>\n\
   </div>\n\
   <form class=\"path-bar\" method=\"GET\" action=\"/\">\n\
@@ -184,6 +190,8 @@ pre#action-log{{margin:0;max-height:170px;overflow-y:auto;background:#0f1115;bor
 <script>\n\
 async function poll(){{try{{const r=await fetch('/api/status');if(!r.ok)return;const d=await r.json();\n\
 const b=document.getElementById('status-badge');b.innerHTML=d.playing?'<span class=\"badge playing\">'+d.mode+'</span>':'<span class=\"badge paused\">Paused (DAC released)</span>';\n\
+const pf=document.getElementById('pause-resume-form');const pb=document.getElementById('pause-resume-btn');\n\
+if(pf&&pb){{if(d.playing){{pf.action='/action/pause';pb.className='pause';pb.textContent='Pause (Release DAC)';}}else{{pf.action='/action/resume';pb.className='resume';pb.textContent='Resume';}}}}\n\
 const n=document.getElementById('now-playing');n.textContent=d.track?(d.format?d.track+' — '+d.format:d.track):'Idle — DAC pin closed (available to Audirvana / other players)';\n\
 const pk=document.getElementById('track-peak');if(pk)pk.textContent=d.peak?'Max Peak: '+d.peak:'';\n\
 const dr=document.getElementById('decision-report');if(dr)dr.textContent=d.decision||'';\n\

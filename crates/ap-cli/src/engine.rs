@@ -122,6 +122,11 @@ enum PlayDirective {
     StreamCapture {
         request: StreamCaptureRequest,
     },
+    /// Play `track` once (replaying the track paused mid-play), then continue seamlessly into `then`.
+    ResumeThen {
+        track: PathBuf,
+        then: Box<PlayDirective>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -237,6 +242,13 @@ struct EngineState<'a> {
     /// Path from the most recent `TrackStart` started/skipped by the consumer (or the last
     /// attempted path when an error-threshold auto-pause occurred).
     last_started_track: Option<PathBuf>,
+    /// Track that was actively playing when paused manually (or on output error) so clicking
+    /// `Resume` replays that track and seamlessly continues the active mode. `None` after
+    /// `EndOfQueue` / `FatalError` / `ErrorThresholdPause`.
+    resume_track: Option<PathBuf>,
+    /// True when paused because the queue naturally reached `EndOfQueue` (so `Resume` in
+    /// `Sequential` mode restarts from track 1 instead of immediately hitting `EndOfQueue` again).
+    paused_at_end_of_queue: bool,
     /// True after a `Next` skip until the next track actually starts playing, so rapid chained
     /// `Next` clicks advance past a pre-buffered front `TrackStart` without double-skipping on
     /// a late `Next` right after a natural track end.
@@ -317,6 +329,8 @@ impl<'a> EngineState<'a> {
             active_epoch: initial_epoch,
             last_play: initial_dir,
             last_started_track: None,
+            resume_track: None,
+            paused_at_end_of_queue: false,
             just_skipped_track: awaiting_first,
             pending_flush_skips: 0,
             awaiting_post_skip_start: awaiting_first,
@@ -362,6 +376,8 @@ impl<'a> EngineState<'a> {
         if reset_started_track {
             self.last_started_track = None;
         }
+        self.resume_track = None;
+        self.paused_at_end_of_queue = false;
         // Review #3 Finding #20: for PlaySequential / PlayRandom, we have not started playing the
         // first track yet, so a Next arriving before Track 1 plays should advance past Track 1
         // (dropping any buffered TrackStart(01) or restarting with skip_count=1) rather than
@@ -581,6 +597,12 @@ impl<'a> EngineState<'a> {
                         PlayDirective::Sequential {
                             root, folder_only, ..
                         } => self.sequential_after_last_started(root, folder_only, skip_count),
+                        PlayDirective::ResumeThen { then, .. } => match *then {
+                            PlayDirective::Sequential {
+                                root, folder_only, ..
+                            } => self.sequential_after_last_started(root, folder_only, skip_count),
+                            other => other,
+                        },
                         other => other,
                     };
                     self.last_play = restart_dir.clone();
@@ -595,6 +617,12 @@ impl<'a> EngineState<'a> {
                     PlayDirective::Sequential {
                         root, folder_only, ..
                     } => self.sequential_after_last_started(root, folder_only, 0),
+                    PlayDirective::ResumeThen { then, .. } => match *then {
+                        PlayDirective::Sequential {
+                            root, folder_only, ..
+                        } => self.sequential_after_last_started(root, folder_only, 0),
+                        other => other,
+                    },
                     other => other,
                 };
                 self.start_directive(resume_dir, false);
@@ -603,6 +631,12 @@ impl<'a> EngineState<'a> {
                 DispatchOutcome::Applied
             }
             ControlCommand::Pause => {
+                let was_playing = !self.is_paused;
+                let saved_resume_track = if was_playing {
+                    self.last_started_track.clone()
+                } else {
+                    self.resume_track.clone()
+                };
                 // Record user-paused capture generation so monitor does not auto-resume over
                 // an explicit AP Pause (Review #8 B5).
                 if let Some(ref cap) = self.capture_transport {
@@ -617,9 +651,106 @@ impl<'a> EngineState<'a> {
                 self.pause_with_message(
                     "Paused — WDM-KS kernel pin closed (DAC available to Audirvana)",
                 );
+                self.resume_track = saved_resume_track;
+                self.paused_at_end_of_queue = false;
                 println!("  [paused] WDM-KS kernel pin closed (DAC released).");
                 let _ = io::stdout().flush();
                 DispatchOutcome::Applied
+            }
+            ControlCommand::Resume => {
+                if !self.is_paused {
+                    return DispatchOutcome::Rejected;
+                }
+                let base_play = match self.last_play.clone() {
+                    PlayDirective::ResumeThen { then, .. } => *then,
+                    other => other,
+                };
+                match base_play {
+                    PlayDirective::StreamCapture { request } => {
+                        if let Some(ref cap) = self.capture_transport {
+                            if let Ok(st) = cap.get_status() {
+                                if st.stream_running != 0 && verify_status_exclusive(&st).is_ok() {
+                                    let mut resumed = request;
+                                    resumed.generation = st.stream_generation;
+                                    resumed.sample_rate_hz = st.format.sample_rate;
+                                    resumed.channels = st.format.channels;
+                                    resumed.bits_per_sample = st.format.bits_per_sample;
+                                    resumed.valid_bits_per_sample =
+                                        if st.format.valid_bits_per_sample > 0 {
+                                            st.format.valid_bits_per_sample
+                                        } else {
+                                            st.format.bits_per_sample
+                                        };
+                                    cap.clear_user_paused();
+                                    self.start_directive(
+                                        PlayDirective::StreamCapture { request: resumed },
+                                        true,
+                                    );
+                                    return DispatchOutcome::Applied;
+                                }
+                            }
+                        }
+                        self.shared.record_action(
+                            "Resume ignored: exclusive stream is not running (press Play in Tidal, or choose a folder)",
+                        );
+                        DispatchOutcome::Rejected
+                    }
+                    PlayDirective::UpnpStream { mut request } => {
+                        request.prefetched_next_gen = None;
+                        self.start_directive(PlayDirective::UpnpStream { request }, true);
+                        DispatchOutcome::Applied
+                    }
+                    PlayDirective::SingleFile { file } => {
+                        self.start_directive(PlayDirective::SingleFile { file }, true);
+                        DispatchOutcome::Applied
+                    }
+                    PlayDirective::Random { root } => {
+                        if let Some(track) = self.resume_track.take() {
+                            self.start_directive(
+                                PlayDirective::ResumeThen {
+                                    track,
+                                    then: Box::new(PlayDirective::Random { root }),
+                                },
+                                false,
+                            );
+                        } else {
+                            self.start_directive(PlayDirective::Random { root }, true);
+                        }
+                        DispatchOutcome::Applied
+                    }
+                    PlayDirective::Sequential {
+                        root, folder_only, ..
+                    } => {
+                        if let Some(track) = self.resume_track.take() {
+                            self.last_started_track = Some(track.clone());
+                            let after = self.sequential_after_last_started(root, folder_only, 0);
+                            self.start_directive(
+                                PlayDirective::ResumeThen {
+                                    track,
+                                    then: Box::new(after),
+                                },
+                                false,
+                            );
+                        } else if self.paused_at_end_of_queue {
+                            let seq_gen = self.alloc_seq_gen();
+                            self.start_directive(
+                                PlayDirective::Sequential {
+                                    root,
+                                    seq_gen,
+                                    start_after: None,
+                                    folder_only,
+                                    skip_count: 0,
+                                },
+                                true,
+                            );
+                        } else {
+                            let dir = self.sequential_after_last_started(root, folder_only, 0);
+                            self.start_directive(dir, false);
+                        }
+                        DispatchOutcome::Applied
+                    }
+                    PlayDirective::ResumeThen { .. } => unreachable!(),
+                }
             }
         }
     }
@@ -1176,6 +1307,8 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
                 }
             }
             state.pause_with_message(msg);
+            state.resume_track = None;
+            state.paused_at_end_of_queue = true;
         }
         StreamEvent::FatalError(msg) => {
             if matches!(state.last_play, PlayDirective::UpnpStream { .. }) {
@@ -1184,6 +1317,8 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
                 }
             }
             state.pause_with_message(msg);
+            state.resume_track = None;
+            state.paused_at_end_of_queue = false;
         }
         StreamEvent::ErrorThresholdPause {
             message,
@@ -1191,6 +1326,8 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
         } => {
             state.record_anchor(last_attempted);
             state.pause_with_message(message);
+            state.resume_track = None;
+            state.paused_at_end_of_queue = false;
         }
         StreamEvent::PcmBlock(_) | StreamEvent::TrackEnd => {
             // Orphaned block/marker from an interrupted track — ignore safely.
@@ -1441,15 +1578,21 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
                         break;
                     }
                     Err(err @ OutputError::DeviceBusy { .. }) => {
+                        let saved = state.last_started_track.clone();
                         let msg = format!("DAC busy ({err}) — staying paused");
                         eprintln!("  [busy] {msg}");
                         state.pause_with_message(msg);
+                        state.resume_track = saved;
+                        state.paused_at_end_of_queue = false;
                         break;
                     }
                     Err(err) => {
+                        let saved = state.last_started_track.clone();
                         let msg = format!("Output error ({err}) — paused & DAC released");
                         eprintln!("  [error] {msg}");
                         state.pause_with_message(msg);
+                        state.resume_track = saved;
+                        state.paused_at_end_of_queue = false;
                         break;
                     }
                 }
@@ -1643,6 +1786,7 @@ fn producer_loop_with_sources_inner(
     let mut single_consumed_epoch: Option<u64> = None;
     let mut upnp_consumed_epoch: Option<u64> = None;
     let mut capture_consumed_epoch: Option<u64> = None;
+    let mut resume_once_consumed_epoch: Option<u64> = None;
     let mut last_random: Option<PathBuf> = None;
     let mut last_seen_epoch: Option<u64> = None;
     let mut consecutive_errors: u32 = 0;
@@ -2064,69 +2208,41 @@ fn producer_loop_with_sources_inner(
             continue;
         }
 
+        let (directive, resumed_first) = match directive {
+            PlayDirective::ResumeThen { track, then } => {
+                if resume_once_consumed_epoch != Some(epoch) {
+                    resume_once_consumed_epoch = Some(epoch);
+                    let mode_label = match *then {
+                        PlayDirective::Sequential { .. } => PlayModeLabel::Sequential,
+                        PlayDirective::Random { .. } => PlayModeLabel::Random,
+                        PlayDirective::SingleFile { .. } => PlayModeLabel::SingleFile,
+                        _ => PlayModeLabel::Random,
+                    };
+                    if mode_label == PlayModeLabel::Random {
+                        last_random = Some(track.clone());
+                    }
+                    (*then, Some((track, mode_label)))
+                } else {
+                    (*then, None)
+                }
+            }
+            other => (other, None),
+        };
+
         let is_single_file = matches!(directive, PlayDirective::SingleFile { .. });
 
-        let (chosen, mode_label) = match directive {
-            PlayDirective::UpnpStream { .. } | PlayDirective::StreamCapture { .. } => {
-                unreachable!()
-            }
-            PlayDirective::Random { root } => {
-                let mut picked = match pick_random_flac_walk(&root) {
-                    Ok(p) => p,
-                    Err(err) => {
-                        finalize_prev_track(
-                            &pipeline,
-                            &buf,
-                            epoch,
-                            &mut carried_tail,
-                            &mut pending_track_end,
-                        );
-                        let _ = buf.push_for_epoch(epoch, StreamEvent::FatalError(err));
-                        ctrl.pause_if_epoch(epoch);
-                        continue;
-                    }
-                };
-                if last_random.as_ref() == Some(&picked) {
-                    for _ in 0..3 {
-                        if let Ok(alt) = pick_random_flac_walk(&root) {
-                            if last_random.as_ref() != Some(&alt) {
-                                picked = alt;
-                                break;
-                            }
-                        }
-                    }
+        let (chosen, mode_label) = if let Some(first) = resumed_first {
+            first
+        } else {
+            match directive {
+                PlayDirective::UpnpStream { .. }
+                | PlayDirective::StreamCapture { .. }
+                | PlayDirective::ResumeThen { .. } => {
+                    unreachable!()
                 }
-                last_random = Some(picked.clone());
-                (picked, PlayModeLabel::Random)
-            }
-            PlayDirective::Sequential {
-                root,
-                seq_gen,
-                start_after,
-                folder_only,
-                skip_count,
-            } => {
-                let needs_init = seq_cursor.as_ref().is_none_or(|(g, _)| *g != seq_gen);
-                if needs_init {
-                    let cursor_res = if folder_only {
-                        SequentialFlacCursor::new_folder_only(
-                            root.clone(),
-                            start_after.as_deref(),
-                        )
-                    } else if let Some(after) = start_after.as_deref() {
-                        SequentialFlacCursor::new_starting_after(root.clone(), after)
-                    } else {
-                        SequentialFlacCursor::new(root.clone())
-                    };
-                    match cursor_res {
-                        Ok(mut c) => {
-                            for _ in 0..skip_count {
-                                if c.next_track().is_none() {
-                                    break;
-                                }
-                            }
-                            seq_cursor = Some((seq_gen, c));
-                        }
+                PlayDirective::Random { root } => {
+                    let mut picked = match pick_random_flac_walk(&root) {
+                        Ok(p) => p,
                         Err(err) => {
                             finalize_prev_track(
                                 &pipeline,
@@ -2139,12 +2255,87 @@ fn producer_loop_with_sources_inner(
                             ctrl.pause_if_epoch(epoch);
                             continue;
                         }
+                    };
+                    if last_random.as_ref() == Some(&picked) {
+                        for _ in 0..3 {
+                            if let Ok(alt) = pick_random_flac_walk(&root) {
+                                if last_random.as_ref() != Some(&alt) {
+                                    picked = alt;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    last_random = Some(picked.clone());
+                    (picked, PlayModeLabel::Random)
+                }
+                PlayDirective::Sequential {
+                    root,
+                    seq_gen,
+                    start_after,
+                    folder_only,
+                    skip_count,
+                } => {
+                    let needs_init = seq_cursor.as_ref().is_none_or(|(g, _)| *g != seq_gen);
+                    if needs_init {
+                        let cursor_res = if folder_only {
+                            SequentialFlacCursor::new_folder_only(
+                                root.clone(),
+                                start_after.as_deref(),
+                            )
+                        } else if let Some(after) = start_after.as_deref() {
+                            SequentialFlacCursor::new_starting_after(root.clone(), after)
+                        } else {
+                            SequentialFlacCursor::new(root.clone())
+                        };
+                        match cursor_res {
+                            Ok(mut c) => {
+                                for _ in 0..skip_count {
+                                    if c.next_track().is_none() {
+                                        break;
+                                    }
+                                }
+                                seq_cursor = Some((seq_gen, c));
+                            }
+                            Err(err) => {
+                                finalize_prev_track(
+                                    &pipeline,
+                                    &buf,
+                                    epoch,
+                                    &mut carried_tail,
+                                    &mut pending_track_end,
+                                );
+                                let _ = buf.push_for_epoch(epoch, StreamEvent::FatalError(err));
+                                ctrl.pause_if_epoch(epoch);
+                                continue;
+                            }
+                        }
+                    }
+                    let next = seq_cursor.as_mut().and_then(|(_, c)| c.next_track());
+                    match next {
+                        Some(p) => (p, PlayModeLabel::Sequential),
+                        None => {
+                            finalize_prev_track(
+                                &pipeline,
+                                &buf,
+                                epoch,
+                                &mut carried_tail,
+                                &mut pending_track_end,
+                            );
+                            let _ = buf.push_for_epoch(
+                                epoch,
+                                StreamEvent::EndOfQueue(format!(
+                                    "Finished sequential playback of '{}' — DAC released",
+                                    root.display()
+                                )),
+                            );
+                            ctrl.pause_if_epoch(epoch);
+                            continue;
+                        }
                     }
                 }
-                let next = seq_cursor.as_mut().and_then(|(_, c)| c.next_track());
-                match next {
-                    Some(p) => (p, PlayModeLabel::Sequential),
-                    None => {
+                PlayDirective::SingleFile { file } => {
+                    if single_consumed_epoch == Some(epoch) {
                         finalize_prev_track(
                             &pipeline,
                             &buf,
@@ -2154,34 +2345,14 @@ fn producer_loop_with_sources_inner(
                         );
                         let _ = buf.push_for_epoch(
                             epoch,
-                            StreamEvent::EndOfQueue(format!(
-                                "Finished sequential playback of '{}' — DAC released",
-                                root.display()
-                            )),
+                            StreamEvent::EndOfQueue("Finished single track — DAC released".into()),
                         );
                         ctrl.pause_if_epoch(epoch);
                         continue;
                     }
+                    single_consumed_epoch = Some(epoch);
+                    (file, PlayModeLabel::SingleFile)
                 }
-            }
-            PlayDirective::SingleFile { file } => {
-                if single_consumed_epoch == Some(epoch) {
-                    finalize_prev_track(
-                        &pipeline,
-                        &buf,
-                        epoch,
-                        &mut carried_tail,
-                        &mut pending_track_end,
-                    );
-                    let _ = buf.push_for_epoch(
-                        epoch,
-                        StreamEvent::EndOfQueue("Finished single track — DAC released".into()),
-                    );
-                    ctrl.pause_if_epoch(epoch);
-                    continue;
-                }
-                single_consumed_epoch = Some(epoch);
-                (file, PlayModeLabel::SingleFile)
             }
         };
 
@@ -6295,5 +6466,100 @@ mod tests {
         assert!(frames_384 >= 4_096 * 8, "gen 8 stashed opening must not be dropped: {frames_384}");
         assert_eq!(track_ends, 2, "clean TrackEnd between gen 7 and gen 8 and at final pause");
         assert!(saw_eoq);
+    }
+
+    #[test]
+    fn pause_then_resume_replays_paused_track_and_continues_mode_and_noop_while_playing() {
+        let root = std::env::temp_dir().join(format!("ap_eng_resume_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let t1 = root.join("01_first.flac");
+        let t2 = root.join("02_second.flac");
+        let t3 = root.join("03_third.flac");
+
+        let shared = SharedControl::new(root.clone(), "Mock DAC");
+        let buf = BoundedBlockStreamBuffer::new(DEFAULT_MAX_BUFFERED_FRAMES);
+        let ep0 = buf.current_epoch();
+        let prod_ctrl = ProducerControl::new(
+            ep0,
+            ProducerDirective::Active(PlayDirective::Sequential {
+                root: root.clone(),
+                seq_gen: 1,
+                start_after: None,
+                folder_only: false,
+                skip_count: 0,
+            }),
+        );
+        let mut state = EngineState::new(
+            ep0,
+            PlayDirective::Sequential {
+                root: root.clone(),
+                seq_gen: 1,
+                start_after: None,
+                folder_only: false,
+                skip_count: 0,
+            },
+            &buf,
+            &prod_ctrl,
+            &shared,
+        );
+
+        // 1. Resume while already playing is a safe no-op (Rejected).
+        assert_eq!(state.dispatch(ControlCommand::Resume), DispatchOutcome::Rejected);
+        assert!(!state.is_paused);
+
+        // 2. Sequential: play t2, Pause, Resume -> replays t2 then continues after t2 (t3...).
+        state.record_anchor(t2.clone());
+        assert_eq!(state.dispatch(ControlCommand::Pause), DispatchOutcome::Applied);
+        assert!(state.is_paused);
+        assert_eq!(state.dispatch(ControlCommand::Resume), DispatchOutcome::Applied);
+        assert!(!state.is_paused);
+        match &state.last_play {
+            PlayDirective::ResumeThen { track, then } => {
+                assert_eq!(track, &t2);
+                match then.as_ref() {
+                    PlayDirective::Sequential { start_after, .. } => {
+                        assert_eq!(start_after.as_ref(), Some(&t2));
+                    }
+                    other => panic!("expected Sequential continuation, got {other:?}"),
+                }
+            }
+            other => panic!("expected ResumeThen(t2, Sequential), got {other:?}"),
+        }
+
+        // 3. Random: play t1, Pause, Resume -> replays t1 then continues Random.
+        assert_eq!(
+            state.dispatch(ControlCommand::PlayRandom(root.clone())),
+            DispatchOutcome::Applied
+        );
+        state.record_anchor(t1.clone());
+        assert_eq!(state.dispatch(ControlCommand::Pause), DispatchOutcome::Applied);
+        assert_eq!(state.dispatch(ControlCommand::Resume), DispatchOutcome::Applied);
+        match &state.last_play {
+            PlayDirective::ResumeThen { track, then } => {
+                assert_eq!(track, &t1);
+                assert!(matches!(then.as_ref(), PlayDirective::Random { .. }));
+            }
+            other => panic!("expected ResumeThen(t1, Random), got {other:?}"),
+        }
+
+        // 4. EndOfQueue in Sequential -> Resume restarts folder from track 1 (`start_after: None`).
+        assert_eq!(
+            state.dispatch(ControlCommand::PlaySequential(root.clone())),
+            DispatchOutcome::Applied
+        );
+        state.record_anchor(t3.clone());
+        state.pause_with_message("Finished sequential playback");
+        state.resume_track = None;
+        state.paused_at_end_of_queue = true;
+        assert_eq!(state.dispatch(ControlCommand::Resume), DispatchOutcome::Applied);
+        match &state.last_play {
+            PlayDirective::Sequential { start_after, .. } => {
+                assert_eq!(*start_after, None, "Resume after EndOfQueue must restart from track 1");
+            }
+            other => panic!("expected Sequential(start_after=None), got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

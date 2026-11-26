@@ -1047,6 +1047,12 @@ fn handle_connection(
             let dir = extract_syntax_only_dir(&req.body, shared, &allowed_root);
             redirect_to_dir(stream, &dir, conn_deadline, stop);
         }
+        ("POST", "/action/resume") => {
+            // Submit Resume immediately with zero blocking filesystem I/O (same as Pause / Next).
+            shared.submit_command(ControlCommand::Resume);
+            let dir = extract_syntax_only_dir(&req.body, shared, &allowed_root);
+            redirect_to_dir(stream, &dir, conn_deadline, stop);
+        }
         _ => {
             write_response(
                 stream,
