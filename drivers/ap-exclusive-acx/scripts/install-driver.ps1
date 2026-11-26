@@ -48,20 +48,22 @@ Write-Host "=== 1. Trusting local test signing certificate ===" -ForegroundColor
 Import-Certificate -FilePath "$out\ApExclusiveTestCert.cer" -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
 Import-Certificate -FilePath "$out\ApExclusiveTestCert.cer" -CertStoreLocation Cert:\LocalMachine\TrustedPublisher | Out-Null
 
-Write-Host "`n=== 2. Installing ap_exclusive_audio.inf into Driver Store ===" -ForegroundColor Cyan
-pnputil /add-driver "$out\ap_exclusive_audio.inf" /install
-
-Write-Host "`n=== 3. Creating ROOT\ApExclusiveAudio virtual audio endpoint ===" -ForegroundColor Cyan
+Write-Host "`n=== 2. Creating ROOT\ApExclusiveAudio virtual audio endpoint ===" -ForegroundColor Cyan
 $existing = Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.HardwareID -contains "ROOT\ApExclusiveAudio" }
-if ($existing) {
-    Write-Host "ROOT\ApExclusiveAudio already exists ($($existing.InstanceId)); restarting..." -ForegroundColor Yellow
-    pnputil /restart-device $existing.InstanceId
-} else {
+if (-not $existing) {
     & $devgen /add /bus ROOT /hardwareid "ROOT\ApExclusiveAudio"
     if ($LASTEXITCODE -ne 0) { throw "devgen /add failed ($LASTEXITCODE)" }
-    Start-Sleep -Seconds 2
-    pnputil /scan-devices
+    Start-Sleep -Seconds 1
 }
+
+Write-Host "`n=== 3. Installing ap_exclusive_audio.inf & binding to ROOT\ApExclusiveAudio ===" -ForegroundColor Cyan
+pnputil /add-driver "$out\ap_exclusive_audio.inf" /install
+Start-Sleep -Seconds 1
+$existing = Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.HardwareID -contains "ROOT\ApExclusiveAudio" }
+foreach ($d in $existing) {
+    pnputil /restart-device $d.InstanceId | Out-Null
+}
+Start-Sleep -Seconds 1
 
 Write-Host "`n=== 4. Verifying device ===" -ForegroundColor Cyan
 Get-PnpDevice -Class MEDIA | Where-Object { $_.HardwareID -contains "ROOT\ApExclusiveAudio" } | Format-Table -AutoSize Status, Class, FriendlyName, InstanceId
