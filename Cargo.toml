@@ -8,6 +8,7 @@
 resolver = "2"
 members = [
     "crates/ap-core",
+    "crates/ap-stream-protocol",
     "crates/ap-source",
     "crates/ap-dsp",
     "crates/ap-output-win",
@@ -24,6 +25,7 @@ repository = "https://github.com/androxylo/audiophile_player"
 
 [workspace.dependencies]
 ap-core = { path = "crates/ap-core" }
+ap-stream-protocol = { path = "crates/ap-stream-protocol" }
 ap-source = { path = "crates/ap-source" }
 ap-dsp = { path = "crates/ap-dsp" }
 ap-output-win = { path = "crates/ap-output-win" }

@@ -2120,6 +2120,16 @@ pub fn classify_ks_pin_error(
 /// - When `device_filter` is `None` (zero-config default mode), prefers dedicated USB audiophile
 ///   DACs (Schiit/Unison/Gungnir/USB UAC2 WaveRT endpoints) over monitor HDMI/DisplayPort audio,
 ///   falling back gracefully to any available WDM-KS render device.
+/// Returns `true` if `dev` is Audiophile Player's own virtual exclusive ACX capture endpoint.
+/// Excluding it prevents an accidental audio feedback loop when selecting the output DAC.
+pub fn is_own_virtual_endpoint(dev: &KsRenderDevice) -> bool {
+    let name = dev.friendly_name.to_ascii_lowercase();
+    let path = dev.device_path.to_ascii_lowercase();
+    path.contains("apexclusiveaudio")
+        || path.contains("aptidaltest")
+        || name.contains("audiophile player")
+}
+
 pub fn select_wdm_ks_device(
     devices: &[KsRenderDevice],
     device_filter: Option<&str>,
@@ -2132,7 +2142,7 @@ pub fn select_wdm_ks_device(
 
     let wavert_devices: Vec<&KsRenderDevice> = devices
         .iter()
-        .filter(|d| d.supports_looped_wavert)
+        .filter(|d| d.supports_looped_wavert && !is_own_virtual_endpoint(d))
         .collect();
     if wavert_devices.is_empty() {
         return Err(OutputError::DeviceNotFound(
@@ -3484,7 +3494,31 @@ fn wide_slice_to_string(slice: &[u16]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{round_i32_to_top_16, round_i32_to_top_24, wide_slice_to_string};
+    use super::{
+        KsRenderDevice, is_own_virtual_endpoint, round_i32_to_top_16, round_i32_to_top_24,
+        select_wdm_ks_device, wide_slice_to_string,
+    };
+
+    #[test]
+    fn own_virtual_capture_endpoint_is_excluded_from_dac_selection() {
+        let virt = KsRenderDevice {
+            friendly_name: "Line (Audiophile Player)".to_string(),
+            device_path: r"\\?\root#devgen#0000#{6994ad04}\render0".to_string(),
+            render_pin_id: 0,
+            supports_looped_wavert: true,
+        };
+        let dac = KsRenderDevice {
+            friendly_name: "Gungnir 2 Unison 384".to_string(),
+            device_path: r"\\?\usb#vid_30be&pid_1022#0000#{6994ad04}\msft_wave".to_string(),
+            render_pin_id: 0,
+            supports_looped_wavert: true,
+        };
+        assert!(is_own_virtual_endpoint(&virt));
+        assert!(!is_own_virtual_endpoint(&dac));
+        assert!(select_wdm_ks_device(&[virt.clone()], None).is_err());
+        let picked = select_wdm_ks_device(&[virt, dac], None).unwrap();
+        assert_eq!(picked.friendly_name, "Gungnir 2 Unison 384");
+    }
 
     #[test]
     fn wide_slice_to_string_handles_unterminated_and_embedded_nul_buffers() {

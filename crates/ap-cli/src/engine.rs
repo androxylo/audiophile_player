@@ -18,7 +18,9 @@ use ap_control::security::validate_playable_flac_path;
 use ap_control::server::{
     ControlServer, clear_runtime_url_file_at, runtime_url_file_path, write_runtime_url_file_at,
 };
-use ap_control::state::{ControlCommand, PlayModeLabel, SharedControl, UpnpPlayRequest};
+use ap_control::state::{
+    ControlCommand, PlayModeLabel, SharedControl, StreamCaptureRequest, UpnpPlayRequest,
+};
 use ap_core::buffer::DEFAULT_SOURCE_BLOCK_FRAMES;
 use std::str::FromStr;
 
@@ -37,6 +39,9 @@ use ap_source::flac::{
 };
 use ap_source::http_stream::{HttpAudioSource, HttpStreamHints};
 use ap_source::library::{SequentialFlacCursor, default_user_music_dir, pick_random_flac_walk};
+use ap_source::stream_capture::{
+    SharedCaptureTransport, StreamCaptureMonitor, StreamCaptureSource,
+};
 use ap_upnp::{UpnpRendererConfig, UpnpRendererServer, UpnpRendererState};
 
 use crate::cli_args::{QuantizerCliOverride, UltimateCliOverride, UpnpCliOverride};
@@ -50,6 +55,10 @@ use crate::ultimate::{UltimateRuntimeContext, UltimateStreamResult, stream_track
 /// Prebuffer cushion for live HTTP/UPnP streams (`2 s` at output rate — absorbs LAN/WAN jitter
 /// and heavy 4M-tap REW/upsampler bursts while starting playback rapidly).
 const UPNP_PREBUFFER_SECONDS: u32 = 2;
+
+/// Prebuffer cushion for live exclusive kernel capture (`0.75 s` at output rate — ~16 Tidal
+/// WaveRT packets / ~4 UPOLS FFT partitions for zero underruns with crisp startup latency).
+const STREAM_CAPTURE_PREBUFFER_MS: usize = 750;
 
 /// Target output frames per streaming DSP chunk (`65,536` = exact 1 UPOLS FFT partition,
 /// `~171 ms` @ 384 kHz / `~186 ms` @ 352.8 kHz). Eliminates multi-second monolithic DSP gulps
@@ -104,6 +113,9 @@ enum PlayDirective {
     },
     UpnpStream {
         request: UpnpPlayRequest,
+    },
+    StreamCapture {
+        request: StreamCaptureRequest,
     },
 }
 
@@ -269,7 +281,9 @@ impl<'a> EngineState<'a> {
         };
         let awaiting_first = !matches!(
             initial_dir,
-            PlayDirective::SingleFile { .. } | PlayDirective::UpnpStream { .. }
+            PlayDirective::SingleFile { .. }
+                | PlayDirective::UpnpStream { .. }
+                | PlayDirective::StreamCapture { .. }
         );
         Self {
             is_paused: false,
@@ -310,7 +324,9 @@ impl<'a> EngineState<'a> {
         // replaying Track 1. SingleFile handles Next explicitly in dispatch().
         let awaiting_first = !matches!(
             dir,
-            PlayDirective::SingleFile { .. } | PlayDirective::UpnpStream { .. }
+            PlayDirective::SingleFile { .. }
+                | PlayDirective::UpnpStream { .. }
+                | PlayDirective::StreamCapture { .. }
         );
         self.pending_flush_skips = 0;
         self.awaiting_post_skip_start = awaiting_first;
@@ -405,7 +421,16 @@ impl<'a> EngineState<'a> {
                 self.start_directive(PlayDirective::UpnpStream { request }, true);
                 DispatchOutcome::Applied
             }
+            ControlCommand::PlayStreamCapture(request) => {
+                self.notify_upnp_preempted();
+                self.start_directive(PlayDirective::StreamCapture { request }, true);
+                DispatchOutcome::Applied
+            }
             ControlCommand::Next => {
+                if matches!(self.last_play, PlayDirective::StreamCapture { .. }) {
+                    // Live exclusive stream (e.g. Tidal Desktop) tracks are controlled in the host app.
+                    return DispatchOutcome::Rejected;
+                }
                 if matches!(self.last_play, PlayDirective::UpnpStream { .. }) {
                     if let Some(next_req) = self
                         .upnp_state
@@ -750,6 +775,35 @@ pub fn run_random_music_player(
     };
     let upnp_state = upnp_server.as_ref().map(|s| Arc::clone(s.state()));
 
+    // Start opt-in exclusive kernel stream capture watcher (\\.\ApExclusiveAudio).
+    // Quietly parks if the virtual ACX driver is not installed; preempts automatically when Tidal
+    // Desktop opens in Exclusive Mode (hard zero-mixer gate enforced in kernel & user mode).
+    let shared_for_cap = Arc::clone(&shared);
+    let shared_for_blk = Arc::clone(&shared);
+    let capture_monitor = StreamCaptureMonitor::start(
+        move |ev| {
+            shared_for_cap.submit_command(ControlCommand::PlayStreamCapture(
+                StreamCaptureRequest {
+                    generation: ev.generation,
+                    sample_rate_hz: ev.sample_rate_hz,
+                    channels: ev.channels,
+                    bits_per_sample: ev.bits_per_sample,
+                    valid_bits_per_sample: ev.valid_bits_per_sample,
+                    caller_name: ev.caller_name,
+                    caller_pid: ev.caller_pid,
+                },
+            ));
+        },
+        move |delta, proc_name, pid, stage| {
+            let msg = format!(
+                "Blocked {delta} Windows mixer (shared-mode) attempt(s) from {proc_name} (PID {pid}) at {stage}"
+            );
+            eprintln!("  [capture zero-mixer] {msg}");
+            shared_for_blk.record_action(msg);
+        },
+    );
+    let capture_transport = capture_monitor.transport();
+
     println!(
         "audiophile-player v{} started (WDM-KS WaveRT, streaming blocks, opt={optimization:?}, DAC='{dac_name}', music='{}').",
         env!("CARGO_PKG_VERSION"),
@@ -769,6 +823,13 @@ pub fn run_random_music_player(
         );
     } else {
         println!("UPnP renderer: disabled");
+    }
+    if capture_monitor.is_driver_connected() {
+        println!(
+            "Exclusive capture: READY (\\\\.\\ApExclusiveAudio -> 'Line (Audiophile Player)' in Tidal Exclusive Mode; Windows mixer blocked)"
+        );
+    } else {
+        println!("Exclusive capture: waiting for opt-in ACX driver (\\\\.\\ApExclusiveAudio)");
     }
     if let Some(ref ult) = ultimate_ctx {
         println!(
@@ -803,15 +864,17 @@ pub fn run_random_music_player(
     let ctrl_bg = Arc::clone(&prod_ctrl);
     let shared_bg = Arc::clone(&shared);
     let upnp_bg = upnp_state.clone();
+    let capture_bg = Some(capture_transport);
     let producer_thread = thread::Builder::new()
         .name("ap-dsp-stream".to_string())
         .spawn(move || {
-            producer_loop_with_upnp(
+            producer_loop_with_sources(
                 pipeline,
                 ctrl_bg,
                 buf_bg,
                 shared_bg,
                 upnp_bg,
+                capture_bg,
                 ultimate_ctx,
             )
         })
@@ -842,6 +905,7 @@ pub fn run_random_music_player(
     }
 
     url_guard.disarm();
+    capture_monitor.stop();
     teardown_player_resources_with_upnp(
         &stream_buf,
         &prod_ctrl,
@@ -1036,12 +1100,15 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
             had_gapless_carryover,
         } => {
             let out_rate = report.output_rate_hz;
-            let prebuf_secs = if mode_label == PlayModeLabel::UpnpRenderer {
-                UPNP_PREBUFFER_SECONDS
-            } else {
-                PREBUFFER_SECONDS
+            let watermark_frames = match mode_label {
+                PlayModeLabel::StreamCapture => {
+                    ((out_rate as usize) * STREAM_CAPTURE_PREBUFFER_MS) / 1_000
+                }
+                PlayModeLabel::UpnpRenderer => {
+                    (out_rate as usize) * (UPNP_PREBUFFER_SECONDS as usize)
+                }
+                _ => (out_rate as usize) * (PREBUFFER_SECONDS as usize),
             };
-            let watermark_frames = (out_rate as usize) * (prebuf_secs as usize);
 
             // Wait until ~2 seconds of PCM are pre-buffered in RAM (or TrackEnd for short clips)
             // while remaining immediately responsive to Pause / Next / Ctrl+C.
@@ -1369,6 +1436,7 @@ fn finalize_prev_track(
     }
 }
 
+#[cfg(test)]
 fn producer_loop_with_upnp(
     pipeline: AudioPipeline,
     ctrl: Arc<ProducerControl>,
@@ -1377,11 +1445,24 @@ fn producer_loop_with_upnp(
     upnp_state: Option<Arc<UpnpRendererState>>,
     ultimate_ctx: Option<UltimateRuntimeContext>,
 ) {
+    producer_loop_with_sources(pipeline, ctrl, buf, shared, upnp_state, None, ultimate_ctx);
+}
+
+fn producer_loop_with_sources(
+    pipeline: AudioPipeline,
+    ctrl: Arc<ProducerControl>,
+    buf: Arc<BoundedBlockStreamBuffer>,
+    shared: Arc<SharedControl>,
+    upnp_state: Option<Arc<UpnpRendererState>>,
+    capture_transport: Option<SharedCaptureTransport>,
+    ultimate_ctx: Option<UltimateRuntimeContext>,
+) {
     const MAX_CONSECUTIVE_UNSUPPORTED: u32 = 50;
 
     let mut seq_cursor: Option<(u64, SequentialFlacCursor)> = None;
     let mut single_consumed_epoch: Option<u64> = None;
     let mut upnp_consumed_epoch: Option<u64> = None;
+    let mut capture_consumed_epoch: Option<u64> = None;
     let mut last_random: Option<PathBuf> = None;
     let mut last_seen_epoch: Option<u64> = None;
     let mut consecutive_errors: u32 = 0;
@@ -1405,6 +1486,141 @@ fn producer_loop_with_upnp(
             carried_tail = None;
             pending_track_end = false;
             last_seen_epoch = Some(epoch);
+        }
+
+        // Handle live exclusive kernel stream capture (e.g. vanilla Tidal Desktop Exclusive Mode).
+        // Never uses the 30 s W0 look-ahead window (real-time 1x push stream); feeds directly
+        // through the pure-f64 5-stage AudioPipeline with -3 dB unknown-peak headroom, rate-following
+        // Gaussian upsampling (352.8/384 kHz), full-tail REW convolution, and WDM-KS output.
+        if let PlayDirective::StreamCapture { request } = directive {
+            if capture_consumed_epoch == Some(epoch) {
+                finalize_prev_track(
+                    &pipeline,
+                    &buf,
+                    epoch,
+                    &mut carried_tail,
+                    &mut pending_track_end,
+                );
+                let _ = buf.push_for_epoch(
+                    epoch,
+                    StreamEvent::EndOfQueue("Exclusive stream paused — DAC released".into()),
+                );
+                ctrl.pause_if_epoch(epoch);
+                continue;
+            }
+            let Some(ref transport) = capture_transport else {
+                let msg = "Exclusive capture transport not available".to_string();
+                let _ = buf.push_for_epoch(epoch, StreamEvent::FatalError(msg));
+                ctrl.pause_if_epoch(epoch);
+                continue;
+            };
+
+            let label = format!(
+                "{} (Exclusive {} Hz {}-in-{}b)",
+                if request.caller_name.is_empty() {
+                    "Live Exclusive Stream"
+                } else {
+                    request.caller_name.as_str()
+                },
+                request.sample_rate_hz,
+                request.valid_bits_per_sample,
+                request.bits_per_sample
+            );
+            let mut panic_backup_carry: Option<GaplessCarryover> = None;
+            let (outcome, next_carry, next_pend) = match catch_unwind(AssertUnwindSafe(|| {
+                match StreamCaptureSource::open_generation(
+                    transport.clone(),
+                    request.generation,
+                    Arc::clone(&cancel_flag),
+                ) {
+                    Ok(mut src) => stream_open_audio_source(
+                        &pipeline,
+                        &ctrl,
+                        &buf,
+                        &shared,
+                        epoch,
+                        &mut src,
+                        &PathBuf::from(&label),
+                        None,
+                        None,
+                        PlayModeLabel::StreamCapture,
+                        None,
+                        None,
+                        &mut carried_tail,
+                        &mut panic_backup_carry,
+                        &mut pending_track_end,
+                        false,
+                    ),
+                    Err(err) => (
+                        TrackStreamOutcome::Failed(format!(
+                            "Exclusive stream open failed for '{label}': {err}"
+                        )),
+                        None,
+                        false,
+                    ),
+                }
+            })) {
+                Ok(res) => res,
+                Err(_) => {
+                    if carried_tail.is_none() {
+                        carried_tail = panic_backup_carry.take();
+                    }
+                    finalize_prev_track(
+                        &pipeline,
+                        &buf,
+                        epoch,
+                        &mut carried_tail,
+                        &mut pending_track_end,
+                    );
+                    (
+                        TrackStreamOutcome::Failed(format!(
+                            "Internal panic while streaming exclusive capture '{label}'"
+                        )),
+                        None,
+                        false,
+                    )
+                }
+            };
+
+            match outcome {
+                TrackStreamOutcome::Played => {
+                    carried_tail = next_carry;
+                    pending_track_end = next_pend;
+                    capture_consumed_epoch = Some(epoch);
+                    finalize_prev_track(
+                        &pipeline,
+                        &buf,
+                        epoch,
+                        &mut carried_tail,
+                        &mut pending_track_end,
+                    );
+                    let _ = buf.push_for_epoch(
+                        epoch,
+                        StreamEvent::EndOfQueue("Exclusive stream paused — DAC released".into()),
+                    );
+                    ctrl.pause_if_epoch(epoch);
+                }
+                TrackStreamOutcome::Aborted => {
+                    carried_tail = None;
+                    pending_track_end = false;
+                }
+                TrackStreamOutcome::Unsupported(msg) | TrackStreamOutcome::Failed(msg) => {
+                    carried_tail = next_carry;
+                    pending_track_end = next_pend;
+                    finalize_prev_track(
+                        &pipeline,
+                        &buf,
+                        epoch,
+                        &mut carried_tail,
+                        &mut pending_track_end,
+                    );
+                    eprintln!("  [capture error] {msg}");
+                    shared.record_action(msg.clone());
+                    let _ = buf.push_for_epoch(epoch, StreamEvent::FatalError(msg));
+                    ctrl.pause_if_epoch(epoch);
+                }
+            }
+            continue;
         }
 
         // Handle UPnP MediaRenderer streaming queue (including chained Ogg FLAC & gapless
@@ -1536,7 +1752,9 @@ fn producer_loop_with_upnp(
         let is_single_file = matches!(directive, PlayDirective::SingleFile { .. });
 
         let (chosen, mode_label) = match directive {
-            PlayDirective::UpnpStream { .. } => unreachable!(),
+            PlayDirective::UpnpStream { .. } | PlayDirective::StreamCapture { .. } => {
+                unreachable!()
+            }
             PlayDirective::Random { root } => {
                 let mut picked = match pick_random_flac_walk(&root) {
                     Ok(p) => p,

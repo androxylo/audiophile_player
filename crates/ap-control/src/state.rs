@@ -35,7 +35,21 @@ pub struct UpnpPlayRequest {
 
 impl Eq for UpnpPlayRequest {}
 
-/// Unified control commands issued by the HTTP UI or UPnP MediaRenderer (no volume control).
+/// Metadata accompanying a live exclusive-mode kernel capture stream (e.g. Tidal Desktop
+/// playing into Audiophile Player's ACX 1.1 virtual render driver, zero Windows mixer).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamCaptureRequest {
+    pub generation: u32,
+    pub sample_rate_hz: u32,
+    pub channels: u16,
+    pub bits_per_sample: u16,
+    pub valid_bits_per_sample: u16,
+    pub caller_name: String,
+    pub caller_pid: u32,
+}
+
+/// Unified control commands issued by the HTTP UI, UPnP MediaRenderer, or Exclusive Stream Capture
+/// (no volume control).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlCommand {
     /// Play random FLAC files from the selected folder tree (`O(depth)` walk).
@@ -46,6 +60,9 @@ pub enum ControlCommand {
     PlayFile(PathBuf),
     /// Play a network lossless audio stream pushed by a UPnP control point (e.g. foobar2000).
     PlayUpnp(UpnpPlayRequest),
+    /// Play a verified zero-mixer exclusive stream captured from the local ACX virtual endpoint
+    /// (e.g. vanilla Tidal Desktop app in Exclusive Mode).
+    PlayStreamCapture(StreamCaptureRequest),
     /// Skip immediately (with smooth fade-out) to the next track in the active playback mode.
     Next,
     /// Unified Pause/Stop: fade out cleanly and release the WDM-KS DAC pin immediately.
@@ -58,6 +75,7 @@ pub enum PlayModeLabel {
     Sequential,
     SingleFile,
     UpnpRenderer,
+    StreamCapture,
     Paused,
 }
 
@@ -68,6 +86,7 @@ impl PlayModeLabel {
             Self::Sequential => "Play Sequential",
             Self::SingleFile => "Play File",
             Self::UpnpRenderer => "UPnP Renderer",
+            Self::StreamCapture => "Exclusive Stream (Tidal / Live)",
             Self::Paused => "Paused (DAC released)",
         }
     }
@@ -171,6 +190,16 @@ impl SharedControl {
                 st.log.push(format!(
                     "Command: UPnP Play -> {} ({})",
                     req.display_name, req.uri
+                ));
+            }
+            ControlCommand::PlayStreamCapture(req) => {
+                st.log.push(format!(
+                    "Command: Exclusive Stream -> {} (PID {}) {} Hz {}-in-{} bit PCM",
+                    req.caller_name,
+                    req.caller_pid,
+                    req.sample_rate_hz,
+                    req.valid_bits_per_sample,
+                    req.bits_per_sample
                 ));
             }
             ControlCommand::Next => {

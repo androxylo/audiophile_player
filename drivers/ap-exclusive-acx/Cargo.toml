@@ -1,0 +1,26 @@
+[workspace]
+
+[package]
+name = "ap-exclusive-acx"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+[lib]
+name = "ap_exclusive_audio"
+crate-type = ["cdylib"]
+
+[dependencies]
+ap-stream-protocol = { path = "../../crates/ap-stream-protocol" }
+
+[build-dependencies]
+bindgen = "0.71"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+lto = false
+codegen-units = 1

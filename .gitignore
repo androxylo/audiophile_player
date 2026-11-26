@@ -19,3 +19,10 @@ dist/
 .DS_Store
 Thumbs.db
 *.swp
+
+# Local WDK cache, test-signed kernel driver output, and experiments (never commit certs/keys/WDK)
+drivers/ap-exclusive-acx/.wdk/
+drivers/ap-exclusive-acx/out/
+drivers/ap-exclusive-acx/target/
+experiments/
+

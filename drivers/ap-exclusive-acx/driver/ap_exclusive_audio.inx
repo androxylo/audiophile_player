@@ -1,0 +1,85 @@
+; Audiophile Player Exclusive-Mode Virtual ACX 1.1 Render Driver
+; SPDX-License-Identifier: GPL-3.0-or-later
+; Root-enumerated virtual render endpoint (ROOT\ApExclusiveAudio). Zero APOs, event-driven WaveRT.
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = MEDIA
+ClassGuid   = {4d36e96c-e325-11ce-bfc1-08002be10318}
+Provider    = %ProviderName%
+DriverVer   = 01/01/2026,1.0.0.0
+CatalogFile = ap_exclusive_audio.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[Manufacturer]
+%ProviderName% = Standard,NT$ARCH$.10.0...19041
+
+[Standard.NT$ARCH$.10.0...19041]
+%ApExcl.DeviceDesc% = ApExcl_Device, ROOT\ApExclusiveAudio
+
+[ApExcl_Device.NT]
+CopyFiles = ApExcl_Device.NT.Copy
+
+[ApExcl_Device.NT.Copy]
+ap_exclusive_audio.sys
+
+[ApExcl_Device.NT.Services]
+AddService = ap_exclusive_audio, %SPSVCINST_ASSOCSERVICE%, ApExcl_Service_Inst
+
+[ApExcl_Service_Inst]
+DisplayName   = %ApExcl.DeviceDesc%
+ServiceType   = 1   ; SERVICE_KERNEL_DRIVER
+StartType     = 3   ; SERVICE_DEMAND_START
+ErrorControl  = 1   ; SERVICE_ERROR_NORMAL
+ServiceBinary = %13%\ap_exclusive_audio.sys
+
+[SourceDisksNames]
+1 = %DiskId1%,,,""
+
+[SourceDisksFiles]
+ap_exclusive_audio.sys = 1,,
+
+[ApExcl_Device.NT.Wdf]
+KmdfService = ap_exclusive_audio, ApExcl_wdfsect
+
+[ApExcl_wdfsect]
+KmdfLibraryVersion = $KMDFVERSION$
+
+; Render endpoint interface (circuit name "Render0" must match driver CIRCUIT_NAME_RENDER)
+[ApExcl_Device.I.Render]
+AddReg = ApExcl_Device.I.Render.AddReg
+
+[ApExcl_Device.I.Render.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%ApExcl.Render.szPname%
+; Opt in to event-driven WaveRT pull mode. ZERO APOs registered.
+HKR,EP\0,%PKEY_AudioEndpoint_Association%,,%KSNODETYPE_ANY%
+HKR,EP\0,%PKEY_AudioEndpoint_Supports_EventDriven_Mode%,0x00010001,0x1
+
+[ApExcl_Device.NT.Interfaces]
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_Render%, ApExcl_Device.I.Render
+AddInterface = %KSCATEGORY_RENDER%,   %KSNAME_Render%, ApExcl_Device.I.Render
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_Render%, ApExcl_Device.I.Render
+
+[Strings]
+; Non-localizable
+KSNAME_Render          = "Render0"
+SPSVCINST_ASSOCSERVICE = 0x00000002
+ProviderName           = "Audiophile Player"
+
+Proxy.CLSID            = "{17CCA71B-ECD7-11D0-B908-00A0C9223196}"
+KSCATEGORY_AUDIO       = "{6994AD04-93EF-11D0-A3CC-00A0C9223196}"
+KSCATEGORY_RENDER      = "{65E8773E-8F56-11D0-A3B9-00A0C9223196}"
+KSCATEGORY_REALTIME    = "{EB115FFC-10C8-4964-831D-6DCB02E6F23F}"
+KSNODETYPE_ANY         = "{00000000-0000-0000-0000-000000000000}"
+
+PKEY_AudioEndpoint_Association               = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},2"
+PKEY_AudioEndpoint_Supports_EventDriven_Mode = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},7"
+
+; Localizable
+DiskId1                = "Audiophile Player Exclusive Audio Driver Disk"
+ApExcl.DeviceDesc      = "Audiophile Player"
+ApExcl.Render.szPname  = "Audiophile Player"

@@ -1,0 +1,10 @@
+[package]
+name = "ap-stream-protocol"
+description = "Shared no_std kernel<->user-mode ABI for Audiophile Player's exclusive-mode virtual ACX render driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"

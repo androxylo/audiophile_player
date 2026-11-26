@@ -1,0 +1,23 @@
+THIRD-PARTY NOTICES — Audiophile Player Exclusive ACX Virtual Audio Driver
+
+This Rust `#![no_std]` KMDF + ACX 1.1 virtual render driver (`ap-exclusive-acx`)
+is licensed under GPL-3.0-or-later and draws architectural patterns from the
+following MIT-licensed open-source reference projects:
+
+1. Microsoft Low-Latency Audio (`microsoft/low-latency-audio`, `src/uac2-driver`)
+   Copyright (c) Microsoft Corporation
+   Copyright (c) Yamaha Corporation
+   License: MIT License
+   Reference patterns: ACX render circuit/pin setup, `KSNODETYPE_LINE_CONNECTOR`
+   friendly-name preservation, page-aligned WaveRT `ACX_RTPACKET` MDL allocation,
+   and `EvtAcxStreamSetRenderPacket` stream handling.
+
+2. Nezucloud acxmic (`nezucloud/acxmic`)
+   Copyright (c) 2026 Nezucloud
+   License: MIT License
+   Reference patterns: root-enumerated virtual KMDF + ACX device lifecycle,
+   exclusive `WdfControlDeviceInitAllocate` user-mode control interface, and
+   high-resolution `WDFTIMER` packet scheduling.
+
+No proprietary code, certificates, or private signing keys are included.
+Per-machine test certificates are generated locally by the user's install script.
