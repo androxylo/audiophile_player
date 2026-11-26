@@ -180,19 +180,41 @@ A "sounds bright, 1982–1989" guess is only logged as a suggestion. It is never
 
 ---
 
-## Your overrides
+## Your overrides (`my-filters.yaml` & `--filters`)
 
-Ultimate mode remembers each track in a small YAML file. It's human-readable, and you're welcome to edit the `user:` section:
+Ultimate mode cleanly separates **machine-managed analysis** from **your personal filter choices** (Schema 2):
+
+- **Machine-managed analysis (`%APPDATA%\audiophile-player\filterdb\`):** one human-readable YAML file per album folder mirroring your library tree (e.g. `filterdb\analysis\main\Jazz\Kind of Blue.yaml`). Every track records `suggested`, a plain-English `why`, detector readings, and exact `post_chain_peaks`. Your music library stays 100% read-only.
+- **Your choices (`%APPDATA%\audiophile-player\my-filters.yaml`):** a single file owned exclusively by you — never silently overwritten by the player or scanner, hot-reloaded on track change, with support for defaults, folder/artist rules, and per-track overrides:
 
 ```yaml
-user:
-  filter: sinc-steep-4m      # force a filter for this track
-  deemphasis: true           # force 50/15 µs de-emphasis
-  apodizing: false           # veto Rule A for this track
-  note: "Japanese pressing, sounds better steep"
+schema: 2
+
+defaults:
+  # optional fallback override
+
+folders:
+  "main:Jazz/Miles Davis - Kind of Blue":
+    filter: gauss-long-lp
+    note: "prefer gauss-long-lp on this pressing"
+
+tracks:
+  "main:Classical/Mahler/01_Adagio.flac":
+    filter: sinc-steep-4m
+    deemphasis: false
+    note: "Japanese pressing, sounds better steep"
 ```
 
-Your `user:` section survives every rescan and learn-on-play. You can put the same choices into the FLAC file itself as tags: `AP_FILTER`, `AP_PHASE`, `AP_DEEMPHASIS`, `AP_APODIZING`. Where the files live is covered in [Getting Started → Track DB](GETTING_STARTED.md#track-db).
+### Precedence & A/B mode (`--filters`)
+
+- **Default (`--filters auto`):** uses `mine` mode whenever `my-filters.yaml` exists, falling back to `suggested`.
+- **A/B comparison (`--filters suggested`):** ignores `my-filters.yaml` and `AP_*` overrides and plays pure machine suggestions without editing any files.
+- **Precedence in `mine` mode:** CLI `--filter` → `my-filters.yaml` `tracks:` → deepest `folders:` → shallower `folders:` → FLAC Vorbis tags (`AP_FILTER`, `AP_PHASE`, `AP_DEEMPHASIS`, `AP_APODIZING`) → `my-filters.yaml` `defaults:` → machine `suggested` analysis.
+- Explicit choices in `my-filters.yaml` also apply to short tracks (`< 30 s`), while automatic detectors remain strictly per-track.
+- Whenever a user choice overrides the machine suggestion, both the console and the HTTP UI display them side by side:
+  `playing: gauss-long-lp (mine: folder) | suggested: sinc-steep-4m (rule_G_classical)`.
+
+Manage overrides and inspect suggestions from the CLI (`audiophile-player filters show | diff | set | check | relink | migrate`) — see [Getting Started → Filter Database](GETTING_STARTED.md#filter-database).
 
 ---
 

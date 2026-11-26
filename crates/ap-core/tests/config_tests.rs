@@ -333,3 +333,48 @@ fn parses_and_validates_capture_section() {
     );
     assert!(PlayerConfig::from_toml_str("[capture]\nunknown = true\n").is_err());
 }
+
+#[test]
+fn parses_and_validates_filters_and_roots_sections() {
+    use ap_core::user_filters::FilterMode;
+
+    let default_cfg = PlayerConfig::default();
+    assert_eq!(default_cfg.filters.mode, FilterMode::Auto);
+    assert_eq!(default_cfg.filters.dir, None);
+    assert_eq!(default_cfg.filters.choices_file, None);
+    assert!(default_cfg.filters.roots.is_empty());
+
+    let toml = r#"
+[filters]
+mode = "mine"
+dir = 'D:\AudioCache\filterdb'
+choices_file = 'D:\AudioCache\my-filters.yaml'
+root.main = 'D:\Music'
+
+[filters.roots]
+classical = 'E:\Classical'
+"#;
+    let cfg = PlayerConfig::from_toml_str(toml).unwrap();
+    assert_eq!(cfg.filters.mode, FilterMode::Mine);
+    assert_eq!(cfg.filters.dir, Some(PathBuf::from(r"D:\AudioCache\filterdb")));
+    assert_eq!(
+        cfg.filters.choices_file,
+        Some(PathBuf::from(r"D:\AudioCache\my-filters.yaml"))
+    );
+    assert_eq!(
+        cfg.filters.roots.get("main"),
+        Some(&PathBuf::from(r"D:\Music"))
+    );
+    assert_eq!(
+        cfg.filters.roots.get("classical"),
+        Some(&PathBuf::from(r"E:\Classical"))
+    );
+
+    assert!(PlayerConfig::from_toml_str("[filters]\nmode = 'bogus'\n").is_err());
+    assert!(PlayerConfig::from_toml_str("[filters]\nmode = 'mine'\nmode = 'suggested'\n").is_err());
+    assert!(
+        PlayerConfig::from_toml_str("[filters]\nroot.main = 'D:\\Music'\n[filters.roots]\nmain = 'E:\\Music'\n")
+            .is_err()
+    );
+    assert!(PlayerConfig::from_toml_str("[filters]\nunknown = 1\n").is_err());
+}

@@ -108,11 +108,20 @@ pub enum GaplessAttachOutcome {
 pub struct UltimateDecisionReport {
     /// `"ultimate: cached"`, `"ultimate: live"`, or `"normal (<30 s)"`.
     pub mode: String,
-    /// Winning selection rule (e.g. `"rule_A_apodizing"`, `"rule_G_classical"`, `"short_track_bypass"`).
+    /// Winning selection rule (e.g. `"rule_A_apodizing"`, `"user_folder"`, `"short_track_bypass"`).
     pub winning_rule: String,
+    /// Active filter name being played (e.g. `"gauss-long-lp"`).
+    pub active_filter: Option<String>,
+    /// Override provenance label when active filter came from user choices (`"mine: track"`,
+    /// `"mine: folder"`, `"mine: tag"`, `"mine: default"`, or `"cli"`).
+    pub override_label: Option<String>,
+    /// Machine-suggested filter name (always populated for side-by-side comparison).
+    pub suggested_filter: Option<String>,
+    /// Machine-suggested winning rule name.
+    pub suggested_rule: Option<String>,
     /// Ordered list of rules/signals that fired for this track.
     pub fired_rules: Vec<String>,
-    /// True when whole-track analysis and/or exact post-chain peak `M` came from Schema-1 YAML cache.
+    /// True when whole-track analysis and/or exact post-chain peak `M` came from YAML cache.
     pub cache_hit: bool,
     /// Measured unity-gain 30 s window post-chain peak `M30` in dBFS (when `W2` ran).
     pub m30_dbfs: Option<f64>,
@@ -145,8 +154,15 @@ impl UltimateDecisionReport {
             .throughput_x_rt
             .map(|s| format!(" speed={s:.1}xRT"))
             .unwrap_or_default();
+        let choice_str = match (&self.active_filter, &self.override_label, &self.suggested_filter) {
+            (Some(active), Some(lbl), Some(sug)) => {
+                let sug_r = self.suggested_rule.as_deref().unwrap_or("suggested");
+                format!("playing: {active} ({lbl}) | suggested: {sug} ({sug_r}) | ")
+            }
+            _ => String::new(),
+        };
         format!(
-            "mode=[{}] rule={} fired=[{}] {peak_str} G={:+.3}dB m_q={:.5}dB{speed_str}",
+            "{choice_str}mode=[{}] rule={} fired=[{}] {peak_str} G={:+.3}dB m_q={:.5}dB{speed_str}",
             self.mode, self.winning_rule, rules, self.fixed_gain_db, self.quantizer_margin_db
         )
     }

@@ -15,9 +15,11 @@
 //! 4. If no config file is found: safe default with convolution **disabled** (null pass-through),
 //!    quantizer `dac_bits = 24` (`shaper = auto`), and UPnP enabled.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use crate::user_filters::FilterMode;
 
 /// Standard local config filename (portable / current working directory).
 pub const LOCAL_CONFIG_FILENAME: &str = "audiophile-player.toml";
@@ -284,6 +286,21 @@ pub struct TrackDbConfig {
     pub sidecar: bool,
 }
 
+/// Schema-2 Filter Database & User Choices configuration loaded from `[filters]` and
+/// `[filters.roots]` in `config.toml` (`FILTER_DATABASE_RESEARCH.md` §§4–5).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FiltersConfig {
+    /// Filter resolution mode: `Auto` (default: `mine` when `my-filters.yaml` exists, else
+    /// `suggested`), `Suggested` (analyser suggestions only), or `Mine` (user choices + fallback).
+    pub mode: FilterMode,
+    /// Machine-managed Schema-2 database directory (`None` -> `%APPDATA%\audiophile-player\filterdb`).
+    pub dir: Option<PathBuf>,
+    /// User-owned filter choices file (`None` -> `%APPDATA%\audiophile-player\my-filters.yaml`).
+    pub choices_file: Option<PathBuf>,
+    /// Named library roots (e.g. `main = 'D:\Music'`, `classical = 'E:\Classical'`).
+    pub roots: BTreeMap<String, PathBuf>,
+}
+
 /// Top-level user configuration file (`config.toml` / `audiophile-player.toml`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlayerConfig {
@@ -293,6 +310,7 @@ pub struct PlayerConfig {
     pub capture: CaptureConfig,
     pub ultimate: UltimateConfig,
     pub trackdb: TrackDbConfig,
+    pub filters: FiltersConfig,
 }
 
 /// Result of config file discovery + loading.
@@ -345,6 +363,8 @@ impl PlayerConfig {
             Capture,
             Ultimate,
             TrackDb,
+            Filters,
+            FiltersRoots,
         }
 
         let mut active_section = Section::None;
@@ -354,12 +374,16 @@ impl PlayerConfig {
         let mut seen_capture_section = false;
         let mut seen_ultimate_section = false;
         let mut seen_trackdb_section = false;
+        let mut seen_filters_section = false;
+        let mut seen_filters_roots_section = false;
         let mut seen_conv_keys: HashSet<&str> = HashSet::new();
         let mut seen_quant_keys: HashSet<&str> = HashSet::new();
         let mut seen_upnp_keys: HashSet<&str> = HashSet::new();
         let mut seen_capture_keys: HashSet<&str> = HashSet::new();
         let mut seen_ultimate_keys: HashSet<&str> = HashSet::new();
         let mut seen_trackdb_keys: HashSet<&str> = HashSet::new();
+        let mut seen_filters_keys: HashSet<String> = HashSet::new();
+        let mut seen_filter_root_names: HashSet<String> = HashSet::new();
         let mut explicit_conv_enabled: Option<bool> = None;
         let mut conv = ConvolutionConfig::default();
         let mut quantizer = QuantizerConfig::default();
@@ -367,6 +391,7 @@ impl PlayerConfig {
         let mut capture = CaptureConfig::default();
         let mut ultimate = UltimateConfig::default();
         let mut trackdb = TrackDbConfig::default();
+        let mut filters = FiltersConfig::default();
 
         for (idx, raw_line) in text.lines().enumerate() {
             let line_no = idx + 1;
@@ -437,9 +462,27 @@ impl PlayerConfig {
                         seen_trackdb_section = true;
                         active_section = Section::TrackDb;
                     }
+                    "filters" => {
+                        if seen_filters_section {
+                            return Err(format!(
+                                "config line {line_no}: duplicate section '[filters]'"
+                            ));
+                        }
+                        seen_filters_section = true;
+                        active_section = Section::Filters;
+                    }
+                    "filters.roots" => {
+                        if seen_filters_roots_section {
+                            return Err(format!(
+                                "config line {line_no}: duplicate section '[filters.roots]'"
+                            ));
+                        }
+                        seen_filters_roots_section = true;
+                        active_section = Section::FiltersRoots;
+                    }
                     other => {
                         return Err(format!(
-                            "config line {line_no}: unknown section '[{other}]' (supported: [convolution], [quantizer], [upnp], [capture], [ultimate], [trackdb])"
+                            "config line {line_no}: unknown section '[{other}]' (supported: [convolution], [quantizer], [upnp], [capture], [ultimate], [trackdb], [filters], [filters.roots])"
                         ));
                     }
                 }
@@ -651,6 +694,85 @@ impl PlayerConfig {
                         }
                     }
                 }
+                Section::Filters => {
+                    if let Some(root_name_raw) = key.strip_prefix("root.") {
+                        let root_name = root_name_raw.trim();
+                        if root_name.is_empty()
+                            || !root_name
+                                .chars()
+                                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                        {
+                            return Err(format!(
+                                "config line {line_no}: invalid root name '{root_name}' in [filters]"
+                            ));
+                        }
+                        let norm = root_name.to_ascii_lowercase();
+                        if !seen_filter_root_names.insert(norm) {
+                            return Err(format!(
+                                "config line {line_no}: duplicate filter root '{root_name}'"
+                            ));
+                        }
+                        let s = parse_toml_string(val, line_no, key)?;
+                        let Some(path) = non_empty_path(s) else {
+                            return Err(format!(
+                                "config line {line_no}: filter root '{root_name}' path cannot be empty"
+                            ));
+                        };
+                        filters.roots.insert(root_name.to_string(), path);
+                    } else {
+                        if !seen_filters_keys.insert(key.to_string()) {
+                            return Err(format!(
+                                "config line {line_no}: duplicate key '{key}' in [filters]"
+                            ));
+                        }
+                        match key {
+                            "mode" => {
+                                let s = parse_toml_string(val, line_no, "mode")?;
+                                filters.mode = FilterMode::parse(&s).map_err(|e| {
+                                    format!("config line {line_no}: [filters] {e}")
+                                })?;
+                            }
+                            "dir" => {
+                                let s = parse_toml_string(val, line_no, "dir")?;
+                                filters.dir = non_empty_path(s);
+                            }
+                            "choices_file" => {
+                                let s = parse_toml_string(val, line_no, "choices_file")?;
+                                filters.choices_file = non_empty_path(s);
+                            }
+                            other => {
+                                return Err(format!(
+                                    "config line {line_no}: unknown key '{other}' in [filters] (allowed: mode, dir, choices_file, root.<name>)"
+                                ));
+                            }
+                        }
+                    }
+                }
+                Section::FiltersRoots => {
+                    let root_name = key.trim();
+                    if root_name.is_empty()
+                        || !root_name
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                    {
+                        return Err(format!(
+                            "config line {line_no}: invalid root name '{root_name}' in [filters.roots]"
+                        ));
+                    }
+                    let norm = root_name.to_ascii_lowercase();
+                    if !seen_filter_root_names.insert(norm) {
+                        return Err(format!(
+                            "config line {line_no}: duplicate filter root '{root_name}'"
+                        ));
+                    }
+                    let s = parse_toml_string(val, line_no, root_name)?;
+                    let Some(path) = non_empty_path(s) else {
+                        return Err(format!(
+                            "config line {line_no}: filter root '{root_name}' path cannot be empty"
+                        ));
+                    };
+                    filters.roots.insert(root_name.to_string(), path);
+                }
             }
         }
 
@@ -666,6 +788,7 @@ impl PlayerConfig {
             capture,
             ultimate,
             trackdb,
+            filters,
         })
     }
 

@@ -20,35 +20,148 @@
 //!   clean EOF with verified `STREAMINFO.md5`. Mid-track skip discards cleanly with zero YAML write.
 
 use std::path::Path;
+use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use ap_control::state::PlayModeLabel;
 use ap_core::buffer::StereoF64Buffer;
 use ap_core::config::UltimateConfig;
+use ap_core::filter_db::{
+    AlbumAnalysisFile, AlbumTrackAnalysis, FilterDbStore, LibraryManifest, file_head_4k_hash,
+};
 use ap_core::headroom::{
     HeadroomDecision, HeadroomMode, quantizer_margin_db, select_ultimate_headroom,
 };
+use ap_core::metadata::PhaseTagOverride;
 use ap_core::track_db::{TrackDbStore, file_size_and_mtime};
+use ap_core::user_filters::{
+    FilterMode, ResolvedUserOverrides, UserFilterProvenance, UserFiltersCache,
+};
 use ap_dsp::analysis::{DETECTOR_VERSION, TrackAnalyzer};
 use ap_dsp::convolution::ConvolutionTail;
 use ap_dsp::fusion::{
-    CachedWholeTrackEvidence, build_track_db_entry, fuse_track_evidence,
+    CachedWholeTrackEvidence, EvidenceSource, build_track_db_entry, fuse_track_evidence,
 };
 use ap_dsp::pipeline::{AudioPipeline, GaplessCarryover, UltimateDecisionReport};
 use ap_dsp::selector::{
-    NoiseShaperProfile, ULTIMATE_LOOKAHEAD_SECONDS, UpsamplerPolicy, build_post_chain_key,
-    check_ultimate_throughput_with_buffer, select_ultimate_plan,
+    FilterArchetype, NoiseShaperProfile, ULTIMATE_LOOKAHEAD_SECONDS, UpsamplerPicker,
+    UpsamplerPolicy, build_post_chain_key, check_ultimate_throughput_with_buffer,
+    select_ultimate_plan,
 };
 use ap_source::flac::AudioBlockSource;
 use ap_source::md5::md5_to_hex;
 
 use crate::prefetch::{BoundedBlockStreamBuffer, StreamEvent};
 
-/// Runtime configuration & Track DB handle active when `[ultimate] enabled = true` or `--ultimate`.
+/// Runtime configuration & Schema-2 Filter Database handle active when `[ultimate] enabled = true`
+/// or `--ultimate`.
 #[derive(Debug, Clone)]
 pub struct UltimateRuntimeContext {
     pub config: UltimateConfig,
+    /// Legacy Schema-1 TrackDbStore (used for read-only fallback & opt-in `--trackdb-sidecar`).
     pub store: TrackDbStore,
+    /// Schema-2 album-folder mirror store (`%APPDATA%\audiophile-player\filterdb`).
+    pub filter_db: FilterDbStore,
+    /// Shared library manifest mapping named roots (`main`, `classical`, ...) to disk paths.
+    pub manifest: Arc<Mutex<LibraryManifest>>,
+    /// Hot-reloading cache for user-owned `my-filters.yaml`.
+    pub user_filters: Arc<UserFiltersCache>,
+    /// Global filter mode (`Auto` -> `Mine` if `my-filters.yaml` exists, else `Suggested`).
+    pub filter_mode: FilterMode,
+    /// Single-album hot cache `(root_name, rel_folder, AlbumAnalysisFile)` to avoid re-parsing
+    /// the same album YAML across consecutive tracks.
+    pub album_cache: Arc<Mutex<Option<(String, String, AlbumAnalysisFile)>>>,
+}
+
+impl UltimateRuntimeContext {
+    /// Production constructor wiring Schema-2 `FilterDbStore`, `LibraryManifest`, `UserFiltersCache`,
+    /// and legacy Schema-1 `TrackDbStore` fallback.
+    pub fn new(
+        config: UltimateConfig,
+        store: TrackDbStore,
+        filter_db: FilterDbStore,
+        manifest: LibraryManifest,
+        choices_path: std::path::PathBuf,
+        filter_mode: FilterMode,
+    ) -> Self {
+        Self {
+            config,
+            store,
+            filter_db,
+            manifest: Arc::new(Mutex::new(manifest)),
+            user_filters: Arc::new(UserFiltersCache::new(choices_path)),
+            filter_mode,
+            album_cache: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Backwards-compatible helper for legacy tests using only Schema-1 `TrackDbStore`.
+    #[cfg(test)]
+    pub fn from_legacy(config: UltimateConfig, store: TrackDbStore) -> Self {
+        let base = store.root_dir().to_path_buf();
+        Self::new(
+            config,
+            store,
+            FilterDbStore::new(base.join("_filterdb")),
+            LibraryManifest::default(),
+            base.join("_my-filters.yaml"),
+            FilterMode::Auto,
+        )
+    }
+
+    fn resolve_track_location(&self, local_path: &Path) -> Option<(String, String, String)> {
+        let guard = self.manifest.lock().unwrap_or_else(|e| e.into_inner());
+        guard.resolve_track_path(local_path)
+    }
+
+    fn load_album_cached(&self, root: &str, rel_folder: &str) -> Option<AlbumAnalysisFile> {
+        {
+            let guard = self.album_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((ref r, ref f, ref album)) = *guard {
+                if r.eq_ignore_ascii_case(root) && f.eq_ignore_ascii_case(rel_folder) {
+                    return Some(album.clone());
+                }
+            }
+        }
+        let loaded = self.filter_db.load_album(root, rel_folder)?;
+        let mut guard = self.album_cache.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some((root.to_string(), rel_folder.to_string(), loaded.clone()));
+        Some(loaded)
+    }
+
+    fn update_album_cache(
+        &self,
+        root: &str,
+        rel_folder: &str,
+        file_name: &str,
+        track: AlbumTrackAnalysis,
+    ) {
+        let mut guard = self.album_cache.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_mut() {
+            Some((r, f, album))
+                if r.eq_ignore_ascii_case(root) && f.eq_ignore_ascii_case(rel_folder) =>
+            {
+                album.detector_version = DETECTOR_VERSION;
+                album.tracks.insert(file_name.to_string(), track);
+            }
+            _ => {
+                let mut album = self
+                    .filter_db
+                    .load_album(root, rel_folder)
+                    .unwrap_or_else(|| {
+                        AlbumAnalysisFile::new(
+                            root.to_string(),
+                            rel_folder.to_string(),
+                            DETECTOR_VERSION,
+                        )
+                    });
+                album.detector_version = DETECTOR_VERSION;
+                album.tracks.insert(file_name.to_string(), track);
+                *guard = Some((root.to_string(), rel_folder.to_string(), album));
+            }
+        }
+    }
 }
 
 /// Outcome of streaming a single track through the Ultimate `W0..W4` engine.
@@ -204,6 +317,37 @@ where
         true
     };
 
+    // --- Resolve Schema-2 User Choices (`my-filters.yaml` hot-reload) & Effective Filter Mode ---
+    let mut user_warnings: Vec<String> = Vec::new();
+    let (choices_exist, user_file, choices_err) = ult.user_filters.load_fresh();
+    if let Some(ref uf) = user_file {
+        user_warnings.extend(uf.parse_warnings.iter().cloned());
+    }
+    if let Some(err) = choices_err {
+        user_warnings.push(err);
+    }
+    let effective_filter_mode = ult
+        .filter_mode
+        .resolve(choices_exist && user_file.is_some());
+    let track_loc = if is_streaming {
+        None
+    } else {
+        local_path.and_then(|p| ult.resolve_track_location(p))
+    };
+    let resolved_user_overrides = if effective_filter_mode == FilterMode::Mine {
+        if let Some(ref uf) = user_file {
+            if let Some((ref root, ref rel_folder, ref file_name)) = track_loc {
+                Some(uf.resolve_for_track(root, rel_folder, file_name, &track_meta))
+            } else {
+                Some(uf.resolve_for_track("", "", "", &track_meta))
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // --- M3 Early Short-Track Check (< 30 s known from header / DIDL) ---
     let header_short = total_duration_s
         .is_some_and(|d| d.is_finite() && d < f64::from(ULTIMATE_LOOKAHEAD_SECONDS));
@@ -226,6 +370,9 @@ where
             had_pending_prev_end,
             gapless_carryover,
             src_block_frames,
+            effective_filter_mode,
+            resolved_user_overrides.as_ref(),
+            &user_warnings,
         );
     }
 
@@ -307,21 +454,41 @@ where
             had_pending_prev_end,
             gapless_carryover,
             src_block_frames,
+            effective_filter_mode,
+            resolved_user_overrides.as_ref(),
+            &user_warnings,
         );
     }
 
-    // --- W1: Strict Per-Track Cache Lookup + Fusion + Selection (OQ-40, U2, U3, U4) ---
+    // --- W1: Strict Per-Track Cache Lookup + Fusion + Selection (Schema 2 -> Schema 1 fallback) ---
     let (file_size, file_mtime) = local_path
         .and_then(file_size_and_mtime)
         .unwrap_or((0, 0));
 
-    let cached_entry = if is_streaming {
+    let cached_s2_track: Option<(AlbumTrackAnalysis, bool)> = if is_streaming {
+        None
+    } else if let Some((ref root, ref rel_folder, ref file_name)) = track_loc {
+        ult.load_album_cached(root, rel_folder).and_then(|album| {
+            let track = album.tracks.get(file_name)?.clone();
+            let current = album.detector_version == DETECTOR_VERSION
+                && track.matches_identity(
+                    header_md5_hex.as_deref(),
+                    Some(file_size),
+                    Some(file_mtime),
+                );
+            Some((track, current))
+        })
+    } else {
+        None
+    };
+
+    let cached_s1_entry = if is_streaming || cached_s2_track.as_ref().is_some_and(|(_, cur)| *cur) {
         None
     } else {
         ult.store
             .load_for_track(local_path, header_md5_hex.as_deref())
     };
-    let cached_current = cached_entry.as_ref().is_some_and(|e| {
+    let cached_s1_current = cached_s1_entry.as_ref().is_some_and(|e| {
         e.is_results_current(
             DETECTOR_VERSION,
             header_md5_hex.as_deref(),
@@ -329,9 +496,26 @@ where
             local_path.map(|_| file_mtime),
         )
     });
-    let cached_wt = cached_entry
-        .as_ref()
-        .map(|e| CachedWholeTrackEvidence::from_track_db_entry(e, cached_current));
+
+    let cached_current = cached_s2_track.as_ref().is_some_and(|(_, cur)| *cur) || cached_s1_current;
+    let base_cached_wt = if let Some((ref t, cur)) = cached_s2_track {
+        CachedWholeTrackEvidence::from_album_track(t, cur)
+    } else if let Some(ref e) = cached_s1_entry {
+        CachedWholeTrackEvidence::from_track_db_entry(e, cached_s1_current)
+    } else {
+        CachedWholeTrackEvidence::default()
+    };
+
+    let cached_wt = match effective_filter_mode {
+        FilterMode::Suggested => base_cached_wt.clone().suggested_only(),
+        FilterMode::Mine | FilterMode::Auto => {
+            if let Some(ref ov) = resolved_user_overrides {
+                base_cached_wt.clone().with_user_overrides(ov)
+            } else {
+                base_cached_wt.clone()
+            }
+        }
+    };
 
     let early_digital = track_meta.is_early_digital_era();
     let orig_below = track_meta
@@ -350,7 +534,7 @@ where
         &raw_peak_meta,
         &track_meta,
         Some(&w30_snapshot),
-        cached_wt.as_ref(),
+        Some(&cached_wt),
     );
 
     let policy = pipeline.policy();
@@ -379,6 +563,35 @@ where
             ));
         }
     };
+    selection.warnings.extend(user_warnings.iter().cloned());
+
+    // If user overrode `apodizing` (attribute-only override), compute pure machine suggestion too.
+    if fused.apodizing.source == EvidenceSource::User {
+        let sug_wt = base_cached_wt.clone().suggested_only();
+        let sug_fused = fuse_track_evidence(
+            spec.sample_rate_hz,
+            spec.bits_per_sample,
+            &raw_peak_meta,
+            &track_meta,
+            Some(&w30_snapshot),
+            Some(&sug_wt),
+        );
+        if let Ok(sug_sel) = select_ultimate_plan(
+            spec,
+            is_streaming,
+            total_duration_s,
+            &sug_fused,
+            &UpsamplerPolicy {
+                filter_override: None,
+                ..policy
+            },
+            ult.config.genre_rules,
+            cached_current,
+        ) {
+            selection.suggested_filter = sug_sel.plan.filter;
+            selection.suggested_rule = sug_sel.winning_rule;
+        }
+    }
 
     // --- W2: Single-Pass Unity-Gain Render of W0 + Startup-Aware Throughput Self-Check (F9/F-B1) ---
     let placeholder_hr = HeadroomDecision {
@@ -638,9 +851,16 @@ where
     let cached_exact_m_db = if is_streaming || !cached_current {
         None
     } else {
-        cached_entry
+        cached_s2_track
             .as_ref()
-            .and_then(|e| e.find_post_chain_peak(&post_key))
+            .filter(|(_, cur)| *cur)
+            .and_then(|(t, _)| t.find_post_chain_peak(&post_key))
+            .or_else(|| {
+                cached_s1_entry
+                    .as_ref()
+                    .filter(|_| cached_s1_current)
+                    .and_then(|e| e.find_post_chain_peak(&post_key))
+            })
     };
 
     let m30_dbfs = linear_to_dbfs(m30_linear);
@@ -696,7 +916,14 @@ where
     let fixed_gain_db = fixed_headroom.total_gain_db();
     session.set_fixed_headroom(fixed_headroom);
 
-    // Attach Showcase Decision Report (U13).
+    // Attach Showcase Decision Report (U13 + Schema-2 dual `playing | suggested` display).
+    let override_label = if policy.filter_override.is_some() {
+        Some("cli".to_string())
+    } else {
+        selection
+            .user_provenance
+            .map(|p| p.short_label().to_string())
+    };
     let decision_report = UltimateDecisionReport {
         mode: if cached_exact_m_db.is_some() {
             "ultimate: cached".to_string()
@@ -704,6 +931,10 @@ where
             selection.mode_label.clone()
         },
         winning_rule: selection.winning_rule.clone(),
+        active_filter: Some(selection.plan.filter.to_string()),
+        override_label,
+        suggested_filter: Some(selection.suggested_filter.to_string()),
+        suggested_rule: Some(selection.suggested_rule.clone()),
         fired_rules: selection.fired_rules.clone(),
         cache_hit: cached_current || cached_exact_m_db.is_some(),
         m30_dbfs: Some(m30_dbfs),
@@ -1212,6 +1443,39 @@ where
             let wt_analysis =
                 analyzer.snapshot(true, early_digital, orig_below, track_meta.is_dsd_hint);
             let final_md5_hex = header_md5_hex.or_else(|| computed_md5.as_ref().map(md5_to_hex));
+            // Compute pure machine-suggested filter/rule from whole-track analysis so Schema-2
+            // album YAML always records the machine suggestion (never a user choice).
+            let wt_sug_ev =
+                CachedWholeTrackEvidence::from_whole_track_analysis(&wt_analysis, None)
+                    .suggested_only();
+            let wt_sug_fused = fuse_track_evidence(
+                spec.sample_rate_hz,
+                spec.bits_per_sample,
+                &raw_peak_meta,
+                &track_meta,
+                Some(&wt_analysis),
+                Some(&wt_sug_ev),
+            );
+            let (wt_sug_filter, wt_sug_rule) = select_ultimate_plan(
+                spec,
+                false,
+                Some(wt_analysis.duration_s),
+                &wt_sug_fused,
+                &UpsamplerPolicy {
+                    filter_override: None,
+                    ..policy
+                },
+                ult.config.genre_rules,
+                false,
+            )
+            .map(|s| (s.plan.filter.to_string(), s.winning_rule))
+            .unwrap_or_else(|_| {
+                (
+                    selection.suggested_filter.to_string(),
+                    selection.suggested_rule.clone(),
+                )
+            });
+
             let mut entry = build_track_db_entry(
                 display_path.to_string_lossy().into_owned(),
                 file_size,
@@ -1219,18 +1483,48 @@ where
                 final_md5_hex,
                 &wt_analysis,
                 selection.plan.deemphasis,
-                selection.plan.filter.to_string(),
-                selection.winning_rule.clone(),
+                wt_sug_filter,
+                wt_sug_rule,
             );
             let whole_m_dbfs = linear_to_dbfs(whole_track_m_linear);
             entry.upsert_post_chain_peak(post_key, whole_m_dbfs, false);
-            match ult.store.save_preserving_user(local_path, entry) {
-                Ok(_) => wrote_yaml = true,
-                Err(err) => {
-                    eprintln!(
-                        "  [ultimate learn-on-play warn] failed to save YAML for '{}': {err}",
-                        display_path.display()
-                    );
+
+            if let Some((ref root, ref rel_folder, ref file_name)) = track_loc {
+                let head_hash = local_path.and_then(file_head_4k_hash);
+                let album_track = AlbumTrackAnalysis::from_schema1(&entry, head_hash);
+                match ult.filter_db.upsert_track_nonblocking(
+                    root,
+                    rel_folder,
+                    file_name,
+                    DETECTOR_VERSION,
+                    album_track.clone(),
+                ) {
+                    Ok(true) => {
+                        ult.update_album_cache(root, rel_folder, file_name, album_track);
+                        wrote_yaml = true;
+                    }
+                    Ok(false) => {
+                        // Another writer (e.g. `scan`) holds this folder lock; skip cleanly!
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "  [ultimate learn-on-play warn] failed to save Schema-2 album YAML for '{}': {err}",
+                            display_path.display()
+                        );
+                    }
+                }
+                if ult.store.sidecar_enabled() {
+                    let _ = ult.store.save_preserving_user(local_path, entry);
+                }
+            } else {
+                match ult.store.save_preserving_user(local_path, entry) {
+                    Ok(_) => wrote_yaml = true,
+                    Err(err) => {
+                        eprintln!(
+                            "  [ultimate learn-on-play warn] failed to save YAML for '{}': {err}",
+                            display_path.display()
+                        );
+                    }
                 }
             }
         }
@@ -1244,7 +1538,8 @@ where
     }
 }
 
-/// Mandate M3: play tracks `< 30 s` through normal-mode defaults and label as `"normal (<30 s)"`.
+/// Mandate M3: play tracks `< 30 s` through normal-mode defaults and label as `"normal (<30 s)"`,
+/// while still honoring explicit user choices from `my-filters.yaml` / `AP_*` tags in `mine` mode.
 #[allow(clippy::too_many_arguments)]
 fn stream_short_track_normal<S, F>(
     pipeline: &AudioPipeline,
@@ -1264,6 +1559,9 @@ fn stream_short_track_normal<S, F>(
     had_pending_prev_end: &mut bool,
     gapless_carryover: bool,
     src_block_frames: usize,
+    effective_filter_mode: FilterMode,
+    user_overrides: Option<&ResolvedUserOverrides>,
+    user_warnings: &[String],
 ) -> UltimateStreamResult
 where
     S: AudioBlockSource,
@@ -1272,28 +1570,152 @@ where
     let spec = source.spec();
     let peak_meta = source.peak_meta();
     let track_meta = source.track_meta();
+    let is_streaming = source.is_streaming();
 
     let mut src_info = ap_dsp::selector::TrackSourceInfo::from_stream_spec(spec);
-    src_info.is_streaming_source = source.is_streaming();
-    src_info.deemphasis = track_meta
-        .ap_deemphasis
-        .unwrap_or(track_meta.cuesheet_pre_emphasis);
+    src_info.is_streaming_source = is_streaming;
+    src_info.deemphasis = if effective_filter_mode == FilterMode::Suggested {
+        track_meta.cuesheet_pre_emphasis
+    } else {
+        user_overrides
+            .and_then(|u| u.deemphasis.as_ref().map(|(d, _)| *d))
+            .or(track_meta.ap_deemphasis)
+            .unwrap_or(track_meta.cuesheet_pre_emphasis)
+    };
 
-    let mut session = match pipeline.start_track_with_source_info(spec, src_info, &peak_meta) {
-        Ok(s) => s,
-        Err(err) => {
+    let mut warnings: Vec<String> = user_warnings.to_vec();
+    if let Some(ov) = user_overrides {
+        warnings.extend(ov.warnings.iter().cloned());
+    }
+
+    let base_policy = pipeline.policy();
+    let mut override_label: Option<String> = None;
+    let mut winning_rule = "short_track_bypass".to_string();
+    let mut user_filter_override: Option<FilterArchetype> = None;
+
+    if base_policy.filter_override.is_some() {
+        override_label = Some("cli".to_string());
+        winning_rule = "cli_override".to_string();
+    } else if effective_filter_mode == FilterMode::Mine {
+        let candidate_filter = user_overrides
+            .and_then(|u| {
+                u.filter
+                    .as_ref()
+                    .map(|(f, prov, _)| (f.as_str(), *prov))
+            })
+            .or_else(|| {
+                track_meta
+                    .ap_filter
+                    .as_deref()
+                    .map(|f| (f, UserFilterProvenance::Tag))
+            });
+        if let Some((fname, prov)) = candidate_filter {
+            match FilterArchetype::from_str(fname) {
+                Ok(arch) => {
+                    if is_streaming && !arch.is_streaming_safe() {
+                        warnings.push(format!(
+                            "M4 streaming guard: user override '{}' is local-only on short track; using normal default",
+                            arch
+                        ));
+                    } else {
+                        user_filter_override = Some(arch);
+                        override_label = Some(prov.short_label().to_string());
+                        winning_rule = prov.rule_name().to_string();
+                    }
+                }
+                Err(err) => {
+                    warnings.push(format!("ignoring unrecognized user filter override '{fname}': {err}"));
+                }
+            }
+        } else {
+            let phase_choice = user_overrides
+                .and_then(|u| u.phase.as_ref().map(|(p, _)| *p))
+                .or(track_meta.ap_phase);
+            match phase_choice {
+                Some(PhaseTagOverride::Minimum) => {
+                    user_filter_override = Some(FilterArchetype::MinphaseLong);
+                    override_label = Some(UserFilterProvenance::Track.short_label().to_string());
+                    winning_rule = "user_phase_min".to_string();
+                }
+                Some(PhaseTagOverride::Intermediate) => {
+                    user_filter_override = Some(FilterArchetype::IntermediateLong);
+                    override_label = Some(UserFilterProvenance::Track.short_label().to_string());
+                    winning_rule = "user_phase_ip".to_string();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut session = if let Some(user_arch) = user_filter_override {
+        let mut eff_policy = base_policy;
+        eff_policy.filter_override = Some(user_arch);
+        let picker = match UpsamplerPicker::new(eff_policy) {
+            Ok(p) => p,
+            Err(err) => {
+                return UltimateStreamResult::Failed(format!(
+                    "DSP picker error on short track '{}': {err}",
+                    display_path.display()
+                ));
+            }
+        };
+        let mut plan = picker.select(&src_info);
+        plan.reason = format!("short track (<30 s) user override -> {user_arch}");
+        let placeholder_hr = HeadroomDecision {
+            mode: HeadroomMode::ZeroDb,
+            peak_dbfs: None,
+            peak_kind: None,
+            convolution_scale_db: 0.0,
+            reason: "short-track user override headroom pending".to_string(),
+        };
+        let mut s = match pipeline.start_track_with_plan_and_headroom(spec, plan, placeholder_hr) {
+            Ok(s) => s,
+            Err(err) => {
+                return UltimateStreamResult::Failed(format!(
+                    "DSP pipeline error on short track '{}': {err}",
+                    display_path.display()
+                ));
+            }
+        };
+        let conv_boost_db = s.convolver_max_boost_db();
+        let hr = ap_core::headroom::select_headroom_for_bits(
+            &peak_meta,
+            spec.bits_per_sample,
+            is_streaming,
+            Some(conv_boost_db),
+            None,
+        );
+        if let Err(err) = s.reconfigure_quantizer_for_headroom(&hr) {
             return UltimateStreamResult::Failed(format!(
-                "DSP pipeline error on short track '{}': {err}",
+                "DSP quantizer error on short track '{}': {err}",
                 display_path.display()
             ));
+        }
+        s.set_fixed_headroom(hr);
+        s
+    } else {
+        match pipeline.start_track_with_source_info(spec, src_info, &peak_meta) {
+            Ok(s) => s,
+            Err(err) => {
+                return UltimateStreamResult::Failed(format!(
+                    "DSP pipeline error on short track '{}': {err}",
+                    display_path.display()
+                ));
+            }
         }
     };
 
     let fixed_g = session.report().headroom.total_gain_db();
     let m_q = quantizer_margin_db(session.report().output_bits, session.shaper_l1_sum());
+    let active_filter_name = session.report().dsp_plan.filter.to_string();
+    let suggested_filter_name = session.report().dsp_plan.target_audiophile_filter.to_string();
     session.set_ultimate_report(UltimateDecisionReport {
         mode: "normal (<30 s)".to_string(),
-        winning_rule: "short_track_bypass".to_string(),
+        winning_rule,
+        active_filter: Some(active_filter_name),
+        override_label,
+        suggested_filter: Some(suggested_filter_name),
+        suggested_rule: Some("short_track_bypass".to_string()),
         fired_rules: vec!["M3(<30 s)".to_string()],
         cache_hit: false,
         m30_dbfs: None,
@@ -1301,7 +1723,7 @@ where
         fixed_gain_db: fixed_g,
         quantizer_margin_db: m_q,
         throughput_x_rt: None,
-        warnings: Vec::new(),
+        warnings,
     });
 
     if let Some(carry) = incoming_carryover.take() {
@@ -1627,14 +2049,14 @@ mod tests {
     #[test]
     fn gate_m3_short_track_header_and_zero_total_samples_use_normal_mode() {
         let db_root = temp_dir("m3");
-        let ult = UltimateRuntimeContext {
-            config: UltimateConfig {
+        let ult = UltimateRuntimeContext::from_legacy(
+            UltimateConfig {
                 enabled: true,
                 genre_rules: true,
                 learn_on_play: true,
             },
-            store: TrackDbStore::new(db_root.clone(), false),
-        };
+            TrackDbStore::new(db_root.clone(), false),
+        );
         let pipeline = make_fast_ultimate_pipeline();
 
         // Case A: header explicitly claims 10 s (< 30 s) -> normal (<30 s), no YAML written.
@@ -1707,14 +2129,14 @@ mod tests {
         let db_root = temp_dir("exact_m");
         let track_path = db_root.join("track_32s.flac");
         fs::write(&track_path, b"dummy").unwrap();
-        let ult = UltimateRuntimeContext {
-            config: UltimateConfig {
+        let ult = UltimateRuntimeContext::from_legacy(
+            UltimateConfig {
                 enabled: true,
                 genre_rules: true,
                 learn_on_play: true,
             },
-            store: TrackDbStore::new(db_root.clone(), false),
-        };
+            TrackDbStore::new(db_root.clone(), false),
+        );
         let pipeline = make_fast_ultimate_pipeline();
 
         // Use native 8fS (352.8 kHz) at 32 s? No, 8 kHz upsampled or 44.1 kHz with --filter null?
@@ -1874,14 +2296,14 @@ mod tests {
     #[test]
     fn gate_streaming_m4_oq33_stale_tag_disproof_and_strict_per_track_independence_oq40() {
         let db_root = temp_dir("stream_oq40");
-        let ult = UltimateRuntimeContext {
-            config: UltimateConfig {
+        let ult = UltimateRuntimeContext::from_legacy(
+            UltimateConfig {
                 enabled: true,
                 genre_rules: true,
                 learn_on_play: true,
             },
-            store: TrackDbStore::new(db_root.clone(), false),
-        };
+            TrackDbStore::new(db_root.clone(), false),
+        );
         let fast_policy = UpsamplerPolicy {
             filter_override: Some(FilterArchetype::Null),
             ..UpsamplerPolicy::default()
@@ -2039,14 +2461,14 @@ mod tests {
     #[test]
     fn ultimate_null_filter_negative_gain_never_bypass_shaper_and_zero_gain_stays_bit_perfect() {
         let db_root = temp_dir("f2_quantizer");
-        let ult = UltimateRuntimeContext {
-            config: UltimateConfig {
+        let ult = UltimateRuntimeContext::from_legacy(
+            UltimateConfig {
                 enabled: true,
                 genre_rules: true,
                 learn_on_play: true,
             },
-            store: TrackDbStore::new(db_root.clone(), false),
-        };
+            TrackDbStore::new(db_root.clone(), false),
+        );
         let fast_policy = UpsamplerPolicy {
             filter_override: Some(FilterArchetype::Null),
             ..UpsamplerPolicy::default()
@@ -2204,14 +2626,14 @@ mod tests {
         let db_root = temp_dir("f7_f8");
         let track_path = db_root.join("corrupt_w4.flac");
         fs::write(&track_path, b"corrupt_w4").unwrap();
-        let ult = UltimateRuntimeContext {
-            config: UltimateConfig {
+        let ult = UltimateRuntimeContext::from_legacy(
+            UltimateConfig {
                 enabled: true,
                 genre_rules: true,
                 learn_on_play: true,
             },
-            store: TrackDbStore::new(db_root.clone(), false),
-        };
+            TrackDbStore::new(db_root.clone(), false),
+        );
         let fast_policy = UpsamplerPolicy {
             filter_override: Some(FilterArchetype::Null),
             ..UpsamplerPolicy::default()
@@ -2343,14 +2765,14 @@ mod tests {
         let db_root = temp_dir("f9_fb1");
         let track_path = db_root.join("slow_probe.flac");
         fs::write(&track_path, b"slow").unwrap();
-        let ult = UltimateRuntimeContext {
-            config: UltimateConfig {
+        let ult = UltimateRuntimeContext::from_legacy(
+            UltimateConfig {
                 enabled: true,
                 genre_rules: true,
                 learn_on_play: false,
             },
-            store: TrackDbStore::new(db_root.clone(), false),
-        };
+            TrackDbStore::new(db_root.clone(), false),
+        );
         // Use a slightly larger buffer ceiling in this test so the pre-populated 1 s cushion
         // stays buffered throughout W2 without racing a concurrent drainer thread.
         let buf = BoundedBlockStreamBuffer::with_limits(
@@ -2491,14 +2913,14 @@ mod tests {
         let db_root = temp_dir("f7_fb2_tail");
         let track_path = db_root.join("tail_and_eof.flac");
         fs::write(&track_path, b"tail_eof").unwrap();
-        let ult = UltimateRuntimeContext {
-            config: UltimateConfig {
+        let ult = UltimateRuntimeContext::from_legacy(
+            UltimateConfig {
                 enabled: true,
                 genre_rules: true,
                 learn_on_play: true,
             },
-            store: TrackDbStore::new(db_root.clone(), false),
-        };
+            TrackDbStore::new(db_root.clone(), false),
+        );
         let fast_policy = UpsamplerPolicy {
             filter_override: Some(FilterArchetype::Null),
             ..UpsamplerPolicy::default()
@@ -2668,14 +3090,14 @@ mod tests {
         // (no discontinuous filter tail appended after the last good block); only any remaining
         // incoming `additive_tail` is drained, followed by `TrackEnd`, and `wrote_yaml == false`.
         let db_root = temp_dir("c4_skip_flush");
-        let ult = UltimateRuntimeContext {
-            config: UltimateConfig {
+        let ult = UltimateRuntimeContext::from_legacy(
+            UltimateConfig {
                 enabled: true,
                 genre_rules: true,
                 learn_on_play: true,
             },
-            store: TrackDbStore::new(db_root.clone(), false),
-        };
+            TrackDbStore::new(db_root.clone(), false),
+        );
         // ShortLp at 44.1 -> 352.8 kHz produces a non-empty filter flush tail if flushed!
         let lp_pipeline = AudioPipeline::with_rew_config_full_tail(
             UpsamplerPolicy {
@@ -2803,5 +3225,201 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(&db_root);
+    }
+
+    #[test]
+    fn schema2_mine_vs_suggested_short_track_override_hot_reload_and_malformed_fallback() {
+        let root = temp_dir("schema2_playback");
+        let music_root = root.join("music");
+        let album_dir = music_root.join("Jazz").join("Miles Davis - Kind of Blue");
+        let filterdb_dir = root.join("filterdb");
+        let choices_path = root.join("my-filters.yaml");
+        fs::create_dir_all(&album_dir).unwrap();
+
+        let track_long = album_dir.join("01 So What.flac");
+        let track_short = album_dir.join("02 Interlude.flac");
+        fs::write(&track_long, b"dummy long flac").unwrap();
+        fs::write(&track_short, b"dummy short flac").unwrap();
+
+        fs::write(
+            &choices_path,
+            "schema: 2\n\nfolders:\n  \"main:Jazz/Miles Davis - Kind of Blue\":\n    filter: short-lp\n    note: \"prefer short-lp on this album\"\n",
+        )
+        .unwrap();
+
+        let mut manifest = LibraryManifest::default();
+        manifest.upsert_root("main", &music_root);
+
+        let make_ctx = |mode: FilterMode| {
+            UltimateRuntimeContext::new(
+                UltimateConfig {
+                    enabled: true,
+                    genre_rules: true,
+                    learn_on_play: true,
+                },
+                TrackDbStore::new(root.join("legacy_trackdb"), false),
+                FilterDbStore::new(filterdb_dir.clone()),
+                manifest.clone(),
+                choices_path.clone(),
+                mode,
+            )
+        };
+
+        let pipeline = make_fast_ultimate_pipeline();
+
+        // 1. Short track (< 30 s) in Auto/Mine mode honors folder override from my-filters.yaml!
+        let ult_auto = make_ctx(FilterMode::Auto);
+        let buf = BoundedBlockStreamBuffer::with_limits(
+            ULTIMATE_MAX_BUFFERED_FRAMES,
+            Duration::from_secs(ULTIMATE_MAX_BUFFERED_SECONDS),
+        );
+        let ep = buf.current_epoch();
+        let mut src_short = SyntheticSource::sine(44_100, 1.0, 0.5, false);
+        let mut carry = None;
+        let mut backup = None;
+        let mut pend = false;
+        let r_short = stream_track_ultimate(
+            &pipeline,
+            &ult_auto,
+            &buf,
+            ep,
+            || false,
+            &mut src_short,
+            &track_short,
+            Some(&track_short),
+            None,
+            None,
+            PlayModeLabel::SingleFile,
+            Some(1.0),
+            &mut carry,
+            &mut backup,
+            &mut pend,
+            false,
+            8_192,
+        );
+        assert!(matches!(r_short, UltimateStreamResult::Played { .. }));
+        let (rep_short, _, _) = drain_track_events(&buf, ep);
+        assert_eq!(rep_short.dsp_plan.filter, FilterArchetype::ShortLp);
+        let ult_rep_short = rep_short.ultimate_report.unwrap();
+        assert_eq!(ult_rep_short.override_label.as_deref(), Some("mine: folder"));
+        assert!(ult_rep_short.summary().contains("playing: short-lp (mine: folder)"));
+
+        // 2. Same short track in Suggested mode ignores my-filters.yaml and plays default gauss-long-lp!
+        let ult_sug = make_ctx(FilterMode::Suggested);
+        let buf2 = BoundedBlockStreamBuffer::with_limits(
+            ULTIMATE_MAX_BUFFERED_FRAMES,
+            Duration::from_secs(ULTIMATE_MAX_BUFFERED_SECONDS),
+        );
+        let ep2 = buf2.current_epoch();
+        let mut src_short2 = SyntheticSource::sine(44_100, 1.0, 0.5, false);
+        let _ = stream_track_ultimate(
+            &pipeline,
+            &ult_sug,
+            &buf2,
+            ep2,
+            || false,
+            &mut src_short2,
+            &track_short,
+            Some(&track_short),
+            None,
+            None,
+            PlayModeLabel::SingleFile,
+            Some(1.0),
+            &mut carry,
+            &mut backup,
+            &mut pend,
+            false,
+            8_192,
+        );
+        let (rep_sug, _, _) = drain_track_events(&buf2, ep2);
+        assert_eq!(rep_sug.dsp_plan.filter, FilterArchetype::GaussLongLp);
+        assert_eq!(rep_sug.ultimate_report.unwrap().override_label, None);
+
+        // 3. Long track (>= 30 s) in Auto/Mine mode uses folder override (`short-lp`), reports
+        //    dual `playing: short-lp (mine: folder) | suggested: ...`, AND writes Schema-2 album
+        //    YAML with pure machine `suggested` (never overwriting my-filters.yaml!).
+        let buf3 = BoundedBlockStreamBuffer::with_limits(
+            ULTIMATE_MAX_BUFFERED_FRAMES,
+            Duration::from_secs(ULTIMATE_MAX_BUFFERED_SECONDS),
+        );
+        let ep3 = buf3.current_epoch();
+        let mut src_long = SyntheticSource::sine(44_100, 31.0, 0.5, false);
+        let buf3_c = Arc::clone(&buf3);
+        let drain_h = std::thread::spawn(move || drain_track_events(&buf3_c, ep3));
+        let r_long = stream_track_ultimate(
+            &pipeline,
+            &ult_auto,
+            &buf3,
+            ep3,
+            || false,
+            &mut src_long,
+            &track_long,
+            Some(&track_long),
+            None,
+            None,
+            PlayModeLabel::SingleFile,
+            Some(31.0),
+            &mut carry,
+            &mut backup,
+            &mut pend,
+            false,
+            16_384,
+        );
+        assert!(matches!(r_long, UltimateStreamResult::Played { wrote_yaml: true, .. }));
+        let (rep_long, _, _) = drain_h.join().unwrap();
+        assert_eq!(rep_long.dsp_plan.filter, FilterArchetype::ShortLp);
+        let u_long = rep_long.ultimate_report.unwrap();
+        assert_eq!(u_long.override_label.as_deref(), Some("mine: folder"));
+        assert_eq!(u_long.suggested_filter.as_deref(), Some("sinc-steep-4m"));
+
+        // Verify Schema-2 album YAML exists and stored machine suggestion (not user choice!),
+        // with post-chain peak keyed to actually played `short-lp`.
+        let album = ult_auto
+            .filter_db
+            .load_album("main", "Jazz/Miles Davis - Kind of Blue")
+            .expect("Schema-2 album YAML should be created on learn-on-play");
+        let tr = album.tracks.get("01 So What.flac").unwrap();
+        assert_eq!(tr.suggested, "sinc-steep-4m");
+        assert_eq!(tr.post_chain_peaks.len(), 1);
+        assert_eq!(tr.post_chain_peaks[0].key.upsampler, "short-lp");
+
+        // 4. Malformed my-filters.yaml falls back cleanly with line-numbered warning, never fails playback!
+        fs::write(&choices_path, "schema: 2\n\tbad_tab: true\n").unwrap();
+        let buf4 = BoundedBlockStreamBuffer::with_limits(
+            ULTIMATE_MAX_BUFFERED_FRAMES,
+            Duration::from_secs(ULTIMATE_MAX_BUFFERED_SECONDS),
+        );
+        let ep4 = buf4.current_epoch();
+        let mut src_bad = SyntheticSource::sine(44_100, 1.0, 0.5, false);
+        let r_bad = stream_track_ultimate(
+            &pipeline,
+            &ult_auto,
+            &buf4,
+            ep4,
+            || false,
+            &mut src_bad,
+            &track_short,
+            Some(&track_short),
+            None,
+            None,
+            PlayModeLabel::SingleFile,
+            Some(1.0),
+            &mut carry,
+            &mut backup,
+            &mut pend,
+            false,
+            8_192,
+        );
+        assert!(matches!(r_bad, UltimateStreamResult::Played { .. }));
+        let (rep_bad, _, _) = drain_track_events(&buf4, ep4);
+        assert_eq!(rep_bad.dsp_plan.filter, FilterArchetype::GaussLongLp);
+        let u_bad = rep_bad.ultimate_report.unwrap();
+        assert!(
+            u_bad.warnings.iter().any(|w| w.contains("line 2")),
+            "expected line-numbered parse warning, got {:?}",
+            u_bad.warnings
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use ap_core::config::{ConvolutionConfig, is_valid_dac_bits};
+use ap_core::user_filters::FilterMode;
 use ap_dsp::MAX_FILTER_TAPS;
 use ap_dsp::selector::{FilterArchetype, NoiseShaperProfile, UpsamplerPolicy};
 use ap_output_win::hygiene::OptimizationLevel;
@@ -39,7 +40,7 @@ pub struct UpnpCliOverride {
     pub bind_ip: Option<Ipv4Addr>,
 }
 
-/// Explicit CLI overrides for `[ultimate]` and `[trackdb]` (`--ultimate`, `--no-ultimate`, etc.).
+/// Explicit CLI overrides for `[ultimate]`, `[trackdb]`, and `[filters]` (`--ultimate`, `--filters`, etc.).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UltimateCliOverride {
     pub enabled: Option<bool>,
@@ -47,6 +48,57 @@ pub struct UltimateCliOverride {
     pub learn_on_play: Option<bool>,
     pub trackdb_dir: Option<PathBuf>,
     pub trackdb_sidecar: Option<bool>,
+    pub filter_mode: Option<FilterMode>,
+    pub filterdb_dir: Option<PathBuf>,
+    pub choices_file: Option<PathBuf>,
+}
+
+/// Subcommands under `audiophile-player filters <SUBCOMMAND>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FiltersCommand {
+    /// Inspect suggested vs active (`mine`) filter decision for one file or album folder.
+    Show {
+        target: PathBuf,
+        config_path: Option<PathBuf>,
+        filterdb_dir: Option<PathBuf>,
+        choices_file: Option<PathBuf>,
+    },
+    /// Show every track where user choices (`my-filters.yaml` / `AP_*`) differ from machine suggestions.
+    Diff {
+        config_path: Option<PathBuf>,
+        filterdb_dir: Option<PathBuf>,
+        choices_file: Option<PathBuf>,
+    },
+    /// Set a track or folder filter choice in `my-filters.yaml` (preserving comments & `.bak` backup).
+    Set {
+        target: PathBuf,
+        filter: String,
+        note: Option<String>,
+        config_path: Option<PathBuf>,
+        filterdb_dir: Option<PathBuf>,
+        choices_file: Option<PathBuf>,
+    },
+    /// Parse and lint `my-filters.yaml` against `library.yaml` (unknown filters, missing paths, shadowed rules).
+    Check {
+        config_path: Option<PathBuf>,
+        filterdb_dir: Option<PathBuf>,
+        choices_file: Option<PathBuf>,
+    },
+    /// Preview (or `--apply`) moved-file relinks from `filterdb/relink-report.yaml` onto `my-filters.yaml`.
+    Relink {
+        apply: bool,
+        config_path: Option<PathBuf>,
+        filterdb_dir: Option<PathBuf>,
+        choices_file: Option<PathBuf>,
+    },
+    /// Non-destructively migrate legacy Schema-1 `trackdb/` entries (and optional sidecars) to Schema 2.
+    Migrate {
+        config_path: Option<PathBuf>,
+        trackdb_dir: Option<PathBuf>,
+        filterdb_dir: Option<PathBuf>,
+        choices_file: Option<PathBuf>,
+        sidecar_root: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,18 +123,23 @@ pub enum RunMode {
         /// Explicit CLI overrides for `[ultimate]` and `[trackdb]` in `config.toml`.
         ultimate_override: UltimateCliOverride,
     },
-    /// Offline parallel resumable library scanner (`audiophile-player scan <folder> [OPTIONS]`).
+    /// Offline parallel resumable library scanner (`audiophile-player scan [FOLDER|ROOT] [OPTIONS]`).
     Scan {
-        folder: PathBuf,
+        folder: Option<PathBuf>,
         report: bool,
         sidecar: bool,
         post_chain: bool,
         force: bool,
+        jobs: Option<usize>,
         trackdb_dir: Option<PathBuf>,
+        filterdb_dir: Option<PathBuf>,
+        choices_file: Option<PathBuf>,
         config_path: Option<PathBuf>,
         rew_override: Option<ConvolutionConfig>,
         upsampler_policy: UpsamplerPolicy,
     },
+    /// Inspect, validate, edit, relink, or migrate the Schema-2 Filter Database (`audiophile-player filters ...`).
+    Filters(FiltersCommand),
     /// Explicit `--idle` mode: keep running without touching audio hardware (for signal tests).
     Idle,
     /// Print concise help text and exit `0`.
@@ -104,10 +161,16 @@ where
     let mut iter = args.into_iter().map(Into::into).peekable();
     let _program = iter.next(); // skip argv[0]
 
-    // Subcommand: `audiophile-player scan <folder> [--report] [--sidecar] [--post-chain] [--force] ...`
+    // Subcommand: `audiophile-player scan [FOLDER|ROOT] [--report] [--sidecar] [--post-chain] [--force] [--jobs N] ...`
     if iter.peek().and_then(|s| s.to_str()) == Some("scan") {
         iter.next();
         return parse_scan_args(iter);
+    }
+
+    // Subcommand: `audiophile-player filters <show|diff|set|check|relink|migrate> ...`
+    if iter.peek().and_then(|s| s.to_str()) == Some("filters") {
+        iter.next();
+        return parse_filters_args(iter);
     }
 
     let mut config_path: Option<PathBuf> = None;
@@ -298,6 +361,25 @@ where
             "--trackdb-sidecar" => {
                 ultimate_override.trackdb_sidecar = Some(true);
             }
+            "--filters" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| "--filters requires auto | suggested | mine".to_string())?;
+                let val_str = require_utf8_arg("--filters", val)?;
+                ultimate_override.filter_mode = Some(FilterMode::parse(&val_str)?);
+            }
+            "--filterdb-dir" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| "--filterdb-dir requires a directory path".to_string())?;
+                ultimate_override.filterdb_dir = Some(PathBuf::from(val));
+            }
+            "--choices-file" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| "--choices-file requires a YAML file path".to_string())?;
+                ultimate_override.choices_file = Some(PathBuf::from(val));
+            }
             "--opt" => {
                 let val = iter
                     .next()
@@ -354,7 +436,10 @@ where
     let mut sidecar = false;
     let mut post_chain = false;
     let mut force = false;
+    let mut jobs: Option<usize> = None;
     let mut trackdb_dir: Option<PathBuf> = None;
+    let mut filterdb_dir: Option<PathBuf> = None;
+    let mut choices_file: Option<PathBuf> = None;
     let mut config_path: Option<PathBuf> = None;
     let mut rew_override: Option<ConvolutionConfig> = None;
     let mut upsampler_policy = UpsamplerPolicy::default();
@@ -377,11 +462,36 @@ where
             "--sidecar" => sidecar = true,
             "--post-chain" => post_chain = true,
             "--force" => force = true,
+            "--jobs" | "-j" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| "--jobs requires a positive integer".to_string())?;
+                let val_str = require_utf8_arg("--jobs", val)?;
+                let n = val_str
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid --jobs '{val_str}'; expected positive integer"))?;
+                if n == 0 {
+                    return Err("--jobs must be >= 1".to_string());
+                }
+                jobs = Some(n);
+            }
             "--trackdb-dir" => {
                 let val = iter
                     .next()
                     .ok_or_else(|| "--trackdb-dir requires a directory path".to_string())?;
                 trackdb_dir = Some(PathBuf::from(val));
+            }
+            "--filterdb-dir" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| "--filterdb-dir requires a directory path".to_string())?;
+                filterdb_dir = Some(PathBuf::from(val));
+            }
+            "--choices-file" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| "--choices-file requires a YAML file path".to_string())?;
+                choices_file = Some(PathBuf::from(val));
             }
             "--config" => {
                 let val = iter
@@ -430,10 +540,6 @@ where
         }
     }
 
-    let folder = folder.ok_or_else(|| {
-        "scan requires a folder path (usage: audiophile-player scan <folder> [--report] [--sidecar] [--post-chain])"
-            .to_string()
-    })?;
     upsampler_policy.validate()?;
 
     Ok(RunMode::Scan {
@@ -442,11 +548,182 @@ where
         sidecar,
         post_chain,
         force,
+        jobs,
         trackdb_dir,
+        filterdb_dir,
+        choices_file,
         config_path,
         rew_override,
         upsampler_policy,
     })
+}
+
+fn parse_filters_args<I>(mut iter: I) -> Result<RunMode, String>
+where
+    I: Iterator<Item = OsString>,
+{
+    let Some(sub_raw) = iter.next() else {
+        return Err(
+            "filters requires a subcommand: show | diff | set | check | relink | migrate"
+                .to_string(),
+        );
+    };
+    let sub = sub_raw.to_str().ok_or_else(|| {
+        format!(
+            "unknown non-UTF-8 filters subcommand '{}'",
+            sub_raw.to_string_lossy()
+        )
+    })?;
+    if matches!(sub, "-h" | "--help") {
+        return Ok(RunMode::Help);
+    }
+    if matches!(sub, "-V" | "--version") {
+        return Ok(RunMode::Version);
+    }
+
+    let mut config_path: Option<PathBuf> = None;
+    let mut filterdb_dir: Option<PathBuf> = None;
+    let mut choices_file: Option<PathBuf> = None;
+    let mut trackdb_dir: Option<PathBuf> = None;
+    let mut sidecar_root: Option<PathBuf> = None;
+    let mut note: Option<String> = None;
+    let mut apply = false;
+    let mut positional: Vec<OsString> = Vec::new();
+
+    while let Some(arg_raw) = iter.next() {
+        let Some(arg) = arg_raw.to_str() else {
+            positional.push(arg_raw);
+            continue;
+        };
+        match arg {
+            "-h" | "--help" => return Ok(RunMode::Help),
+            "-V" | "--version" => return Ok(RunMode::Version),
+            "--config" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| "--config requires a TOML config file path".to_string())?;
+                config_path = Some(PathBuf::from(val));
+            }
+            "--filterdb-dir" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| "--filterdb-dir requires a directory path".to_string())?;
+                filterdb_dir = Some(PathBuf::from(val));
+            }
+            "--choices-file" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| "--choices-file requires a YAML file path".to_string())?;
+                choices_file = Some(PathBuf::from(val));
+            }
+            "--trackdb-dir" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| "--trackdb-dir requires a directory path".to_string())?;
+                trackdb_dir = Some(PathBuf::from(val));
+            }
+            "--sidecar-root" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| "--sidecar-root requires a music directory path".to_string())?;
+                sidecar_root = Some(PathBuf::from(val));
+            }
+            "--note" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| "--note requires a text string".to_string())?;
+                note = Some(require_utf8_arg("--note", val)?);
+            }
+            "--apply" => apply = true,
+            other if other.starts_with('-') => {
+                return Err(format!(
+                    "unknown filters {sub} option '{other}' (run with --help for usage)"
+                ));
+            }
+            _ => positional.push(arg_raw),
+        }
+    }
+
+    match sub {
+        "show" => {
+            if positional.len() != 1 {
+                return Err(
+                    "filters show requires one target file or folder (usage: audiophile-player filters show <PATH>)"
+                        .to_string(),
+                );
+            }
+            Ok(RunMode::Filters(FiltersCommand::Show {
+                target: PathBuf::from(positional.remove(0)),
+                config_path,
+                filterdb_dir,
+                choices_file,
+            }))
+        }
+        "diff" => {
+            if !positional.is_empty() {
+                return Err("filters diff takes no positional arguments".to_string());
+            }
+            Ok(RunMode::Filters(FiltersCommand::Diff {
+                config_path,
+                filterdb_dir,
+                choices_file,
+            }))
+        }
+        "set" => {
+            if positional.len() != 2 {
+                return Err(
+                    "filters set requires <PATH> <FILTER> (usage: audiophile-player filters set <PATH> <FILTER> [--note TEXT])"
+                        .to_string(),
+                );
+            }
+            let target = PathBuf::from(positional.remove(0));
+            let filter = require_utf8_arg("filters set <FILTER>", positional.remove(0))?;
+            Ok(RunMode::Filters(FiltersCommand::Set {
+                target,
+                filter,
+                note,
+                config_path,
+                filterdb_dir,
+                choices_file,
+            }))
+        }
+        "check" => {
+            if !positional.is_empty() {
+                return Err("filters check takes no positional arguments".to_string());
+            }
+            Ok(RunMode::Filters(FiltersCommand::Check {
+                config_path,
+                filterdb_dir,
+                choices_file,
+            }))
+        }
+        "relink" => {
+            if !positional.is_empty() {
+                return Err("filters relink takes no positional arguments".to_string());
+            }
+            Ok(RunMode::Filters(FiltersCommand::Relink {
+                apply,
+                config_path,
+                filterdb_dir,
+                choices_file,
+            }))
+        }
+        "migrate" => {
+            if !positional.is_empty() {
+                return Err("filters migrate takes no positional arguments".to_string());
+            }
+            Ok(RunMode::Filters(FiltersCommand::Migrate {
+                config_path,
+                trackdb_dir,
+                filterdb_dir,
+                choices_file,
+                sidecar_root,
+            }))
+        }
+        other => Err(format!(
+            "unknown filters subcommand '{other}' (expected: show | diff | set | check | relink | migrate)"
+        )),
+    }
 }
 
 pub fn help_text() -> String {
@@ -458,12 +735,15 @@ pub fn help_text() -> String {
                                               playing random FLACs from ~/Music + local HTTP UI\n\
                                               + UPnP AV MediaRenderer (for foobar2000 / BubbleUPnP).\n\
            audiophile-player [OPTIONS]\n\
-           audiophile-player scan <FOLDER> [--report] [--sidecar] [--post-chain] [--force]\n\
-                                              Offline whole-track library scanner (writes Schema-1\n\
-                                              YAML trackdb entries; never modifies FLAC files).\n\n\
+           audiophile-player scan [FOLDER|ROOT] [--report] [--post-chain] [--force] [--jobs N]\n\
+                                              Offline whole-track library scanner (writes Schema-2\n\
+                                              album YAML under filterdb/; never modifies FLAC files).\n\
+           audiophile-player filters <show|diff|set|check|relink|migrate> [ARGS]\n\
+                                              Inspect, edit, validate, relink, or migrate your\n\
+                                              filter database and my-filters.yaml overrides.\n\n\
          CONFIG FILE:\n\
            Auto-loads .\\audiophile-player.toml or %APPDATA%\\audiophile-player\\config.toml\n\
-           (or pass --config <PATH>). Configures [convolution], [quantizer], [upnp], [capture], [ultimate], and [trackdb].\n\n\
+           (or pass --config <PATH>). Configures [convolution], [quantizer], [upnp], [capture], [ultimate], [trackdb], and [filters].\n\n\
          OPTIONS:\n\
            --config <PATH>      Path to TOML config file (default: auto-discover)\n\
            --music-dir <PATH>   Root folder containing FLAC subfolders (default: ~/Music)\n\
@@ -493,7 +773,10 @@ pub fn help_text() -> String {
            --no-ultimate        Force-disable Ultimate Mode even if enabled in config.toml\n\
            --no-genre-rules     Disable Rule G genre-aware filter defaults in Ultimate Mode\n\
            --no-learn-on-play   Disable YAML trackdb write-back at clean EOF in Ultimate Mode\n\
-           --trackdb-dir <PATH> Override central Schema-1 YAML trackdb folder\n\
+           --filters <MODE>     Filter choice mode: auto | suggested | mine (default: auto)\n\
+           --filterdb-dir <DIR> Override Schema-2 machine-managed filterdb directory\n\
+           --choices-file <YML> Override user-owned my-filters.yaml path\n\
+           --trackdb-dir <PATH> Override legacy Schema-1 YAML trackdb folder\n\
            --trackdb-sidecar    Persist `<track.flac>.ap.yaml` sidecars next to local files\n\
            --opt <LEVEL>        KS priority tier: normal | high | extreme (default: high)\n\
            --idle               Start idle without opening audio hardware (signal test mode)\n\
@@ -615,6 +898,9 @@ mod tests {
                     learn_on_play: None,
                     trackdb_dir: Some(PathBuf::from(r"C:\TrackDb")),
                     trackdb_sidecar: Some(true),
+                    filter_mode: None,
+                    filterdb_dir: None,
+                    choices_file: None,
                 },
             }
         );
@@ -689,7 +975,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_subcommand_parses_all_flags_and_rejects_missing_folder() {
+    fn scan_subcommand_parses_all_flags_and_supports_optional_folder() {
         let mode = parse_args([
             "audiophile-player",
             "scan",
@@ -698,26 +984,104 @@ mod tests {
             "--sidecar",
             "--post-chain",
             "--force",
+            "--jobs",
+            "6",
             "--trackdb-dir",
             r"C:\DB",
+            "--filterdb-dir",
+            r"C:\FilterDB",
             "--no-conv",
         ])
         .unwrap();
         assert_eq!(
             mode,
             RunMode::Scan {
-                folder: PathBuf::from(r"D:\Music"),
+                folder: Some(PathBuf::from(r"D:\Music")),
                 report: true,
                 sidecar: true,
                 post_chain: true,
                 force: true,
+                jobs: Some(6),
                 trackdb_dir: Some(PathBuf::from(r"C:\DB")),
+                filterdb_dir: Some(PathBuf::from(r"C:\FilterDB")),
+                choices_file: None,
                 config_path: None,
                 rew_override: Some(ConvolutionConfig::disabled()),
                 upsampler_policy: UpsamplerPolicy::default(),
             }
         );
-        assert!(parse_args(["audiophile-player", "scan"]).is_err());
+        // Omitting folder scans configured roots.
+        assert!(matches!(
+            parse_args(["audiophile-player", "scan"]).unwrap(),
+            RunMode::Scan { folder: None, .. }
+        ));
+        assert!(parse_args(["audiophile-player", "scan", "--jobs", "0"]).is_err());
         assert!(parse_args(["audiophile-player", "scan", r"D:\Music", "--bogus"]).is_err());
+    }
+
+    #[test]
+    fn filters_subcommands_and_mode_flag_parse_cleanly() {
+        let play_mode = parse_args([
+            "audiophile-player",
+            "--filters",
+            "suggested",
+            "--filterdb-dir",
+            r"C:\FDB",
+            "--choices-file",
+            r"C:\my-filters.yaml",
+        ])
+        .unwrap();
+        assert!(matches!(
+            play_mode,
+            RunMode::PlayRandom {
+                ultimate_override: UltimateCliOverride {
+                    filter_mode: Some(FilterMode::Suggested),
+                    filterdb_dir: Some(_),
+                    choices_file: Some(_),
+                    ..
+                },
+                ..
+            }
+        ));
+
+        assert!(matches!(
+            parse_args(["audiophile-player", "filters", "show", r"D:\Music\A"]).unwrap(),
+            RunMode::Filters(FiltersCommand::Show { .. })
+        ));
+        assert!(matches!(
+            parse_args(["audiophile-player", "filters", "diff"]).unwrap(),
+            RunMode::Filters(FiltersCommand::Diff { .. })
+        ));
+        assert!(matches!(
+            parse_args([
+                "audiophile-player",
+                "filters",
+                "set",
+                r"D:\Music\A",
+                "gauss-long-lp",
+                "--note",
+                "warmer",
+            ])
+            .unwrap(),
+            RunMode::Filters(FiltersCommand::Set {
+                ref filter,
+                ref note,
+                ..
+            }) if filter == "gauss-long-lp" && note.as_deref() == Some("warmer")
+        ));
+        assert!(matches!(
+            parse_args(["audiophile-player", "filters", "check"]).unwrap(),
+            RunMode::Filters(FiltersCommand::Check { .. })
+        ));
+        assert!(matches!(
+            parse_args(["audiophile-player", "filters", "relink", "--apply"]).unwrap(),
+            RunMode::Filters(FiltersCommand::Relink { apply: true, .. })
+        ));
+        assert!(matches!(
+            parse_args(["audiophile-player", "filters", "migrate"]).unwrap(),
+            RunMode::Filters(FiltersCommand::Migrate { .. })
+        ));
+        assert!(parse_args(["audiophile-player", "filters"]).is_err());
+        assert!(parse_args(["audiophile-player", "filters", "bogus"]).is_err());
     }
 }

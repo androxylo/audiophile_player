@@ -188,7 +188,7 @@ Or just add `--ultimate` for one session. [What it does →](ULTIMATE_MODE.md)
 
 ## Scan your library (optional)
 
-A one-off, read-only pass that analyses each track ahead of time. After it, Ultimate mode starts every track in `cached` state, with exact headroom from the very first play.
+A one-off, read-only pass that analyses each track ahead of time (sharded per album folder in parallel). After it, Ultimate mode starts every track in `cached` state, with exact headroom from the very first play.
 
 ```powershell
 audiophile-player scan D:\Music --post-chain --report
@@ -196,17 +196,27 @@ audiophile-player scan D:\Music --post-chain --report
 
 | Option | Effect |
 |---|---|
+| `[FOLDER\|ROOT]` | Folder path or configured root name (omit to scan all roots in `[filters.roots]` / `library.yaml`) |
 | `--post-chain` | Also renders each track through the real filter and REW chain to measure its exact peak (slower, recommended) |
-| `--report` | One line per track: peak, loudness, detector results, chosen filter |
+| `--report` | One line per track: peak, loudness, detector results, suggested filter |
 | `--force` | Re-analyse tracks that are already current |
-| `--sidecar` | Write `track.flac.ap.yaml` next to each file instead of the central folder |
+| `--jobs <N>` | Number of parallel folder workers (default: up to 4) |
+| `--sidecar` | Also write legacy `<track>.flac.ap.yaml` sidecars next to each file (off by default) |
 
-The scan uses up to 4 threads and can be resumed. It never modifies audio files, and it refuses to cache a file whose audio checksum doesn't match its header.
+The scan is incremental and resumable: unchanged files are skipped in microseconds, metadata-only edits (`GENRE` tags, artwork) reuse audio analysis without re-decoding, and moved files are detected automatically by `STREAMINFO.md5` (recording moves for `my-filters.yaml` in `filterdb\relink-report.yaml`). It never modifies FLAC files, and it refuses to cache a file whose audio checksum doesn't match its header.
 
-### Track DB
-- **Central (default):** `%APPDATA%\audiophile-player\trackdb\`. Override with `[trackdb] dir = '…'` or `--trackdb-dir`.
-- **Sidecar:** `<track>.flac.ap.yaml` next to the music. Enable with `[trackdb] sidecar = true` or `--trackdb-sidecar`. An existing sidecar is always read.
-- Edit the `user:` section to override a track. See [Your overrides](ULTIMATE_MODE.md#your-overrides).
+### Filter Database (Schema 2)
+- **Machine-managed analysis:** `%APPDATA%\audiophile-player\filterdb\` (`library.yaml` + one human-readable YAML file per album folder under `analysis\<root>\...`). Override with `[filters] dir = '…'` or `--filterdb-dir`.
+- **Your filter choices:** `%APPDATA%\audiophile-player\my-filters.yaml` — owned solely by you, hot-reloaded on track change, never overwritten by playback or scan. Override path with `[filters] choices_file = '…'` or `--choices-file`.
+- **A/B mode:** `--filters auto` (default: uses `mine` when `my-filters.yaml` exists, else `suggested`), `--filters mine`, or `--filters suggested` (ignores overrides for instant comparison).
+- **CLI management (`audiophile-player filters ...`):**
+  - `filters show <PATH>` — show active (`mine`) vs `suggested` filter, rule, and plain-English `why` for a file or album folder
+  - `filters diff` — list every track where your choices differ from machine suggestions
+  - `filters set <PATH> <FILTER> [--note "..."]` — validate and write a track or folder choice in `my-filters.yaml` (preserving comments + creating `.bak`)
+  - `filters check` — validate `my-filters.yaml` against `library.yaml` (unknown filters, missing paths, shadowed rules)
+  - `filters relink [--apply]` — preview or apply moved-file path updates from `filterdb\relink-report.yaml`
+  - `filters migrate` — non-destructively import legacy Schema-1 `trackdb\` entries and `user:` overrides into Schema 2
+- Legacy Schema-1 `[trackdb]` files remain readable as a fallback. See [Your overrides](ULTIMATE_MODE.md#your-overrides-my-filtersyaml--filters).
 
 ---
 
@@ -226,7 +236,9 @@ Options on the command line always win over the file. Unknown sections or keys a
 | `[convolution]` | `enabled`, `dir`, `file`, `file_352800`, `file_384000` |
 | `[quantizer]` | `dac_bits` (24), `shaper` (auto) |
 | `[ultimate]` | `enabled` (false), `genre_rules` (true), `learn_on_play` (true) |
-| `[trackdb]` | `dir` (%APPDATA%\audiophile-player\trackdb), `sidecar` (false) |
+| `[filters]` | `mode` (auto), `dir` (%APPDATA%\audiophile-player\filterdb), `choices_file` (%APPDATA%\audiophile-player\my-filters.yaml), `root.<name>` |
+| `[filters.roots]` | Named library roots (e.g. `main = 'D:\Music'`) |
+| `[trackdb]` | Legacy Schema-1 fallback: `dir` (%APPDATA%\audiophile-player\trackdb), `sidecar` (false) |
 | `[upnp]` | `enabled` (true), `friendly_name` ("Audiophile Player"), `port` (auto), `bind_ip` |
 | `[capture]` | `enabled` (true) — opt-in exclusive capture watcher (`\\.\ApExclusiveAudio`) |
 
@@ -248,7 +260,9 @@ Options on the command line always win over the file. Unknown sections or keys a
 | `--conv-dir <path>` / `--conv-file <file>` / `--no-conv` | Room correction source, or off |
 | `--ultimate` / `--no-ultimate` | Ultimate mode on / off |
 | `--no-genre-rules`, `--no-learn-on-play` | Ultimate mode refinements |
-| `--trackdb-dir <path>`, `--trackdb-sidecar` | Track DB location |
+| `--filters <auto\|suggested\|mine>` | Filter choice mode (default `auto`) |
+| `--filterdb-dir <path>`, `--choices-file <file>` | Schema-2 Filter DB / `my-filters.yaml` location |
+| `--trackdb-dir <path>`, `--trackdb-sidecar` | Legacy Schema-1 Track DB / opt-in sidecar location |
 | `--no-upnp`, `--upnp-name <n>`, `--upnp-port <p>`, `--upnp-bind <ip>` | UPnP renderer |
 | `--no-capture` | Disable the opt-in exclusive capture watcher (`\\.\ApExclusiveAudio`) |
 | `--port <p>` | Web page port |
@@ -260,9 +274,11 @@ Options on the command line always win over the file. Unknown sections or keys a
 </details>
 
 <details>
-<summary><b>Scan options</b></summary>
+<summary><b>Scan &amp; filters options</b></summary>
 
-`audiophile-player scan <folder> [--report] [--post-chain] [--force] [--sidecar] [--trackdb-dir <p>] [--config <file>] [--filter <name>] [--conv-dir <p> | --conv-file <file> | --no-conv]`
+`audiophile-player scan [folder|root] [--report] [--post-chain] [--force] [--jobs <n>] [--sidecar] [--filterdb-dir <p>] [--choices-file <f>] [--trackdb-dir <p>] [--config <file>] [--filter <name>] [--conv-dir <p> | --conv-file <file> | --no-conv]`
+
+`audiophile-player filters <show <path> | diff | set <path> <filter> [--note "..."] | check | relink [--apply] | migrate>`
 
 </details>
 

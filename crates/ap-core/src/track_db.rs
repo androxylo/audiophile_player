@@ -544,7 +544,7 @@ fn db_write_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-fn normalize_path_for_eq(s: &str) -> String {
+pub(crate) fn normalize_path_for_eq(s: &str) -> String {
     let trimmed = s.trim();
     #[cfg(windows)]
     {
@@ -591,6 +591,10 @@ impl TrackDbStore {
 
     pub fn root_dir(&self) -> &Path {
         &self.root_dir
+    }
+
+    pub fn sidecar_enabled(&self) -> bool {
+        self.sidecar_enabled
     }
 
     /// Sidecar path `<track.flac>.ap.yaml` next to a local music file.
@@ -918,7 +922,7 @@ fn read_entry_if_exists(path: &Path) -> Option<TrackDbEntry> {
     }
 }
 
-fn atomic_write_yaml(target: &Path, yaml: &str) -> Result<(), String> {
+pub(crate) fn atomic_write_yaml(target: &Path, yaml: &str) -> Result<(), String> {
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent).map_err(|e| {
             format!(
@@ -974,7 +978,7 @@ fn atomic_write_yaml(target: &Path, yaml: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn fnv1a_128_hex(bytes: &[u8]) -> String {
+pub(crate) fn fnv1a_128_hex(bytes: &[u8]) -> String {
     const FNV_OFFSET: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
     const FNV_PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
     let mut h = FNV_OFFSET;
@@ -985,7 +989,7 @@ fn fnv1a_128_hex(bytes: &[u8]) -> String {
     format!("{h:032x}")
 }
 
-fn yaml_quote(s: &str) -> String {
+pub(crate) fn yaml_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for ch in s.chars() {
@@ -1030,31 +1034,37 @@ fn yaml_opt_f64(v: Option<f64>, prec: usize) -> String {
     }
 }
 
-fn strip_yaml_comment(line: &str) -> &str {
-    let mut in_quotes = false;
+pub(crate) fn strip_yaml_comment(line: &str) -> &str {
+    let mut in_double = false;
+    let mut in_single = false;
     let mut escape = false;
     for (i, ch) in line.char_indices() {
         if escape {
             escape = false;
             continue;
         }
-        if ch == '\\' && in_quotes {
+        if ch == '\\' && in_double {
             escape = true;
             continue;
         }
-        if ch == '"' {
-            in_quotes = !in_quotes;
+        if ch == '"' && !in_single {
+            in_double = !in_double;
             continue;
         }
-        if ch == '#' && !in_quotes {
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            continue;
+        }
+        if ch == '#' && !in_double && !in_single {
             return &line[..i];
         }
     }
     line
 }
 
-fn contains_unquoted_yaml_special(line: &str) -> bool {
-    let mut in_quotes = false;
+pub(crate) fn contains_unquoted_yaml_special(line: &str) -> bool {
+    let mut in_double = false;
+    let mut in_single = false;
     let mut escape = false;
     let bytes = line.as_bytes();
     for (i, ch) in line.char_indices() {
@@ -1062,17 +1072,21 @@ fn contains_unquoted_yaml_special(line: &str) -> bool {
             escape = false;
             continue;
         }
-        if ch == '\\' && in_quotes {
+        if ch == '\\' && in_double {
             escape = true;
             continue;
         }
-        if ch == '"' {
-            in_quotes = !in_quotes;
+        if ch == '"' && !in_single {
+            in_double = !in_double;
             continue;
         }
-        if !in_quotes && matches!(ch, '!' | '&' | '*') {
-            // Only flag when at start of value token (after space or colon or line start).
-            if i == 0 || matches!(bytes[i - 1], b' ' | b':') {
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            continue;
+        }
+        if !in_double && !in_single && matches!(ch, '!' | '&' | '*') {
+            // Only flag when at start of value token (after space, colon, comma, brace, or line start).
+            if i == 0 || matches!(bytes[i - 1], b' ' | b':' | b',' | b'{' | b'[') {
                 return true;
             }
         }
@@ -1080,7 +1094,7 @@ fn contains_unquoted_yaml_special(line: &str) -> bool {
     false
 }
 
-fn parse_yaml_string(val: &str) -> Result<String, String> {
+pub(crate) fn parse_yaml_string(val: &str) -> Result<String, String> {
     let trimmed = val.trim();
     if let Some(inner) = trimmed.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
         let mut out = String::with_capacity(inner.len());

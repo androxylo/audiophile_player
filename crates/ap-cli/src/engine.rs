@@ -30,6 +30,7 @@ use std::str::FromStr;
 use ap_core::config::{
     ConvolutionConfig, PlayerConfig, QuantizerConfig, TrackDbConfig, UltimateConfig,
 };
+use ap_core::filter_db::{FilterDbStore, LibraryManifest};
 use ap_core::format::DacWireFormat;
 use ap_core::track_db::TrackDbStore;
 use ap_dsp::pipeline::{AudioPipeline, GaplessAttachOutcome, GaplessCarryover};
@@ -909,6 +910,18 @@ pub fn run_random_music_player(
             .trackdb_sidecar
             .unwrap_or(loaded_cfg.config.trackdb.sidecar),
     };
+    let music_dir = match music_dir_override {
+        Some(dir) => dir,
+        None => default_user_music_dir()
+            .ok_or_else(|| "could not resolve default ~/Music directory".to_string())?,
+    };
+    if !music_dir.is_dir() {
+        return Err(format!(
+            "music directory does not exist or is not a folder: '{}'",
+            music_dir.display()
+        ));
+    }
+
     let optimization = if effective_ultimate.enabled && !optimization_explicit {
         OptimizationLevel::Extreme
     } else {
@@ -919,10 +932,37 @@ pub fn run_random_music_player(
             .dir
             .clone()
             .unwrap_or_else(TrackDbStore::default_central_dir);
-        Some(UltimateRuntimeContext {
-            config: effective_ultimate,
-            store: TrackDbStore::new(db_root, effective_trackdb.sidecar),
-        })
+        let filterdb_dir = ultimate_override
+            .filterdb_dir
+            .clone()
+            .or_else(|| loaded_cfg.config.filters.dir.clone())
+            .unwrap_or_else(FilterDbStore::default_dir);
+        let choices_path = ultimate_override
+            .choices_file
+            .clone()
+            .or_else(|| loaded_cfg.config.filters.choices_file.clone())
+            .unwrap_or_else(FilterDbStore::default_choices_path);
+        let filter_mode = ultimate_override
+            .filter_mode
+            .unwrap_or(loaded_cfg.config.filters.mode);
+        let filter_db = FilterDbStore::new(filterdb_dir);
+        let mut manifest = filter_db
+            .load_manifest()
+            .unwrap_or_else(|| LibraryManifest::new(ap_dsp::analysis::DETECTOR_VERSION));
+        for (name, path) in &loaded_cfg.config.filters.roots {
+            manifest.upsert_root(name, path);
+        }
+        if manifest.resolve_folder_path(&music_dir).is_none() {
+            manifest.upsert_root("main", &music_dir);
+        }
+        Some(UltimateRuntimeContext::new(
+            effective_ultimate,
+            TrackDbStore::new(db_root, effective_trackdb.sidecar),
+            filter_db,
+            manifest,
+            choices_path,
+            filter_mode,
+        ))
     } else {
         None
     };
@@ -956,17 +996,6 @@ pub fn run_random_music_player(
         effective_conv,
         effective_ultimate.enabled,
     )?;
-    let music_dir = match music_dir_override {
-        Some(dir) => dir,
-        None => default_user_music_dir()
-            .ok_or_else(|| "could not resolve default ~/Music directory".to_string())?,
-    };
-    if !music_dir.is_dir() {
-        return Err(format!(
-            "music directory does not exist or is not a folder: '{}'",
-            music_dir.display()
-        ));
-    }
 
     let mut sink = WdmKsSink::open_best(device_filter.as_deref(), optimization)
         .map_err(|e| e.to_string())?;
@@ -1068,12 +1097,16 @@ pub fn run_random_music_player(
         }
     }
     if let Some(ref ult) = ultimate_ctx {
+        let eff_mode = ult
+            .filter_mode
+            .resolve(ult.user_filters.path().is_file());
         println!(
-            "Ultimate mode: ENABLED ({}s look-ahead, full-tail REW, VirtualLock RAM, genre_rules={}, learn_on_play={}, trackdb='{}')",
+            "Ultimate mode: ENABLED ({}s look-ahead, full-tail REW, VirtualLock RAM, genre_rules={}, learn_on_play={}, filters={}, filterdb='{}')",
             ULTIMATE_MAX_BUFFERED_SECONDS,
             ult.config.genre_rules,
             ult.config.learn_on_play,
-            ult.store.root_dir().display()
+            eff_mode.as_str(),
+            ult.filter_db.root_dir().display()
         );
     }
     println!("Press Ctrl+C or Ctrl+Break to stop gracefully.");
@@ -5787,14 +5820,14 @@ mod tests {
             true,
         )
         .unwrap();
-        let ult = UltimateRuntimeContext {
-            config: UltimateConfig {
+        let ult = UltimateRuntimeContext::from_legacy(
+            UltimateConfig {
                 enabled: true,
                 genre_rules: true,
                 learn_on_play: false,
             },
-            store: TrackDbStore::new(root.clone(), false),
-        };
+            TrackDbStore::new(root.clone(), false),
+        );
         let buf = BoundedBlockStreamBuffer::new(384_000 * 10);
         let ep = buf.current_epoch();
 
@@ -5976,14 +6009,14 @@ mod tests {
                 }),
             );
             let q_shared = SharedControl::new(qdir.clone(), "Mock DAC".to_string());
-            let q_ult = UltimateRuntimeContext {
-                config: UltimateConfig {
+            let q_ult = UltimateRuntimeContext::from_legacy(
+                UltimateConfig {
                     enabled: true,
                     genre_rules: false,
                     learn_on_play: false,
                 },
-                store: TrackDbStore::new(root.join("c5_db"), false),
-            };
+                TrackDbStore::new(root.join("c5_db"), false),
+            );
 
             let target_b2 = qdir.join("02_track_b.flac").to_string_lossy().into_owned();
             arm_test_panic_after_carry_take(Some(&target_b2));

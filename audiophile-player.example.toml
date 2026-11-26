@@ -69,8 +69,27 @@
 # genre_rules = true
 # learn_on_play = true
 
+[filters]
+# Schema-2 Filter Database (album-folder mirror under %APPDATA%\audiophile-player\filterdb)
+# and user-owned overrides file (%APPDATA%\audiophile-player\my-filters.yaml).
+# Your music library stays 100% read-only.
+#
+# mode:
+#   'auto'      - use 'mine' whenever my-filters.yaml exists, else 'suggested' (default)
+#   'mine'      - apply my-filters.yaml + AP_* FLAC tags, falling back to machine suggestions
+#   'suggested' - ignore user overrides and play pure machine suggestions (for A/B comparison)
+# mode = 'auto'
+# dir = 'C:\Users\you\AppData\Roaming\audiophile-player\filterdb'
+# choices_file = 'C:\Users\you\AppData\Roaming\audiophile-player\my-filters.yaml'
+
+[filters.roots]
+# Optional named music roots referenced as "main:Artist/Album" in my-filters.yaml.
+# main = 'D:\Music'
+# classical = 'E:\Classical'
+
 [trackdb]
-# Persistent Schema-1 YAML Track Database (read-only on your music files).
+# Legacy Schema-1 YAML Track Database (kept for read-only fallback and opt-in --trackdb-sidecar).
+# Run `audiophile-player filters migrate` to import existing Schema-1 entries into Schema 2.
 # Default central location: %APPDATA%\audiophile-player\trackdb
 # dir = 'C:\Users\you\AppData\Roaming\audiophile-player\trackdb'
 # Set `sidecar = true` to write `<track.flac>.ap.yaml` next to local FLAC files instead.

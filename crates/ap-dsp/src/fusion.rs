@@ -9,12 +9,14 @@
 //! Order of trust (`docs/research/07-ultimate-mode.md` §5.3):
 //!   `User > Cache (WT) > Header (facts) > Window (W30) > Tag (priors) > Default`
 
+use ap_core::filter_db::AlbumTrackAnalysis;
 use ap_core::headroom::{PEAK_TAG_ROUNDING_TOLERANCE, PeakKind, TrackPeakMetadata};
 use ap_core::metadata::{GenreClass, PhaseTagOverride, TrackMetadata};
 use ap_core::track_db::{
     TRACK_DB_SCHEMA_VERSION, TrackDbDecision, TrackDbEntry, TrackDbFileInfo, TrackDbResults,
     TrackDbScanInfo, TrackDbUserOverrides, now_unix_secs,
 };
+use ap_core::user_filters::{ResolvedUserOverrides, UserFilterProvenance};
 
 use crate::analysis::{AnalysisResult, DETECTOR_VERSION, DetectorVerdict};
 
@@ -63,7 +65,7 @@ impl<T> Evidence<T> {
     }
 }
 
-/// Optional cached whole-track (`WT`) results loaded from the track's own Schema-1 YAML entry.
+/// Optional cached whole-track (`WT`) results loaded from Schema-2 album analysis or legacy Schema-1 YAML.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CachedWholeTrackEvidence {
     /// True only when the cached detector results match the current `DETECTOR_VERSION` and file
@@ -71,8 +73,20 @@ pub struct CachedWholeTrackEvidence {
     /// `W30`/whole-track analysis drives all detector rules (`A`, `H`, `L`, `HF`, `B`, peak).
     pub results_current: bool,
     pub user_filter: Option<String>,
+    /// Provenance of `user_filter` when resolved from Schema 2 `my-filters.yaml` (`Track`/`Folder`/`Tag`/`Default`).
+    pub user_filter_provenance: Option<UserFilterProvenance>,
+    /// Human-readable source detail for `user_filter` (e.g. `"my-filters.yaml folders:main:Jazz"`).
+    pub user_filter_detail: Option<String>,
+    /// Optional phase override from `my-filters.yaml` (`min` / `ip` / `lin`), overriding `AP_PHASE`.
+    pub user_phase: Option<PhaseTagOverride>,
+    pub user_phase_detail: Option<String>,
     pub user_deemphasis: Option<bool>,
     pub user_apodizing: Option<bool>,
+    /// Non-fatal warnings from user override resolution (e.g. `my-filters.yaml` vs `AP_FILTER` conflicts).
+    pub user_warnings: Vec<String>,
+    /// When `true` (`FilterMode::Suggested`), ignore ALL user overrides (`my-filters.yaml`,
+    /// Schema-1 `user:`, and `AP_*` Vorbis tags) so pure machine suggestions are evaluated.
+    pub ignore_user_overrides: bool,
     pub effective_nyquist_hz: Option<u32>,
     pub upsampled_from_1x: DetectorVerdict,
     pub apod_events: u32,
@@ -93,6 +107,7 @@ impl CachedWholeTrackEvidence {
         let mut out = Self {
             results_current,
             user_filter: entry.user.filter.clone(),
+            user_filter_provenance: entry.user.filter.as_ref().map(|_| UserFilterProvenance::Track),
             user_deemphasis: entry.user.deemphasis,
             user_apodizing: entry.user.apodizing,
             ..Self::default()
@@ -113,6 +128,67 @@ impl CachedWholeTrackEvidence {
         out
     }
 
+    /// Convert a validated Schema-2 [`AlbumTrackAnalysis`] into [`CachedWholeTrackEvidence`].
+    ///
+    /// Note: Schema 2 separates machine-owned analysis from user choices (`my-filters.yaml`), so
+    /// chain `.with_user_overrides(...)` (in `Mine` mode) or `.suggested_only()` (in `Suggested` mode).
+    pub fn from_album_track(track: &AlbumTrackAnalysis, results_current: bool) -> Self {
+        let mut out = Self {
+            results_current,
+            ..Self::default()
+        };
+        if results_current {
+            out.effective_nyquist_hz = track.effective_nyquist_hz;
+            out.upsampled_from_1x = DetectorVerdict::from_str_lossy(&track.fake_hires);
+            out.apod_events = track.apod_events;
+            out.apodizing_needed = DetectorVerdict::from_str_lossy(&track.apodizing_needed);
+            out.integrated_lufs = track.lufs;
+            out.clipped_runs = track.clipped_runs;
+            out.loud_and_clipped = DetectorVerdict::from_str_lossy(&track.loud_and_clipped);
+            out.true_peak_dbtp = track.true_peak_dbtp;
+            out.effective_bits = (track.effective_bits > 0).then_some(track.effective_bits);
+            out.ultrasonic_noise_detected =
+                DetectorVerdict::from_str_lossy(&track.hf_noise);
+        }
+        out
+    }
+
+    /// Apply resolved Schema-2 [`ResolvedUserOverrides`] (from `my-filters.yaml` + `AP_*` tags).
+    pub fn with_user_overrides(mut self, overrides: &ResolvedUserOverrides) -> Self {
+        self.ignore_user_overrides = false;
+        if let Some((ref f, prov, ref detail)) = overrides.filter {
+            self.user_filter = Some(f.clone());
+            self.user_filter_provenance = Some(prov);
+            self.user_filter_detail = Some(detail.clone());
+        }
+        if let Some((p, ref detail)) = overrides.phase {
+            self.user_phase = Some(p);
+            self.user_phase_detail = Some(detail.clone());
+        }
+        if let Some((ap, _)) = overrides.apodizing {
+            self.user_apodizing = Some(ap);
+        }
+        if let Some((de, _)) = overrides.deemphasis {
+            self.user_deemphasis = Some(de);
+        }
+        self.user_warnings.extend(overrides.warnings.iter().cloned());
+        self
+    }
+
+    /// Mark this evidence as `FilterMode::Suggested` (ignore all user overrides and `AP_*` tags).
+    pub fn suggested_only(mut self) -> Self {
+        self.ignore_user_overrides = true;
+        self.user_filter = None;
+        self.user_filter_provenance = None;
+        self.user_filter_detail = None;
+        self.user_phase = None;
+        self.user_phase_detail = None;
+        self.user_apodizing = None;
+        self.user_deemphasis = None;
+        self.user_warnings.clear();
+        self
+    }
+
     /// Construct current whole-track (`WT`) evidence directly from a fresh full-track
     /// [`AnalysisResult`] plus optional persisted `user:` overrides (Review #7 re-review R4).
     ///
@@ -126,6 +202,9 @@ impl CachedWholeTrackEvidence {
         Self {
             results_current: true,
             user_filter: user.and_then(|u| u.filter.clone()),
+            user_filter_provenance: user
+                .and_then(|u| u.filter.as_ref())
+                .map(|_| UserFilterProvenance::Track),
             user_deemphasis: user.and_then(|u| u.deemphasis),
             user_apodizing: user.and_then(|u| u.apodizing),
             effective_nyquist_hz: analysis.effective_nyquist_hz,
@@ -141,6 +220,7 @@ impl CachedWholeTrackEvidence {
                 .then_some(analysis.true_peak_dbtp),
             effective_bits: (analysis.effective_bits > 0).then_some(analysis.effective_bits),
             ultrasonic_noise_detected: analysis.ultrasonic_noise_detected,
+            ..Self::default()
         }
     }
 }
@@ -211,6 +291,8 @@ pub struct FusedTrackEvidence {
     pub hf_noise_filter: Evidence<bool>,
     pub deemphasis: Evidence<bool>,
     pub user_filter: Option<Evidence<String>>,
+    /// Provenance of `user_filter` (`Track` / `Folder` / `Tag` / `Default`) for rule naming & dual display.
+    pub user_filter_provenance: Option<UserFilterProvenance>,
     pub phase_override: Option<Evidence<PhaseTagOverride>>,
     pub genre_class: Evidence<GenreClass>,
 
@@ -229,6 +311,12 @@ pub fn fuse_track_evidence(
     cached_wt: Option<&CachedWholeTrackEvidence>,
 ) -> FusedTrackEvidence {
     let mut notices = Vec::new();
+    let ignore_user = cached_wt.is_some_and(|c| c.ignore_user_overrides);
+    if !ignore_user {
+        if let Some(c) = cached_wt {
+            notices.extend(c.user_warnings.iter().cloned());
+        }
+    }
     // Gate all detector-result lookups on `results_current` so stale entries never mask fresh
     // W30 / whole-track analysis, while `cached_wt` still provides `user:` overrides (Review #7 F1).
     let wt_results = cached_wt.filter(|c| c.results_current);
@@ -280,42 +368,63 @@ pub fn fuse_track_evidence(
         }
     }
 
-    // --- User filter & phase overrides (YAML user.filter > AP_FILTER; AP_PHASE) ---
-    let user_filter = if let Some(uf) = cached_wt.and_then(|c| c.user_filter.as_ref()) {
-        if let Some(ref tag_f) = track_meta.ap_filter {
-            if !tag_f.eq_ignore_ascii_case(uf) {
-                notices.push(format!(
-                    "filter override conflict: YAML user.filter='{uf}' wins over AP_FILTER='{tag_f}'"
-                ));
+    // --- User filter & phase overrides (`my-filters.yaml` > `AP_FILTER` / `AP_PHASE`, skipped in `suggested` mode) ---
+    let (user_filter, user_filter_provenance) = if ignore_user {
+        (None, None)
+    } else if let Some(uf) = cached_wt.and_then(|c| c.user_filter.as_ref()) {
+        let prov = cached_wt
+            .and_then(|c| c.user_filter_provenance)
+            .unwrap_or(UserFilterProvenance::Track);
+        let detail = cached_wt
+            .and_then(|c| c.user_filter_detail.clone())
+            .unwrap_or_else(|| format!("YAML user.filter={uf}"));
+        if prov != UserFilterProvenance::Tag {
+            if let Some(ref tag_f) = track_meta.ap_filter {
+                if !tag_f.eq_ignore_ascii_case(uf)
+                    && !notices.iter().any(|n| n.contains("wins over AP_FILTER"))
+                {
+                    notices.push(format!(
+                        "filter override conflict: {detail} wins over AP_FILTER='{tag_f}'"
+                    ));
+                }
             }
         }
-        Some(Evidence::new(
-            uf.clone(),
-            EvidenceSource::User,
-            format!("YAML user.filter={uf}"),
-        ))
-    } else {
-        track_meta.ap_filter.as_ref().map(|tag_f| {
-            Evidence::new(
+        (
+            Some(Evidence::new(uf.clone(), EvidenceSource::User, detail)),
+            Some(prov),
+        )
+    } else if let Some(tag_f) = track_meta.ap_filter.as_ref() {
+        (
+            Some(Evidence::new(
                 tag_f.clone(),
                 EvidenceSource::User,
                 format!("AP_FILTER={tag_f}"),
-            )
-        })
+            )),
+            Some(UserFilterProvenance::Tag),
+        )
+    } else {
+        (None, None)
     };
 
-    let phase_override = track_meta.ap_phase.map(|p| {
-        Evidence::new(
-            p,
-            EvidenceSource::User,
-            format!("AP_PHASE={p:?}"),
-        )
-    });
+    let phase_override = if ignore_user {
+        None
+    } else if let Some(up) = cached_wt.and_then(|c| c.user_phase) {
+        let detail = cached_wt
+            .and_then(|c| c.user_phase_detail.clone())
+            .unwrap_or_else(|| format!("my-filters.yaml phase={up:?}"));
+        Some(Evidence::new(up, EvidenceSource::User, detail))
+    } else {
+        track_meta
+            .ap_phase
+            .map(|p| Evidence::new(p, EvidenceSource::User, format!("AP_PHASE={p:?}")))
+    };
 
     // --- Row 8: Pre-emphasis (Rule P) — facts only! Analyser NEVER enables automatically. ---
-    let deemphasis = if let Some(u_de) = cached_wt.and_then(|c| c.user_deemphasis) {
+    let deemphasis = if !ignore_user && cached_wt.and_then(|c| c.user_deemphasis).is_some() {
+        let u_de = cached_wt.and_then(|c| c.user_deemphasis).unwrap();
         Evidence::new(u_de, EvidenceSource::User, format!("YAML user.deemphasis={u_de}"))
-    } else if let Some(tag_de) = track_meta.ap_deemphasis {
+    } else if !ignore_user && track_meta.ap_deemphasis.is_some() {
+        let tag_de = track_meta.ap_deemphasis.unwrap();
         Evidence::new(tag_de, EvidenceSource::User, format!("AP_DEEMPHASIS={tag_de}"))
     } else if track_meta.cuesheet_pre_emphasis {
         Evidence::new(
@@ -342,9 +451,11 @@ pub fn fuse_track_evidence(
     }
 
     // --- Row 5: Apodizing need (Rule A) — user > WT > W30 (with Rule E era prior). Tags alone never fire A. ---
-    let apodizing = if let Some(u_ap) = cached_wt.and_then(|c| c.user_apodizing) {
+    let apodizing = if !ignore_user && cached_wt.and_then(|c| c.user_apodizing).is_some() {
+        let u_ap = cached_wt.and_then(|c| c.user_apodizing).unwrap();
         Evidence::new(u_ap, EvidenceSource::User, format!("YAML user.apodizing={u_ap}"))
-    } else if let Some(tag_ap) = track_meta.ap_apodizing {
+    } else if !ignore_user && track_meta.ap_apodizing.is_some() {
+        let tag_ap = track_meta.ap_apodizing.unwrap();
         Evidence::new(tag_ap, EvidenceSource::User, format!("AP_APODIZING={tag_ap}"))
     } else if let Some(wt) = wt_results {
         let pos = wt.apodizing_needed == DetectorVerdict::Positive;
@@ -572,6 +683,7 @@ pub fn fuse_track_evidence(
         hf_noise_filter,
         deemphasis,
         user_filter,
+        user_filter_provenance,
         phase_override,
         genre_class,
         notices,
@@ -602,9 +714,7 @@ mod tests {
             effective_nyquist_hz: None,
             ultrasonic_noise_detected: DetectorVerdict::Negative,
             effective_bits: Some(24),
-            user_filter: None,
-            user_apodizing: None,
-            user_deemphasis: None,
+            ..CachedWholeTrackEvidence::default()
         };
 
         let fused = fuse_track_evidence(
@@ -620,5 +730,60 @@ mod tests {
             "C1: current WT Negative must override W30 Positive for hf_noise_filter"
         );
         assert_eq!(fused.hf_noise_filter.source, EvidenceSource::Cache);
+    }
+
+    #[test]
+    fn suggested_only_ignores_user_overrides_and_ap_tags_but_keeps_cuesheet_preemphasis() {
+        let mut meta = TrackMetadata::default();
+        meta.ap_filter = Some("short-mp".to_string());
+        meta.ap_phase = Some(PhaseTagOverride::Minimum);
+        meta.ap_apodizing = Some(true);
+        meta.cuesheet_pre_emphasis = true;
+
+        let mut ov = ResolvedUserOverrides::default();
+        ov.filter = Some((
+            "gauss-long-lp".to_string(),
+            UserFilterProvenance::Folder,
+            "my-filters.yaml folders:main:Jazz".to_string(),
+        ));
+        ov.phase = Some((PhaseTagOverride::Intermediate, "my-filters.yaml phase=ip".to_string()));
+
+        // Mine mode applies folder override and user phase
+        let wt_mine = CachedWholeTrackEvidence::default().with_user_overrides(&ov);
+        let fused_mine = fuse_track_evidence(
+            44_100,
+            16,
+            &TrackPeakMetadata::default(),
+            &meta,
+            None,
+            Some(&wt_mine),
+        );
+        assert_eq!(
+            fused_mine.user_filter.as_ref().map(|e| e.value.as_str()),
+            Some("gauss-long-lp")
+        );
+        assert_eq!(fused_mine.user_filter_provenance, Some(UserFilterProvenance::Folder));
+        assert_eq!(
+            fused_mine.phase_override.as_ref().map(|e| e.value),
+            Some(PhaseTagOverride::Intermediate)
+        );
+        assert!(fused_mine.apodizing.value);
+        assert!(fused_mine.deemphasis.value);
+
+        // Suggested mode ignores all user overrides and AP_* tags, keeping CUESHEET facts
+        let wt_sug = wt_mine.suggested_only();
+        let fused_sug = fuse_track_evidence(
+            44_100,
+            16,
+            &TrackPeakMetadata::default(),
+            &meta,
+            None,
+            Some(&wt_sug),
+        );
+        assert!(fused_sug.user_filter.is_none());
+        assert!(fused_sug.user_filter_provenance.is_none());
+        assert!(fused_sug.phase_override.is_none());
+        assert!(!fused_sug.apodizing.value);
+        assert!(fused_sug.deemphasis.value, "CUESHEET pre-emphasis is a disc header fact");
     }
 }

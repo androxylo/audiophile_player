@@ -26,6 +26,7 @@ use ap_core::config::{DEFAULT_DAC_BITS, is_valid_dac_bits};
 use ap_core::format::{StreamSpec, TargetDspRate};
 use ap_core::metadata::{GenreClass, PhaseTagOverride};
 use ap_core::track_db::PostChainKey;
+use ap_core::user_filters::UserFilterProvenance;
 
 use crate::MAX_FILTER_TAPS;
 use crate::fusion::{EvidenceSource, FusedTrackEvidence};
@@ -828,8 +829,14 @@ pub struct UltimateSelection {
     pub plan: SelectedDspPlan,
     /// Display mode label: `"ultimate: cached"`, `"ultimate: live"`, or `"normal (<30 s)"`.
     pub mode_label: String,
-    /// Winning rule identifier (e.g. `"rule_A_apodizing"`, `"rule_G_classical"`, `"short_track_bypass"`).
+    /// Winning rule identifier (e.g. `"rule_A_apodizing"`, `"user_folder"`, `"short_track_bypass"`).
     pub winning_rule: String,
+    /// Provenance when a user filter override won (`mine: track` / `mine: folder` / `mine: tag` / `mine: default`).
+    pub user_provenance: Option<UserFilterProvenance>,
+    /// Machine-suggested filter archetype (computed without user/CLI overrides for side-by-side display).
+    pub suggested_filter: FilterArchetype,
+    /// Machine-suggested winning rule name.
+    pub suggested_rule: String,
     /// Ordered list of all rules/signals that fired for this track.
     pub fired_rules: Vec<String>,
     /// True when M3 bypassed ultimate analysis because the track is `< 30 s`.
@@ -918,9 +925,14 @@ fn resolve_ultimate_filter_choice(
                         warnings,
                     );
                 }
+                let rule_name = fused
+                    .user_filter_provenance
+                    .unwrap_or(UserFilterProvenance::Track)
+                    .rule_name()
+                    .to_string();
                 return (
                     arch,
-                    format!("user_filter({})", uf.source.as_str()),
+                    rule_name,
                     format!("ultimate: user override {} ({})", arch, uf.detail),
                     warnings,
                 );
@@ -1126,10 +1138,14 @@ pub fn select_ultimate_plan(
         src.deemphasis = fused.deemphasis.value;
         let picker = UpsamplerPicker::new(*policy)?;
         let plan = picker.select(&src);
+        let suggested_filter = plan.target_audiophile_filter;
         return Ok(UltimateSelection {
             plan,
             mode_label: "normal (<30 s)".to_string(),
             winning_rule: "short_track_bypass".to_string(),
+            user_provenance: None,
+            suggested_filter,
+            suggested_rule: "short_track_bypass".to_string(),
             fired_rules: vec!["M3(<30 s)".to_string()],
             short_track_bypass: true,
             warnings,
@@ -1181,9 +1197,34 @@ pub fn select_ultimate_plan(
     );
     warnings.append(&mut choice_warnings);
 
+    // Compute machine-suggested filter/rule (without user filter or phase overrides) for side-by-side display.
+    let mut suggested_view = fused.clone();
+    suggested_view.user_filter = None;
+    suggested_view.user_filter_provenance = None;
+    suggested_view.phase_override = None;
+    let (suggested_filter, suggested_rule, _, _) = resolve_ultimate_filter_choice(
+        spec.sample_rate_hz,
+        is_streaming_source,
+        raw_ratio,
+        &suggested_view,
+        genre_rules,
+    );
+
+    let mut user_provenance = if matches!(
+        winning_rule.as_str(),
+        "user_filter" | "user_folder" | "user_tag" | "user_default"
+    ) {
+        fused.user_filter_provenance.or(Some(UserFilterProvenance::Track))
+    } else if matches!(winning_rule.as_str(), "user_phase_min" | "user_phase_ip") {
+        Some(UserFilterProvenance::Track)
+    } else {
+        None
+    };
+
     // Protect streaming sources even if CLI explicitly passed `--filter gauss-apod-4m` (Mandate M4).
     let mut effective_policy = *policy;
     if let Some(cli_f) = policy.filter_override {
+        user_provenance = None;
         if is_streaming_source && !cli_f.is_streaming_safe() {
             let is_1x = spec.sample_rate_hz <= 48_000 || fused.effective_nyquist_hz.value.is_some();
             let fb = streaming_safe_fallback(is_1x);
@@ -1235,6 +1276,9 @@ pub fn select_ultimate_plan(
         plan,
         mode_label,
         winning_rule,
+        user_provenance,
+        suggested_filter,
+        suggested_rule,
         fired_rules,
         short_track_bypass: false,
         warnings,
@@ -1456,5 +1500,52 @@ mod throughput_tests {
             2.0,
         );
         assert!(!double_sub.passed, "double-subtraction demands 5.0x and fails 3.9x");
+    }
+
+    #[test]
+    fn select_ultimate_plan_reports_user_provenance_and_machine_suggestion_side_by_side() {
+        use ap_core::headroom::TrackPeakMetadata;
+        use ap_core::metadata::{GenreClass, TrackMetadata};
+        use ap_core::user_filters::ResolvedUserOverrides;
+        use crate::fusion::{CachedWholeTrackEvidence, fuse_track_evidence};
+
+        let mut meta = TrackMetadata::default();
+        meta.genre_class = GenreClass::Classical;
+
+        let mut ov = ResolvedUserOverrides::default();
+        ov.filter = Some((
+            "gauss-long-lp".to_string(),
+            UserFilterProvenance::Folder,
+            "my-filters.yaml folders:main:Classical/Mahler".to_string(),
+        ));
+        let wt = CachedWholeTrackEvidence::default().with_user_overrides(&ov);
+        let fused = fuse_track_evidence(
+            44_100,
+            16,
+            &TrackPeakMetadata::default(),
+            &meta,
+            None,
+            Some(&wt),
+        );
+        let spec = StreamSpec {
+            sample_rate_hz: 44_100,
+            bits_per_sample: 16,
+            channels: 2,
+        };
+        let sel = select_ultimate_plan(
+            spec,
+            false,
+            Some(180.0),
+            &fused,
+            &UpsamplerPolicy::default(),
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(sel.plan.filter, FilterArchetype::GaussLongLp);
+        assert_eq!(sel.winning_rule, "user_folder");
+        assert_eq!(sel.user_provenance, Some(UserFilterProvenance::Folder));
+        assert_eq!(sel.suggested_filter, FilterArchetype::SincSteep4M);
+        assert_eq!(sel.suggested_rule, "rule_G_classical");
     }
 }

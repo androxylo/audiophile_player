@@ -9,6 +9,7 @@
 
 mod cli_args;
 mod engine;
+mod filters_cmd;
 mod prefetch;
 mod scanner;
 mod signals;
@@ -83,7 +84,10 @@ fn main() -> ExitCode {
             sidecar,
             post_chain,
             force,
+            jobs,
             trackdb_dir,
+            filterdb_dir,
+            choices_file,
             config_path,
             rew_override,
             upsampler_policy,
@@ -94,13 +98,17 @@ fn main() -> ExitCode {
                 sidecar,
                 post_chain,
                 force,
+                jobs,
                 trackdb_dir,
+                filterdb_dir,
+                choices_file,
                 config_path,
                 rew_override,
                 upsampler_policy,
             },
             controller,
         ),
+        RunMode::Filters(cmd) => filters_cmd::run_filters_cli(cmd),
         RunMode::Help | RunMode::Version => unreachable!(),
     };
 
