@@ -28,23 +28,18 @@ use ap_dsp::analysis::DETECTOR_VERSION;
 use ap_source::flac::{AudioBlockSource, FlacBlockReader};
 use ap_source::library::{default_user_music_dir, discover_flac_files};
 
-use crate::cli_args::FiltersCommand;
+use crate::cli_args::{CommonPaths, FiltersAction, FiltersCommand};
 
 type FiltersEnv = DbEnv;
 
-fn load_env(
-    config_path: Option<&Path>,
-    filterdb_dir: Option<&Path>,
-    choices_file: Option<&Path>,
-    trackdb_dir: Option<&Path>,
-) -> Result<FiltersEnv, String> {
-    let loaded = PlayerConfig::discover_and_load(config_path)?;
+fn load_env(paths: &CommonPaths) -> Result<FiltersEnv, String> {
+    let loaded = PlayerConfig::discover_and_load(paths.config_path.as_deref())?;
     let default_music = default_user_music_dir().filter(|p| p.is_dir());
     Ok(DbEnv::resolve(
         &loaded.config,
-        filterdb_dir,
-        choices_file,
-        trackdb_dir,
+        paths.filterdb_dir.as_deref(),
+        paths.choices_file.as_deref(),
+        paths.trackdb_dir.as_deref(),
         default_music.as_deref(),
         DETECTOR_VERSION,
     ))
@@ -62,7 +57,7 @@ fn load_user_filters_if_present(path: &Path) -> Result<Option<UserFiltersFile>, 
 
 /// Dispatch entrypoint for `audiophile-player filters <SUBCOMMAND>`.
 pub fn run_filters_cli(cmd: FiltersCommand) -> Result<(), crate::exit_codes::CliError> {
-    let is_check = matches!(cmd, FiltersCommand::Check { .. });
+    let is_check = matches!(cmd.action, FiltersAction::Check);
     match run_filters_capture(cmd) {
         Ok(out) => {
             print!("{out}");
@@ -80,98 +75,26 @@ pub fn run_filters_cli(cmd: FiltersCommand) -> Result<(), crate::exit_codes::Cli
     }
 }
 
-/// Run a `filters` subcommand and capture its human-readable output (shared by CLI & MCP).
+/// Run a `filters` subcommand and capture its human-readable output (shared by CLI & MCP, Q12).
 pub fn run_filters_capture(cmd: FiltersCommand) -> Result<String, String> {
-    match cmd {
-        FiltersCommand::Show {
-            target,
-            config_path,
-            filterdb_dir,
-            choices_file,
-        } => {
-            let env = load_env(
-                config_path.as_deref(),
-                filterdb_dir.as_deref(),
-                choices_file.as_deref(),
-                None,
-            )?;
-            cmd_show(&env, &target)
-        }
-        FiltersCommand::Diff {
-            config_path,
-            filterdb_dir,
-            choices_file,
-        } => {
-            let env = load_env(
-                config_path.as_deref(),
-                filterdb_dir.as_deref(),
-                choices_file.as_deref(),
-                None,
-            )?;
-            cmd_diff(&env)
-        }
-        FiltersCommand::Set {
+    let mut env = load_env(&cmd.paths)?;
+    match cmd.action {
+        FiltersAction::Show { target } => cmd_show(&env, &target),
+        FiltersAction::Diff => cmd_diff(&env),
+        FiltersAction::Set {
             target,
             filter,
             note,
-            config_path,
-            filterdb_dir,
-            choices_file,
-        } => {
-            let env = load_env(
-                config_path.as_deref(),
-                filterdb_dir.as_deref(),
-                choices_file.as_deref(),
-                None,
-            )?;
-            cmd_set(&env, &target, &filter, note.as_deref())
-        }
-        FiltersCommand::Check {
-            config_path,
-            filterdb_dir,
-            choices_file,
-        } => {
-            let env = load_env(
-                config_path.as_deref(),
-                filterdb_dir.as_deref(),
-                choices_file.as_deref(),
-                None,
-            )?;
+        } => cmd_set(&env, &target, &filter, note.as_deref()),
+        FiltersAction::Check => {
             let (out, issues) = cmd_check(&env)?;
             if issues > 0 {
                 return Err(format!("{out}my-filters.yaml check found {issues} issue(s)"));
             }
             Ok(out)
         }
-        FiltersCommand::Relink {
-            apply,
-            config_path,
-            filterdb_dir,
-            choices_file,
-        } => {
-            let env = load_env(
-                config_path.as_deref(),
-                filterdb_dir.as_deref(),
-                choices_file.as_deref(),
-                None,
-            )?;
-            cmd_relink(&env, apply)
-        }
-        FiltersCommand::Migrate {
-            config_path,
-            trackdb_dir,
-            filterdb_dir,
-            choices_file,
-            sidecar_root,
-        } => {
-            let mut env = load_env(
-                config_path.as_deref(),
-                filterdb_dir.as_deref(),
-                choices_file.as_deref(),
-                trackdb_dir.as_deref(),
-            )?;
-            cmd_migrate(&mut env, sidecar_root.as_deref())
-        }
+        FiltersAction::Relink { apply } => cmd_relink(&env, apply),
+        FiltersAction::Migrate { sidecar_root } => cmd_migrate(&mut env, sidecar_root.as_deref()),
     }
 }
 
@@ -850,7 +773,13 @@ mod tests {
         assert_eq!(s.scanned, 2);
 
         // 2. `filters set` rejects unknown filter names.
-        let env = load_env(None, Some(&filterdb_dir), Some(&choices_path), Some(&legacy_dir)).unwrap();
+        let test_paths = CommonPaths {
+            config_path: None,
+            filterdb_dir: Some(filterdb_dir.clone()),
+            choices_file: Some(choices_path.clone()),
+            trackdb_dir: Some(legacy_dir.clone()),
+        };
+        let env = load_env(&test_paths).unwrap();
         assert!(cmd_set(&env, &track1, "bogus-filter", None).is_err());
 
         // 3. `filters set` sets track override cleanly and creates my-filters.yaml.
@@ -949,7 +878,7 @@ user:
         .unwrap();
         assert!(saved_legacy.is_file());
 
-        let mut env_mut = load_env(None, Some(&filterdb_dir), Some(&choices_path), Some(&legacy_dir)).unwrap();
+        let mut env_mut = load_env(&test_paths).unwrap();
         let mig_out = cmd_migrate(&mut env_mut, None).unwrap();
         assert!(mig_out.contains("migrated tracks: 1"));
         assert!(mig_out.contains("user choices migrated to my-filters.yaml: 1"));

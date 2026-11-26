@@ -209,7 +209,7 @@ if (-not $Binary) {
             Copy-Item -Force (Join-Path $srcDir "scripts\$sc") (Join-Path $Dir 'scripts\')
         }
     }
-    foreach ($doc in @('GETTING_STARTED.md', 'SOUND_ENGINE.md', 'ULTIMATE_MODE.md', 'CLI.md')) {
+    foreach ($doc in @('GETTING_STARTED.md', 'SOUND_ENGINE.md', 'ULTIMATE_MODE.md', 'CLI.md', 'FILTER_PREFERENCES.md')) {
         if (Test-Path -LiteralPath (Join-Path $srcDir "docs\$doc")) {
             Copy-Item -Force (Join-Path $srcDir "docs\$doc") (Join-Path $Dir 'docs\')
         }

@@ -20,14 +20,13 @@ use std::fs::OpenOptions;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ap_core::config::canonicalize_config_key;
 use ap_core::json::JsonValue;
 use ap_core::track_db::now_unix_secs;
 
-use crate::cli_args::FiltersCommand;
+use crate::cli_args::{CommonPaths, FiltersAction, FiltersCommand};
 use crate::cli_spec::{
     self, OPTIONS, ValueKind, find_option, mcp_play_options_schema, render_detail_help,
     render_help_json,
@@ -58,7 +57,7 @@ struct BackgroundScanJob {
 
 pub struct McpServer {
     audit_path: Option<PathBuf>,
-    scan_jobs: Arc<Mutex<HashMap<String, BackgroundScanJob>>>,
+    scan_jobs: HashMap<String, BackgroundScanJob>,
     next_job_seq: u64,
 }
 
@@ -66,7 +65,7 @@ impl McpServer {
     pub fn new(audit_path: Option<PathBuf>) -> Self {
         Self {
             audit_path,
-            scan_jobs: Arc::new(Mutex::new(HashMap::new())),
+            scan_jobs: HashMap::new(),
             next_job_seq: 1,
         }
     }
@@ -277,38 +276,15 @@ impl McpServer {
             }
             "play" => {
                 self.audit(name, args);
-                let (rs, _) = query_running_status().map_err(|e| e.message)?;
-                let (code, body) =
-                    api_v1_request(&rs.url, &rs.token, "POST", "/api/v1/play", Some(args))?;
-                if code >= 400 {
-                    return Err(format!("HTTP {code}: {}", body.to_compact_string()));
-                }
-                Ok(body)
+                call_running_api("POST", "/api/v1/play", Some(args))
             }
             "play_file" => {
                 self.audit(name, args);
-                let (rs, _) = query_running_status().map_err(|e| e.message)?;
-                let (code, body) =
-                    api_v1_request(&rs.url, &rs.token, "POST", "/api/v1/play-file", Some(args))?;
-                if code >= 400 {
-                    return Err(format!("HTTP {code}: {}", body.to_compact_string()));
-                }
-                Ok(body)
+                call_running_api("POST", "/api/v1/play-file", Some(args))
             }
             "pause" | "resume" | "next" => {
                 self.audit(name, args);
-                let (rs, _) = query_running_status().map_err(|e| e.message)?;
-                let (code, body) = api_v1_request(
-                    &rs.url,
-                    &rs.token,
-                    "POST",
-                    &format!("/api/v1/{name}"),
-                    None,
-                )?;
-                if code >= 400 {
-                    return Err(format!("HTTP {code}: {}", body.to_compact_string()));
-                }
-                Ok(body)
+                call_running_api("POST", &format!("/api/v1/{name}"), None)
             }
             "options_list" => {
                 let group_filter = args.get("group").and_then(JsonValue::as_str);
@@ -428,8 +404,7 @@ impl McpServer {
                 let job_id = format!("scan-{}", self.next_job_seq);
                 self.next_job_seq += 1;
                 let pid = child.id();
-                let mut jobs_map = self.scan_jobs.lock().unwrap_or_else(|e| e.into_inner());
-                jobs_map.insert(
+                self.scan_jobs.insert(
                     job_id.clone(),
                     BackgroundScanJob {
                         id: job_id.clone(),
@@ -453,8 +428,8 @@ impl McpServer {
                     .get("job")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| "missing required 'job' parameter".to_string())?;
-                let mut jobs_map = self.scan_jobs.lock().unwrap_or_else(|e| e.into_inner());
-                let job = jobs_map
+                let job = self
+                    .scan_jobs
                     .get_mut(job_id)
                     .ok_or_else(|| format!("unknown scan job '{job_id}'"))?;
                 if !job.finished {
@@ -483,8 +458,8 @@ impl McpServer {
                     .get("job")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| "missing required 'job' parameter".to_string())?;
-                let mut jobs_map = self.scan_jobs.lock().unwrap_or_else(|e| e.into_inner());
-                let job = jobs_map
+                let job = self
+                    .scan_jobs
                     .get_mut(job_id)
                     .ok_or_else(|| format!("unknown scan job '{job_id}'"))?;
                 if !job.finished {
@@ -504,16 +479,7 @@ impl McpServer {
                     .get("path")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| "missing required 'path' parameter".to_string())?;
-                let out = filters_cmd::run_filters_capture(FiltersCommand::Show {
-                    target: PathBuf::from(path),
-                    config_path: None,
-                    filterdb_dir: None,
-                    choices_file: None,
-                })?;
-                Ok(JsonValue::obj(vec![
-                    ("ok", JsonValue::from(true)),
-                    ("output", JsonValue::from(out)),
-                ]))
+                run_filters_tool(FiltersAction::Show { target: PathBuf::from(path) }, &[])
             }
             "filters_set" => {
                 self.audit(name, args);
@@ -529,42 +495,17 @@ impl McpServer {
                     .get("note")
                     .and_then(JsonValue::as_str)
                     .map(str::to_string);
-                let out = filters_cmd::run_filters_capture(FiltersCommand::Set {
-                    target: PathBuf::from(path),
-                    filter: filter.to_string(),
-                    note,
-                    config_path: None,
-                    filterdb_dir: None,
-                    choices_file: None,
-                })?;
-                Ok(JsonValue::obj(vec![
-                    ("ok", JsonValue::from(true)),
-                    ("restart_required", JsonValue::from(false)),
-                    ("output", JsonValue::from(out)),
-                ]))
+                run_filters_tool(
+                    FiltersAction::Set {
+                        target: PathBuf::from(path),
+                        filter: filter.to_string(),
+                        note,
+                    },
+                    &[("restart_required", JsonValue::from(false))],
+                )
             }
-            "filters_diff" => {
-                let out = filters_cmd::run_filters_capture(FiltersCommand::Diff {
-                    config_path: None,
-                    filterdb_dir: None,
-                    choices_file: None,
-                })?;
-                Ok(JsonValue::obj(vec![
-                    ("ok", JsonValue::from(true)),
-                    ("output", JsonValue::from(out)),
-                ]))
-            }
-            "filters_check" => {
-                let out = filters_cmd::run_filters_capture(FiltersCommand::Check {
-                    config_path: None,
-                    filterdb_dir: None,
-                    choices_file: None,
-                })?;
-                Ok(JsonValue::obj(vec![
-                    ("ok", JsonValue::from(true)),
-                    ("output", JsonValue::from(out)),
-                ]))
-            }
+            "filters_diff" => run_filters_tool(FiltersAction::Diff, &[]),
+            "filters_check" => run_filters_tool(FiltersAction::Check, &[]),
             "doctor" => {
                 let (report, _) = doctor_report_json(None);
                 Ok(report)
@@ -716,6 +657,34 @@ fn mcp_tool_text_result(payload: &JsonValue, is_error: bool) -> JsonValue {
     ])
 }
 
+fn call_running_api(
+    method: &str,
+    path: &str,
+    body: Option<&JsonValue>,
+) -> Result<JsonValue, String> {
+    let (rs, _) = query_running_status().map_err(|e| e.message)?;
+    let (code, resp) = api_v1_request(&rs.url, &rs.token, method, path, body)?;
+    if code >= 400 {
+        return Err(format!("HTTP {code}: {}", resp.to_compact_string()));
+    }
+    Ok(resp)
+}
+
+fn run_filters_tool(
+    action: FiltersAction,
+    extra: &[(&'static str, JsonValue)],
+) -> Result<JsonValue, String> {
+    let out = filters_cmd::run_filters_capture(FiltersCommand {
+        paths: CommonPaths::default(),
+        action,
+    })?;
+    let mut fields = Vec::with_capacity(2 + extra.len());
+    fields.push(("ok", JsonValue::from(true)));
+    fields.extend(extra.iter().cloned());
+    fields.push(("output", JsonValue::from(out)));
+    Ok(JsonValue::obj(fields))
+}
+
 fn tool_def(name: &str, description: &str, input_schema: JsonValue) -> JsonValue {
     JsonValue::obj(vec![
         ("name", JsonValue::from(name)),
@@ -724,11 +693,34 @@ fn tool_def(name: &str, description: &str, input_schema: JsonValue) -> JsonValue
     ])
 }
 
-fn empty_schema() -> JsonValue {
+fn prop(ty: &str) -> JsonValue {
+    JsonValue::obj(vec![("type", JsonValue::from(ty))])
+}
+
+fn enum_prop(values: &[&str]) -> JsonValue {
     JsonValue::obj(vec![
-        ("type", JsonValue::from("object")),
-        ("properties", JsonValue::Object(Vec::new())),
+        ("type", JsonValue::from("string")),
+        (
+            "enum",
+            JsonValue::Array(values.iter().map(|&v| JsonValue::from(v)).collect()),
+        ),
     ])
+}
+
+fn obj_schema(props: Vec<(&'static str, JsonValue)>, required: &[&str]) -> JsonValue {
+    let mut fields = vec![("type", JsonValue::from("object"))];
+    if !required.is_empty() {
+        fields.push((
+            "required",
+            JsonValue::Array(required.iter().map(|&r| JsonValue::from(r)).collect()),
+        ));
+    }
+    fields.push(("properties", JsonValue::obj(props)));
+    JsonValue::obj(fields)
+}
+
+fn empty_schema() -> JsonValue {
+    obj_schema(Vec::new(), &[])
 }
 
 fn tool_definitions() -> Vec<JsonValue> {
@@ -742,103 +734,39 @@ fn tool_definitions() -> Vec<JsonValue> {
         tool_def(
             "player_start",
             "Start Audiophile Player as a detached process (outlives MCP session) with validated options from cli_spec.",
-            JsonValue::obj(vec![
-                ("type", JsonValue::from("object")),
-                (
-                    "properties",
-                    JsonValue::obj(vec![("options", play_opts_schema.clone())]),
-                ),
-            ]),
+            obj_schema(vec![("options", play_opts_schema.clone())], &[]),
         ),
         tool_def(
             "player_stop",
             "Gracefully stop the running player and release the exclusive DAC pin.",
-            JsonValue::obj(vec![
-                ("type", JsonValue::from("object")),
-                (
-                    "properties",
-                    JsonValue::obj(vec![(
-                        "when",
-                        JsonValue::obj(vec![
-                            ("type", JsonValue::from("string")),
-                            (
-                                "enum",
-                                JsonValue::Array(vec![
-                                    JsonValue::from("now"),
-                                    JsonValue::from("after_track"),
-                                ]),
-                            ),
-                        ]),
-                    )]),
-                ),
-            ]),
+            obj_schema(vec![("when", enum_prop(&["now", "after_track"]))], &[]),
         ),
         tool_def(
             "player_restart",
             "Gracefully restart Audiophile Player with updated options (defaults to when='after_track' so the current track finishes cleanly).",
-            JsonValue::obj(vec![
-                ("type", JsonValue::from("object")),
-                (
-                    "properties",
-                    JsonValue::obj(vec![
-                        ("changes", play_opts_schema),
-                        (
-                            "when",
-                            JsonValue::obj(vec![
-                                ("type", JsonValue::from("string")),
-                                (
-                                    "enum",
-                                    JsonValue::Array(vec![
-                                        JsonValue::from("after_track"),
-                                        JsonValue::from("now"),
-                                    ]),
-                                ),
-                            ]),
-                        ),
-                    ]),
-                ),
-            ]),
+            obj_schema(
+                vec![
+                    ("changes", play_opts_schema),
+                    ("when", enum_prop(&["after_track", "now"])),
+                ],
+                &[],
+            ),
         ),
         tool_def(
             "play",
             "Play a folder under the configured music root in random or sequential order.",
-            JsonValue::obj(vec![
-                ("type", JsonValue::from("object")),
-                (
-                    "properties",
-                    JsonValue::obj(vec![
-                        ("folder", JsonValue::obj(vec![("type", JsonValue::from("string"))])),
-                        (
-                            "order",
-                            JsonValue::obj(vec![
-                                ("type", JsonValue::from("string")),
-                                (
-                                    "enum",
-                                    JsonValue::Array(vec![
-                                        JsonValue::from("random"),
-                                        JsonValue::from("sequential"),
-                                    ]),
-                                ),
-                            ]),
-                        ),
-                    ]),
-                ),
-            ]),
+            obj_schema(
+                vec![
+                    ("folder", prop("string")),
+                    ("order", enum_prop(&["random", "sequential"])),
+                ],
+                &[],
+            ),
         ),
         tool_def(
             "play_file",
             "Play one specific FLAC file inside the configured music root.",
-            JsonValue::obj(vec![
-                ("type", JsonValue::from("object")),
-                ("required", JsonValue::Array(vec![JsonValue::from("path")])),
-                (
-                    "properties",
-                    JsonValue::obj(vec![(
-                        "path",
-                        JsonValue::obj(vec![("type", JsonValue::from("string"))]),
-                    )]),
-                ),
-            ]),
+            obj_schema(vec![("path", prop("string"))], &["path"]),
         ),
         tool_def("pause", "Pause playback immediately and release the WDM-KS DAC pin.", empty_schema()),
         tool_def("resume", "Resume playback after Pause.", empty_schema()),
@@ -846,144 +774,65 @@ fn tool_definitions() -> Vec<JsonValue> {
         tool_def(
             "options_list",
             "List CLI options directly from cli_spec.rs (optionally filtered by group: output|dsp|ultimate|library|network|capture|general).",
-            JsonValue::obj(vec![
-                ("type", JsonValue::from("object")),
-                (
-                    "properties",
-                    JsonValue::obj(vec![(
-                        "group",
-                        JsonValue::obj(vec![("type", JsonValue::from("string"))]),
-                    )]),
-                ),
-            ]),
+            obj_schema(vec![("group", prop("string"))], &[]),
         ),
         tool_def(
             "option_describe",
             "Show detailed documentation, default, config key, and examples for any CLI option or command.",
-            JsonValue::obj(vec![
-                ("type", JsonValue::from("object")),
-                ("required", JsonValue::Array(vec![JsonValue::from("name")])),
-                (
-                    "properties",
-                    JsonValue::obj(vec![(
-                        "name",
-                        JsonValue::obj(vec![("type", JsonValue::from("string"))]),
-                    )]),
-                ),
-            ]),
+            obj_schema(vec![("name", prop("string"))], &["name"]),
         ),
         tool_def(
             "config_get",
             "Read effective configuration values and their provenance from config.toml.",
-            JsonValue::obj(vec![
-                ("type", JsonValue::from("object")),
-                (
-                    "properties",
-                    JsonValue::obj(vec![(
-                        "key",
-                        JsonValue::obj(vec![("type", JsonValue::from("string"))]),
-                    )]),
-                ),
-            ]),
+            obj_schema(vec![("key", prop("string"))], &[]),
         ),
         tool_def(
             "config_set",
             "Validate and write a config.toml key (preserving comments + creating .bak). Returns restart_required.",
-            JsonValue::obj(vec![
-                ("type", JsonValue::from("object")),
-                (
-                    "required",
-                    JsonValue::Array(vec![JsonValue::from("key"), JsonValue::from("value")]),
-                ),
-                (
-                    "properties",
-                    JsonValue::obj(vec![
-                        ("key", JsonValue::obj(vec![("type", JsonValue::from("string"))])),
-                        ("value", JsonValue::obj(vec![("type", JsonValue::from("string"))])),
-                    ]),
-                ),
-            ]),
+            obj_schema(
+                vec![("key", prop("string")), ("value", prop("string"))],
+                &["key", "value"],
+            ),
         ),
         tool_def(
             "scan_start",
             "Start a read-only background library scan job writing Schema-2 filterdb album YAMLs.",
-            JsonValue::obj(vec![
-                ("type", JsonValue::from("object")),
-                ("required", JsonValue::Array(vec![JsonValue::from("folder")])),
-                (
-                    "properties",
-                    JsonValue::obj(vec![
-                        ("folder", JsonValue::obj(vec![("type", JsonValue::from("string"))])),
-                        ("force", JsonValue::obj(vec![("type", JsonValue::from("boolean"))])),
-                        ("post_chain", JsonValue::obj(vec![("type", JsonValue::from("boolean"))])),
-                        ("jobs", JsonValue::obj(vec![("type", JsonValue::from("integer"))])),
-                    ]),
-                ),
-            ]),
+            obj_schema(
+                vec![
+                    ("folder", prop("string")),
+                    ("force", prop("boolean")),
+                    ("post_chain", prop("boolean")),
+                    ("jobs", prop("integer")),
+                ],
+                &["folder"],
+            ),
         ),
         tool_def(
             "scan_progress",
             "Check status of a background scan job started by scan_start.",
-            JsonValue::obj(vec![
-                ("type", JsonValue::from("object")),
-                ("required", JsonValue::Array(vec![JsonValue::from("job")])),
-                (
-                    "properties",
-                    JsonValue::obj(vec![(
-                        "job",
-                        JsonValue::obj(vec![("type", JsonValue::from("string"))]),
-                    )]),
-                ),
-            ]),
+            obj_schema(vec![("job", prop("string"))], &["job"]),
         ),
         tool_def(
             "scan_cancel",
             "Cancel a running background scan job.",
-            JsonValue::obj(vec![
-                ("type", JsonValue::from("object")),
-                ("required", JsonValue::Array(vec![JsonValue::from("job")])),
-                (
-                    "properties",
-                    JsonValue::obj(vec![(
-                        "job",
-                        JsonValue::obj(vec![("type", JsonValue::from("string"))]),
-                    )]),
-                ),
-            ]),
+            obj_schema(vec![("job", prop("string"))], &["job"]),
         ),
         tool_def(
             "filters_show",
             "Show active (mine) vs machine-suggested filter, rule, and why for a file or album folder.",
-            JsonValue::obj(vec![
-                ("type", JsonValue::from("object")),
-                ("required", JsonValue::Array(vec![JsonValue::from("path")])),
-                (
-                    "properties",
-                    JsonValue::obj(vec![(
-                        "path",
-                        JsonValue::obj(vec![("type", JsonValue::from("string"))]),
-                    )]),
-                ),
-            ]),
+            obj_schema(vec![("path", prop("string"))], &["path"]),
         ),
         tool_def(
             "filters_set",
             "Set a per-folder or per-track filter choice in my-filters.yaml (hot-reloaded next track, no restart).",
-            JsonValue::obj(vec![
-                ("type", JsonValue::from("object")),
-                (
-                    "required",
-                    JsonValue::Array(vec![JsonValue::from("path"), JsonValue::from("filter")]),
-                ),
-                (
-                    "properties",
-                    JsonValue::obj(vec![
-                        ("path", JsonValue::obj(vec![("type", JsonValue::from("string"))])),
-                        ("filter", JsonValue::obj(vec![("type", JsonValue::from("string"))])),
-                        ("note", JsonValue::obj(vec![("type", JsonValue::from("string"))])),
-                    ]),
-                ),
-            ]),
+            obj_schema(
+                vec![
+                    ("path", prop("string")),
+                    ("filter", prop("string")),
+                    ("note", prop("string")),
+                ],
+                &["path", "filter"],
+            ),
         ),
         tool_def("filters_diff", "List all scanned tracks where user choices differ from machine suggestions.", empty_schema()),
         tool_def("filters_check", "Validate my-filters.yaml against library.yaml.", empty_schema()),
@@ -992,16 +841,7 @@ fn tool_definitions() -> Vec<JsonValue> {
         tool_def(
             "logs_tail",
             "Return the most recent action log lines from the running player.",
-            JsonValue::obj(vec![
-                ("type", JsonValue::from("object")),
-                (
-                    "properties",
-                    JsonValue::obj(vec![(
-                        "lines",
-                        JsonValue::obj(vec![("type", JsonValue::from("integer"))]),
-                    )]),
-                ),
-            ]),
+            obj_schema(vec![("lines", prop("integer"))], &[]),
         ),
     ]
 }

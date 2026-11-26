@@ -18,9 +18,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ap_control::security::validate_playable_flac_path;
-use ap_control::server::{
-    ControlServer, clear_runtime_url_file_at, runtime_url_file_path, write_runtime_url_file_at,
-};
+use ap_control::server::ControlServer;
 use ap_control::state::{
     ControlCommand, PlayModeLabel, SharedControl, StreamCaptureRequest, UpnpPlayRequest,
 };
@@ -812,40 +810,6 @@ impl<'a> EngineState<'a> {
     }
 }
 
-/// RAII guard ensuring `server.url` is always removed on ANY early startup error (Review #5 #21).
-struct RuntimeUrlGuard {
-    path: Option<PathBuf>,
-    url: String,
-    active: bool,
-}
-
-impl RuntimeUrlGuard {
-    fn write(path: Option<PathBuf>, url: String) -> Self {
-        if let Some(ref p) = path {
-            write_runtime_url_file_at(p, &url);
-        }
-        Self {
-            path,
-            url,
-            active: true,
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.active = false;
-    }
-}
-
-impl Drop for RuntimeUrlGuard {
-    fn drop(&mut self) {
-        if self.active {
-            if let Some(ref p) = self.path {
-                clear_runtime_url_file_at(p, &self.url);
-            }
-        }
-    }
-}
-
 /// Merge `[quantizer]` config settings with explicit CLI `--dac-bits` / `--shaper` overrides
 /// (CLI always takes precedence over `config.toml`).
 fn resolve_upsampler_policy(
@@ -1218,8 +1182,6 @@ pub fn run_random_music_player(
 
     let http_server = ControlServer::start(shared.clone(), http_port)?;
     let http_url = http_server.url();
-    let url_file_path = runtime_url_file_path();
-    let mut url_guard = RuntimeUrlGuard::write(url_file_path.clone(), http_url.clone());
 
     let run_state = RunStateFile {
         pid: std::process::id(),
@@ -1232,8 +1194,8 @@ pub fn run_random_music_player(
     };
     let mut run_state_guard = RunStateGuard::write(run_state_file_path(), &run_state);
 
-    // Review #5 Finding #21: explicit UPnP port/bind failures abort cleanly (and RuntimeUrlGuard
-    // removes server.url); default zero-config UPnP bind failure logs a warning and continues!
+    // Review #5 Finding #21: explicit UPnP port/bind failures abort cleanly (and RunStateGuard
+    // removes run.json); default zero-config UPnP bind failure logs a warning and continues!
     let upnp_server = if upnp_enabled {
         match UpnpRendererServer::start(shared.clone(), effective_upnp_cfg) {
             Ok(srv) => Some(srv),
@@ -1412,7 +1374,6 @@ pub fn run_random_music_player(
         }
     }
 
-    url_guard.disarm();
     run_state_guard.remove_now();
     if let Some(mon) = capture_monitor {
         mon.stop();
@@ -1423,8 +1384,6 @@ pub fn run_random_music_player(
         state.active_epoch,
         http_server,
         upnp_server,
-        url_file_path.as_deref(),
-        &http_url,
         sink,
         producer_thread,
         controller,
@@ -1920,7 +1879,7 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
 
 /// Ordered graceful teardown shared by `run_random_music_player` and teardown-order tests:
 /// 1. Close stream buffer & signal producer `Shutdown` (unblocks producer backpressure & cancels HTTP).
-/// 2. Shut down UPnP MediaRenderer (`ssdp:byebye`), HTTP server & remove runtime `server.url`.
+/// 2. Shut down UPnP MediaRenderer (`ssdp:byebye`) & HTTP server.
 /// 3. Drop the audio sink (releases WDM-KS DAC pin immediately).
 /// 4. Join the producer thread with a bounded deadline (never hangs on stalled NAS / FFT).
 #[allow(clippy::too_many_arguments)]
@@ -1930,8 +1889,6 @@ fn teardown_player_resources_with_upnp<S>(
     active_epoch: u64,
     mut http_server: ControlServer,
     mut upnp_server: Option<UpnpRendererServer>,
-    url_file_path: Option<&Path>,
-    http_url: &str,
     sink: S,
     producer_thread: thread::JoinHandle<()>,
     controller: &ShutdownController,
@@ -1944,9 +1901,6 @@ fn teardown_player_resources_with_upnp<S>(
         upnp.shutdown();
     }
     http_server.shutdown();
-    if let Some(p) = url_file_path {
-        clear_runtime_url_file_at(p, http_url);
-    }
     drop(sink);
     join_producer_bounded(producer_thread, controller, normal_timeout, fast_timeout)
 }
@@ -4342,8 +4296,7 @@ mod tests {
     #[test]
     fn teardown_player_resources_releases_http_and_sink_before_producer_join() {
         // Review #4 Finding #19 & Review #5 Finding #22: deterministic condvar-synchronized
-        // teardown order test using an isolated temp server.url path (never clobbering the live
-        // %LOCALAPPDATA%\audiophile-player\server.url) AND verifying UPnP teardown too.
+        // teardown order test verifying HTTP + UPnP close before sink drop before producer join.
         use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 
         let dir = std::env::temp_dir().join(format!(
@@ -4351,7 +4304,6 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::create_dir_all(&dir);
-        let temp_url_file = dir.join("test_server.url");
 
         let shared = SharedControl::new(dir.clone(), "Mock DAC");
         let server = ControlServer::start(shared.clone(), None).unwrap();
@@ -4372,7 +4324,6 @@ mod tests {
             .next()
             .and_then(|p| p.trim_end_matches('/').parse().ok())
             .expect("valid port in ControlServer URL");
-        write_runtime_url_file_at(&temp_url_file, &url);
 
         let log = Arc::new(Mutex::new(Vec::<&'static str>::new()));
         let sink_dropped_gate = Arc::new((Mutex::new(false), Condvar::new()));
@@ -4382,8 +4333,6 @@ mod tests {
             gate: Arc<(Mutex<bool>, Condvar)>,
             http_port: u16,
             upnp_port: u16,
-            url_file: PathBuf,
-            http_url: String,
         }
         impl Drop for MockSink {
             fn drop(&mut self) {
@@ -4406,15 +4355,7 @@ mod tests {
                     upnp_closed,
                     "UPnP server must already be shut down before dropping the audio sink"
                 );
-                // Verify isolated temp `server.url` was already cleared before sink drops.
-                let still_ours = std::fs::read_to_string(&self.url_file)
-                    .ok()
-                    .is_some_and(|s| s.trim() == self.http_url);
-                assert!(
-                    !still_ours,
-                    "server.url must already be cleared before dropping the audio sink"
-                );
-                self.log.lock().unwrap().push("http_and_url_closed");
+                self.log.lock().unwrap().push("http_and_upnp_closed");
                 self.log.lock().unwrap().push("sink_dropped");
                 let (lock, cv) = &*self.gate;
                 *lock.lock().unwrap() = true;
@@ -4454,15 +4395,11 @@ mod tests {
             ep,
             server,
             Some(upnp_srv),
-            Some(&temp_url_file),
-            &url,
             MockSink {
                 log: Arc::clone(&log),
                 gate: Arc::clone(&sink_dropped_gate),
                 http_port: port,
                 upnp_port,
-                url_file: temp_url_file.clone(),
-                http_url: url.clone(),
             },
             producer,
             &controller,
@@ -4474,8 +4411,8 @@ mod tests {
         assert!(joined, "producer thread should join cleanly on teardown");
         assert_eq!(
             *log.lock().unwrap(),
-            vec!["http_and_url_closed", "sink_dropped", "producer_exited"],
-            "teardown must close HTTP + server.url, then drop sink, then join producer"
+            vec!["http_and_upnp_closed", "sink_dropped", "producer_exited"],
+            "teardown must close HTTP + UPnP, then drop sink, then join producer"
         );
     }
 

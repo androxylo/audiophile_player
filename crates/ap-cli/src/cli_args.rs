@@ -100,52 +100,40 @@ pub struct UltimateCliOverride {
     pub choices_file: Option<PathBuf>,
 }
 
-/// Subcommands under `audiophile-player filters <SUBCOMMAND>`.
+/// Common path override flags shared across `play`, `scan`, and `filters` (Review #9 Q3/Q12).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommonPaths {
+    pub config_path: Option<PathBuf>,
+    pub filterdb_dir: Option<PathBuf>,
+    pub choices_file: Option<PathBuf>,
+    pub trackdb_dir: Option<PathBuf>,
+}
+
+/// Subcommands under `audiophile-player filters <SUBCOMMAND>` (Review #9 Q12: shared path header).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FiltersCommand {
+pub struct FiltersCommand {
+    pub paths: CommonPaths,
+    pub action: FiltersAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FiltersAction {
     /// Inspect suggested vs active (`mine`) filter decision for one file or album folder.
-    Show {
-        target: PathBuf,
-        config_path: Option<PathBuf>,
-        filterdb_dir: Option<PathBuf>,
-        choices_file: Option<PathBuf>,
-    },
+    Show { target: PathBuf },
     /// Show every track where user choices (`my-filters.yaml` / `AP_*`) differ from machine suggestions.
-    Diff {
-        config_path: Option<PathBuf>,
-        filterdb_dir: Option<PathBuf>,
-        choices_file: Option<PathBuf>,
-    },
+    Diff,
     /// Set a track or folder filter choice in `my-filters.yaml` (preserving comments & `.bak` backup).
     Set {
         target: PathBuf,
         filter: String,
         note: Option<String>,
-        config_path: Option<PathBuf>,
-        filterdb_dir: Option<PathBuf>,
-        choices_file: Option<PathBuf>,
     },
     /// Parse and lint `my-filters.yaml` against `library.yaml` (unknown filters, missing paths, shadowed rules).
-    Check {
-        config_path: Option<PathBuf>,
-        filterdb_dir: Option<PathBuf>,
-        choices_file: Option<PathBuf>,
-    },
+    Check,
     /// Preview (or `--apply`) moved-file relinks from `filterdb/relink-report.yaml` onto `my-filters.yaml`.
-    Relink {
-        apply: bool,
-        config_path: Option<PathBuf>,
-        filterdb_dir: Option<PathBuf>,
-        choices_file: Option<PathBuf>,
-    },
+    Relink { apply: bool },
     /// Non-destructively migrate legacy Schema-1 `trackdb/` entries (and optional sidecars) to Schema 2.
-    Migrate {
-        config_path: Option<PathBuf>,
-        trackdb_dir: Option<PathBuf>,
-        filterdb_dir: Option<PathBuf>,
-        choices_file: Option<PathBuf>,
-        sidecar_root: Option<PathBuf>,
-    },
+    Migrate { sidecar_root: Option<PathBuf> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,6 +209,92 @@ fn require_utf8_arg(flag: &str, raw: OsString) -> Result<String, String> {
         .map_err(|bad| format!("{flag} requires valid UTF-8, got '{}'", bad.to_string_lossy()))
 }
 
+/// Spec-driven raw value consumption (`cli_spec::find_option`, Review #9 Q3).
+fn take_opt_raw<I: Iterator<Item = OsString>>(flag: &str, iter: &mut I) -> Result<OsString, String> {
+    iter.next().ok_or_else(|| {
+        let placeholder = cli_spec::find_option(flag)
+            .and_then(|s| s.value.placeholder())
+            .unwrap_or("VALUE");
+        format!("{flag} requires {placeholder}")
+    })
+}
+
+fn take_opt_path<I: Iterator<Item = OsString>>(flag: &str, iter: &mut I) -> Result<PathBuf, String> {
+    take_opt_raw(flag, iter).map(PathBuf::from)
+}
+
+fn take_opt_str<I: Iterator<Item = OsString>>(flag: &str, iter: &mut I) -> Result<String, String> {
+    let raw = take_opt_raw(flag, iter)?;
+    require_utf8_arg(flag, raw)
+}
+
+/// Spec-driven bounded integer parser enforcing `cli_spec::ValueKind::Int { min, max }` (Q3).
+fn take_opt_int<I: Iterator<Item = OsString>>(flag: &str, iter: &mut I) -> Result<i64, String> {
+    let s = take_opt_str(flag, iter)?;
+    let (min, max) = match cli_spec::find_option(flag).map(|o| o.value) {
+        Some(cli_spec::ValueKind::Int { min, max, .. }) => (min, max),
+        _ => (i64::MIN, i64::MAX),
+    };
+    let n = s
+        .trim()
+        .parse::<i64>()
+        .map_err(|_| format!("invalid {flag} '{s}'; expected integer in {min}..={max}"))?;
+    if n < min || n > max {
+        return Err(format!("{flag} must be in {min}..={max}, got {n}"));
+    }
+    Ok(n)
+}
+
+/// Parse shared path flags (`--config`, `--filterdb-dir`, `--choices-file`, `--trackdb-dir`) once
+/// across `play`, `scan`, and `filters` (Review #9 Q3).
+fn try_parse_common_path<I: Iterator<Item = OsString>>(
+    flag: &str,
+    iter: &mut I,
+    paths: &mut CommonPaths,
+) -> Result<bool, String> {
+    match flag {
+        "--config" => {
+            paths.config_path = Some(take_opt_path(flag, iter)?);
+            Ok(true)
+        }
+        "--filterdb-dir" => {
+            paths.filterdb_dir = Some(take_opt_path(flag, iter)?);
+            Ok(true)
+        }
+        "--choices-file" => {
+            paths.choices_file = Some(take_opt_path(flag, iter)?);
+            Ok(true)
+        }
+        "--trackdb-dir" => {
+            paths.trackdb_dir = Some(take_opt_path(flag, iter)?);
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn try_parse_conv_flag<I: Iterator<Item = OsString>>(
+    flag: &str,
+    iter: &mut I,
+    rew_override: &mut Option<ConvolutionConfig>,
+) -> Result<bool, String> {
+    match flag {
+        "--conv-dir" => {
+            *rew_override = Some(ConvolutionConfig::auto_dir(take_opt_path(flag, iter)?));
+            Ok(true)
+        }
+        "--conv-file" => {
+            *rew_override = Some(ConvolutionConfig::explicit_file(take_opt_path(flag, iter)?));
+            Ok(true)
+        }
+        "--no-conv" => {
+            *rew_override = Some(ConvolutionConfig::disabled());
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
 pub fn parse_args<I, S>(args: I) -> Result<RunMode, String>
 where
     I: IntoIterator<Item = S>,
@@ -274,7 +348,7 @@ where
         _ => {}
     }
 
-    let mut config_path: Option<PathBuf> = None;
+    let mut common = CommonPaths::default();
     let mut music_dir: Option<PathBuf> = None;
     let mut device_filter: Option<String> = None;
     let mut max_rate_hz: Option<u32> = None;
@@ -298,35 +372,20 @@ where
                 arg_raw.to_string_lossy()
             )
         })?;
+        if try_parse_common_path(arg, &mut iter, &mut common)?
+            || try_parse_conv_flag(arg, &mut iter, &mut rew_override)?
+        {
+            continue;
+        }
         match arg {
             "-h" | "--help" => return Ok(RunMode::Help(HelpMode::Summary)),
             "-V" | "--version" => show_version = true,
             "--json" => as_json = true,
             "--idle" => idle = true,
-            "--config" => {
-                let val = iter
-                    .next()
-                    .ok_or_else(|| "--config requires a TOML config file path".to_string())?;
-                config_path = Some(PathBuf::from(val));
-            }
-            "--music-dir" => {
-                let val = iter
-                    .next()
-                    .ok_or_else(|| "--music-dir requires a folder path".to_string())?;
-                music_dir = Some(PathBuf::from(val));
-            }
-            "--device" => {
-                let val = iter
-                    .next()
-                    .ok_or_else(|| "--device requires a DAC name substring".to_string())?;
-                device_filter = Some(require_utf8_arg("--device", val)?);
-            }
+            "--music-dir" => music_dir = Some(take_opt_path("--music-dir", &mut iter)?),
+            "--device" => device_filter = Some(take_opt_str("--device", &mut iter)?),
             "--max-rate" => {
-                let val = iter.next().ok_or_else(|| {
-                    "--max-rate requires 'auto' or a standard sample rate (44100|48000|88200|96000|176400|192000|352800|384000)"
-                        .to_string()
-                })?;
-                let val_str = require_utf8_arg("--max-rate", val)?;
+                let val_str = take_opt_str("--max-rate", &mut iter)?;
                 let trimmed = val_str.trim();
                 if trimmed.eq_ignore_ascii_case("auto") {
                     max_rate_hz = None;
@@ -344,24 +403,9 @@ where
                     max_rate_hz = Some(rate);
                 }
             }
-            "--port" => {
-                let val = iter
-                    .next()
-                    .ok_or_else(|| "--port requires a numeric TCP port".to_string())?;
-                let val_str = require_utf8_arg("--port", val)?;
-                let port = val_str
-                    .parse::<u16>()
-                    .map_err(|_| format!("invalid --port '{val_str}'; expected 1..=65535"))?;
-                if port == 0 {
-                    return Err("--port must be in 1..=65535".to_string());
-                }
-                http_port = Some(port);
-            }
+            "--port" => http_port = Some(take_opt_int("--port", &mut iter)? as u16),
             "--filter" => {
-                let val = iter
-                    .next()
-                    .ok_or_else(|| "--filter requires a filter name or 'auto'".to_string())?;
-                let val_str = require_utf8_arg("--filter", val)?;
+                let val_str = take_opt_str("--filter", &mut iter)?;
                 if val_str.eq_ignore_ascii_case("auto") {
                     upsampler_policy.filter_override = None;
                     quantizer_override.filter = Some(None);
@@ -372,10 +416,7 @@ where
                 }
             }
             "--shaper" => {
-                let val = iter
-                    .next()
-                    .ok_or_else(|| "--shaper requires a shaper name or 'auto'".to_string())?;
-                let val_str = require_utf8_arg("--shaper", val)?;
+                let val_str = take_opt_str("--shaper", &mut iter)?;
                 if val_str.eq_ignore_ascii_case("auto") {
                     upsampler_policy.shaper_override = None;
                     quantizer_override.shaper = Some(None);
@@ -386,13 +427,7 @@ where
                 }
             }
             "--dac-bits" => {
-                let val = iter
-                    .next()
-                    .ok_or_else(|| "--dac-bits requires 16, 18, 20, or 24".to_string())?;
-                let val_str = require_utf8_arg("--dac-bits", val)?;
-                let bits = val_str.parse::<u8>().map_err(|_| {
-                    format!("invalid --dac-bits '{val_str}'; expected 16, 18, 20, or 24")
-                })?;
+                let bits = take_opt_int("--dac-bits", &mut iter)? as u8;
                 if !is_valid_dac_bits(bits) {
                     return Err(format!(
                         "invalid --dac-bits {bits}; expected one of 16, 18, 20, or 24"
@@ -402,13 +437,7 @@ where
                 quantizer_override.dac_bits = Some(bits);
             }
             "--max-taps" => {
-                let val = iter
-                    .next()
-                    .ok_or_else(|| "--max-taps requires a positive integer <= 4000000".to_string())?;
-                let val_str = require_utf8_arg("--max-taps", val)?;
-                let taps = val_str
-                    .parse::<usize>()
-                    .map_err(|_| format!("invalid --max-taps '{val_str}'"))?;
+                let taps = take_opt_int("--max-taps", &mut iter)? as usize;
                 if taps == 0 || taps > MAX_FILTER_TAPS {
                     return Err(format!(
                         "--max-taps must be in 1..={MAX_FILTER_TAPS}, got {taps}"
@@ -417,103 +446,34 @@ where
                 upsampler_policy.max_taps = taps;
                 quantizer_override.max_taps = Some(taps);
             }
-            "--conv-dir" => {
-                let val = iter
-                    .next()
-                    .ok_or_else(|| "--conv-dir requires a REW WAV directory path".to_string())?;
-                rew_override = Some(ConvolutionConfig::auto_dir(PathBuf::from(val)));
-            }
-            "--conv-file" => {
-                let val = iter
-                    .next()
-                    .ok_or_else(|| "--conv-file requires a stereo REW WAV file path".to_string())?;
-                rew_override = Some(ConvolutionConfig::explicit_file(PathBuf::from(val)));
-            }
-            "--no-conv" => {
-                rew_override = Some(ConvolutionConfig::disabled());
-            }
-            "--no-upnp" => {
-                upnp_override.disabled = true;
-            }
-            "--no-capture" => {
-                capture_disabled = true;
-            }
+            "--no-upnp" => upnp_override.disabled = true,
+            "--no-capture" => capture_disabled = true,
             "--upnp-name" => {
-                let val = iter
-                    .next()
-                    .ok_or_else(|| "--upnp-name requires a renderer display name".to_string())?;
-                let val_str = require_utf8_arg("--upnp-name", val)?;
+                let val_str = take_opt_str("--upnp-name", &mut iter)?;
                 let trimmed = val_str.trim();
                 if trimmed.is_empty() {
                     return Err("--upnp-name cannot be empty".to_string());
                 }
                 upnp_override.friendly_name = Some(trimmed.to_string());
             }
-            "--upnp-port" => {
-                let val = iter
-                    .next()
-                    .ok_or_else(|| "--upnp-port requires a numeric TCP port".to_string())?;
-                let val_str = require_utf8_arg("--upnp-port", val)?;
-                let port = val_str
-                    .parse::<u16>()
-                    .map_err(|_| format!("invalid --upnp-port '{val_str}'; expected 1..=65535"))?;
-                if port == 0 {
-                    return Err("--upnp-port must be in 1..=65535".to_string());
-                }
-                upnp_override.port = Some(port);
-            }
+            "--upnp-port" => upnp_override.port = Some(take_opt_int("--upnp-port", &mut iter)? as u16),
             "--upnp-bind" => {
-                let val = iter
-                    .next()
-                    .ok_or_else(|| "--upnp-bind requires an IPv4 address".to_string())?;
-                let val_str = require_utf8_arg("--upnp-bind", val)?;
+                let val_str = take_opt_str("--upnp-bind", &mut iter)?;
                 let ip = val_str
                     .parse::<Ipv4Addr>()
                     .map_err(|_| format!("invalid --upnp-bind IPv4 address '{val_str}'"))?;
                 upnp_override.bind_ip = Some(ip);
             }
-            "--ultimate" => {
-                ultimate_override.enabled = Some(true);
-            }
-            "--no-ultimate" => {
-                ultimate_override.enabled = Some(false);
-            }
-            "--no-genre-rules" => {
-                ultimate_override.genre_rules = Some(false);
-            }
-            "--no-learn-on-play" => {
-                ultimate_override.learn_on_play = Some(false);
-            }
-            "--trackdb-dir" => {
-                let val = iter
-                    .next()
-                    .ok_or_else(|| "--trackdb-dir requires a directory path".to_string())?;
-                ultimate_override.trackdb_dir = Some(PathBuf::from(val));
-            }
+            "--ultimate" => ultimate_override.enabled = Some(true),
+            "--no-ultimate" => ultimate_override.enabled = Some(false),
+            "--no-genre-rules" => ultimate_override.genre_rules = Some(false),
+            "--no-learn-on-play" => ultimate_override.learn_on_play = Some(false),
             "--filters" => {
-                let val = iter
-                    .next()
-                    .ok_or_else(|| "--filters requires auto | suggested | mine".to_string())?;
-                let val_str = require_utf8_arg("--filters", val)?;
+                let val_str = take_opt_str("--filters", &mut iter)?;
                 ultimate_override.filter_mode = Some(FilterMode::parse(&val_str)?);
             }
-            "--filterdb-dir" => {
-                let val = iter
-                    .next()
-                    .ok_or_else(|| "--filterdb-dir requires a directory path".to_string())?;
-                ultimate_override.filterdb_dir = Some(PathBuf::from(val));
-            }
-            "--choices-file" => {
-                let val = iter
-                    .next()
-                    .ok_or_else(|| "--choices-file requires a YAML file path".to_string())?;
-                ultimate_override.choices_file = Some(PathBuf::from(val));
-            }
             "--opt" => {
-                let val = iter
-                    .next()
-                    .ok_or_else(|| "--opt requires normal | high | extreme".to_string())?;
-                let val_str = require_utf8_arg("--opt", val)?;
+                let val_str = take_opt_str("--opt", &mut iter)?;
                 optimization = parse_optimization_level(&val_str)?;
                 optimization_explicit = true;
             }
@@ -541,9 +501,12 @@ where
     }
 
     upsampler_policy.validate()?;
+    ultimate_override.trackdb_dir = common.trackdb_dir;
+    ultimate_override.filterdb_dir = common.filterdb_dir;
+    ultimate_override.choices_file = common.choices_file;
 
     Ok(RunMode::PlayRandom {
-        config_path,
+        config_path: common.config_path,
         music_dir,
         device_filter,
         max_rate_hz,
@@ -568,10 +531,7 @@ where
     let mut post_chain = false;
     let mut force = false;
     let mut jobs: Option<usize> = None;
-    let mut trackdb_dir: Option<PathBuf> = None;
-    let mut filterdb_dir: Option<PathBuf> = None;
-    let mut choices_file: Option<PathBuf> = None;
-    let mut config_path: Option<PathBuf> = None;
+    let mut common = CommonPaths::default();
     let mut rew_override: Option<ConvolutionConfig> = None;
     let mut upsampler_policy = UpsamplerPolicy::default();
 
@@ -586,74 +546,25 @@ where
                 arg_raw.to_string_lossy()
             ));
         };
+        if try_parse_common_path(arg, &mut iter, &mut common)?
+            || try_parse_conv_flag(arg, &mut iter, &mut rew_override)?
+        {
+            continue;
+        }
         match arg {
             "-h" | "--help" => return Ok(RunMode::Help(HelpMode::Detail("scan".to_string()))),
             "-V" | "--version" => return Ok(RunMode::Version { as_json: false }),
             "--report" => report = true,
             "--post-chain" => post_chain = true,
             "--force" => force = true,
-            "--jobs" | "-j" => {
-                let val = iter
-                    .next()
-                    .ok_or_else(|| "--jobs requires a positive integer".to_string())?;
-                let val_str = require_utf8_arg("--jobs", val)?;
-                let n = val_str
-                    .parse::<usize>()
-                    .map_err(|_| format!("invalid --jobs '{val_str}'; expected positive integer"))?;
-                if n == 0 {
-                    return Err("--jobs must be >= 1".to_string());
-                }
-                jobs = Some(n);
-            }
-            "--trackdb-dir" => {
-                let val = iter
-                    .next()
-                    .ok_or_else(|| "--trackdb-dir requires a directory path".to_string())?;
-                trackdb_dir = Some(PathBuf::from(val));
-            }
-            "--filterdb-dir" => {
-                let val = iter
-                    .next()
-                    .ok_or_else(|| "--filterdb-dir requires a directory path".to_string())?;
-                filterdb_dir = Some(PathBuf::from(val));
-            }
-            "--choices-file" => {
-                let val = iter
-                    .next()
-                    .ok_or_else(|| "--choices-file requires a YAML file path".to_string())?;
-                choices_file = Some(PathBuf::from(val));
-            }
-            "--config" => {
-                let val = iter
-                    .next()
-                    .ok_or_else(|| "--config requires a TOML config file path".to_string())?;
-                config_path = Some(PathBuf::from(val));
-            }
+            "--jobs" | "-j" => jobs = Some(take_opt_int("--jobs", &mut iter)? as usize),
             "--filter" => {
-                let val = iter
-                    .next()
-                    .ok_or_else(|| "--filter requires a filter name or 'auto'".to_string())?;
-                let val_str = require_utf8_arg("--filter", val)?;
+                let val_str = take_opt_str("--filter", &mut iter)?;
                 if val_str.eq_ignore_ascii_case("auto") {
                     upsampler_policy.filter_override = None;
                 } else {
                     upsampler_policy.filter_override = Some(FilterArchetype::from_str(&val_str)?);
                 }
-            }
-            "--conv-dir" => {
-                let val = iter
-                    .next()
-                    .ok_or_else(|| "--conv-dir requires a REW WAV directory path".to_string())?;
-                rew_override = Some(ConvolutionConfig::auto_dir(PathBuf::from(val)));
-            }
-            "--conv-file" => {
-                let val = iter
-                    .next()
-                    .ok_or_else(|| "--conv-file requires a stereo REW WAV file path".to_string())?;
-                rew_override = Some(ConvolutionConfig::explicit_file(PathBuf::from(val)));
-            }
-            "--no-conv" => {
-                rew_override = Some(ConvolutionConfig::disabled());
             }
             other if other.starts_with('-') => {
                 return Err(format!(
@@ -678,10 +589,10 @@ where
         post_chain,
         force,
         jobs,
-        trackdb_dir,
-        filterdb_dir,
-        choices_file,
-        config_path,
+        trackdb_dir: common.trackdb_dir,
+        filterdb_dir: common.filterdb_dir,
+        choices_file: common.choices_file,
+        config_path: common.config_path,
         rew_override,
         upsampler_policy,
     })
@@ -710,10 +621,7 @@ where
         return Ok(RunMode::Version { as_json: false });
     }
 
-    let mut config_path: Option<PathBuf> = None;
-    let mut filterdb_dir: Option<PathBuf> = None;
-    let mut choices_file: Option<PathBuf> = None;
-    let mut trackdb_dir: Option<PathBuf> = None;
+    let mut paths = CommonPaths::default();
     let mut sidecar_root: Option<PathBuf> = None;
     let mut note: Option<String> = None;
     let mut apply = false;
@@ -724,45 +632,14 @@ where
             positional.push(arg_raw);
             continue;
         };
+        if try_parse_common_path(arg, &mut iter, &mut paths)? {
+            continue;
+        }
         match arg {
             "-h" | "--help" => return Ok(RunMode::Help(HelpMode::Detail("filters".to_string()))),
             "-V" | "--version" => return Ok(RunMode::Version { as_json: false }),
-            "--config" => {
-                let val = iter
-                    .next()
-                    .ok_or_else(|| "--config requires a TOML config file path".to_string())?;
-                config_path = Some(PathBuf::from(val));
-            }
-            "--filterdb-dir" => {
-                let val = iter
-                    .next()
-                    .ok_or_else(|| "--filterdb-dir requires a directory path".to_string())?;
-                filterdb_dir = Some(PathBuf::from(val));
-            }
-            "--choices-file" => {
-                let val = iter
-                    .next()
-                    .ok_or_else(|| "--choices-file requires a YAML file path".to_string())?;
-                choices_file = Some(PathBuf::from(val));
-            }
-            "--trackdb-dir" => {
-                let val = iter
-                    .next()
-                    .ok_or_else(|| "--trackdb-dir requires a directory path".to_string())?;
-                trackdb_dir = Some(PathBuf::from(val));
-            }
-            "--sidecar-root" => {
-                let val = iter
-                    .next()
-                    .ok_or_else(|| "--sidecar-root requires a music directory path".to_string())?;
-                sidecar_root = Some(PathBuf::from(val));
-            }
-            "--note" => {
-                let val = iter
-                    .next()
-                    .ok_or_else(|| "--note requires a text string".to_string())?;
-                note = Some(require_utf8_arg("--note", val)?);
-            }
+            "--sidecar-root" => sidecar_root = Some(take_opt_path("--sidecar-root", &mut iter)?),
+            "--note" => note = Some(take_opt_str("--note", &mut iter)?),
             "--apply" => apply = true,
             "--yes" => {}
             other if other.starts_with('-') => {
@@ -774,7 +651,7 @@ where
         }
     }
 
-    match sub {
+    let action = match sub {
         "show" => {
             if positional.len() != 1 {
                 return Err(
@@ -782,22 +659,15 @@ where
                         .to_string(),
                 );
             }
-            Ok(RunMode::Filters(FiltersCommand::Show {
+            FiltersAction::Show {
                 target: PathBuf::from(positional.remove(0)),
-                config_path,
-                filterdb_dir,
-                choices_file,
-            }))
+            }
         }
         "diff" => {
             if !positional.is_empty() {
                 return Err("filters diff takes no positional arguments".to_string());
             }
-            Ok(RunMode::Filters(FiltersCommand::Diff {
-                config_path,
-                filterdb_dir,
-                choices_file,
-            }))
+            FiltersAction::Diff
         }
         "set" => {
             if positional.len() != 2 {
@@ -808,52 +678,37 @@ where
             }
             let target = PathBuf::from(positional.remove(0));
             let filter = require_utf8_arg("filters set <FILTER>", positional.remove(0))?;
-            Ok(RunMode::Filters(FiltersCommand::Set {
+            FiltersAction::Set {
                 target,
                 filter,
                 note,
-                config_path,
-                filterdb_dir,
-                choices_file,
-            }))
+            }
         }
         "check" => {
             if !positional.is_empty() {
                 return Err("filters check takes no positional arguments".to_string());
             }
-            Ok(RunMode::Filters(FiltersCommand::Check {
-                config_path,
-                filterdb_dir,
-                choices_file,
-            }))
+            FiltersAction::Check
         }
         "relink" => {
             if !positional.is_empty() {
                 return Err("filters relink takes no positional arguments".to_string());
             }
-            Ok(RunMode::Filters(FiltersCommand::Relink {
-                apply,
-                config_path,
-                filterdb_dir,
-                choices_file,
-            }))
+            FiltersAction::Relink { apply }
         }
         "migrate" => {
             if !positional.is_empty() {
                 return Err("filters migrate takes no positional arguments".to_string());
             }
-            Ok(RunMode::Filters(FiltersCommand::Migrate {
-                config_path,
-                trackdb_dir,
-                filterdb_dir,
-                choices_file,
-                sidecar_root,
-            }))
+            FiltersAction::Migrate { sidecar_root }
         }
-        other => Err(format!(
-            "unknown filters subcommand '{other}' (expected: show | diff | set | check | relink | migrate)"
-        )),
-    }
+        other => {
+            return Err(format!(
+                "unknown filters subcommand '{other}' (expected: show | diff | set | check | relink | migrate)"
+            ));
+        }
+    };
+    Ok(RunMode::Filters(FiltersCommand { paths, action }))
 }
 
 fn parse_help_args<I>(mut iter: I) -> Result<RunMode, String>
@@ -1445,11 +1300,17 @@ mod tests {
 
         assert!(matches!(
             parse_args(["audiophile-player", "filters", "show", r"D:\Music\A"]).unwrap(),
-            RunMode::Filters(FiltersCommand::Show { .. })
+            RunMode::Filters(FiltersCommand {
+                action: FiltersAction::Show { .. },
+                ..
+            })
         ));
         assert!(matches!(
             parse_args(["audiophile-player", "filters", "diff"]).unwrap(),
-            RunMode::Filters(FiltersCommand::Diff { .. })
+            RunMode::Filters(FiltersCommand {
+                action: FiltersAction::Diff,
+                ..
+            })
         ));
         assert!(matches!(
             parse_args([
@@ -1462,23 +1323,35 @@ mod tests {
                 "warmer",
             ])
             .unwrap(),
-            RunMode::Filters(FiltersCommand::Set {
-                ref filter,
-                ref note,
+            RunMode::Filters(FiltersCommand {
+                action: FiltersAction::Set {
+                    ref filter,
+                    ref note,
+                    ..
+                },
                 ..
             }) if filter == "gauss-long-lp" && note.as_deref() == Some("warmer")
         ));
         assert!(matches!(
             parse_args(["audiophile-player", "filters", "check"]).unwrap(),
-            RunMode::Filters(FiltersCommand::Check { .. })
+            RunMode::Filters(FiltersCommand {
+                action: FiltersAction::Check,
+                ..
+            })
         ));
         assert!(matches!(
             parse_args(["audiophile-player", "filters", "relink", "--apply"]).unwrap(),
-            RunMode::Filters(FiltersCommand::Relink { apply: true, .. })
+            RunMode::Filters(FiltersCommand {
+                action: FiltersAction::Relink { apply: true },
+                ..
+            })
         ));
         assert!(matches!(
             parse_args(["audiophile-player", "filters", "migrate"]).unwrap(),
-            RunMode::Filters(FiltersCommand::Migrate { .. })
+            RunMode::Filters(FiltersCommand {
+                action: FiltersAction::Migrate { .. },
+                ..
+            })
         ));
         assert!(parse_args(["audiophile-player", "filters"]).is_err());
         assert!(parse_args(["audiophile-player", "filters", "bogus"]).is_err());

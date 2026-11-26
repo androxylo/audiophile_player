@@ -724,7 +724,10 @@ pub fn config_show_json(
                     "default"
                 }),
             ),
-            ("restart_required", JsonValue::from(key != "filters.choices_file")),
+            (
+                "restart_required",
+                JsonValue::from(crate::cli_spec::config_key_requires_restart(key)),
+            ),
         ]));
     }
 
@@ -779,7 +782,7 @@ pub fn config_set_value(
         ("config_file", JsonValue::from(path.to_string_lossy().into_owned())),
         (
             "restart_required",
-            JsonValue::from(canonical != "filters.choices_file"),
+            JsonValue::from(crate::cli_spec::config_key_requires_restart(canonical)),
         ),
     ]))
 }
@@ -819,7 +822,10 @@ pub fn config_unset_value(
         ("key", JsonValue::from(canonical)),
         ("removed", JsonValue::from(removed)),
         ("config_file", JsonValue::from(path.to_string_lossy().into_owned())),
-        ("restart_required", JsonValue::from(removed)),
+        (
+            "restart_required",
+            JsonValue::from(removed && crate::cli_spec::config_key_requires_restart(canonical)),
+        ),
     ]))
 }
 

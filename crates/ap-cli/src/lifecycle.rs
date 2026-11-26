@@ -23,20 +23,28 @@ use crate::exit_codes::CliError;
 pub const ENGINE_MUTEX_NAME: &str = "Local\\AudiophilePlayer.Engine";
 pub const SHUTDOWN_EVENT_NAME: &str = "Local\\AudiophilePlayer.Shutdown";
 
-/// Path to `%LOCALAPPDATA%\audiophile-player\run.json`.
+/// Path to `%LOCALAPPDATA%\audiophile-player\run.json` (Review #9 Q10: sole runtime discovery file).
 pub fn run_state_file_path() -> Option<PathBuf> {
-    if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        let trimmed = local.trim();
-        if !trimmed.is_empty() {
-            return Some(
-                PathBuf::from(trimmed)
-                    .join("audiophile-player")
-                    .join("run.json"),
-            );
+    #[cfg(windows)]
+    {
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            let trimmed = local.trim();
+            if !trimmed.is_empty() {
+                return Some(
+                    PathBuf::from(trimmed)
+                        .join("audiophile-player")
+                        .join("run.json"),
+                );
+            }
         }
+        None
     }
-    ap_control::server::runtime_url_file_path()
-        .and_then(|p| p.parent().map(|d| d.join("run.json")))
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(|dir| PathBuf::from(dir).join("audiophile-player").join("run.json"))
+    }
 }
 
 /// Path to `%LOCALAPPDATA%\audiophile-player\mcp-audit.log`.

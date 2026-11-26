@@ -109,10 +109,8 @@ impl Group {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum Restart {
     Always,
-    Live,
     NextTrack,
     NotApplicable,
 }
@@ -121,7 +119,6 @@ impl Restart {
     pub const fn tag(self) -> &'static str {
         match self {
             Self::Always => "restart",
-            Self::Live => "live",
             Self::NextTrack => "next-track",
             Self::NotApplicable => "n/a",
         }
@@ -130,7 +127,6 @@ impl Restart {
     pub const fn description(self) -> &'static str {
         match self {
             Self::Always => "needs restart",
-            Self::Live => "takes effect immediately",
             Self::NextTrack => "re-read on next track (no restart)",
             Self::NotApplicable => "command-only",
         }
@@ -1048,10 +1044,20 @@ pub fn negated_options(flag: &str) -> &'static [&'static str] {
         "--no-ultimate" => &["--ultimate"],
         "--no-conv" => &["--conv-dir", "--conv-file"],
         "--conv-dir" | "--conv-file" => &["--no-conv"],
-        "--no-upnp" => &["--upnp-name", "--upnp-port", "--upnp-ip"],
-        "--upnp-name" | "--upnp-port" | "--upnp-ip" => &["--no-upnp"],
+        "--no-upnp" => &["--upnp-name", "--upnp-port", "--upnp-bind"],
+        "--upnp-name" | "--upnp-port" | "--upnp-bind" => &["--no-upnp"],
         _ => &[],
     }
+}
+
+/// Look up an option by its canonical `config.toml` key (Review #9 Q15).
+pub fn find_config_key(key: &str) -> Option<&'static OptSpec> {
+    OPTIONS.iter().find(|opt| opt.config_key == Some(key))
+}
+
+/// Whether changing `key` in `config.toml` requires restarting the running player (Review #9 Q15).
+pub fn config_key_requires_restart(key: &str) -> bool {
+    find_config_key(key).is_none_or(|opt| opt.restart == Restart::Always)
 }
 
 /// Look up an option by `--name` or `-short` (with or without leading dashes).
@@ -1170,11 +1176,16 @@ pub fn render_summary_help() -> String {
         }
     }
 
-    out.push_str(
+    let exit_summary: String = crate::exit_codes::EXIT_CODE_SPECS
+        .iter()
+        .map(|s| format!("{}={}", s.code, s.summary_tag))
+        .collect::<Vec<_>>()
+        .join("  ");
+    out.push_str(&format!(
         "\nDetails: audiophile-player help <option|command>  |  JSON: help --json  |  Docs: docs/CLI.md\n\
-         Exit codes: 0=ok  1=error  2=usage  3=device  4=config  5=instance-state\n\
-         Copyright (C) 2026 androxylo — License GPL-3.0-or-later (NO WARRANTY).\n",
-    );
+         Exit codes: {exit_summary}\n\
+         Copyright (C) 2026 androxylo — License GPL-3.0-or-later (NO WARRANTY).\n"
+    ));
     out
 }
 
@@ -1250,6 +1261,24 @@ pub fn render_detail_help(topic: &str) -> Result<String, String> {
     ))
 }
 
+/// Append `enum` / `minimum` / `maximum` JSON schema constraints for `kind` (shared by `help --json`
+/// and `mcp_play_options_schema`, Review #9 Q11).
+fn append_value_kind_constraints(fields: &mut Vec<(&'static str, JsonValue)>, kind: ValueKind) {
+    match kind {
+        ValueKind::Enum { values, .. } => {
+            fields.push((
+                "enum",
+                JsonValue::Array(values.iter().map(|&v| JsonValue::from(v)).collect()),
+            ));
+        }
+        ValueKind::Int { min, max, .. } => {
+            fields.push(("minimum", JsonValue::from(min)));
+            fields.push(("maximum", JsonValue::from(max)));
+        }
+        _ => {}
+    }
+}
+
 /// Render the full machine-readable CLI specification (`audiophile-player help --json`).
 pub fn render_help_json() -> JsonValue {
     let cmds: Vec<JsonValue> = COMMANDS
@@ -1298,37 +1327,22 @@ pub fn render_help_json() -> JsonValue {
                 ),
                 ("since", JsonValue::from(o.since)),
             ];
-            match o.value {
-                ValueKind::Enum { values, .. } => {
-                    entries.push((
-                        "enum",
-                        JsonValue::Array(values.iter().map(|&v| JsonValue::from(v)).collect()),
-                    ));
-                }
-                ValueKind::Int { min, max, .. } => {
-                    entries.push(("minimum", JsonValue::from(min)));
-                    entries.push(("maximum", JsonValue::from(max)));
-                }
-                _ => {}
-            }
+            append_value_kind_constraints(&mut entries, o.value);
             JsonValue::obj(entries)
         })
         .collect();
 
+    let exit_codes_obj = JsonValue::obj(
+        crate::exit_codes::EXIT_CODE_SPECS
+            .iter()
+            .map(|s| (s.code_str, JsonValue::from(s.json_slug)))
+            .collect(),
+    );
+
     JsonValue::obj(vec![
         ("schema", JsonValue::from("ap.cli_spec/1")),
         ("version", JsonValue::from(env!("CARGO_PKG_VERSION"))),
-        (
-            "exit_codes",
-            JsonValue::obj(vec![
-                ("0", JsonValue::from("success")),
-                ("1", JsonValue::from("general_error")),
-                ("2", JsonValue::from("usage_error")),
-                ("3", JsonValue::from("device_or_hardware_error")),
-                ("4", JsonValue::from("config_error")),
-                ("5", JsonValue::from("instance_already_or_not_running")),
-            ]),
-        ),
+        ("exit_codes", exit_codes_obj),
         (
             "config_only_keys",
             JsonValue::Array(
@@ -1357,19 +1371,7 @@ pub fn mcp_play_options_schema() -> JsonValue {
             ("type", JsonValue::from(opt.value.json_type())),
             ("description", JsonValue::from(opt.summary)),
         ];
-        match opt.value {
-            ValueKind::Enum { values, .. } => {
-                fields.push((
-                    "enum",
-                    JsonValue::Array(values.iter().map(|&v| JsonValue::from(v)).collect()),
-                ));
-            }
-            ValueKind::Int { min, max, .. } => {
-                fields.push(("minimum", JsonValue::from(min)));
-                fields.push(("maximum", JsonValue::from(max)));
-            }
-            _ => {}
-        }
+        append_value_kind_constraints(&mut fields, opt.value);
         props.push((prop_name, JsonValue::obj(fields)));
     }
     JsonValue::obj(vec![
@@ -1436,12 +1438,9 @@ pub fn render_help_markdown() -> String {
     out.push_str("\n## Exit Codes\n\n");
     out.push_str("| Code | Meaning |\n");
     out.push_str("|---|---|\n");
-    out.push_str("| `0` | Success |\n");
-    out.push_str("| `1` | General runtime error |\n");
-    out.push_str("| `2` | CLI argument / usage error |\n");
-    out.push_str("| `3` | Audio device / hardware error (missing DAC, unsupported 8fS, DAC busy) |\n");
-    out.push_str("| `4` | Configuration file error (`config.toml` syntax or validation) |\n");
-    out.push_str("| `5` | Process lifecycle state conflict (already running on start, or not running on stop/status) |\n");
+    for s in crate::exit_codes::EXIT_CODE_SPECS {
+        out.push_str(&format!("| `{}` | {} |\n", s.code, s.markdown_meaning));
+    }
     out
 }
 
@@ -1558,6 +1557,70 @@ mod tests {
                 "docs/GETTING_STARTED.md line {} contains a duplicated CLI option table row (`{trimmed}`); link to docs/CLI.md instead",
                 idx + 1
             );
+        }
+    }
+
+    /// Drift guard 5 (Review #9 Q3): verify every `ValueKind::Enum` value set and `ValueKind::Int`
+    /// range in `OPTIONS` is enforced identically by `cli_args::parse_args`.
+    #[test]
+    fn spec_enum_and_int_bounds_match_parser() {
+        for opt in OPTIONS {
+            let prefix: Vec<&str> = if opt.scope.contains(&Cmd::Play) {
+                vec!["audiophile-player"]
+            } else if opt.scope.contains(&Cmd::Scan) {
+                vec!["audiophile-player", "scan"]
+            } else if opt.scope.contains(&Cmd::Stop) {
+                vec!["audiophile-player", "stop"]
+            } else {
+                continue;
+            };
+            match opt.value {
+                ValueKind::Enum { values, .. } => {
+                    for &v in values {
+                        let mut argv = prefix.clone();
+                        argv.push(opt.name);
+                        argv.push(v);
+                        assert!(
+                            crate::cli_args::parse_args(argv).is_ok(),
+                            "spec enum value `{v}` for {} failed to parse",
+                            opt.name
+                        );
+                    }
+                    let mut bad = prefix.clone();
+                    bad.push(opt.name);
+                    bad.push("__definitely_invalid_enum__");
+                    assert!(
+                        crate::cli_args::parse_args(bad).is_err(),
+                        "invalid enum value for {} should be rejected",
+                        opt.name
+                    );
+                }
+                ValueKind::Int { min, max, .. } => {
+                    for edge in [min, max] {
+                        let s = edge.to_string();
+                        let mut argv = prefix.clone();
+                        argv.push(opt.name);
+                        argv.push(&s);
+                        assert!(
+                            crate::cli_args::parse_args(argv).is_ok(),
+                            "spec int bound {edge} for {} failed to parse",
+                            opt.name
+                        );
+                    }
+                    for oob in [min - 1, max + 1] {
+                        let s = oob.to_string();
+                        let mut argv = prefix.clone();
+                        argv.push(opt.name);
+                        argv.push(&s);
+                        assert!(
+                            crate::cli_args::parse_args(argv).is_err(),
+                            "out-of-range int {oob} for {} should be rejected",
+                            opt.name
+                        );
+                    }
+                }
+                _ => {}
+            }
         }
     }
 

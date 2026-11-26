@@ -322,54 +322,6 @@ where
     run_fs_op_bounded_for_key("default", timeout, op)
 }
 
-/// Path to the runtime URL discovery file (`%LOCALAPPDATA%\audiophile-player\server.url` on
-/// Windows) read by launcher scripts so they find the active port even beyond 8105 without
-/// launching a duplicate instance.
-pub fn runtime_url_file_path() -> Option<PathBuf> {
-    #[cfg(windows)]
-    {
-        std::env::var_os("LOCALAPPDATA")
-            .map(|dir| PathBuf::from(dir).join("audiophile-player").join("server.url"))
-    }
-    #[cfg(not(windows))]
-    {
-        std::env::var_os("XDG_RUNTIME_DIR")
-            .or_else(|| std::env::var_os("HOME"))
-            .map(|dir| PathBuf::from(dir).join("audiophile-player").join("server.url"))
-    }
-}
-
-/// Best-effort write of the active localhost control UI URL to an explicit file path.
-pub fn write_runtime_url_file_at(path: &Path, url: &str) {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(path, format!("{url}\n"));
-}
-
-/// Best-effort cleanup of an explicit runtime URL file if it still points to `url`.
-pub fn clear_runtime_url_file_at(path: &Path, url: &str) {
-    if let Ok(contents) = std::fs::read_to_string(path) {
-        if contents.trim() == url.trim() {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-}
-
-/// Best-effort write of the active localhost control UI URL for launcher discovery.
-pub fn write_runtime_url_file(url: &str) {
-    if let Some(path) = runtime_url_file_path() {
-        write_runtime_url_file_at(&path, url);
-    }
-}
-
-/// Best-effort cleanup of the runtime URL file if it still points to `url`.
-pub fn clear_runtime_url_file(url: &str) {
-    if let Some(path) = runtime_url_file_path() {
-        clear_runtime_url_file_at(&path, url);
-    }
-}
-
 /// Non-destructively check whether another service is already accepting TCP connections
 /// on localhost at `port` (catches services bound to `0.0.0.0:port`, `[::]:port`, or
 /// `127.0.0.1:port` so Windows' dual-bind quirk cannot hijack another process's traffic).
