@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Headless playback coordinator wiring the bounded-memory streaming pipeline:
 //!   `FlacBlockReader` (`DEFAULT_SOURCE_BLOCK_FRAMES` chunks — never loads multi-GB files)
 //!   -> Tidy 5-Stage `f64` `StreamingPipelineSession` (Headroom -> Upsampler -> Convolver

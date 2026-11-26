@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Localhost-only HTTP/1.1 control server strictly decoupled from the audio output thread.
 //!
 //! Port selection policy:

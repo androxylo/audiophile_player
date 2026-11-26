@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Stateful, bounded-memory floating-point upsamplers: Gaussian windowed-sinc defaults
 //! (`gauss-long-lp` / `gauss-hires-lp`), zero-copy `NullUpsampler`, and legacy `SimpleTest`.
 //!

@@ -1,5 +1,7 @@
-; Audiophile Player Exclusive-Mode Virtual ACX 1.1 Render Driver
 ; SPDX-License-Identifier: GPL-3.0-or-later
+; Copyright (C) 2026 androxylo
+
+; Audiophile Player Exclusive-Mode Virtual ACX 1.1 Render Driver
 ; Root-enumerated virtual render endpoint (ROOT\ApExclusiveAudio) for Windows 11 22H2+ x64.
 ; Zero APOs, event-driven WaveRT, LineLevel form factor.
 

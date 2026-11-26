@@ -1,4 +1,7 @@
-﻿# Run as Administrator to install Audiophile Player's opt-in Exclusive ACX Virtual Render Driver
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 androxylo
+
+# Run as Administrator to install Audiophile Player's opt-in Exclusive ACX Virtual Render Driver
 # (ROOT\ApExclusiveAudio -> "Line (Audiophile Player)" in Tidal Desktop Exclusive Mode).
 #
 # Self-contained: works both inside an unpacked GitHub Release zip (driver\install-driver.ps1)
@@ -114,7 +117,7 @@ function Import-ValidatedPublicCert([string]$CerPath) {
     return $x509.Thumbprint
 }
 
-# === 0. Preflight checks (BEFORE any system modification — Review #8 D1, D5) ===
+# === 0. Preflight checks (BEFORE any system modification - Review #8 D1, D5) ===
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
     Write-Host "ERROR: Please run this script from an Administrator PowerShell window." -ForegroundColor Red
@@ -266,7 +269,7 @@ if ($infContent -match '(?m)^DriverVer\s*=\s*[^,\r\n]+,\s*([0-9]+\.[0-9]+\.[0-9]
     $expectedInfVer = $Matches[1]
 }
 
-Write-Host "`n=== 2. Local test-signing (ephemeral key — private key deleted immediately) ===" -ForegroundColor Cyan
+Write-Host "`n=== 2. Local test-signing (ephemeral key - private key deleted immediately) ===" -ForegroundColor Cyan
 $cerFile = Join-Path $pkgDir "ApExclusiveTestCert.cer"
 if ((Test-Path -LiteralPath $cerFile) -and -not $ForceResign) {
     $devThumb = Import-ValidatedPublicCert $cerFile
@@ -409,7 +412,7 @@ $mediaDevs = @(Get-PnpDevice -Class MEDIA -ErrorAction SilentlyContinue | Where-
 $mediaDevs | Format-Table -AutoSize Status, Class, FriendlyName, InstanceId
 
 if ($rebootRequired) {
-    Write-Host "`nDriver staged — REBOOT REQUIRED (exit 3010) because a process held the audio device open." -ForegroundColor Yellow
+    Write-Host "`nDriver staged - REBOOT REQUIRED (exit 3010) because a process held the audio device open." -ForegroundColor Yellow
     exit 3010
 }
 

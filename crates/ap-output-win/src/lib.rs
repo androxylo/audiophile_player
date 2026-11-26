@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Windows-only strictly zero-mixer audio output backends.
 //!
 //! Hard architectural invariant:

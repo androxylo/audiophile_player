@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Resilient local FLAC library picker designed for very large libraries (20,000+ tracks).
 //!
 //! Instead of recursively scanning the entire library upfront, [`pick_random_flac_walk`]

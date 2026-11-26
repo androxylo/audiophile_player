@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+// Additional permission under GPLv3 section 7: see NOTICE for WDK/KMDF/ACX linking.
+
 use std::env;
 use std::path::{Path, PathBuf};
 

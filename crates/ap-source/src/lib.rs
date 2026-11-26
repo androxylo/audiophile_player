@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Audio sources: local FLAC files, HTTP/UPnP lossless streams, and Milestone 2 Tidal/capture interfaces.
 
 pub mod flac;

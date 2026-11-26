@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Pure-Rust UPnP AV 1.0 MediaRenderer (`urn:schemas-upnp-org:device:MediaRenderer:1`).
 //!
 //! Enables zero-mixer, rate-following lossless playback from **foobar2000 ≥ 2.25** (built-in

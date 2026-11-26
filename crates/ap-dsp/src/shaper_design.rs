@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Clean-room `8fS` (`352.8 / 384 kHz`) minimum-phase FIR error-feedback noise-shaper designer
 //! and frozen runtime coefficient tables (`docs/research/04-noise-shapers.md` §2.3–§6.2).
 //!

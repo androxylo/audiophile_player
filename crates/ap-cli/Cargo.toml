@@ -1,8 +1,12 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 androxylo
+
 [package]
 name = "ap-cli"
 description = "Headless CLI binary wiring ap-source -> ap-dsp -> ap-output-win + rudimentary ap-control server"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
 repository.workspace = true
 

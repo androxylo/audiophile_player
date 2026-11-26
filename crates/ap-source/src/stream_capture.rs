@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Live exclusive-mode kernel stream capture source (`\\.\ApExclusiveAudio`).
 //!
 //! Connects to Audiophile Player's opt-in pure-Rust KMDF + ACX 1.1 virtual render driver

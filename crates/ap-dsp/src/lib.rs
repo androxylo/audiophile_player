@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Pure IEEE 754 `f64` DSP pipeline locked to `352.8 kHz` and `384 kHz` (`8fS`).
 //!
 //! Hard invariants:

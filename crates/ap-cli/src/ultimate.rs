@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Ultimate Mode `W0 -> W1 -> W2 -> W3 -> W4` bounded 30 s look-ahead streaming track engine
 //! (`docs/research/07-ultimate-mode.md` §§2–5, Mandates M1–M4, `OQ-33..OQ-41`).
 //!

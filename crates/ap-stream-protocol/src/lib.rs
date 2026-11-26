@@ -1,8 +1,10 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Shared `#![no_std]` ABI and pure-Rust host-testable timing/ring math between
 //! `ap-exclusive-acx` (KMDF + ACX 1.1 kernel render driver) and `ap-source::stream_capture`
 //! (user-mode engine reader).
 //!
-//! SPDX-License-Identifier: GPL-3.0-or-later
 #![no_std]
 
 use core::mem::{offset_of, size_of};

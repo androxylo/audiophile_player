@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Comprehensive TDD verification suite for `INV-04` `8fS` error-feedback noise shapers
 //! (`docs/research/04-noise-shapers.md` §6.7 — all 6 verification gates).
 

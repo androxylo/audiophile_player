@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 androxylo
+
 """Clean-room 8fS (352.8 / 384 kHz) minimum-phase error-feedback noise-shaper designer.
 
 Implements docs/research/04-noise-shapers.md §2.3–§5:

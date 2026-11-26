@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 androxylo
+
 <#
 .SYNOPSIS
     Installs Windows Desktop and Start Menu shortcuts for Audiophile Player.

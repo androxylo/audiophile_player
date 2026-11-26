@@ -1,6 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+// Additional permission under GPLv3 section 7: see NOTICE for WDK/KMDF/ACX linking.
+
 // Pure-Rust `#![no_std]` KMDF 1.31 + ACX 1.1 Virtual Render Audio Driver
 // Production opt-in exclusive-mode target ("Audiophile Player") for Tidal Desktop & WASAPI Exclusive.
-// SPDX-License-Identifier: GPL-3.0-or-later
 #![no_std]
 
 #[allow(

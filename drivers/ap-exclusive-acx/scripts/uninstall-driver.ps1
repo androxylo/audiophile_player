@@ -1,4 +1,7 @@
-﻿# Run as Administrator to cleanly uninstall ROOT\ApExclusiveAudio, its Driver Store package,
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 androxylo
+
+# Run as Administrator to cleanly uninstall ROOT\ApExclusiveAudio, its Driver Store package,
 # admin staging folder, and all local test-signing certificates (+ private keys).
 #
 # Test Mode behavior (Review #8 D7):
@@ -141,7 +144,7 @@ if ($failures.Count -gt 0) {
 }
 
 if ($rebootRequired) {
-    Write-Host "`nUninstalled — REBOOT REQUIRED (exit 3010) to finish removing the driver / leaving Test Mode." -ForegroundColor Yellow
+    Write-Host "`nUninstalled - REBOOT REQUIRED (exit 3010) to finish removing the driver / leaving Test Mode." -ForegroundColor Yellow
     exit 3010
 }
 

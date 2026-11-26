@@ -1,4 +1,7 @@
-﻿# Assembles a self-contained Windows x64 release archive under dist\audiophile-player-v<ver>-win-x64.zip.
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 androxylo
+
+# Assembles a self-contained Windows x64 release archive under dist\audiophile-player-v<ver>-win-x64.zip.
 #
 # The release bundle contains:
 #   - audiophile-player.exe + audiophile-player.example.toml
@@ -106,7 +109,7 @@ $wsMemberIds = [System.Collections.Generic.HashSet[string]]::new()
 foreach ($id in $meta.workspace_members) { [void]$wsMemberIds.Add($id) }
 
 $sb = New-Object System.Text.StringBuilder
-[void]$sb.AppendLine("Audiophile Player v$version — Third-Party Rust Crate Licenses & Notices")
+[void]$sb.AppendLine("Audiophile Player v$version - Third-Party Rust Crate Licenses & Notices")
 [void]$sb.AppendLine("========================================================================")
 [void]$sb.AppendLine("")
 [void]$sb.AppendLine("Audiophile Player itself is licensed under GPL-3.0-or-later (see LICENSE).")
@@ -193,7 +196,7 @@ if ($forbidden) {
     throw "Forbidden files found in release staging dir: $(($forbidden | ForEach-Object FullName) -join ', ')"
 }
 
-# Review #8 D13: Strict manifest allowlist — fail if ANY unexpected file would enter the release zip!
+# Review #8 D13: Strict manifest allowlist - fail if ANY unexpected file would enter the release zip!
 $allowedManifest = @(
     "audiophile-player.exe",
     "audiophile-player.example.toml",

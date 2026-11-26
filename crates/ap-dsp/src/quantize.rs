@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Single final floating-point -> integer PCM quantization stage, `8fS` minimum-phase
 //! error-feedback noise shaping (`docs/research/04-noise-shapers.md`), and `<= 0 dB` safety headroom.
 //!

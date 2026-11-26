@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! UPnP GENA eventing (`SUBSCRIBE`, renewal, `UNSUBSCRIBE`, and background `NOTIFY` delivery).
 //!
 //! Security & reliability hardening (Review #5 Findings #25 & #33):

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! TDD unit & live localhost HTTP integration tests for `ap-control`.
 
 use std::fs;

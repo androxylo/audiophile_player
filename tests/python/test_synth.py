@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 androxylo
+
 """TDD unit tests for copyright-free synthetic test signal generation."""
 
 import numpy as np

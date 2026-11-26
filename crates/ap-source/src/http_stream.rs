@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Pure-Rust bounded-memory HTTP/1.1 streaming lossless audio source (`AudioBlockSource`).
 //!
 //! Designed for UPnP AV MediaRenderer playback (foobar2000 ≥ 2.25 built-in UPnP output,

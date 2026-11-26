@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Audirvana-style Direct Windows Kernel Streaming (`WDM-KS`) WaveRT backend.
 //!
 //! Communicates directly with `usbaudio2.sys` (or any WDM-KS WaveRT audio driver) via:

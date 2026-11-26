@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Bounded-memory streaming RFC 9639 FLAC decoding (16-bit, 24-bit, and 32-bit FLAC 1.4+)
 //! plus ReplayGain / True Peak Vorbis comment parsing.
 //!

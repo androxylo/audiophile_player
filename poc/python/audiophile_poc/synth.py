@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 androxylo
+
 """Copyright-free deterministic synthetic audio signals for TDD and hardware verification.
 
 All synthesis runs strictly in IEEE 754 float64 and converts once to integer PCM

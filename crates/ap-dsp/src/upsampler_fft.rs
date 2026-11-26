@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Lossless zero-stuffed tiled-FFT Uniform Partitioned Overlap-Save (UPOLS) `f64` upsampler.
 //!
 //! Architectural properties (`docs/research/07-ultimate-mode.md` §1, `UPSAMPLING_RESEARCH.md` §4.2):

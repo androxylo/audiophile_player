@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+// Additional permission under GPLv3 section 7: see NOTICE for WDK/KMDF/ACX linking.
+
 // Kernel-mode header wrapper for bindgen (WDK 10.0.26100, KMDF 1.31, ACX 1.1)
 #define _AMD64_ 1
 #define AMD64 1

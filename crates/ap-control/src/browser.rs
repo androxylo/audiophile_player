@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Single-folder directory listing (never recursive), lossless OS path tokens, and URL/HTML/JSON
 //! encoding helpers.
 

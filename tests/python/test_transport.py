@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 androxylo
+
 """TDD unit tests enforcing the strict zero-Windows-mixer transport invariant."""
 
 import pytest

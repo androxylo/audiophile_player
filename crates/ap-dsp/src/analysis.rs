@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Dual-mode pure-`f64` content analysers (`H`, `A`, `L`, `B`, 4× BS.1770 true-peak meter, and
 //! report-only pre-emphasis shelf heuristic) shared by 30 s window analysis (`W30`), streaming
 //! whole-track learn-on-play (`WT`), and offline library scanning (`ap scan`).

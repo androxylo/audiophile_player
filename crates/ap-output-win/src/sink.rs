@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Abstract zero-mixer Windows output sink trait and structured error types.
 
 use std::fmt;

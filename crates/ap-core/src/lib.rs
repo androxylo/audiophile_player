@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Core domain types and strict invariants shared across all crates.
 //!
 //! Enforces:

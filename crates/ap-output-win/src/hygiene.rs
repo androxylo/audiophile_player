@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Windows real-time playback hygiene helpers.
 //!
 //! - MMCSS `"Pro Audio"` thread elevation (`AvSetMmThreadCharacteristicsW` via `avrt.dll`).

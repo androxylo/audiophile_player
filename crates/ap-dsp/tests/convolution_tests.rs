@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;

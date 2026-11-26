@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Graceful Windows interrupt & termination signal handling.
 //!
 //! Uses Win32 `SetConsoleCtrlHandler` directly (zero external crates) to intercept:

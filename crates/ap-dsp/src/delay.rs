@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Optional per-channel room alignment delay stage (`352.8 / 384 kHz` pure `f64`, block-streaming).
 //!
 //! At `352.8 / 384 kHz`, 1 sample is ~2.6 microseconds (~0.9 mm acoustic distance),

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 use std::io::{Cursor, Read, Write};
 use std::net::TcpListener;
 use std::sync::Arc;

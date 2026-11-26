@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 androxylo
+
 # Run as Administrator to hot-update ap_exclusive_audio.sys (NO REBOOT NEEDED when idle).
 # Works both inside a source checkout and inside an unpacked release zip.
 # Enforces SHA-256 verification, admin-only staging, ephemeral signing, exit code checking,

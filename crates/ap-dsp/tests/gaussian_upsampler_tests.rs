@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Issue #5 §6 & Issue #6 §4 mathematical verification suite for the Phase 1 default Gaussian
 //! windowed-sinc upsamplers (`gauss-long-lp` and `gauss-hires-lp`) and dummy `DefaultFilterSelector`.
 //!

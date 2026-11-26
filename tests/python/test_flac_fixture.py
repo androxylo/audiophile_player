@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 androxylo
+
 """TDD tests for the copyright-free 24/96 algorithmic FLAC fixture and RAM loader."""
 
 from pathlib import Path

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Decided audiophile safety headroom & convolution excess-scaling policy (`HEADROOM_DESIGN.md`).
 //!
 //! Strict per-track rules:

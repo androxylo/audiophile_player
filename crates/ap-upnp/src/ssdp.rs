@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! SSDP multicast discovery (`239.255.255.250:1900`) for UPnP AV MediaRenderer:1.
 //!
 //! - Uses `SO_REUSEADDR` on Windows via `Win32_Networking_WinSock` so the renderer coexists

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 androxylo
+
 # Builds ap_exclusive_audio.sys + ap_exclusive_audio.inf + ap_exclusive_audio.cat
 # using either the local .wdk\kit cache or a system WDK 10.0.26100 install (no Admin needed).
 #

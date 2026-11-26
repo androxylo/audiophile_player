@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Dynamic per-track upsampler & 8fS noise-shaper picker with pluggable [`FilterSelector`].
 //!
 //! Architectural design:

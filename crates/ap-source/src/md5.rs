@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Zero-dependency clean-room RFC 1321 MD5 & RFC 9639 §8.2 streaming FLAC sample MD5 verifier.
 //!
 //! Used by Ultimate Mode learn-on-play (`U5b` / `U14`, `docs/research/07-ultimate-mode.md` §5.2):

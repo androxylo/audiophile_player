@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Phase 1 (§1 & U7) lossless FFT/UPOLS upsampler equivalence & full-tail REW verification.
 //!
 //! Acceptance gates (`docs/research/07-ultimate-mode.md` §1 & U7):

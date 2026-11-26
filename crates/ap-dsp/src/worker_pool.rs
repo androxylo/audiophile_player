@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Persistent zero-dependency scoped worker pools for real-time-safe parallel DSP (Review #7 F12).
 //!
 //! Eliminates per-block OS thread creation (`std::thread::scope` / `CreateThread` + 2 MB stack

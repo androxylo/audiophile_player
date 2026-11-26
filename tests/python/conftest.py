@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 androxylo
+
 """Ensure `poc/python` is importable even without editable installation."""
 
 from pathlib import Path

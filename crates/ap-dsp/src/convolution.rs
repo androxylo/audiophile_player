@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Core first-class REW stereo convolution stage (`352.8 / 384 kHz` pure `f64`, block-streaming).
 //!
 //! ## Pipeline Position (INV-05)

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! UPnP AV 1.0 SOAP service dispatchers:
 //! - `AVTransport:1`
 //! - `ConnectionManager:1` (lossless-only sink MIME types — zero lossy transcoding)

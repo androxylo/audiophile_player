@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! TDD tests for bit-exact full-memory FLAC decoding in `ap-source`.
 
 use std::fs;

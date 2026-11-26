@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Dedicated bounded HTTP/1.1 server for UPnP XML, SOAP control, and GENA eventing.
 //!
 //! Strictly separate from `ap-control` (which stays 127.0.0.1-only with CSRF/Origin checks).

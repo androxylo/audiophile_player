@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Ultra-minimal HTML control page and lightweight JSON status serializer.
 //!
 //! Deliberately excludes volume controls, EQ/DSP sliders, and heavy JS frameworks.

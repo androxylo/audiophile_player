@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Zero-dependency strict Schema-1 YAML Track Database (`FILTER_SELECTION_RESEARCH.md` §§7.9–7.10,
 //! `HEADROOM_DESIGN.md` §4, `docs/research/07-ultimate-mode.md` U5b/U5c).
 //!

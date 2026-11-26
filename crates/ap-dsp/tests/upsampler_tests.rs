@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! TDD mathematical verification tests for the stateful streaming `f64` windowed-sinc
 //! upsampler (`SimpleWindowedSincUpsampler`), zero-copy `NullUpsampler`, chunk-boundary
 //! bit-exact equivalence, and final `f64 -> i32` TPDF quantizer.

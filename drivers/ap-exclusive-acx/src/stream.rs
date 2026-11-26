@@ -1,6 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+// Additional permission under GPLv3 section 7: see NOTICE for WDK/KMDF/ACX linking.
+
 // ACX 1.1 WaveRT Render Stream implementation in pure `#![no_std]` Rust with interior-mutable
 // per-stream spinlock guard (zero `&mut` aliasing UB, Review #8 A2/A3/A4/A8/A9/A10/A11).
-// SPDX-License-Identifier: GPL-3.0-or-later
 
 use core::cell::UnsafeCell;
 use core::mem::size_of;

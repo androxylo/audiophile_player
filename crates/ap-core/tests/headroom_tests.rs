@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! TDD unit tests for the decided `-3 dB` / `0 dB` upsampler headroom & excess-only
 //! convolution scaling policy (`HEADROOM_DESIGN.md`).
 

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! TDD end-to-end tests for the tidy 5-stage `AudioPipeline` (with null convolver & delay).
 
 use std::sync::Arc;

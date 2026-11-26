@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Shared UPnP MediaRenderer transport state synchronized between `ap-upnp` SOAP/GENA and
 //! the `ap-cli` audio engine.
 

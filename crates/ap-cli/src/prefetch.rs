@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Bounded-memory streaming PCM block buffer between the DSP Producer and WDM-KS Consumer.
 //!
 //! Designed for BOTH arbitrarily large FLAC files (multi-hour 32/384 masters) AND continuous

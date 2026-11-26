@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Event-driven WASAPI Exclusive (`AUDCLNT_SHAREMODE_EXCLUSIVE`) backend.
 //!
 //! Uses in-process `AudioSes.dll` to evict shared-mode clients (`audiodg.exe`), map the

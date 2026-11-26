@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Phase 2 verification suite covering all curated filter archetypes (`#3`–`#8`, `OQ-37` HF noise
 //! filter, `U8` double-double kernel design) per `UPSAMPLING_RESEARCH.md` §6 Tests 0–8, plus the
 //! `OQ-39` Ryzen 9 7900 real-time throughput benchmark (`#3`/`#4` + 4M-tap full-tail REW).

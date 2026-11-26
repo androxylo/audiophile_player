@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 androxylo
+
 """Full-memory RAM FLAC loader & zero-mixer playback helper."""
 
 from __future__ import annotations

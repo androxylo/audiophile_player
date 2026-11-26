@@ -1,5 +1,8 @@
-// Inline dispatch wrappers around bindgen-generated KMDF 1.31 & ACX 1.1 function tables.
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+// Additional permission under GPLv3 section 7: see NOTICE for WDK/KMDF/ACX linking.
+
+// Inline dispatch wrappers around bindgen-generated KMDF 1.31 & ACX 1.1 function tables.
 #![allow(dead_code)]
 
 use core::ffi::c_void;

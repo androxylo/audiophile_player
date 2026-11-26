@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! PCM sample rates, locked `352.8 / 384 kHz` DSP families, and integer DAC wire formats.
 
 /// Locked `8fS` floating-point DSP target rates (integer multiples of 44.1 / 48 kHz families).

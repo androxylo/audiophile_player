@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 androxylo
+
 """Original, copyright-free (CC0) physical-modeling acoustic chamber duet.
 
 Synthesizes a warm, intimate 14-second nylon-string acoustic guitar & upright

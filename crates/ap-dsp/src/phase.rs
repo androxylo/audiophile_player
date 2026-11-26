@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Building Block C: Cepstral minimum-phase and intermediate-phase conversion
 //! (`UPSAMPLING_RESEARCH.md` §4.3 — `#6 minphase-long`, `#7 intermediate-long`, `#8b short-mp`).
 //!

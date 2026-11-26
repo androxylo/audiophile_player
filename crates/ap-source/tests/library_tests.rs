@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Offline TDD unit tests for resilient O(depth) random subfolder-walk FLAC picker.
 
 use std::collections::HashSet;

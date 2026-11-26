@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Phase 3 TDD tests: extended FLAC `TrackMetadata` (`VORBIS_COMMENT` + `CUESHEET` pre-emphasis
 //! & `OQ-41` mixed flags) and exact RFC 9639 §8.2 streaming `FlacSampleMd5Hasher` verification
 //! against `flac-codec`'s `STREAMINFO.md5` on mono/stereo 16-bit and 24-bit FLAC files.

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Engine configuration schema & zero-dependency TOML config file loader.
 //!
 //! Configures **REW stereo convolution** (`[convolution]`), **quantizer / noise shaping**

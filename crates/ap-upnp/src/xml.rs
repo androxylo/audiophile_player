@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! UPnP Device Description XML, SCPD XMLs, bounded SOAP/DIDL-Lite parsing, and duration helpers.
 
 /// Metadata extracted from a DIDL-Lite XML payload (`CurrentURIMetaData` / `NextURIMetaData`).

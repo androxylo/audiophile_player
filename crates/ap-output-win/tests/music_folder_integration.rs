@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Full end-to-end integration test: pick a random FLAC from `~/Music` using the
 //! scalable O(depth) subfolder-walk picker (resilient to 20,000+ track libraries;
 //! zero copyrighted music is ever stored in the repository) and play it for 10 seconds

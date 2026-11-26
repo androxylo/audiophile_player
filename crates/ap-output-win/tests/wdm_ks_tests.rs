@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Test-First (TDD) verification suite for native Rust Windows Kernel Streaming (`WDM-KS`).
 //!
 //! Structure:

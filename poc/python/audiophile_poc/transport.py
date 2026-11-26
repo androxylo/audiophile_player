@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 androxylo
+
 """Strictly zero-mixer Windows audio transport (WDM-KS and WASAPI Exclusive ONLY).
 
 Policy enforced at runtime:

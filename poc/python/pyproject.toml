@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 androxylo
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
@@ -6,6 +9,8 @@ build-backend = "setuptools.build_meta"
 name = "audiophile-poc"
 version = "0.1.0"
 description = "Zero-mixer Windows audio transport & DSP prototypes for audiophile_player"
+authors = [{ name = "androxylo" }]
+license = { text = "GPL-3.0-or-later" }
 requires-python = ">=3.11"
 dependencies = [
     "numpy>=1.26",

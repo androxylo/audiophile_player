@@ -2,8 +2,10 @@ THIRD-PARTY NOTICES & ADDITIONAL LICENSING PERMISSION
 Audiophile Player Exclusive ACX Virtual Audio Driver (`ap-exclusive-acx`)
 
 ===========================================================================
-1. GPLv3 Section 7 Additional Permission (Windows Driver Kit Linking)
+1. Copyright & GPLv3 Section 7 Additional Permission (WDK Linking)
 ===========================================================================
+
+Copyright (C) 2026 androxylo
 
 This driver is licensed under the GNU General Public License, version 3 or
 (at your option) any later version (GPL-3.0-or-later).

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 androxylo
+
 <#
 .SYNOPSIS
     Launches Audiophile Player (if not already running) and opens its local HTTP control UI.

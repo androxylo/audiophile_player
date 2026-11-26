@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Offline parallel, incremental, resumable FLAC library scanner (`audiophile-player scan`,
 //! `docs/research/07-ultimate-mode.md` U5c).
 //!

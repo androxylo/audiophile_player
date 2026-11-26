@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Bounded action-history ring buffer for the bottom status panel.
 //!
 //! Automatically discards entries beyond `max_entries` (default `50`) so memory usage

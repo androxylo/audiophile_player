@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Headless `audiophile-player` binary entrypoint.
 //!
 //! Default mode (no command-line options): immediately starts playing random FLAC files
@@ -13,7 +16,7 @@ mod ultimate;
 
 use std::process::ExitCode;
 
-use cli_args::{RunMode, help_text, parse_args};
+use cli_args::{RunMode, help_text, parse_args, version_text};
 
 fn main() -> ExitCode {
     let mode = match parse_args(std::env::args_os()) {
@@ -26,6 +29,10 @@ fn main() -> ExitCode {
 
     if mode == RunMode::Help {
         print!("{}", help_text());
+        return ExitCode::SUCCESS;
+    }
+    if mode == RunMode::Version {
+        print!("{}", version_text());
         return ExitCode::SUCCESS;
     }
 
@@ -94,7 +101,7 @@ fn main() -> ExitCode {
             },
             controller,
         ),
-        RunMode::Help => unreachable!(),
+        RunMode::Help | RunMode::Version => unreachable!(),
     };
 
     controller.mark_cleanup_complete();

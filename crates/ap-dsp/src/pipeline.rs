@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Tidy, linear, bounded-memory streaming pure-`f64` audio processing pipeline.
 //!
 //! Designed so multi-hour 32-bit/384 kHz FLACs and continuous live streams (Milestone 2

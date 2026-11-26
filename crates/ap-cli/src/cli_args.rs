@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Minimal zero-dependency CLI argument parser.
 //!
 //! Default behavior with **zero arguments**: immediately plays random FLAC files from
@@ -84,6 +87,8 @@ pub enum RunMode {
     Idle,
     /// Print concise help text and exit `0`.
     Help,
+    /// Print version, copyright, and GNU GPLv3+ license/no-warranty notice and exit `0`.
+    Version,
 }
 
 fn require_utf8_arg(flag: &str, raw: OsString) -> Result<String, String> {
@@ -128,6 +133,7 @@ where
         })?;
         match arg {
             "-h" | "--help" => return Ok(RunMode::Help),
+            "-V" | "--version" => return Ok(RunMode::Version),
             "--idle" => idle = true,
             "--config" => {
                 let val = iter
@@ -366,6 +372,7 @@ where
         };
         match arg {
             "-h" | "--help" => return Ok(RunMode::Help),
+            "-V" | "--version" => return Ok(RunMode::Version),
             "--report" => report = true,
             "--sidecar" => sidecar = true,
             "--post-chain" => post_chain = true,
@@ -490,7 +497,22 @@ pub fn help_text() -> String {
            --trackdb-sidecar    Persist `<track.flac>.ap.yaml` sidecars next to local files\n\
            --opt <LEVEL>        KS priority tier: normal | high | extreme (default: high)\n\
            --idle               Start idle without opening audio hardware (signal test mode)\n\
-           -h, --help           Show this help message\n",
+           -V, --version        Show version, copyright, and GNU GPLv3+ license notice\n\
+           -h, --help           Show this help message\n\
+         \n\
+         Copyright (C) 2026 androxylo — License GPL-3.0-or-later (NO WARRANTY).\n",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+/// Standard FSF GNU GPLv3+ `--version` notice.
+pub fn version_text() -> String {
+    format!(
+        "audiophile-player v{}\n\
+         Copyright (C) 2026 androxylo\n\
+         License GPLv3+: GNU GPL version 3 or later <https://gnu.org/licenses/gpl.html>.\n\
+         This is free software: you are free to change and redistribute it.\n\
+         There is NO WARRANTY, to the extent permitted by law.\n",
         env!("CARGO_PKG_VERSION")
     )
 }

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Shared control state bridging the low-priority HTTP server thread and the audio engine.
 //!
 //! Pause and Stop are intentionally a single unified action ([`ControlCommand::Pause`]):

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Extremely rudimentary local HTTP control interface for out-of-the-box zero-CLI testing.
 //!
 //! Strict scope:

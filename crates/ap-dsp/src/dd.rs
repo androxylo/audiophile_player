@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Zero-dependency double-double (~106-bit IEEE 754 `f64 + f64`) arithmetic for U8 kernel design.
 //!
 //! Used exclusively during one-time filter prototype synthesis (`sinc`, Gaussian/Kaiser windows,

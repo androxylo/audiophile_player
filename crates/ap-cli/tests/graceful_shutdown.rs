@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Integration test verifying that the real compiled `audiophile-player.exe` binary:
 //! 1. Starts and prints its startup line.
 //! 2. Stays alive cleanly until interrupted.

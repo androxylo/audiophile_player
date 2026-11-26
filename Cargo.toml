@@ -1,8 +1,7 @@
-# Audiophile Player — Rust Production Workspace (Architectural Outline)
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 androxylo
 #
-# Status: Structural skeleton only. Implementation begins after Phase 0 research
-# and Python/C++ POC validation. Third-party crate dependencies will be vetted
-# for open-source license compatibility in docs/research/08-architecture-and-verification.md.
+# Audiophile Player — Pure-f64 8fS Windows Kernel-Streaming Rust Workspace
 
 [workspace]
 resolver = "2"
@@ -20,6 +19,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+authors = ["androxylo"]
 license = "GPL-3.0-or-later"
 repository = "https://github.com/androxylo/audiophile_player"
 

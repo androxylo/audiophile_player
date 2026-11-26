@@ -1,8 +1,12 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 androxylo
+
 [package]
 name = "ap-upnp"
 description = "Pure-Rust UPnP AV MediaRenderer (SSDP, AVTransport:1, ConnectionManager:1, RenderingControl:1, GENA eventing) for foobar2000 and BubbleUPnP"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
 repository.workspace = true
 

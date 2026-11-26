@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Phase 6 TDD suite: `UltimateSelector`, §3 decision table, M3 `< 30 s` bypass, M4 streaming
 //! guard against `gauss-apod-4m`, `OQ-34`, `OQ-35` genre rules (`A > L > G > R`), `OQ-37` HF
 //! noise filter, user overrides, and §4.3 throughput self-check refusal.

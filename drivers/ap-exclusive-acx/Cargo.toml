@@ -1,10 +1,16 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 androxylo
+# Additional permission under GPLv3 section 7: see NOTICE for WDK/KMDF/ACX linking.
+
 [workspace]
 
 [package]
 name = "ap-exclusive-acx"
 version = "0.1.0"
 edition = "2024"
+authors = ["androxylo"]
 license = "GPL-3.0-or-later"
+repository = "https://github.com/androxylo/audiophile_player"
 
 [lib]
 name = "ap_exclusive_audio"

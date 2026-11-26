@@ -1,5 +1,8 @@
-// Non-paged spinlock-protected kernel ring buffer, session isolation, and audiodg.exe zero-mixer gate.
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+// Additional permission under GPLv3 section 7: see NOTICE for WDK/KMDF/ACX linking.
+
+// Non-paged spinlock-protected kernel ring buffer, session isolation, and audiodg.exe zero-mixer gate.
 
 use core::mem::size_of;
 use core::ptr;

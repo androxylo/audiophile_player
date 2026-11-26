@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Metadata × Analyser Fusion Engine (`Evidence<T>` & §5.3 strict per-track fusion rules).
 //!
 //! Strictly per-track (`OQ-40`): every decision depends solely on this track's own user overrides,

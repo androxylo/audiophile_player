@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Extended per-track metadata (`TrackMetadata`) and normalized genre taxonomy
 //! (`FILTER_SELECTION_RESEARCH.md` §§1, 5; `docs/research/07-ultimate-mode.md` §5.5).
 //!

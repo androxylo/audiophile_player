@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Phase 4 TDD tests: Detectors H, A, L, B, 4× BS.1770 true-peak meter, `OQ-37` ultrasonic noise
 //! shelf detection, and all §5.3 Metadata × Analyser fusion rules (including stale peak tag
 //! disproof and strict per-track independence).

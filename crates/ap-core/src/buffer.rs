@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Audio buffer types separating internal `f64` DSP from final integer DAC output.
 
 /// Default bounded source block size (frames per channel) fed into the streaming DSP pipeline.

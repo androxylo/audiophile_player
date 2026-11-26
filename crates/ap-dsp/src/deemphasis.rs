@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Pure-`f64` zero-latency CD-DA 50/15 µs de-emphasis stage (`U6`, `FILTER_SELECTION_RESEARCH.md` §6,
 //! `docs/research/07-ultimate-mode.md` §4.1).
 //!

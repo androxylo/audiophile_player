@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 androxylo
+
 """Zero-mixer Windows audio prototypes for audiophile_player."""
 
 from .compose import compose_nocturne_float64, write_nocturne_flac

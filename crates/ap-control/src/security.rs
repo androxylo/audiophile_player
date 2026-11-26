@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 androxylo
+
 //! Path and HTTP request security helpers for the localhost control server and playback engine.
 //!
 //! Enforces:
