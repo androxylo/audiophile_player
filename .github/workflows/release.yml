@@ -14,7 +14,7 @@ on:
         required: false
         default: ''
       build_binary:
-        description: 'Build and attach opt-in verified Windows x64 app zip + SHA256SUMS + attestation'
+        description: 'Build and attach verified Windows x64 app zip + opt-in driver zip + SHA256SUMS + attestations'
         type: boolean
         required: false
         default: true
@@ -30,6 +30,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -37,7 +39,7 @@ jobs:
       - name: Run workspace unit tests
         shell: pwsh
         run: |
-          cargo test --release --workspace -- --skip hardware_live --skip plays_random_flac_from_user_music
+          cargo test --release --workspace --locked -- --skip hardware_live --skip plays_random_flac_from_user_music
 
       - name: Determine release tag and version
         id: meta
@@ -49,6 +51,9 @@ jobs:
           $tag = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" }
                  elseif ("${{ inputs.tag }}") { "${{ inputs.tag }}" }
                  else { "v$ver" }
+          if ($tag -match '^v(\d+\.\d+\.\d+)$' -and $Matches[1] -ne $ver) {
+            throw "Release tag '$tag' does not match Cargo.toml version '$ver'"
+          }
           echo "version=$ver" >> $env:GITHUB_OUTPUT
           echo "tag=$tag" >> $env:GITHUB_OUTPUT
 
@@ -58,22 +63,39 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item -Force scripts\bootstrap.ps1 dist\bootstrap.ps1
 
-      - name: Build opt-in Windows x64 app zip (no kernel driver)
+      - name: Build verified Windows x64 app zip (no kernel driver) + opt-in Tidal driver zip
         if: ${{ github.event_name == 'push' || inputs.build_binary }}
         shell: pwsh
         run: |
           powershell -ExecutionPolicy Bypass -File scripts\package-release.ps1 -WithoutDriver
-          $zip = Get-ChildItem dist\audiophile-player-v*-win-x64.zip | Select-Object -First 1
-          if (-not $zip) { throw "Release zip missing in dist\" }
-          $hash = (Get-FileHash -Algorithm SHA256 -Path $zip.FullName).Hash.ToLowerInvariant()
-          "$hash  $($zip.Name)" | Set-Content -LiteralPath dist\SHA256SUMS -Encoding ASCII
-          echo "ZIP_PATH=$($zip.FullName)" >> $env:GITHUB_ENV
+          if ($LASTEXITCODE -ne 0) { throw "App release packaging failed with $LASTEXITCODE" }
+
+          powershell -ExecutionPolicy Bypass -File scripts\package-release.ps1 -DriverOnly -FetchWdk
+          if ($LASTEXITCODE -ne 0) { throw "Driver release packaging failed with $LASTEXITCODE" }
+
+          $appZip = Get-ChildItem dist\audiophile-player-v*-win-x64.zip | Where-Object { $_.Name -notmatch '-driver-' } | Select-Object -First 1
+          $drvZip = Get-ChildItem dist\audiophile-player-driver-v*-win-x64.zip | Select-Object -First 1
+          if (-not $appZip) { throw "App release zip missing in dist\" }
+          if (-not $drvZip) { throw "Driver release zip missing in dist\" }
+
+          $shaLines = New-Object System.Collections.Generic.List[string]
+          foreach ($f in @($appZip, $drvZip, (Get-Item dist\bootstrap.ps1))) {
+            $h = (Get-FileHash -Algorithm SHA256 -Path $f.FullName).Hash.ToLowerInvariant()
+            $shaLines.Add("$h  $($f.Name)")
+          }
+          Set-Content -LiteralPath dist\SHA256SUMS -Value ($shaLines -join "`n") -Encoding ASCII
+
+          echo "APP_ZIP_PATH=$($appZip.FullName)" >> $env:GITHUB_ENV
+          echo "DRV_ZIP_PATH=$($drvZip.FullName)" >> $env:GITHUB_ENV
 
       - name: Attest build provenance
         if: ${{ github.event_name == 'push' || inputs.build_binary }}
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: ${{ env.ZIP_PATH }}
+          subject-path: |
+            ${{ env.APP_ZIP_PATH }}
+            ${{ env.DRV_ZIP_PATH }}
+            dist/bootstrap.ps1
 
       - name: Create or update GitHub Release
         shell: pwsh
@@ -81,13 +103,54 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $tag = "${{ steps.meta.outputs.tag }}"
+          $ver = "${{ steps.meta.outputs.version }}"
           $assets = @("dist\bootstrap.ps1")
           if (Test-Path "dist\SHA256SUMS") {
-            $assets += @("dist\SHA256SUMS", $env:ZIP_PATH, ($env:ZIP_PATH + ".sha256"))
+            $assets += @(
+              "dist\SHA256SUMS",
+              $env:APP_ZIP_PATH,
+              ($env:APP_ZIP_PATH + ".sha256"),
+              $env:DRV_ZIP_PATH,
+              ($env:DRV_ZIP_PATH + ".sha256")
+            )
           }
+
+          $notes = @"
+## Install (Windows 10/11 x64)
+
+**Recommended — build from source** (transparent, verifiable):
+``````powershell
+irm https://github.com/androxylo/audiophile_player/releases/latest/download/bootstrap.ps1 | iex
+``````
+
+**Opt-in verified prebuilt binary** (no compiler, no admin prompt, zero kernel `.sys` files):
+``````powershell
+& ([scriptblock]::Create((irm https://github.com/androxylo/audiophile_player/releases/latest/download/bootstrap.ps1))) -Binary
+``````
+
+## Release Assets
+
+| Asset | Contents |
+|---|---|
+| ``bootstrap.ps1`` | One-line Windows installer (builds from source by default; ``-Binary`` verifies SHA-256 + GitHub provenance attestation) |
+| ``audiophile-player-v$ver-win-x64.zip`` | Standalone Windows x64 player, docs, shortcuts, and third-party notices (no kernel driver) |
+| ``audiophile-player-driver-v$ver-win-x64.zip`` | **Opt-in** unsigned ACX 1.1 virtual render driver for Tidal Desktop Exclusive Mode (Windows 11 22H2+ x64 only; requires Secure Boot OFF + Test Mode ON — read [Getting Started](https://github.com/androxylo/audiophile_player/blob/$tag/docs/GETTING_STARTED.md#tidal-desktop-exclusive-mode-opt-in) first) |
+| ``SHA256SUMS`` | SHA-256 checksums for all downloadable assets (also individually attested via GitHub Build Provenance) |
+
+Verify provenance with GitHub CLI:
+``````powershell
+gh attestation verify audiophile-player-v$ver-win-x64.zip -R androxylo/audiophile_player
+``````
+
+Full setup guide: [Quick Start](https://github.com/androxylo/audiophile_player/blob/$tag/docs/QUICK_START.md) · [Getting Started](https://github.com/androxylo/audiophile_player/blob/$tag/docs/GETTING_STARTED.md) · [What's New](https://github.com/androxylo/audiophile_player/blob/$tag/docs/WHATS_NEW.md)
+"@
+          $notesFile = "dist\RELEASE_NOTES.md"
+          Set-Content -LiteralPath $notesFile -Value $notes -Encoding UTF8
+
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
             gh release upload $tag @assets --clobber
+            gh release edit $tag --title "Audiophile Player $tag" --notes-file $notesFile
           } else {
-            gh release create $tag @assets --title "Audiophile Player $tag" --generate-notes
+            gh release create $tag @assets --title "Audiophile Player $tag" --notes-file $notesFile
           }

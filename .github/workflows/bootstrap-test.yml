@@ -8,17 +8,21 @@ on:
   push:
     branches: [main]
     paths:
-      - 'scripts/bootstrap.ps1'
+      - 'scripts/*.ps1'
+      - 'drivers/ap-exclusive-acx/scripts/*.ps1'
       - '.config/configuration.winget'
       - '.vsconfig'
+      - '.github/workflows/bootstrap-test.yml'
       - 'crates/ap-cli/src/cli_spec.rs'
       - 'docs/CLI.md'
       - 'docs/GETTING_STARTED.md'
   pull_request:
     paths:
-      - 'scripts/bootstrap.ps1'
+      - 'scripts/*.ps1'
+      - 'drivers/ap-exclusive-acx/scripts/*.ps1'
       - '.config/configuration.winget'
       - '.vsconfig'
+      - '.github/workflows/bootstrap-test.yml'
       - 'crates/ap-cli/src/cli_spec.rs'
       - 'docs/CLI.md'
       - 'docs/GETTING_STARTED.md'
@@ -36,7 +40,17 @@ jobs:
       - name: Validate PowerShell syntax and bootstrap -WhatIf
         shell: pwsh
         run: |
-          foreach ($f in @("scripts\bootstrap.ps1", "scripts\package-release.ps1", "scripts\launch-audiophile-player.ps1")) {
+          $scripts = @(
+            "scripts\bootstrap.ps1",
+            "scripts\package-release.ps1",
+            "scripts\launch-audiophile-player.ps1",
+            "scripts\install-shortcuts.ps1",
+            "drivers\ap-exclusive-acx\scripts\build-and-sign.ps1",
+            "drivers\ap-exclusive-acx\scripts\install-driver.ps1",
+            "drivers\ap-exclusive-acx\scripts\update-driver.ps1",
+            "drivers\ap-exclusive-acx\scripts\uninstall-driver.ps1"
+          )
+          foreach ($f in $scripts) {
             $errs = $null
             [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f).Path, [ref]$null, [ref]$errs)
             if ($errs.Count -gt 0) { throw "Syntax error in $f : $($errs | Out-String)" }
@@ -47,19 +61,25 @@ jobs:
       - name: Build release binary and run drift-guard + workspace tests
         shell: pwsh
         run: |
-          cargo test --release --workspace -- --skip hardware_live --skip plays_random_flac_from_user_music
-          cargo build --release --bin audiophile-player
+          cargo test --release --workspace --locked -- --skip hardware_live --skip plays_random_flac_from_user_music
+          cargo build --release --locked --bin audiophile-player
 
       - name: Smoke test CLI JSON surfaces
         shell: pwsh
         run: |
-          .\target\release\audiophile-player.exe --version --json | ConvertFrom-Json | Out-Null
-          .\target\release\audiophile-player.exe help --json | ConvertFrom-Json | Out-Null
-          .\target\release\audiophile-player.exe config show --json | ConvertFrom-Json | Out-Null
-          .\target\release\audiophile-player.exe devices --json | ConvertFrom-Json | Out-Null
-          # doctor exits 0 or 3 on headless CI runners without a 352.8/384 kHz USB DAC
-          $doc = .\target\release\audiophile-player.exe doctor --json
-          $doc | ConvertFrom-Json | Out-Null
-          if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 3) {
-            throw "Unexpected doctor exit code on CI: $LASTEXITCODE"
+          $ver = .\target\release\audiophile-player.exe --version --json | ConvertFrom-Json
+          if ($ver.schema -ne 'ap.version/1') { throw "Unexpected version schema: $($ver.schema)" }
+          $help = .\target\release\audiophile-player.exe help --json | ConvertFrom-Json
+          if ($help.schema -ne 'ap.cli_spec/1') { throw "Unexpected help schema: $($help.schema)" }
+          $cfg = .\target\release\audiophile-player.exe config show --json | ConvertFrom-Json
+          if ($cfg.schema -ne 'ap.config/1') { throw "Unexpected config schema: $($cfg.schema)" }
+          $devs = .\target\release\audiophile-player.exe devices --json | ConvertFrom-Json
+          if ($devs.schema -ne 'ap.devices/1') { throw "Unexpected devices schema: $($devs.schema)" }
+          # doctor exits 0 (all checks ok) or 1 (blocking error such as no USB DAC on headless CI runners)
+          $docRaw = .\target\release\audiophile-player.exe doctor --json
+          $docExit = $LASTEXITCODE
+          $doc = ($docRaw -join "`n") | ConvertFrom-Json
+          if ($doc.schema -ne 'ap.doctor/1') { throw "Unexpected doctor schema: $($doc.schema)" }
+          if ($docExit -ne 0 -and $docExit -ne 1) {
+            throw "Unexpected doctor exit code on CI: $docExit"
           }

@@ -19,7 +19,7 @@ It exposes a stereo integer-PCM virtual endpoint (**`Line (Audiophile Player)`**
 
 ## Installing (From a Release Zip — Zero WDK Required)
 
-Extract the verified release archive into an admin-protected directory (e.g. `C:\Program Files\AudiophilePlayer`), unblock extracted files (`Get-ChildItem -Recurse | Unblock-File`), and open an **Administrator PowerShell** in `driver\` (or `drivers\ap-exclusive-acx\scripts\` in a source checkout):
+Download the opt-in **`audiophile-player-driver-vX.Y.Z-win-x64.zip`** and **`SHA256SUMS`** from [GitHub Releases](https://github.com/androxylo/audiophile_player/releases), verify the SHA-256 (and optionally `gh attestation verify`), extract into an admin-protected directory (e.g. `C:\Program Files\AudiophilePlayer-Driver`), unblock extracted files (`Get-ChildItem -Recurse | Unblock-File`), and open an **Administrator PowerShell** in the extracted folder (or `drivers\ap-exclusive-acx\scripts\` in a source checkout):
 
 ```powershell
 powershell -ExecutionPolicy RemoteSigned -File .\install-driver.ps1
@@ -36,7 +36,7 @@ In an **Administrator PowerShell**:
 
 ```powershell
 # Hot-update an already-installed driver without rebooting (when Tidal & Audiophile Player are closed):
-# From a release zip (inside driver\):
+# From an unpacked audiophile-player-driver-vX.Y.Z-win-x64.zip folder:
 powershell -ExecutionPolicy RemoteSigned -File .\update-driver.ps1
 # From a source checkout:
 powershell -ExecutionPolicy RemoteSigned -File drivers\ap-exclusive-acx\scripts\update-driver.ps1

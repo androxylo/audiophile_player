@@ -190,8 +190,8 @@ if (-not $Binary) {
     Push-Location $srcDir
     try {
         $commitSha = (& git rev-parse --short=12 HEAD).Trim()
-        Write-Step 'Building audiophile-player.exe (release)'
-        & cargo build --release --bin audiophile-player
+        Write-Step 'Building audiophile-player.exe (release, --locked)'
+        & cargo build --release --locked --bin audiophile-player
         if ($LASTEXITCODE -ne 0) { exit 30 }
         $cargoToml = Get-Content -LiteralPath (Join-Path $srcDir 'Cargo.toml') -Raw
         if ($cargoToml -match '(?m)^version\s*=\s*"([^"]+)"') { $installVer = $Matches[1] }
@@ -239,7 +239,7 @@ if (-not $Binary) {
     } catch {
         Fail "No published GitHub Release found at $apiUrl. Run without -Binary to build from source instead." 40
     }
-    $zipAsset = $rel.assets | Where-Object { $_.name -match '^audiophile-player-v.*-win-x64\.zip$' } | Select-Object -First 1
+    $zipAsset = $rel.assets | Where-Object { $_.name -match '^audiophile-player-v[0-9].*-win-x64\.zip$' } | Select-Object -First 1
     $shaAsset = $rel.assets | Where-Object { $_.name -eq 'SHA256SUMS' -or $_.name -eq ($zipAsset.name + '.sha256') } | Select-Object -First 1
     if (-not $zipAsset -or -not $shaAsset) {
         Fail 'Release is missing win-x64 zip or SHA-256 checksum asset. Run without -Binary to build from source.' 40
@@ -262,11 +262,26 @@ if (-not $Binary) {
         Write-Ok "SHA-256 verified: $zipSha"
 
         if (Get-Command gh -ErrorAction SilentlyContinue) {
-            & gh attestation verify $zipFile --repo $RepoSlug
-            if ($LASTEXITCODE -ne 0) {
-                Fail 'GitHub build provenance attestation verification FAILED.' 40
+            $ghAuthed = [bool]($env:GH_TOKEN -or $env:GITHUB_TOKEN)
+            if (-not $ghAuthed) {
+                $prevEap = $ErrorActionPreference
+                $ErrorActionPreference = 'Continue'
+                try {
+                    & gh auth status 2>$null | Out-Null
+                    $ghAuthed = ($LASTEXITCODE -eq 0)
+                } finally {
+                    $ErrorActionPreference = $prevEap
+                }
             }
-            Write-Ok 'GitHub build provenance attestation verified.'
+            if ($ghAuthed) {
+                & gh attestation verify $zipFile --repo $RepoSlug
+                if ($LASTEXITCODE -ne 0) {
+                    Fail 'GitHub build provenance attestation verification FAILED.' 40
+                }
+                Write-Ok 'GitHub build provenance attestation verified.'
+            } else {
+                Write-Warn "gh CLI is installed but not authenticated (run 'gh auth login'); skipped optional GitHub provenance attestation (SHA-256 already verified)."
+            }
         } else {
             Write-Warn 'gh CLI not installed; skipped optional GitHub provenance attestation (SHA-256 already verified).'
         }
@@ -304,7 +319,8 @@ if (-not $SkipShortcuts) {
 
 if ($RegisterMcp) {
     $mcpSnippet = Join-Path $Dir 'mcp-config.json'
-    $escapedExe = $activeExe.Replace('\', '\\')
+    $stableExe = Join-Path $Dir 'audiophile-player.exe'
+    $escapedExe = $stableExe.Replace('\', '\\')
     $json = "{`r`n  `"mcpServers`": {`r`n    `"audiophile-player`": {`r`n      `"command`": `"$escapedExe`",`r`n      `"args`": [`"mcp`"]`r`n    }`r`n  }`r`n}"
     Set-Content -LiteralPath $mcpSnippet -Value $json -Encoding ASCII
     Write-Ok "Wrote MCP server snippet to $mcpSnippet (merge into your AI client MCP config)."

@@ -9,6 +9,25 @@ fn main() {
     println!("cargo:rerun-if-env-changed=AP_GIT_COMMIT");
     println!("cargo:rerun-if-env-changed=AP_BUILD_DATE");
 
+    // Track git HEAD and its target ref so AP_GIT_COMMIT / AP_BUILD_DATE stay fresh across commits/tags.
+    let git_dir = std::path::Path::new("../../.git");
+    let head_path = git_dir.join("HEAD");
+    if head_path.is_file() {
+        println!("cargo:rerun-if-changed={}", head_path.display());
+        if let Ok(head_text) = std::fs::read_to_string(&head_path) {
+            if let Some(ref_rel) = head_text.trim().strip_prefix("ref: ") {
+                let ref_path = git_dir.join(ref_rel.trim());
+                if ref_path.is_file() {
+                    println!("cargo:rerun-if-changed={}", ref_path.display());
+                }
+            }
+        }
+        let packed_refs = git_dir.join("packed-refs");
+        if packed_refs.is_file() {
+            println!("cargo:rerun-if-changed={}", packed_refs.display());
+        }
+    }
+
     let commit = std::env::var("AP_GIT_COMMIT")
         .ok()
         .filter(|s| !s.trim().is_empty())

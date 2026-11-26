@@ -167,30 +167,33 @@ See [Troubleshooting](#troubleshooting) for what to do with each.
 (or `powershell -ExecutionPolicy Bypass -File .\bootstrap.ps1 -Binary` if you downloaded it as in A2).
 
 The installer then:
-1. Asks GitHub for the latest release (or the tag given with `-Ref v0.2.0`).
-2. Downloads `audiophile-player-vX.Y.Z-win-x64.zip` and `SHA256SUMS`, and **refuses to continue if the SHA-256 doesn't match** (exit 40).
-3. If the GitHub CLI (`gh`) is installed, also verifies the **build attestation**, proving the zip was built by this repository's CI from a public tag. If `gh` isn't installed it says so and relies on the SHA-256 check. Install `gh` with `winget install GitHub.cli` (then `gh auth login`) to get the extra check.
-4. Unpacks into `%LOCALAPPDATA%\AudiophilePlayer\bin\vX.Y.Z\`, next to any older version, creates the shortcuts and runs `doctor`.
+1. Asks GitHub for the latest release (or the tag given with `-Ref v0.1.0`).
+2. Downloads the app-only archive `audiophile-player-vX.Y.Z-win-x64.zip` (zero kernel `.sys` files) and `SHA256SUMS`, and **refuses to continue if the SHA-256 doesn't match** (exit 40).
+3. If the GitHub CLI (`gh`) is installed and signed in (`gh auth login`), also verifies the **build attestation**, proving the zip was built by this repository's CI from a public tag. If `gh` isn't installed or isn't signed in, it warns and relies on the SHA-256 check. Install `gh` with `winget install GitHub.cli` (then `gh auth login`) to enable the extra check.
+4. Unpacks into `%LOCALAPPDATA%\AudiophilePlayer\bin\vX.Y.Z\` (and updates the stable copy in `%LOCALAPPDATA%\AudiophilePlayer\`), next to any older version, creates the shortcuts and runs `doctor`.
 
 **Option 2: do it by hand.**
 
-1. Open the [Releases page](https://github.com/androxylo/audiophile_player/releases) and download **`audiophile-player-vX.Y.Z-win-x64.zip`** and **`SHA256SUMS`** from the same release.
+1. Open the [Releases page](https://github.com/androxylo/audiophile_player/releases) and download **`audiophile-player-vX.Y.Z-win-x64.zip`** (the app-only archive; the optional Tidal driver is a separate zip) and **`SHA256SUMS`** from the same release.
 2. Check the hash. The two values must be identical:
    ```powershell
    cd $HOME\Downloads
-   (Get-FileHash .\audiophile-player-vX.Y.Z-win-x64.zip -Algorithm SHA256).Hash.ToLower()
+   (Get-FileHash .\audiophile-player-v0.1.0-win-x64.zip -Algorithm SHA256).Hash.ToLower()
    Get-Content .\SHA256SUMS
    ```
 3. Optional but recommended: verify where it was built:
    ```powershell
-   gh attestation verify .\audiophile-player-vX.Y.Z-win-x64.zip -R androxylo/audiophile_player
+   gh attestation verify .\audiophile-player-v0.1.0-win-x64.zip -R androxylo/audiophile_player
    ```
    It must report a successful verification for `androxylo/audiophile_player`. Anything else: delete the zip.
-4. Unpack it into a folder of your choice (for example `%LOCALAPPDATA%\AudiophilePlayer`), clear the "downloaded from the internet" flag, and create the shortcuts:
+4. Unpack its contents into `%LOCALAPPDATA%\AudiophilePlayer` (stripping the single top-level folder inside the zip), clear the "downloaded from the internet" flag, and create the shortcuts:
    ```powershell
    $d = "$env:LOCALAPPDATA\AudiophilePlayer"
-   Expand-Archive .\audiophile-player-vX.Y.Z-win-x64.zip -DestinationPath $d
-   # if the zip contains a single top folder, use that folder as $d from here on
+   Expand-Archive .\audiophile-player-v0.1.0-win-x64.zip -DestinationPath "$env:TEMP\ap-unpack" -Force
+   $inner = Get-ChildItem "$env:TEMP\ap-unpack" -Directory | Select-Object -First 1
+   New-Item -ItemType Directory -Force -Path $d | Out-Null
+   Copy-Item -Recurse -Force "$($inner.FullName)\*" $d
+   Remove-Item -Recurse -Force "$env:TEMP\ap-unpack"
    Get-ChildItem $d -Recurse | Unblock-File
    powershell -ExecutionPolicy Bypass -File "$d\scripts\install-shortcuts.ps1"
    ```
@@ -614,7 +617,7 @@ To control the player from any folder, or after a **prebuilt** install (which ha
 }
 ```
 
-Shortcut: running the installer with **`-RegisterMcp`** writes a ready-made `mcp-config.json` (Antigravity format) into `%LOCALAPPDATA%\AudiophilePlayer\`. It points at the versioned `bin\vX.Y.Z\` copy, so after an update that changes the version, either re-run with `-RegisterMcp` or use the stable path shown above.
+Shortcut: running the installer with **`-RegisterMcp`** writes a ready-made `mcp-config.json` (Antigravity format) into `%LOCALAPPDATA%\AudiophilePlayer\` pointing at the stable `%LOCALAPPDATA%\AudiophilePlayer\audiophile-player.exe` path, so it keeps working across updates.
 
 Any other MCP client works the same way: a stdio server with command `audiophile-player.exe` and the single argument `mcp`.
 

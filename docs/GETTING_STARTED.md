@@ -237,9 +237,9 @@ flowchart LR
 
 ### Install the virtual driver (no WDK needed for release archives)
 
-1. **Get and verify a release archive** that includes the `driver\` folder: check its SHA-256 against `SHA256SUMS` (and optionally its GitHub attestation), exactly as in [Quick Start → A3](QUICK_START.md#a3-prebuilt-binary-no-compiler-no-admin-prompt).
-2. **Extract it to an admin-protected folder** (for example `C:\Program Files\AudiophilePlayer`) so non-admin processes can't tamper with the extracted files, and unblock them (`Get-ChildItem -Recurse | Unblock-File`).
-3. Open an **Administrator PowerShell** in `driver\` (from a release zip), or build it from source first with `drivers\ap-exclusive-acx\scripts\build-and-sign.ps1 -FetchWdk` and run from `drivers\ap-exclusive-acx\scripts\`:
+1. **Get and verify the separate opt-in driver archive** from the [Releases page](https://github.com/androxylo/audiophile_player/releases): download **`audiophile-player-driver-vX.Y.Z-win-x64.zip`** and **`SHA256SUMS`** (the main app zip intentionally contains no kernel `.sys` files). Check its SHA-256 against `SHA256SUMS` and optionally run `gh attestation verify .\audiophile-player-driver-vX.Y.Z-win-x64.zip -R androxylo/audiophile_player`, just like in [Quick Start → A3](QUICK_START.md#a3-prebuilt-binary-no-compiler-no-admin-prompt).
+2. **Extract it to an admin-protected folder** (for example `C:\Program Files\AudiophilePlayer-Driver`) so non-admin processes can't tamper with the extracted files, and unblock them (`Get-ChildItem -Recurse | Unblock-File`).
+3. Open an **Administrator PowerShell** in the extracted driver folder (`audiophile-player-driver-vX.Y.Z-win-x64\`), or build it from source first with `drivers\ap-exclusive-acx\scripts\build-and-sign.ps1 -FetchWdk` and run from `drivers\ap-exclusive-acx\scripts\`:
 
 ```powershell
 powershell -ExecutionPolicy RemoteSigned -File .\install-driver.ps1
