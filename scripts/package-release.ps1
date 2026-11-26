@@ -92,7 +92,7 @@ Copy-Item -Force (Join-Path $repoRoot "audiophile-player.example.toml") $stageDi
 Copy-Item -Force (Join-Path $repoRoot "README.md") $stageDir
 Copy-Item -Force (Join-Path $repoRoot "LICENSE") $stageDir
 
-foreach ($doc in @("QUICK_START.md", "GETTING_STARTED.md", "SOUND_ENGINE.md", "ULTIMATE_MODE.md", "CLI.md", "FILTER_PREFERENCES.md")) {
+foreach ($doc in @("QUICK_START.md", "GETTING_STARTED.md", "SOUND_ENGINE.md", "ULTIMATE_MODE.md", "CLI.md", "FILTER_PREFERENCES.md", "WHATS_NEW.md")) {
     Copy-Item -Force (Join-Path $repoRoot "docs\$doc") (Join-Path $stageDir "docs\$doc")
 }
 Copy-Item -Force (Join-Path $repoRoot "assets\audiophile-player.ico") (Join-Path $stageDir "assets\audiophile-player.ico")
@@ -217,6 +217,7 @@ $allowedManifest = @(
     "docs\ULTIMATE_MODE.md",
     "docs\CLI.md",
     "docs\FILTER_PREFERENCES.md",
+    "docs\WHATS_NEW.md",
     "scripts\launch-audiophile-player.ps1",
     "scripts\install-shortcuts.ps1"
 )

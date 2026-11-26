@@ -653,7 +653,7 @@ Any other MCP client works the same way: a stdio server with command `audiophile
 | A4 (manual) | `git pull`, then `cargo build --release --locked --bin audiophile-player` |
 | An AI agent | Ask: "Update Audiophile Player following AGENTS.md." |
 
-Stop the player first (`audiophile-player stop`) so its files aren't in use. Your `config.toml`, `my-filters.yaml` and scan database are never touched by updates. `audiophile-player --version` shows what you're running.
+Stop the player first (`audiophile-player stop`) so its files aren't in use. Your `config.toml`, `my-filters.yaml` and scan database are never touched by updates. `audiophile-player --version` shows what you're running; see **[What's new](WHATS_NEW.md)** for recent highlights.
 
 ---
 
