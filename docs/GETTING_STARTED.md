@@ -106,32 +106,50 @@ flowchart LR
     classDef dac fill:#d3f9d8,stroke:#2f9e44,color:#000
 ```
 
-### Honest trade-offs (opt-in only)
-- **Windows Test Mode is required** (and UEFI Secure Boot must be off). Because this is an open-source community project without a paid Microsoft EV/WHQL certificate, the driver is **locally test-signed on your own PC** during install — no third-party private keys or pre-signed certificates are ever distributed.
-- If you only play local FLACs or UPnP, **you do not need this driver**. Audiophile Player quietly parks its capture watcher when the driver is not installed.
+### Security implications & trade-offs (opt-in only)
+
+> [!WARNING]
+> **Read before installing the virtual driver:**
+> - **Windows 11 22H2+ (Build 22621+) x64 only** (requires Microsoft's ACX 1.1 runtime).
+> - **Windows Test Mode & UEFI Secure Boot:** Because this is a community open-source project without a paid Microsoft EV/WHQL certificate, loading the driver requires **UEFI Secure Boot OFF** and **Windows Test Mode ON** (`bcdedit /set testsigning on`).
+> - **BitLocker / Device Encryption:** Turning off Secure Boot (PCR7) and toggling `testsigning` are BitLocker-validated boot settings. **Back up your 48-digit BitLocker recovery key** ([aka.ms/myrecoverykey](https://aka.ms/myrecoverykey)) before changing BIOS/UEFI settings. `install-driver.ps1` detects BitLocker and automatically suspends it for 2 reboots before editing BCD.
+> - **Machine-wide code integrity & anti-cheat/DRM:** While Test Mode is enabled, Windows allows **any** test-signed kernel driver to load, displays a "Test Mode" desktop watermark, and some kernel anti-cheat systems (e.g. Vanguard, FACEIT, EA AC) or DRM paths refuse to run.
+> - **Local certificate lifecycle:** `install-driver.ps1` verifies the SHA-256 of the unsigned `.sys`/`.inf`/`.cat` artifacts, copies them to an admin-only directory (`%ProgramData%\AudiophilePlayer\driver`), generates an ephemeral self-signed certificate, adds its **public** cert to `LocalMachine\Root` and `LocalMachine\TrustedPublisher`, signs the staged files, and **immediately deletes the private key**. No third-party private keys or developer certificates are ever distributed.
+> - **Clean revert:** Running `uninstall-driver.ps1` as Administrator removes the virtual device, Driver Store package, admin staging folder, and local test certificate, and automatically disables Test Mode if `install-driver.ps1` enabled it (reboot once afterward; you may then re-enable Secure Boot in UEFI with BitLocker suspended/backed up).
+> - If you only play local FLACs or UPnP, **you do not need this driver**. Audiophile Player quietly parks its capture watcher when the driver is not installed.
 
 ### Install the virtual driver (no WDK needed for release archives)
 
-Open an **Administrator PowerShell** in `driver\` (from a release zip) — or build first from source with `drivers\ap-exclusive-acx\scripts\build-and-sign.ps1 -FetchWdk` and then run from `drivers\ap-exclusive-acx\scripts\`:
+1. **Verify the archive:** Compare the `.zip` file's SHA-256 against the published `.zip.sha256` (`Get-FileHash -Algorithm SHA256 audiophile-player-vX.Y.Z-win-x64.zip`).
+2. **Extract to an admin-protected folder** (for example `C:\Program Files\AudiophilePlayer`) so non-admin processes cannot tamper with extracted files, and unblock downloaded files (`Get-ChildItem -Recurse | Unblock-File`).
+3. Open an **Administrator PowerShell** in `driver\` (from a release zip) — or build first from source with `drivers\ap-exclusive-acx\scripts\build-and-sign.ps1 -FetchWdk` and then run from `drivers\ap-exclusive-acx\scripts\`:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\install-driver.ps1
+powershell -ExecutionPolicy RemoteSigned -File .\install-driver.ps1
 ```
 
-1. If Test Mode is off, the script runs `bcdedit /set testsigning on` and asks you to **reboot once**, then run the same command again.
-2. It creates a per-machine self-signed certificate, signs `ap_exclusive_audio.sys` and `ap_exclusive_audio.cat` locally with SHA-256, registers `ROOT\ApExclusiveAudio`, and binds the driver via `pnputil`.
+1. If Test Mode is off, the script prints the full security summary, asks you to type `YES` (or pass `-AcceptTestModeRisk`), suspends BitLocker if active, runs `bcdedit /set testsigning on`, and asks you to **reboot once** (exit `3010`), then run the same command again.
+2. On the second run (or immediately if Test Mode is already on), the script verifies artifact SHA-256 hashes, stages them into `%ProgramData%\AudiophilePlayer\driver`, signs ephemerally with a fresh per-machine certificate (deleting the private key right afterward), registers `ROOT\ApExclusiveAudio`, binds the driver via `pnputil`, and verifies the bound `DriverVersion`.
 3. **Restart Tidal Desktop** (if it was already open) so it sees the new output device.
 4. In Tidal Desktop → **Sound output**, pick **`Line (Audiophile Player)`**, turn **Use Exclusive Mode ON**, and leave **Force volume OFF**.
-5. Start Audiophile Player (the startup log prints `Exclusive capture: READY`) and press Play in Tidal. Audiophile Player automatically preempts local playback, follows every sample-rate change (44.1–384 kHz), blocks any Windows shared-mode mixer attempt (`audiodg.exe`) in the kernel, and releases the DAC cleanly when you pause Tidal.
+5. Start Audiophile Player (the startup log prints `Exclusive capture: READY`) and press Play in Tidal.
+
+### How Tidal exclusive capture behaves
+
+- **Preemption:** Starting playback in Tidal automatically preempts local FLAC or UPnP playback; clicking Pause or switching modes in Audiophile Player releases capture and pauses (clicking **Next** while paused on an active Tidal stream resumes it).
+- **Zero-mixer kernel gate & default-device note:** The kernel driver rejects `audiodg.exe` and system/idle callers on `Run`/`SetRenderPacket`, and restricts `\\.\ApExclusiveAudio` to Medium-IL+ callers in the same Windows session as the rendering player. Do **not** set `Line (Audiophile Player)` as your Windows default output device (Windows Shared Mode apps will fail cleanly because `audiodg.exe` is blocked).
+- **Rate changes & gapless following:** Tidal track changes at the same sample rate flow continuously without flushing Audiophile Player's output buffer (because Tidal pushes raw PCM over WASAPI Exclusive with no track metadata, consecutive same-rate Tidal tracks appear as one continuous stream). Sample-rate switches (44.1–384 kHz) drain the previous track's full REW tail cleanly and switch DAC rate automatically with zero lost opening samples.
+- **Pause latency & clock locking:** Audiophile Player holds a compact ~1.0 s real-time cushion ahead of the DAC (capped at ~3 s total) and slaves the virtual driver's hardware position clock smoothly to your DAC crystal (±500 ppm low-pass). Pausing in Tidal drains the remaining ~0.75–1.0 s cushion plus a 250 ms stop grace before releasing the DAC cleanly.
 
 ### Uninstall or disable
 
 ```powershell
-# Remove the virtual endpoint, Driver Store package, and local test certificate (Admin PowerShell):
-powershell -ExecutionPolicy Bypass -File .\uninstall-driver.ps1
+# Remove the virtual endpoint, Driver Store package, local test cert, and automatically revert
+# Test Mode if install-driver.ps1 enabled it (Admin PowerShell; pass -KeepTestSigning to leave Test Mode on):
+powershell -ExecutionPolicy RemoteSigned -File .\uninstall-driver.ps1
 
-# Same, and turn off Windows Test Mode too (reboot once afterward):
-powershell -ExecutionPolicy Bypass -File .\uninstall-driver.ps1 -DisableTestSigning
+# Force turning off Windows Test Mode even if you had enabled it manually:
+powershell -ExecutionPolicy RemoteSigned -File .\uninstall-driver.ps1 -DisableTestSigning
 ```
 
 To keep the driver installed while temporarily disabling capture in Audiophile Player, pass `--no-capture` or set `enabled = false` under `[capture]` in `config.toml`. Full driver build details are in [`drivers/ap-exclusive-acx/README.md`](../drivers/ap-exclusive-acx/README.md).

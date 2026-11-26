@@ -1575,6 +1575,23 @@ fn finalize_prev_track(
     }
 }
 
+/// Shared panic-recovery helper used by all three `catch_unwind` sites in the producer loop
+/// (Review #8 C5 / Review #7 F8): restores Track A's backup carryover if Track B panicked after
+/// taking it but before pushing PCM, then drains Track A's full REW tail and emits `TrackEnd`.
+fn recover_after_track_panic(
+    pipeline: &AudioPipeline,
+    buf: &BoundedBlockStreamBuffer,
+    epoch: u64,
+    carried: &mut Option<GaplessCarryover>,
+    backup: &mut Option<GaplessCarryover>,
+    pending_end: &mut bool,
+) {
+    if carried.is_none() {
+        *carried = backup.take();
+    }
+    finalize_prev_track(pipeline, buf, epoch, carried, pending_end);
+}
+
 #[cfg(test)]
 fn producer_loop_with_upnp(
     pipeline: AudioPipeline,
@@ -1588,6 +1605,30 @@ fn producer_loop_with_upnp(
 }
 
 fn producer_loop_with_sources(
+    pipeline: AudioPipeline,
+    ctrl: Arc<ProducerControl>,
+    buf: Arc<BoundedBlockStreamBuffer>,
+    shared: Arc<SharedControl>,
+    upnp_state: Option<Arc<UpnpRendererState>>,
+    capture_transport: Option<SharedCaptureTransport>,
+    ultimate_ctx: Option<UltimateRuntimeContext>,
+) {
+    // Review #8 C9: Run the real-time playback producer on the high-priority DSP worker pool lane
+    // so stereo/MAC jobs always jump ahead of any background scan/analysis work.
+    ap_dsp::worker_pool::with_high_priority_dsp(|| {
+        producer_loop_with_sources_inner(
+            pipeline,
+            ctrl,
+            buf,
+            shared,
+            upnp_state,
+            capture_transport,
+            ultimate_ctx,
+        );
+    });
+}
+
+fn producer_loop_with_sources_inner(
     pipeline: AudioPipeline,
     ctrl: Arc<ProducerControl>,
     buf: Arc<BoundedBlockStreamBuffer>,
@@ -1783,14 +1824,12 @@ fn producer_loop_with_sources(
                     })) {
                         Ok(res) => res,
                         Err(_) => {
-                            if carried_tail.is_none() {
-                                carried_tail = panic_backup_carry.take();
-                            }
-                            finalize_prev_track(
+                            recover_after_track_panic(
                                 &pipeline,
                                 &buf,
                                 epoch,
                                 &mut carried_tail,
+                                &mut panic_backup_carry,
                                 &mut pending_track_end,
                             );
                             (
@@ -1946,14 +1985,12 @@ fn producer_loop_with_sources(
                 })) {
                     Ok(res) => res,
                     Err(_) => {
-                        if carried_tail.is_none() {
-                            carried_tail = panic_backup_carry.take();
-                        }
-                        finalize_prev_track(
+                        recover_after_track_panic(
                             &pipeline,
                             &buf,
                             epoch,
                             &mut carried_tail,
+                            &mut panic_backup_carry,
                             &mut pending_track_end,
                         );
                         (
@@ -2185,16 +2222,14 @@ fn producer_loop_with_sources(
         })) {
             Ok(res) => res,
             Err(_) => {
-                // Review #5 Finding #20: if Track B panicked after attaching A's carryover but
-                // before emitting any PCM, restore the backup clone so A's full REW tail drains!
-                if carried_tail.is_none() {
-                    carried_tail = panic_backup_carry.take();
-                }
-                finalize_prev_track(
+                // Review #5 Finding #20 + Review #8 C5: shared panic recovery restores backup
+                // carryover and drains Track A's full REW tail cleanly.
+                recover_after_track_panic(
                     &pipeline,
                     &buf,
                     epoch,
                     &mut carried_tail,
+                    &mut panic_backup_carry,
                     &mut pending_track_end,
                 );
                 (
@@ -5506,7 +5541,8 @@ mod tests {
         // `engine.rs:1671-1701`, with a panic injected right after `incoming_carryover.take()`.
         // Assert Track A's nonzero REW carryover tail PCM and `TrackEnd` are both emitted!
         use crate::ultimate::{
-            TEST_PANIC_AFTER_CARRY_TAKE, UltimateRuntimeContext, stream_track_ultimate,
+            UltimateRuntimeContext, arm_test_panic_after_carry_take,
+            disarm_test_panic_after_carry_take, stream_track_ultimate,
         };
         use ap_core::config::UltimateConfig;
         use ap_core::format::StreamSpec;
@@ -5614,7 +5650,8 @@ mod tests {
             total: 44_100 * 31,
         };
 
-        TEST_PANIC_AFTER_CARRY_TAKE.with(|c| c.set(true));
+        let target_b1 = track_b.to_string_lossy().into_owned();
+        arm_test_panic_after_carry_take(Some(&target_b1));
         let res = catch_unwind(AssertUnwindSafe(|| {
             stream_track_ultimate(
                 &pipeline,
@@ -5636,17 +5673,21 @@ mod tests {
                 16_384,
             )
         }));
-        TEST_PANIC_AFTER_CARRY_TAKE.with(|c| c.set(false));
+        disarm_test_panic_after_carry_take(&target_b1);
 
         assert!(res.is_err(), "expected injected F8 panic");
         assert!(carried_tail.is_none());
         assert!(panic_backup_carry.is_some());
 
-        // Exact engine.rs panic recovery path: restore backup carry and finalize Track A cleanly!
-        if carried_tail.is_none() {
-            carried_tail = panic_backup_carry.take();
-        }
-        finalize_prev_track(&pipeline, &buf, ep, &mut carried_tail, &mut pending_track_end);
+        // Exercise the shared production `recover_after_track_panic` helper directly (Review #8 C5).
+        recover_after_track_panic(
+            &pipeline,
+            &buf,
+            ep,
+            &mut carried_tail,
+            &mut panic_backup_carry,
+            &mut pending_track_end,
+        );
         assert!(carried_tail.is_none());
         assert!(!pending_track_end);
 
@@ -5668,6 +5709,157 @@ mod tests {
         }
         assert!(saw_tail_pcm, "F8: Track A's carryover tail PCM must be flushed on panic");
         assert!(saw_track_end, "F8: Track A's TrackEnd must be emitted on panic");
+
+        // Review #8 C5: Also drive the real `producer_loop_with_sources` on a 2-track sequential
+        // queue (Track A = 1 s normal FLAC with REW tail, Track B = 31 s Ultimate FLAC with
+        // cross-thread `TEST_PANIC_AFTER_CARRY_TAKE` armed!) and assert Track A's tail + TrackEnd
+        // + EndOfQueue are emitted cleanly without killing the producer thread.
+        {
+            use flac_codec::encode::{FlacSampleWriter, Options};
+            let qdir = root.join("c5_queue");
+            std::fs::create_dir_all(&qdir).unwrap();
+            let write_flac = |path: &Path, frames: usize, amp: f64| {
+                let mut samples = Vec::with_capacity(frames * 2);
+                for n in 0..frames {
+                    let s = (2.0 * std::f64::consts::PI * 440.0 * n as f64 / 44_100.0).sin() * amp;
+                    let v = (s * 32767.0).round() as i32;
+                    samples.push(v);
+                    samples.push(v);
+                }
+                let mut w = FlacSampleWriter::create(
+                    path,
+                    Options::default(),
+                    44_100,
+                    16,
+                    2,
+                    Some(samples.len() as u64),
+                )
+                .unwrap();
+                w.write(&samples).unwrap();
+                w.finalize().unwrap();
+            };
+            // Track A: 1 s (< 30 s -> normal mode with REW carryover exported at EOF).
+            write_flac(&qdir.join("01_track_a.flac"), 44_100, 0.4);
+            // Track B: 31 s (>= 30 s -> enters stream_track_ultimate and hits TEST_PANIC_AFTER_CARRY_TAKE!).
+            write_flac(&qdir.join("02_track_b.flac"), 44_100 * 31, 0.3);
+
+            let rew_ir = qdir.join("rew_44100.wav");
+            {
+                let rate: u32 = 44_100;
+                let ir_frames: u32 = 2_048;
+                let data_bytes: u32 = ir_frames * 2 * 4;
+                let mut wav = Vec::with_capacity(44 + data_bytes as usize);
+                wav.extend_from_slice(b"RIFF");
+                wav.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+                wav.extend_from_slice(b"WAVEfmt ");
+                wav.extend_from_slice(&16u32.to_le_bytes());
+                wav.extend_from_slice(&3u16.to_le_bytes()); // IEEE float
+                wav.extend_from_slice(&2u16.to_le_bytes()); // stereo
+                wav.extend_from_slice(&rate.to_le_bytes());
+                wav.extend_from_slice(&(rate * 8).to_le_bytes());
+                wav.extend_from_slice(&8u16.to_le_bytes());
+                wav.extend_from_slice(&32u16.to_le_bytes());
+                wav.extend_from_slice(b"data");
+                wav.extend_from_slice(&data_bytes.to_le_bytes());
+                for i in 0..ir_frames {
+                    let v: f32 = if i == 0 {
+                        0.5
+                    } else if i == 1024 {
+                        0.25
+                    } else {
+                        0.0
+                    };
+                    wav.extend_from_slice(&v.to_le_bytes());
+                    wav.extend_from_slice(&v.to_le_bytes());
+                }
+                std::fs::write(&rew_ir, &wav).unwrap();
+            }
+            let q_pipeline = AudioPipeline::with_rew_config_full_tail(
+                UpsamplerPolicy {
+                    filter_override: Some(FilterArchetype::Null),
+                    ..UpsamplerPolicy::default()
+                },
+                ConvolutionConfig {
+                    enabled: true,
+                    dir: None,
+                    file: Some(rew_ir),
+                    file_352800: None,
+                    file_384000: None,
+                },
+                true,
+            )
+            .unwrap();
+            let q_buf = BoundedBlockStreamBuffer::new(384_000 * 35);
+            let q_ep = q_buf.current_epoch();
+            let q_ctrl = ProducerControl::new(
+                q_ep,
+                ProducerDirective::Active(PlayDirective::Sequential {
+                    root: qdir.clone(),
+                    seq_gen: 1,
+                    start_after: None,
+                    folder_only: true,
+                    skip_count: 0,
+                }),
+            );
+            let q_shared = SharedControl::new(qdir.clone(), "Mock DAC".to_string());
+            let q_ult = UltimateRuntimeContext {
+                config: UltimateConfig {
+                    enabled: true,
+                    genre_rules: false,
+                    learn_on_play: false,
+                },
+                store: TrackDbStore::new(root.join("c5_db"), false),
+            };
+
+            let target_b2 = qdir.join("02_track_b.flac").to_string_lossy().into_owned();
+            arm_test_panic_after_carry_take(Some(&target_b2));
+            let p_ctrl = Arc::clone(&q_ctrl);
+            let p_buf = Arc::clone(&q_buf);
+            let p_shared = Arc::clone(&q_shared);
+            let prod = thread::spawn(move || {
+                producer_loop_with_sources(
+                    q_pipeline,
+                    p_ctrl,
+                    p_buf,
+                    p_shared,
+                    None,
+                    None,
+                    Some(q_ult),
+                );
+            });
+
+            let mut a_frames = 0usize;
+            let mut saw_a_end = false;
+            let mut saw_eoq = false;
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while Instant::now() < deadline {
+                match q_buf.pop_for_epoch_timeout(q_ep, Duration::from_secs(5)) {
+                    Some(StreamEvent::TrackStart { .. }) => {}
+                    Some(StreamEvent::PcmBlock(b)) => a_frames += b.frames.len(),
+                    Some(StreamEvent::TrackEnd) => saw_a_end = true,
+                    Some(StreamEvent::EndOfQueue(_)) => {
+                        saw_eoq = true;
+                        break;
+                    }
+                    Some(StreamEvent::FatalError(e)) => panic!("unexpected FatalError: {e}"),
+                    Some(StreamEvent::ErrorThresholdPause { message, .. }) => {
+                        panic!("unexpected ErrorThresholdPause: {message}")
+                    }
+                    None => {}
+                }
+            }
+            disarm_test_panic_after_carry_take(&target_b2);
+            q_ctrl.set(q_ep, ProducerDirective::Shutdown);
+            q_buf.close();
+            prod.join().expect("producer thread must survive Track B panic");
+
+            assert!(saw_a_end, "C5: producer_loop must emit TrackEnd for Track A after Track B panic");
+            assert!(
+                a_frames > 44_100,
+                "C5: Track A must include its flushed REW carryover tail (> 44,100 frames), got {a_frames}"
+            );
+            assert!(saw_eoq, "C5: producer_loop must reach EndOfQueue cleanly after Track B panic");
+        }
 
         let _ = std::fs::remove_dir_all(&root);
     }

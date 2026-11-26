@@ -30,6 +30,22 @@ thread_local! {
     /// Thread-local sequential execution override used by integration tests to assert exact
     /// `0 ULPs` (`to_bits()`) bit-identity between parallel pool and single-threaded paths.
     static FORCE_SEQUENTIAL: Cell<bool> = const { Cell::new(false) };
+    /// Thread-local high-priority lane flag for the real-time playback producer thread
+    /// so playback stereo/MAC jobs jump ahead of any background scan/analysis jobs (Review #8 C9).
+    static HIGH_PRIORITY_DSP: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Run `f` with high-priority DSP worker pool scheduling (Review #8 C9).
+pub fn with_high_priority_dsp<R>(f: impl FnOnce() -> R) -> R {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            HIGH_PRIORITY_DSP.with(|c| c.set(self.0));
+        }
+    }
+    let prev = HIGH_PRIORITY_DSP.with(|c| c.replace(true));
+    let _reset = Reset(prev);
+    f()
 }
 
 /// Run `f` with parallel worker-pool fan-out forced to run sequentially on the calling thread
@@ -53,9 +69,18 @@ pub const MAC_PARALLEL_MIN_WORK: usize = 131_072;
 /// for asserting zero thread creation after warmup in tests).
 static WORKER_SPAWN_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// Total number of jobs dispatched onto persistent worker pools (Review #8 C8: lets tests prove
+/// parallel paths actually executed instead of vacuously running sequentially).
+static PARALLEL_DISPATCH_COUNT: AtomicUsize = AtomicUsize::new(0);
+
 /// Return total persistent DSP worker threads ever spawned in this process.
 pub fn worker_spawn_count() -> usize {
     WORKER_SPAWN_COUNT.load(Ordering::Relaxed)
+}
+
+/// Return total jobs dispatched to the persistent worker pools (Review #8 C8).
+pub fn parallel_dispatch_count() -> usize {
+    PARALLEL_DISPATCH_COUNT.load(Ordering::Relaxed)
 }
 
 /// Recommended MAC slice count for a single channel when L/R already run concurrently, avoiding
@@ -74,6 +99,7 @@ pub fn mac_slice_count(parallel_stereo: bool) -> usize {
 type ErasedJob = Box<dyn FnOnce() + Send + 'static>;
 
 struct PoolQueue {
+    jobs_hi: VecDeque<ErasedJob>,
     jobs: VecDeque<ErasedJob>,
 }
 
@@ -87,6 +113,7 @@ impl PersistentPool {
         let num_workers = num_workers.max(1);
         let queue = Arc::new((
             Mutex::new(PoolQueue {
+                jobs_hi: VecDeque::with_capacity(32),
                 jobs: VecDeque::with_capacity(64),
             }),
             Condvar::new(),
@@ -100,10 +127,13 @@ impl PersistentPool {
                     let job = {
                         let (lock, cv) = &*q;
                         let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
-                        while st.jobs.is_empty() {
+                        while st.jobs_hi.is_empty() && st.jobs.is_empty() {
                             st = cv.wait(st).unwrap_or_else(|e| e.into_inner());
                         }
-                        st.jobs.pop_front().unwrap()
+                        st.jobs_hi
+                            .pop_front()
+                            .or_else(|| st.jobs.pop_front())
+                            .unwrap()
                     };
                     job();
                 })
@@ -112,10 +142,15 @@ impl PersistentPool {
         Self { queue, num_workers }
     }
 
-    fn submit(&self, job: ErasedJob) {
+    fn submit(&self, job: ErasedJob, high_priority: bool) {
+        PARALLEL_DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
         let (lock, cv) = &*self.queue;
         let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
-        st.jobs.push_back(job);
+        if high_priority {
+            st.jobs_hi.push_back(job);
+        } else {
+            st.jobs.push_back(job);
+        }
         cv.notify_one();
     }
 }
@@ -216,6 +251,7 @@ where
     }
 
     let pool = channel_pool();
+    let hi_prio = HIGH_PRIORITY_DSP.with(Cell::get);
     let latch = ScopeLatch::new(1);
     let left_slot: Mutex<Option<RL>> = Mutex::new(None);
 
@@ -226,14 +262,16 @@ where
 
     // Erase the lifetime of `left_fn` strictly inside the `WaitGuard`-protected scope.
     let boxed: Box<dyn FnOnce() + Send + '_> = Box::new(move || {
-        struct FlagGuard;
+        struct FlagGuard(bool);
         impl Drop for FlagGuard {
             fn drop(&mut self) {
                 IN_CHANNEL_POOL.with(|c| c.set(false));
+                HIGH_PRIORITY_DSP.with(|c| c.set(self.0));
             }
         }
         IN_CHANNEL_POOL.with(|c| c.set(true));
-        let _fg = FlagGuard;
+        let prev_hi = HIGH_PRIORITY_DSP.with(|c| c.replace(hi_prio));
+        let _fg = FlagGuard(prev_hi);
         let res = catch_unwind(AssertUnwindSafe(left_fn));
         match res {
             Ok(val) => {
@@ -250,7 +288,7 @@ where
     let guard = WaitGuard {
         latch: Arc::clone(&latch),
     };
-    pool.submit(static_job);
+    pool.submit(static_job, hi_prio);
 
     let right_res = right_fn();
     drop(guard);
@@ -304,6 +342,7 @@ where
     }
 
     let pool = mac_pool();
+    let hi_prio = HIGH_PRIORITY_DSP.with(Cell::get);
     let latch = ScopeLatch::new(rest.len());
     let guard = WaitGuard {
         latch: Arc::clone(&latch),
@@ -332,7 +371,7 @@ where
             latch_w.complete_one();
         });
         let static_job: ErasedJob = unsafe { std::mem::transmute(boxed) };
-        pool.submit(static_job);
+        pool.submit(static_job, hi_prio);
     }
 
     // Execute slice 0 inline on the calling thread!
@@ -377,6 +416,72 @@ mod tests {
             worker_spawn_count(),
             count_after_warmup,
             "F12: persistent worker pool must not spawn any threads after warmup"
+        );
+    }
+
+    #[test]
+    fn high_priority_lane_jumps_ahead_of_queued_low_priority_jobs_c9() {
+        use std::sync::Barrier;
+        use std::time::{Duration, Instant};
+
+        // Dedicated 1-worker pool so queue ordering is 100% deterministic:
+        // job 0 occupies the worker while jobs 1..=8 (low prio) and job HI (high prio) queue up.
+        let pool = PersistentPool::new("ap-dsp-prio-test", 1);
+        let gate = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+
+        let g_w = Arc::clone(&gate);
+        let r_w = Arc::clone(&release);
+        pool.submit(
+            Box::new(move || {
+                g_w.wait();
+                r_w.wait();
+            }),
+            false,
+        );
+        gate.wait(); // worker is now blocked inside job 0
+
+        let low_latch = ScopeLatch::new(8);
+        for _ in 0..8 {
+            let ord = Arc::clone(&order);
+            let l = Arc::clone(&low_latch);
+            pool.submit(
+                Box::new(move || {
+                    thread::sleep(Duration::from_millis(15));
+                    ord.lock().unwrap().push("low");
+                    l.complete_one();
+                }),
+                false,
+            );
+        }
+
+        let hi_latch = ScopeLatch::new(1);
+        let hi_ord = Arc::clone(&order);
+        let hi_l = Arc::clone(&hi_latch);
+        pool.submit(
+            Box::new(move || {
+                hi_ord.lock().unwrap().push("hi");
+                hi_l.complete_one();
+            }),
+            true,
+        );
+
+        let t0 = Instant::now();
+        release.wait();
+        hi_latch.wait_all();
+        let hi_elapsed = t0.elapsed();
+        low_latch.wait_all();
+
+        let seq = order.lock().unwrap();
+        assert_eq!(
+            seq.first().copied(),
+            Some("hi"),
+            "C9: high-priority job must execute BEFORE queued low-priority jobs: {seq:?}"
+        );
+        assert!(
+            hi_elapsed < Duration::from_millis(80),
+            "C9: high-priority job waited behind low-priority queue ({hi_elapsed:?})"
         );
     }
 }

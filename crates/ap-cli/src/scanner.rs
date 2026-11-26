@@ -842,9 +842,10 @@ mod tests {
         assert_eq!(summary.scanned, 1);
         assert_eq!(summary.failed, 0);
 
-        // Reload via playback's exact `TrackDbStore` lookup + `CachedWholeTrackEvidence::from_track_db_entry(..., true)`.
+        // Reload via playback's exact `TrackDbStore` lookup + `CachedWholeTrackEvidence::from_track_db_entry(..., true)`,
+        // AND compute a REAL W30 `TrackAnalyzer` snapshot as `window` (matching `ultimate.rs:298`).
         let store = TrackDbStore::new(db_dir.clone(), true);
-        let reader = FlacBlockReader::open(&flac_path).unwrap();
+        let mut reader = FlacBlockReader::open(&flac_path).unwrap();
         let spec = reader.spec();
         let header_md5_hex = reader.streaminfo_md5().as_ref().map(md5_to_hex);
         let entry = store
@@ -855,16 +856,29 @@ mod tests {
             "post_chain_peaks must be populated"
         );
 
+        let mut w30_analyzer = TrackAnalyzer::new(spec.sample_rate_hz, spec.bits_per_sample);
+        let w30_target = (spec.sample_rate_hz as usize) * 30;
+        let mut fed = 0usize;
+        while fed < w30_target {
+            let take = SCAN_BLOCK_FRAMES.min(w30_target - fed);
+            match reader.read_next_block(take).unwrap() {
+                Some(blk) => {
+                    fed += blk.left.len();
+                    w30_analyzer.push_block(&blk);
+                }
+                None => break,
+            }
+        }
+        let w30_snapshot = w30_analyzer.snapshot(false, false, false, false);
+
         let cached_wt = CachedWholeTrackEvidence::from_track_db_entry(&entry, true);
-        // Simulate playback even when a ReplayGain tag is present (R4 verifies WT branch parity).
-        let mut peak_meta = reader.peak_meta();
-        peak_meta.replaygain_track_gain_db = Some(-10.5);
+        // Simulate playback with REAL W30 window + WT evidence (R4/C1 parity).
         let playback_fused = fuse_track_evidence(
             spec.sample_rate_hz,
             spec.bits_per_sample,
-            &peak_meta,
+            &reader.peak_meta(),
             &reader.track_meta(),
-            None,
+            Some(&w30_snapshot),
             Some(&cached_wt),
         );
         let playback_sel = select_ultimate_plan(
@@ -895,6 +909,100 @@ mod tests {
             playback_key
         );
         assert_eq!(entry.decision.filter, playback_key.upsampler);
+
+        // Review #8 C1: 96 kHz variant where W30 has a synthetic ultrasonic shelf (> 40 kHz)
+        // while the whole-track average (35 s total, shelf only in first 30 s? Better: 10 s shelf
+        // in W30 + 60 s clean? Even faster: scan a 96 kHz track where WT is Negative, and pass a
+        // W30 snapshot with `ultrasonic_noise_detected = Positive` into playback fusion -> MUST
+        // stay Negative from authoritative WT and hit `entry.find_post_chain_peak`!).
+        let hires_dir = root.join("hires_c1");
+        fs::create_dir_all(&hires_dir).unwrap();
+        let hires_flac = hires_dir.join("02_clean_96k.flac");
+        {
+            let rate = 96_000u32;
+            let frames = (rate as usize) * 4;
+            let mut interleaved = Vec::with_capacity(frames * 2);
+            for n in 0..frames {
+                let s = (2.0 * PI * 1_000.0 * n as f64 / rate as f64).sin() * 0.25;
+                let v = (s * 8_388_607.0).round() as i32;
+                interleaved.push(v);
+                interleaved.push(v);
+            }
+            let mut writer = FlacSampleWriter::create(
+                &hires_flac,
+                Options::default(),
+                rate,
+                24,
+                2,
+                Some(interleaved.len() as u64),
+            )
+            .unwrap();
+            writer.write(&interleaved).unwrap();
+            writer.finalize().unwrap();
+        }
+        let hires_opts = ScanOptions {
+            folder: hires_dir.clone(),
+            report: false,
+            sidecar: true,
+            post_chain: true,
+            force: true,
+            trackdb_dir: Some(db_dir.clone()),
+            config_path: None,
+            rew_override: Some(ConvolutionConfig::disabled()),
+            upsampler_policy: policy,
+        };
+        let hires_sum = scan_folder(&hires_opts, None).unwrap();
+        assert_eq!(hires_sum.scanned, 1);
+        let hires_reader = FlacBlockReader::open(&hires_flac).unwrap();
+        let hires_spec = hires_reader.spec();
+        let hires_entry = store
+            .load_for_track(
+                Some(&hires_flac),
+                hires_reader.streaminfo_md5().as_ref().map(md5_to_hex).as_deref(),
+            )
+            .expect("96k scanned YAML must load");
+        let hires_wt = CachedWholeTrackEvidence::from_track_db_entry(&hires_entry, true);
+        // Simulate a W30 intro with an ultrasonic noise shelf while WT average is Negative:
+        let mut noisy_w30 = TrackAnalyzer::new(hires_spec.sample_rate_hz, hires_spec.bits_per_sample)
+            .snapshot(false, false, false, false);
+        noisy_w30.ultrasonic_noise_detected = ap_dsp::analysis::DetectorVerdict::Positive;
+        noisy_w30.ultrasonic_noise_rise_db = 9.0;
+        noisy_w30.ultrasonic_noise_level_dbfs = -62.0;
+
+        let hires_fused = fuse_track_evidence(
+            hires_spec.sample_rate_hz,
+            hires_spec.bits_per_sample,
+            &hires_reader.peak_meta(),
+            &hires_reader.track_meta(),
+            Some(&noisy_w30),
+            Some(&hires_wt),
+        );
+        assert!(
+            !hires_fused.hf_noise_filter.value,
+            "C1: authoritative WT Negative must prevent W30 ultrasonic intro from flipping hf_noise_filter"
+        );
+        let hires_sel = select_ultimate_plan(
+            hires_spec,
+            false,
+            Some(35.0),
+            &hires_fused,
+            &policy,
+            true,
+            true,
+        )
+        .unwrap();
+        let hires_key = build_post_chain_key(
+            &hires_sel.plan,
+            hires_spec.sample_rate_hz,
+            hires_sel.plan.target_rate_hz,
+            None,
+        );
+        assert!(
+            hires_entry.find_post_chain_peak(&hires_key).is_some(),
+            "C1: scanned 96 kHz post_chain_peaks {:?} must match cached playback key {:?}",
+            hires_entry.results.post_chain_peaks,
+            hires_key
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

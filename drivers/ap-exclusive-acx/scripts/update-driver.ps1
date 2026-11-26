@@ -1,5 +1,10 @@
-# Run as Administrator to hot-update ap_exclusive_audio.sys (NO REBOOT NEEDED).
+# Run as Administrator to hot-update ap_exclusive_audio.sys (NO REBOOT NEEDED when idle).
 # Works both inside a source checkout and inside an unpacked release zip.
+# Enforces SHA-256 verification, admin-only staging, ephemeral signing, exit code checking,
+# and post-update DEVPKEY_Device_DriverVersion verification (Review #8 D2, D3, D6, D8).
+param(
+    [switch]$ForceResign
+)
 $ErrorActionPreference = "Stop"
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -8,26 +13,27 @@ if (-not $isAdmin) {
     exit 1
 }
 
-if ((Test-Path (Join-Path $PSScriptRoot "ap_exclusive_audio.sys")) -and (Test-Path (Join-Path $PSScriptRoot "ap_exclusive_audio.inf"))) {
-    $pkgDir = $PSScriptRoot
-} elseif (Test-Path (Join-Path (Split-Path -Parent $PSScriptRoot) "out\ap_exclusive_audio.sys")) {
-    $pkgDir = Join-Path (Split-Path -Parent $PSScriptRoot) "out"
-} else {
-    throw "Driver files not found next to this script or in ..\out."
+$devs = @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.HardwareID -contains "ROOT\ApExclusiveAudio" })
+if ($devs.Count -eq 0) {
+    throw "ROOT\ApExclusiveAudio is not installed on this machine. Run install-driver.ps1 first."
 }
 
-# Re-sign locally if artifacts are unsigned or not yet trusted
-$sysPath = Join-Path $pkgDir "ap_exclusive_audio.sys"
-$catPath = Join-Path $pkgDir "ap_exclusive_audio.cat"
-if ((Get-AuthenticodeSignature $sysPath).Status -ne "Valid" -or (Get-AuthenticodeSignature $catPath).Status -ne "Valid") {
-    & (Join-Path $PSScriptRoot "install-driver.ps1")
-    exit $LASTEXITCODE
+# Remove older staged OEM INF entries for ap_exclusive_audio.inf so same-day rebuilds always bind
+# the fresh package (Review #8 D8).
+$oldInfs = pnputil /enum-drivers | Select-String -Pattern "ap_exclusive_audio\.inf" -Context 3,0
+foreach ($m in $oldInfs) {
+    $block = ($m.Context.PreContext -join "`n")
+    if ($block -match "(oem\d+\.inf)") {
+        & pnputil.exe /delete-driver $Matches[1] /uninstall /force | Out-Null
+    }
 }
 
-pnputil /add-driver (Join-Path $pkgDir "ap_exclusive_audio.inf") /install
-$devs = Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.HardwareID -contains "ROOT\ApExclusiveAudio" }
-foreach ($d in $devs) {
-    pnputil /restart-device $d.InstanceId
+$installScript = Join-Path $PSScriptRoot "install-driver.ps1"
+if (-not (Test-Path -LiteralPath $installScript)) {
+    throw "install-driver.ps1 not found next to update-driver.ps1"
 }
-Start-Sleep -Seconds 1
-Get-PnpDevice -Class MEDIA | Where-Object { $_.HardwareID -contains "ROOT\ApExclusiveAudio" } | Format-Table -AutoSize Status, FriendlyName, InstanceId
+
+$argsMap = @{ NoEnableTestSigning = $true }
+if ($ForceResign) { $argsMap.ForceResign = $true }
+& $installScript @argsMap
+exit $LASTEXITCODE

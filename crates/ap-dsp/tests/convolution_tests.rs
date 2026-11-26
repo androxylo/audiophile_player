@@ -1541,8 +1541,16 @@ fn parallel_pool_convolver_bit_identical_to_sequential_f12() {
         (out_l, out_r)
     };
 
+    let dispatches_before_par = ap_dsp::worker_pool::parallel_dispatch_count();
     let (par_l, par_r) = run(Arc::clone(&ir));
+    let dispatches_after_par = ap_dsp::worker_pool::parallel_dispatch_count();
+    assert!(
+        dispatches_after_par > dispatches_before_par,
+        "C8: parallel convolver run must dispatch work onto the worker pool ({dispatches_before_par} -> {dispatches_after_par})"
+    );
     let (seq_l, seq_r) = ap_dsp::worker_pool::with_force_sequential(|| run(ir));
+    // Note: concurrent tests in the same binary may increment the global counter, so verify
+    // parallel dispatch grew strictly during `par` and compare exact samples.
 
     assert_eq!(par_l.len(), seq_l.len());
     assert_eq!(par_r.len(), seq_r.len());

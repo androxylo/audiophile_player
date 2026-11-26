@@ -194,11 +194,29 @@ pub fn classify_genre_token(token: &str) -> GenreClass {
         ("new age", GenreClass::AmbientSoundtrack),
         ("chill out", GenreClass::AmbientSoundtrack),
     ];
-    if let Some((_, class)) = EXACT.iter().find(|(k, _)| *k == joined) {
+    // Review #8 C3: singularize tokens up front (guarding "ss" and denylist words like "blues",
+    // "bass", "chaos") so EXACT and PHRASES match pluralized compounds ("New Romantics",
+    // "Rock Operas", "Pop Operas", "Film Scores") before falling back to single head nouns.
+    fn singular(w: &str) -> &str {
+        const DENY: &[&str] = &["blues", "bass", "chaos"];
+        if w.len() >= 5 && !w.ends_with("ss") && !DENY.contains(&w) {
+            w.strip_suffix('s').unwrap_or(w)
+        } else {
+            w
+        }
+    }
+    let sing_words: Vec<&str> = words.iter().map(|w| singular(w)).collect();
+    let joined_sing = sing_words.join(" ");
+
+    if let Some((_, class)) = EXACT
+        .iter()
+        .find(|(k, _)| *k == joined || *k == joined_sing)
+    {
         return *class;
     }
 
-    // 2. Multi-word phrase matches on contiguous word slices (rightmost phrase wins).
+    // 2. Multi-word phrase matches on contiguous word slices (rightmost phrase wins; matches both
+    //    raw words and singularized words so plural compounds never fall through to head-noun traps).
     const PHRASES: &[(&[&str], GenreClass)] = &[
         (&["modern", "classical"], GenreClass::Classical),
         (&["contemporary", "classical"], GenreClass::Classical),
@@ -232,7 +250,9 @@ pub fn classify_genre_token(token: &str) -> GenreClass {
     for &(pat, class) in PHRASES {
         if pat.len() <= words.len() {
             for start in 0..=(words.len() - pat.len()) {
-                if &words[start..start + pat.len()] == pat {
+                if &words[start..start + pat.len()] == pat
+                    || &sing_words[start..start + pat.len()] == pat
+                {
                     let end = start + pat.len();
                     if phrase_hit.is_none_or(|(prev_end, _)| end >= prev_end) {
                         phrase_hit = Some((end, class));
@@ -360,13 +380,8 @@ pub fn classify_genre_token(token: &str) -> GenreClass {
 
     let word_class = |w: &str| -> Option<GenreClass> {
         lookup_exact(w).or_else(|| {
-            // Safe singular fallback for regular English plurals (length >= 5, e.g. "scores",
-            // "soundtracks") while avoiding short tokens like "ost" or "bop".
-            if w.len() >= 5 {
-                w.strip_suffix('s').and_then(lookup_exact)
-            } else {
-                None
-            }
+            let s = singular(w);
+            if s != w { lookup_exact(s) } else { None }
         })
     };
 
@@ -653,6 +668,14 @@ mod tests {
             ("folktronica", GenreClass::RockPopElectronic),
             ("ghost", GenreClass::Unknown),
             ("minimalism", GenreClass::Unknown),
+            // Review #8 C3 plural compounds & denylist/over-match guards:
+            ("New Romantics", GenreClass::RockPopElectronic),
+            ("Rock Operas", GenreClass::RockPopElectronic),
+            ("Pop Operas", GenreClass::RockPopElectronic),
+            ("Film Scores", GenreClass::AmbientSoundtrack),
+            ("Blues", GenreClass::JazzAcoustic),
+            ("Ghosts", GenreClass::Unknown),
+            ("Hosts", GenreClass::Unknown),
         ];
         for (tok, expected) in cases {
             assert_eq!(

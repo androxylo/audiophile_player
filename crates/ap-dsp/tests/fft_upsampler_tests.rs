@@ -552,8 +552,14 @@ fn parallel_pool_fft_upsampler_bit_identical_to_sequential_f12() {
     let designed = design_gaussian_filter(spec);
     let input = synth_stereo_signal(44_100, 20_000);
 
+    let dispatches_before_par = ap_dsp::worker_pool::parallel_dispatch_count();
     let mut par_up = FftUpolsUpsampler::from_gaussian(designed.clone()).expect("par fft");
     let par_out = run_chunked(&mut par_up, &input, &[4_096, 8_192, 7_712]);
+    let dispatches_after_par = ap_dsp::worker_pool::parallel_dispatch_count();
+    assert!(
+        dispatches_after_par > dispatches_before_par,
+        "C8: parallel FFT upsampler run must dispatch work onto the worker pool ({dispatches_before_par} -> {dispatches_after_par})"
+    );
 
     let seq_out = ap_dsp::worker_pool::with_force_sequential(|| {
         let mut seq_up = FftUpolsUpsampler::from_gaussian(designed).expect("seq fft");

@@ -1416,4 +1416,42 @@ mod throughput_tests {
         assert!(res.passed);
         assert!(res.fallback_filter.is_none());
     }
+
+    #[test]
+    fn throughput_check_r2_post_decode_cushion_does_not_double_subtract_c6() {
+        // Review #8 C6 / Review #7 R2 regression:
+        // buffered_s = 10.0 s (sampled AFTER W0 decode -> decode_wall_s = 0.0), w0 = 30.0 s.
+        // Budget = 10.0 - 2.0 = 8.0 s -> required_x_rt == 30.0 / 8.0 == 3.75x RT.
+        // A measured 3.9x RT passes (double-subtracting 2 s of decode would demand 5.0x and fail!).
+        let wall_for_3_9x = 30.0 / 3.9;
+        let res = check_ultimate_throughput_with_buffer(
+            FilterArchetype::GaussApod4M,
+            44_100,
+            30.0,
+            wall_for_3_9x,
+            Some(240.0),
+            30.0,
+            Some(10.0),
+            0.0,
+        );
+        assert!(
+            (res.required_x_rt - 3.75).abs() < 1e-9,
+            "expected required_x_rt == 3.75, got {}",
+            res.required_x_rt
+        );
+        assert!(res.passed, "3.9x RT must pass against 3.75x required");
+
+        // Contrast: double-subtracting 2.0 s of already-elapsed decode wall would fail 3.9x RT!
+        let double_sub = check_ultimate_throughput_with_buffer(
+            FilterArchetype::GaussApod4M,
+            44_100,
+            30.0,
+            wall_for_3_9x,
+            Some(240.0),
+            30.0,
+            Some(10.0),
+            2.0,
+        );
+        assert!(!double_sub.passed, "double-subtraction demands 5.0x and fails 3.9x");
+    }
 }

@@ -163,6 +163,9 @@ struct BufferInner {
     pinned_guards: HashMap<usize, PinGuard>,
     /// Guards corresponding to `deferred_drops`, ALWAYS unlocked BEFORE `deferred_drops` are freed.
     deferred_guards: Vec<PinGuard>,
+    /// Pre-allocated spare guard vector swapped in O(1) under lock (Review #8 C7: zero heap
+    /// allocation while holding `self.inner`).
+    spare_guards: Vec<PinGuard>,
     /// Pointer keys of PCM blocks currently popped and in-flight on the RT DMA thread (never
     /// unlocked by `flush_locked` / `close` until `recycle_consumed_block` returns them).
     in_flight_ptrs: HashSet<usize>,
@@ -183,6 +186,8 @@ struct BufferInner {
     /// Consumed PCM blocks handed off by the real-time WaveRT thread so large `Vec<[i32; 2]>`
     /// buffers are deallocated exclusively on the non-RT producer/control thread.
     deferred_drops: Vec<InterleavedInt32Buffer>,
+    /// Pre-allocated spare drop vector swapped in O(1) under lock (Review #8 C7).
+    spare_drops: Vec<InterleavedInt32Buffer>,
     closed: bool,
 }
 
@@ -217,6 +222,47 @@ impl FlushPayload {
 }
 
 impl BufferInner {
+    /// Swap `deferred_guards` / `deferred_drops` with pre-allocated spares in O(1) under lock
+    /// (Review #8 C7: zero heap allocation while holding `self.inner`, and both `deferred_*`
+    /// queues permanently retain capacity >= `INITIAL_DEFERRED_DROP_CAPACITY`).
+    fn swap_deferred_with_spares(&mut self) -> (Vec<PinGuard>, Vec<InterleavedInt32Buffer>) {
+        let g = if self.deferred_guards.is_empty() {
+            Vec::new()
+        } else if self.spare_guards.capacity() >= INITIAL_DEFERRED_DROP_CAPACITY {
+            let mut out = std::mem::take(&mut self.spare_guards);
+            std::mem::swap(&mut out, &mut self.deferred_guards);
+            out
+        } else {
+            self.deferred_guards.drain(..).collect()
+        };
+        let d = if self.deferred_drops.is_empty() {
+            Vec::new()
+        } else if self.spare_drops.capacity() >= INITIAL_DEFERRED_DROP_CAPACITY {
+            let mut out = std::mem::take(&mut self.spare_drops);
+            std::mem::swap(&mut out, &mut self.deferred_drops);
+            out
+        } else {
+            self.deferred_drops.drain(..).collect()
+        };
+        (g, d)
+    }
+
+    /// Return cleared spare vectors back under lock so subsequent drains remain allocation-free.
+    fn restore_spares(
+        &mut self,
+        mut guards: Vec<PinGuard>,
+        mut drops: Vec<InterleavedInt32Buffer>,
+    ) {
+        guards.clear();
+        drops.clear();
+        if guards.capacity() > self.spare_guards.capacity() {
+            self.spare_guards = guards;
+        }
+        if drops.capacity() > self.spare_drops.capacity() {
+            self.spare_drops = drops;
+        }
+    }
+
     fn flush_locked(
         &mut self,
         #[cfg(test)] on_free_phase: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -342,6 +388,7 @@ impl BoundedBlockStreamBuffer {
                 epoch: 0,
                 pinned_guards: HashMap::with_capacity(INITIAL_DEFERRED_DROP_CAPACITY),
                 deferred_guards: Vec::with_capacity(INITIAL_DEFERRED_DROP_CAPACITY),
+                spare_guards: Vec::with_capacity(INITIAL_DEFERRED_DROP_CAPACITY),
                 in_flight_ptrs: HashSet::with_capacity(8),
                 events: VecDeque::new(),
                 buffered_frames: 0,
@@ -352,6 +399,7 @@ impl BoundedBlockStreamBuffer {
                 epoch_duration_cap_ns: None,
                 track_min_buffered_ns: None,
                 deferred_drops: Vec::with_capacity(INITIAL_DEFERRED_DROP_CAPACITY),
+                spare_drops: Vec::with_capacity(INITIAL_DEFERRED_DROP_CAPACITY),
                 closed: false,
             }),
             cv: Condvar::new(),
@@ -418,25 +466,22 @@ impl BoundedBlockStreamBuffer {
     }
 
     /// Explicitly unlock and drop any deferred consumed PCM blocks on a non-RT thread.
-    /// Review #7 re-review R6: drains in place so `deferred_guards` / `deferred_drops` keep their
-    /// pre-allocated capacity (`>= 256`) and the RT thread NEVER allocates in `recycle_consumed_block`.
+    /// Review #7 re-review R6 + Review #8 C7: O(1) swap with pre-allocated spares under lock
+    /// (zero heap allocations while holding `self.inner`), unlock/free strictly outside lock,
+    /// then return the capacity-retaining spare vectors!
     pub fn drain_deferred_drops(&self) {
-        let (guards, drops) = {
+        let (mut guards, mut drops) = {
             let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            let g: Vec<PinGuard> = if st.deferred_guards.is_empty() {
-                Vec::new()
-            } else {
-                st.deferred_guards.drain(..).collect()
-            };
-            let d: Vec<InterleavedInt32Buffer> = if st.deferred_drops.is_empty() {
-                Vec::new()
-            } else {
-                st.deferred_drops.drain(..).collect()
-            };
-            (g, d)
+            st.swap_deferred_with_spares()
         };
-        drop(guards);
-        drop(drops);
+        if guards.capacity() == 0 && drops.capacity() == 0 {
+            return;
+        }
+        // Unlock pages BEFORE dropping backing buffers, strictly outside `self.inner`.
+        guards.clear();
+        drops.clear();
+        let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        st.restore_spares(guards, drops);
     }
 
     #[cfg(test)]
@@ -640,23 +685,18 @@ impl BoundedBlockStreamBuffer {
             };
 
         let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let mut guards: Vec<PinGuard> = if st.deferred_guards.is_empty() {
-            Vec::new()
-        } else {
-            st.deferred_guards.drain(..).collect()
-        };
-        let mut drops: Vec<InterleavedInt32Buffer> = if st.deferred_drops.is_empty() {
-            Vec::new()
-        } else {
-            st.deferred_drops.drain(..).collect()
-        };
+        let (mut guards, mut drops) = st.swap_deferred_with_spares();
         loop {
             if st.closed || st.epoch != epoch {
                 drop(st);
                 drop(pre_pinned);
                 drop(event);
-                drop(guards);
-                drop(drops);
+                guards.clear();
+                drops.clear();
+                if guards.capacity() > 0 || drops.capacity() > 0 {
+                    let mut st2 = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    st2.restore_spares(guards, drops);
+                }
                 return false;
             }
             // Control markers pass immediately; PCM blocks respect both duration and RAM caps
@@ -673,16 +713,27 @@ impl BoundedBlockStreamBuffer {
                     st.pinned_guards.insert(ptr_key, guard);
                 }
                 st.push_back_event(event, block_peak_u32);
-                if !st.deferred_guards.is_empty() {
-                    guards.append(&mut st.deferred_guards);
-                }
-                if !st.deferred_drops.is_empty() {
-                    drops.append(&mut st.deferred_drops);
+                if guards.is_empty() && drops.is_empty() {
+                    let (g2, d2) = st.swap_deferred_with_spares();
+                    if guards.capacity() == 0 {
+                        guards = g2;
+                    } else {
+                        st.restore_spares(g2, Vec::new());
+                    }
+                    if drops.capacity() == 0 {
+                        drops = d2;
+                    } else {
+                        st.restore_spares(Vec::new(), d2);
+                    }
                 }
                 self.cv.notify_all();
                 drop(st);
-                drop(guards);
-                drop(drops);
+                guards.clear();
+                drops.clear();
+                if guards.capacity() > 0 || drops.capacity() > 0 {
+                    let mut st2 = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    st2.restore_spares(guards, drops);
+                }
                 return true;
             }
             if !drops.is_empty() || !guards.is_empty() {
@@ -690,20 +741,18 @@ impl BoundedBlockStreamBuffer {
                 guards.clear();
                 drops.clear();
                 st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-                if !st.deferred_guards.is_empty() {
-                    guards.append(&mut st.deferred_guards);
-                }
-                if !st.deferred_drops.is_empty() {
-                    drops.append(&mut st.deferred_drops);
-                }
+                st.restore_spares(guards, drops);
+                let (g2, d2) = st.swap_deferred_with_spares();
+                guards = g2;
+                drops = d2;
                 continue;
             }
             st = self.cv.wait(st).unwrap_or_else(|e| e.into_inner());
-            if !st.deferred_guards.is_empty() {
-                guards.append(&mut st.deferred_guards);
-            }
-            if !st.deferred_drops.is_empty() {
-                drops.append(&mut st.deferred_drops);
+            if guards.is_empty() && drops.is_empty() {
+                st.restore_spares(guards, drops);
+                let (g2, d2) = st.swap_deferred_with_spares();
+                guards = g2;
+                drops = d2;
             }
         }
     }
@@ -1374,6 +1423,14 @@ mod tests {
             assert!(
                 st.deferred_drops.capacity() >= INITIAL_DEFERRED_DROP_CAPACITY,
                 "R6: deferred_drops lost pre-allocated capacity after drain_deferred_drops"
+            );
+            assert!(
+                st.spare_guards.capacity() >= INITIAL_DEFERRED_DROP_CAPACITY,
+                "C7: spare_guards lost pre-allocated capacity after swap-and-restore"
+            );
+            assert!(
+                st.spare_drops.capacity() >= INITIAL_DEFERRED_DROP_CAPACITY,
+                "C7: spare_drops lost pre-allocated capacity after swap-and-restore"
             );
         }
 

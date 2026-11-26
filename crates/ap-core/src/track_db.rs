@@ -545,7 +545,16 @@ fn normalize_path_for_eq(s: &str) -> String {
     let trimmed = s.trim();
     #[cfg(windows)]
     {
-        trimmed.replace('/', "\\").to_ascii_lowercase()
+        let mut norm = trimmed.replace('/', "\\");
+        // Review #8 C10: normalize Windows verbatim prefixes (`\\?\UNC\` -> `\\`, `\\?\` -> ``).
+        if let Some(rest) = norm.strip_prefix(r"\\?\UNC\") {
+            norm = format!(r"\\{rest}");
+        } else if let Some(rest) = norm.strip_prefix(r"\\?\unc\") {
+            norm = format!(r"\\{rest}");
+        } else if let Some(rest) = norm.strip_prefix(r"\\?\") {
+            norm = rest.to_string();
+        }
+        norm.to_ascii_lowercase()
     }
     #[cfg(not(windows))]
     {
@@ -601,7 +610,35 @@ impl TrackDbStore {
             .join(format!("{clean}.yaml"))
     }
 
+    /// Move-recovery mirror written alongside central by-path entries (Review #8 C2).
+    /// Separate from legacy `md5/` so deleting a by-path file to reset an existing file NEVER
+    /// resurrects stale `user:` overrides, while renaming/moving a library recovers both results
+    /// and `user:` overrides seamlessly.
+    fn central_move_mirror_for_md5(&self, md5_hex: &str) -> PathBuf {
+        let clean: String = md5_hex
+            .chars()
+            .filter(|c| c.is_ascii_hexdigit())
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+        let prefix = if clean.len() >= 2 { &clean[..2] } else { "00" };
+        self.root_dir
+            .join("move")
+            .join(prefix)
+            .join(format!("{clean}.yaml"))
+    }
+
     fn central_path_for_file(&self, track_path: &Path) -> PathBuf {
+        // Review #8 C10: hash normalized path spelling so `D:\A\x.flac`, `d:/a/X.flac`, and
+        // `\\?\D:\A\x.flac` always map to the exact same central YAML entry on Windows.
+        let norm = normalize_path_for_eq(&track_path.to_string_lossy());
+        let h = fnv1a_128_hex(norm.as_bytes());
+        self.root_dir
+            .join("path")
+            .join(&h[..2])
+            .join(format!("{h}.yaml"))
+    }
+
+    fn legacy_raw_central_path_for_file(&self, track_path: &Path) -> PathBuf {
         let h = fnv1a_128_hex(track_path.to_string_lossy().as_bytes());
         self.root_dir
             .join("path")
@@ -609,11 +646,13 @@ impl TrackDbStore {
             .join(format!("{h}.yaml"))
     }
 
-    /// Strictly per-track lookup order (`FILTER_SELECTION_RESEARCH.md` §7.9):
+    /// Strictly per-track lookup order (`FILTER_SELECTION_RESEARCH.md` §7.9 + Review #8 C2/C10):
     /// 1. Sidecar `<track>.ap.yaml` (if `track_path` is local and sidecar exists).
-    /// 2. Central DB by `track_path`.
-    /// 3. Central DB by `STREAMINFO.md5` (if non-null). Note: MD5-matched entry from another path
-    ///    clears `user:` so per-path user overrides never leak onto a different file!
+    /// 2. Central DB by normalized `track_path` (with read fallback to legacy raw-hash path).
+    /// 3. Legacy central DB by `STREAMINFO.md5` (`md5/`): inherits `user:` for same or moved path.
+    /// 4. Central move-recovery mirror (`move/`): inherits `user:` ONLY for a genuine file move
+    ///    (different path AND old path no longer exists on disk), preventing duplicate leakage and
+    ///    preventing reset resurrection when a user deletes a by-path file.
     pub fn load_for_track(
         &self,
         track_path: Option<&Path>,
@@ -628,14 +667,39 @@ impl TrackDbStore {
             if let Some(e) = read_entry_if_exists(&by_path) {
                 return Some(e);
             }
+            let legacy_raw = self.legacy_raw_central_path_for_file(p);
+            if legacy_raw != by_path {
+                if let Some(e) = read_entry_if_exists(&legacy_raw) {
+                    return Some(e);
+                }
+            }
         }
         if let Some(md5) = md5_hex {
             let by_md5 = self.central_path_for_md5(md5);
             if let Some(mut e) = read_entry_if_exists(&by_md5) {
-                // FSR §7.9: an MD5 match never carries `user` overrides across different paths.
-                if track_path
-                    .is_some_and(|p| !paths_equivalent(&p.to_string_lossy(), &e.file.path))
-                {
+                let same = track_path
+                    .is_some_and(|p| paths_equivalent(&p.to_string_lossy(), &e.file.path));
+                let moved = track_path.is_some_and(|p| p.exists())
+                    && !same
+                    && !e.file.path.is_empty()
+                    && !Path::new(&e.file.path).exists();
+                if track_path.is_some() && !(same || moved) {
+                    e.user = TrackDbUserOverrides::default();
+                }
+                return Some(e);
+            }
+            let move_mirror = self.central_move_mirror_for_md5(md5);
+            if let Some(mut e) = read_entry_if_exists(&move_mirror) {
+                let same = track_path
+                    .is_some_and(|p| paths_equivalent(&p.to_string_lossy(), &e.file.path));
+                let moved = track_path.is_some_and(|p| p.exists())
+                    && !same
+                    && !e.file.path.is_empty()
+                    && !Path::new(&e.file.path).exists();
+                // For move-mirror entries: keep `user:` ONLY on a true move (`!same && old gone`).
+                // If `same` (user deleted the by-path file while file still exists) or duplicate
+                // copy (old path still exists), clear `user:`.
+                if track_path.is_some() && !moved {
                     e.user = TrackDbUserOverrides::default();
                 }
                 return Some(e);
@@ -646,17 +710,14 @@ impl TrackDbStore {
 
     /// Atomically persist `entry`, preserving any existing hand-edited `user:` section on disk.
     ///
-    /// - **Deterministic target (Review #7 F4 & F-A1):** For local tracks, saves to the sidecar
-    ///   (when enabled) or the central **by-path** file so `load_for_track` always finds entries
-    ///   even when `STREAMINFO.md5` is unset, and duplicate audio at two paths never shares or
-    ///   ping-pongs `user:` overrides.
-    /// - **Per-file `user:` preservation (Review #7 re-review R3):** Sidecar and central by-path
-    ///   targets belong exclusively to one track, so `user:` is ALWAYS preserved even when a
-    ///   hand-written sidecar omits `file.path` or a library was moved with its sidecars. The
-    ///   path-equivalence guard applies ONLY when inheriting from a shared central `by-md5` file.
-    /// - **File-identity-checked peak merge (Review #7 F5):** Existing `post_chain_peaks` are
-    ///   merged only when the on-disk entry describes the same underlying audio file (matching MD5,
-    ///   or matching size + mtime tolerance when MD5 is absent).
+    /// - **Deterministic normalized target (Review #7 F4/F-A1 + Review #8 C10):** For local tracks,
+    ///   saves to the sidecar (when enabled) or the central **normalized by-path** file so
+    ///   `load_for_track` always finds entries regardless of Windows path casing/slashes/verbatim
+    ///   prefix, and cleans up any superseded legacy raw-hash or legacy `md5/` file.
+    /// - **Library move recovery & zero resurrection (Review #8 C2):** Central by-path saves also
+    ///   update a `move/<prefix>/<md5>.yaml` mirror so renaming/moving a library recovers both
+    ///   results and `user:` overrides when the old path no longer exists, while never leaking
+    ///   `user:` onto duplicate copies or resurrecting `user:` after a by-path reset.
     pub fn save_preserving_user(
         &self,
         track_path: Option<&Path>,
@@ -680,30 +741,85 @@ impl TrackDbStore {
             return Err("cannot determine trackdb save path (no path or MD5)".to_string());
         };
 
-        // Read existing target entry (or one-time legacy by-md5 fallback when migrating to by-path).
-        let (existing_opt, existing_from_shared_md5) =
+        let legacy_raw_target = if !self.sidecar_enabled {
+            track_path
+                .map(|p| self.legacy_raw_central_path_for_file(p))
+                .filter(|raw| raw != &target)
+        } else {
+            None
+        };
+        let legacy_md5_path = if !self.sidecar_enabled && track_path.is_some() {
+            entry
+                .file
+                .streaminfo_md5
+                .as_deref()
+                .map(|md5| self.central_path_for_md5(md5))
+        } else {
+            None
+        };
+
+        enum ExistingSource {
+            PerFile,
+            LegacyMd5,
+            MoveMirror,
+        }
+
+        // Read existing target entry (or migrate from legacy raw-path / legacy md5 / move mirror).
+        let (existing_opt, existing_src, consumed_legacy_md5) =
             if let Some(e) = read_entry_if_exists(&target) {
-                (Some(e), target_is_shared_md5)
-            } else if !self.sidecar_enabled && track_path.is_some() {
-                let legacy = entry
-                    .file
-                    .streaminfo_md5
-                    .as_deref()
-                    .and_then(|md5| read_entry_if_exists(&self.central_path_for_md5(md5)));
-                (legacy, true)
+                (
+                    Some(e),
+                    if target_is_shared_md5 {
+                        ExistingSource::LegacyMd5
+                    } else {
+                        ExistingSource::PerFile
+                    },
+                    false,
+                )
+            } else if let Some(ref raw_p) = legacy_raw_target {
+                if let Some(e) = read_entry_if_exists(raw_p) {
+                    (Some(e), ExistingSource::PerFile, false)
+                } else if let Some(ref lmd5) = legacy_md5_path {
+                    if let Some(e) = read_entry_if_exists(lmd5) {
+                        (Some(e), ExistingSource::LegacyMd5, true)
+                    } else {
+                        let mm = entry
+                            .file
+                            .streaminfo_md5
+                            .as_deref()
+                            .and_then(|m| read_entry_if_exists(&self.central_move_mirror_for_md5(m)));
+                        (mm, ExistingSource::MoveMirror, false)
+                    }
+                } else {
+                    (None, ExistingSource::PerFile, false)
+                }
+            } else if let Some(ref lmd5) = legacy_md5_path {
+                if let Some(e) = read_entry_if_exists(lmd5) {
+                    (Some(e), ExistingSource::LegacyMd5, true)
+                } else {
+                    let mm = entry
+                        .file
+                        .streaminfo_md5
+                        .as_deref()
+                        .and_then(|m| read_entry_if_exists(&self.central_move_mirror_for_md5(m)));
+                    (mm, ExistingSource::MoveMirror, false)
+                }
             } else {
-                (None, false)
+                (None, ExistingSource::PerFile, false)
             };
 
         if let Some(existing) = existing_opt {
-            // Preserve hand-edited `user:`: ALWAYS for per-file sidecar/by-path targets (R3), and
-            // only for matching track paths when loaded from a shared central by-md5 entry (F-A1).
-            let allow_user_inherit = if existing_from_shared_md5 {
-                paths_equivalent(&existing.file.path, &entry.file.path)
-                    || track_path
-                        .is_some_and(|p| paths_equivalent(&p.to_string_lossy(), &existing.file.path))
-            } else {
-                true
+            let same = paths_equivalent(&existing.file.path, &entry.file.path)
+                || track_path
+                    .is_some_and(|p| paths_equivalent(&p.to_string_lossy(), &existing.file.path));
+            let moved = !same
+                && track_path.is_some_and(|p| p.exists())
+                && !existing.file.path.is_empty()
+                && !Path::new(&existing.file.path).exists();
+            let allow_user_inherit = match existing_src {
+                ExistingSource::PerFile => true,
+                ExistingSource::LegacyMd5 => same || moved,
+                ExistingSource::MoveMirror => moved,
             };
             if allow_user_inherit && entry.user == TrackDbUserOverrides::default() {
                 entry.user = existing.user;
@@ -738,7 +854,30 @@ impl TrackDbStore {
             }
         }
 
-        atomic_write_yaml(&target, &entry.to_yaml_string())?;
+        let yaml = entry.to_yaml_string();
+        atomic_write_yaml(&target, &yaml)?;
+
+        // Review #8 C10: remove superseded legacy raw-hash file once migrated to normalized path.
+        if let Some(ref raw_p) = legacy_raw_target {
+            if raw_p.exists() {
+                let _ = fs::remove_file(raw_p);
+            }
+        }
+        // Review #8 C2: remove consumed legacy by-md5 file so deleting by-path later never resurrects
+        // stale `user:` overrides.
+        if consumed_legacy_md5 {
+            if let Some(ref lmd5) = legacy_md5_path {
+                let _ = fs::remove_file(lmd5);
+            }
+        }
+        // Review #8 C2: maintain central move-recovery mirror for central by-path entries with MD5.
+        if !self.sidecar_enabled && track_path.is_some() {
+            if let Some(ref md5) = entry.file.streaminfo_md5 {
+                let mirror = self.central_move_mirror_for_md5(md5);
+                let _ = atomic_write_yaml(&mirror, &yaml);
+            }
+        }
+
         Ok(target)
     }
 }
@@ -1315,6 +1454,113 @@ mod tests {
             "R3: moved library sidecar must preserve user.filter"
         );
         assert_eq!(reloaded_moved.user.apodizing, Some(false));
+
+        // 6. Review #8 C2: Central store move recovery, duplicate isolation, and zero legacy resurrection.
+        let c2_dir = tmp_dir.join("c2_central");
+        let c2_store = TrackDbStore::new(c2_dir.clone(), false);
+        let p1 = tmp_dir.join("lib_old").join("01_move.flac");
+        let p2 = tmp_dir.join("lib_new").join("01_move.flac");
+        let p_dup = tmp_dir.join("lib_dup").join("01_move.flac");
+        fs::create_dir_all(p1.parent().unwrap()).unwrap();
+        fs::create_dir_all(p2.parent().unwrap()).unwrap();
+        fs::create_dir_all(p_dup.parent().unwrap()).unwrap();
+        fs::write(&p1, b"audio-bytes").unwrap();
+        fs::write(&p_dup, b"audio-bytes").unwrap();
+        let md5_move = "11223344556677889900aabbccddeeff";
+
+        let mut e_p1 = TrackDbEntry::default();
+        e_p1.file = TrackDbFileInfo {
+            path: p1.to_string_lossy().into_owned(),
+            size: 11,
+            mtime_unix_s: 9000,
+            streaminfo_md5: Some(md5_move.to_string()),
+            sample_rate: 44_100,
+            bits: 16,
+        };
+        e_p1.user.filter = Some("short-lp".to_string());
+        e_p1.results.true_peak_dbtp = Some(-1.25);
+        c2_store.save_preserving_user(Some(&p1), e_p1).unwrap();
+
+        // 6a. Duplicate copy at p_dup while p1 STILL EXISTS -> results found, user NOT inherited!
+        let dup_loaded = c2_store.load_for_track(Some(&p_dup), Some(md5_move)).unwrap();
+        assert_eq!(dup_loaded.user, TrackDbUserOverrides::default());
+        assert_eq!(dup_loaded.results.true_peak_dbtp, Some(-1.25));
+
+        // 6b. True library move: rename p1 -> p2 (p1 no longer exists) -> BOTH user and results recovered!
+        fs::rename(&p1, &p2).unwrap();
+        let moved_loaded = c2_store.load_for_track(Some(&p2), Some(md5_move)).unwrap();
+        assert_eq!(
+            moved_loaded.user.filter.as_deref(),
+            Some("short-lp"),
+            "C2: central store must recover user override when file is moved"
+        );
+        assert_eq!(moved_loaded.results.true_peak_dbtp, Some(-1.25));
+
+        // 6c. Legacy md5/ migration deletes legacy file so deleting by-path later NEVER resurrects user:!
+        let p_leg = tmp_dir.join("lib_leg").join("02_legacy.flac");
+        fs::create_dir_all(p_leg.parent().unwrap()).unwrap();
+        fs::write(&p_leg, b"legacy-audio").unwrap();
+        let md5_leg = "ffeeddccbbaa00998877665544332211";
+        let leg_md5_file = c2_store.central_path_for_md5(md5_leg);
+        let mut leg_entry = TrackDbEntry::default();
+        leg_entry.file = TrackDbFileInfo {
+            path: p_leg.to_string_lossy().into_owned(),
+            size: 12,
+            mtime_unix_s: 9100,
+            streaminfo_md5: Some(md5_leg.to_string()),
+            sample_rate: 44_100,
+            bits: 16,
+        };
+        leg_entry.user.apodizing = Some(true);
+        atomic_write_yaml(&leg_md5_file, &leg_entry.to_yaml_string()).unwrap();
+
+        let mut mig_entry = TrackDbEntry::default();
+        mig_entry.file = leg_entry.file.clone();
+        let by_path_saved = c2_store.save_preserving_user(Some(&p_leg), mig_entry).unwrap();
+        assert!(
+            !leg_md5_file.exists(),
+            "C2: consumed legacy by-md5 file must be removed after by-path migration"
+        );
+        // Now delete by-path file to reset while p_leg still exists -> user: MUST NOT resurrect!
+        fs::remove_file(&by_path_saved).unwrap();
+        if let Some(after_reset) = c2_store.load_for_track(Some(&p_leg), Some(md5_leg)) {
+            assert_eq!(
+                after_reset.user,
+                TrackDbUserOverrides::default(),
+                "C2: deleting by-path file must never resurrect stale user: overrides"
+            );
+        }
+
+        // 7. Review #8 C10: Windows path spelling normalization -> identical by-path hash & single file.
+        #[cfg(windows)]
+        {
+            let c10_dir = tmp_dir.join("c10_norm");
+            let c10_store = TrackDbStore::new(c10_dir.clone(), false);
+            let p_win_upper = PathBuf::from(r"D:\Music\Album\01_Track.flac");
+            let p_win_slash = PathBuf::from("d:/music/album/01_track.flac");
+            let p_win_verb = PathBuf::from(r"\\?\D:\Music\Album\01_Track.flac");
+
+            let mut e_norm = TrackDbEntry::default();
+            e_norm.file.path = p_win_upper.to_string_lossy().into_owned();
+            e_norm.user.filter = Some("sinc-steep-4m".to_string());
+            c10_store.save_preserving_user(Some(&p_win_upper), e_norm).unwrap();
+
+            let loaded_slash = c10_store.load_for_track(Some(&p_win_slash), None).unwrap();
+            let loaded_verb = c10_store.load_for_track(Some(&p_win_verb), None).unwrap();
+            assert_eq!(loaded_slash.user.filter.as_deref(), Some("sinc-steep-4m"));
+            assert_eq!(loaded_verb.user.filter.as_deref(), Some("sinc-steep-4m"));
+
+            // Verify only ONE YAML file exists under `path/`!
+            let mut yaml_count = 0usize;
+            for sub in fs::read_dir(c10_dir.join("path")).unwrap() {
+                for f in fs::read_dir(sub.unwrap().path()).unwrap() {
+                    if f.unwrap().path().extension().and_then(|e| e.to_str()) == Some("yaml") {
+                        yaml_count += 1;
+                    }
+                }
+            }
+            assert_eq!(yaml_count, 1, "C10: normalized Windows paths must map to one file");
+        }
 
         let _ = fs::remove_dir_all(&tmp_dir);
     }

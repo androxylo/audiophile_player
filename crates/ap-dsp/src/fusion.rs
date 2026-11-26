@@ -242,7 +242,9 @@ pub fn fuse_track_evidence(
     }
 
     // Disprove stale Vorbis peak tags if the 30 s window provably exceeds them.
-    if peak_meta.full_scan_true_peak_linear.is_none() {
+    // Review #8 C1: When current whole-track (`wt_results`) is available, WT is authoritative
+    // so scan and cached playback never disagree on stale-peak disproof.
+    if wt_results.is_none() && peak_meta.full_scan_true_peak_linear.is_none() {
         if let Some(w) = window {
             if let Some(cp) = raw_peak_meta.classified_peak_for_bits(container_bits) {
                 match cp.kind {
@@ -475,14 +477,27 @@ pub fn fuse_track_evidence(
     };
 
     // --- Row 7: DSD-origin / ultrasonic ADC noise above 40 kHz (`OQ-37`) ---
+    // Review #8 C1: When current whole-track (`wt_results`) is available, treat WT as
+    // authoritative (matching trust order Cache (WT) > Window) so scan and cached playback
+    // always produce identical `PostChainKey.hf_noise_filter` values.
     let hf_noise_filter = if sample_rate_hz >= 88_200 {
-        let wt_pos = wt_results
-            .is_some_and(|wt| wt.ultrasonic_noise_detected == DetectorVerdict::Positive);
-        let w_pos = window
-            .is_some_and(|w| w.ultrasonic_noise_detected == DetectorVerdict::Positive);
-        if wt_pos {
-            Evidence::new(true, EvidenceSource::Cache, "WT ultrasonic noise shelf > 40 kHz (OQ-37)")
-        } else if w_pos {
+        if let Some(wt) = wt_results {
+            let pos = wt.ultrasonic_noise_detected == DetectorVerdict::Positive;
+            if !pos && track_meta.is_dsd_hint {
+                notices.push(
+                    "DSD/SACD provenance tag present without rising ultrasonic noise shelf in WT (tag alone: log only)"
+                        .to_string(),
+                );
+            }
+            Evidence::new(
+                pos,
+                EvidenceSource::Cache,
+                format!(
+                    "WT ultrasonic noise shelf > 40 kHz ({})",
+                    wt.ultrasonic_noise_detected.as_str()
+                ),
+            )
+        } else if window.is_some_and(|w| w.ultrasonic_noise_detected == DetectorVerdict::Positive) {
             let tag_note = if track_meta.is_dsd_hint { " + DSD/SACD tag" } else { "" };
             let w = window.unwrap();
             Evidence::new(
@@ -557,5 +572,50 @@ pub fn fuse_track_evidence(
         phase_override,
         genre_class,
         notices,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wt_negative_overrides_w30_positive_hf_noise_c1() {
+        let mut w30 = crate::analysis::TrackAnalyzer::new(96_000, 24)
+            .snapshot(false, false, false, false);
+        w30.ultrasonic_noise_detected = DetectorVerdict::Positive;
+        w30.ultrasonic_noise_rise_db = 8.5;
+        w30.ultrasonic_noise_level_dbfs = -65.0;
+
+        let wt = CachedWholeTrackEvidence {
+            results_current: true,
+            true_peak_dbtp: Some(-1.0),
+            integrated_lufs: Some(-16.0),
+            clipped_runs: 0,
+            loud_and_clipped: DetectorVerdict::Negative,
+            apodizing_needed: DetectorVerdict::Negative,
+            apod_events: 0,
+            upsampled_from_1x: DetectorVerdict::Negative,
+            effective_nyquist_hz: None,
+            ultrasonic_noise_detected: DetectorVerdict::Negative,
+            effective_bits: Some(24),
+            user_filter: None,
+            user_apodizing: None,
+            user_deemphasis: None,
+        };
+
+        let fused = fuse_track_evidence(
+            96_000,
+            24,
+            &TrackPeakMetadata::default(),
+            &TrackMetadata::default(),
+            Some(&w30),
+            Some(&wt),
+        );
+        assert!(
+            !fused.hf_noise_filter.value,
+            "C1: current WT Negative must override W30 Positive for hf_noise_filter"
+        );
+        assert_eq!(fused.hf_noise_filter.source, EvidenceSource::Cache);
     }
 }
