@@ -20,7 +20,7 @@ crate-type = ["cdylib"]
 ap-stream-protocol = { path = "../../crates/ap-stream-protocol" }
 
 [build-dependencies]
-bindgen = "0.71"
+bindgen = "0.72.1"
 
 [profile.dev]
 panic = "abort"

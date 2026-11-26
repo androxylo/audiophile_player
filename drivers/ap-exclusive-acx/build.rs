@@ -79,16 +79,23 @@ fn main() {
         .clang_arg(format!("-I{}", clean(&inc_acx)))
         .allowlist_type("DRIVER_OBJECT|PDRIVER_OBJECT|UNICODE_STRING|PCUNICODE_STRING|GUID|LARGE_INTEGER|KSPIN_LOCK|KIRQL|PMDL|MDL|PEPROCESS|PIRP|NTSTATUS|ULONG|USHORT|UCHAR|LONG|LONGLONG|ULONGLONG|BOOLEAN|PVOID|SIZE_T")
         .allowlist_type("WAVEFORMATEX|WAVEFORMATEXTENSIBLE|KSDATAFORMAT.*")
-        .allowlist_type("WDF.*|PWDF.*|PFN_WDF.*|EVT_WDF.*|_WDFFUNCENUM")
-        .allowlist_type("ACX.*|PACX.*|PFN_ACX.*|EVT_ACX.*|_ACXFUNCENUM")
+        .allowlist_type("WDF.*|PWDF.*|_WDF_.*|PFN_WDF.*|EVT_WDF.*|_WDFFUNCENUM")
+        .allowlist_type("ACX.*|PACX.*|_ACX_.*|PFN_ACX.*|EVT_ACX.*|_ACXFUNCENUM")
         .allowlist_function("DbgPrintEx|ExAllocatePool2|ExFreePoolWithTag|IoAllocateMdl|IoFreeMdl|MmBuildMdlForNonPagedPool|IoGetCurrentProcess|PsGetCurrentProcessId|PsGetProcessImageFileName|KeInitializeSpinLock|KeAcquireSpinLockRaiseToDpc|KeReleaseSpinLock|KeQueryPerformanceCounter|KeFlushQueuedDpcs|KeBugCheckEx")
         .allowlist_var("WdfFunctions.*|WdfDriverGlobals|AcxFunctions|AcxDriverGlobals|STATUS_.*|POOL_FLAG_.*|PAGE_SIZE|WAVE_FORMAT_.*|KSAUDIO_SPEAKER_.*|SPEAKER_.*|DPFLTR_.*|WDF_NO_.*|ACX_.*|KSSTREAM_HEADER_OPTIONSF_.*")
         .generate()
         .expect("Failed to generate WDK/KMDF/ACX bindings via bindgen");
 
+    let rendered = bindings.to_string();
+    assert!(
+        rendered.contains("pub struct _WDF_OBJECT_ATTRIBUTES")
+            && rendered.contains("pub Size")
+            && rendered.contains("pub ParentObject"),
+        "bindgen generated an incomplete _WDF_OBJECT_ATTRIBUTES (check bindgen >= 0.72.1 / libclang compatibility)"
+    );
+
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    bindings
-        .write_to_file(out_dir.join("bindings.rs"))
+    std::fs::write(out_dir.join("bindings.rs"), rendered)
         .expect("Couldn't write bindings.rs");
 
     println!("cargo:rustc-link-search=native={}", clean(&lib_km));

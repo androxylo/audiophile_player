@@ -260,7 +260,7 @@ Write-Host "=== 1. Building Pure-Rust ACX 1.1 Kernel Driver (ap_exclusive_audio.
 Write-Host "  WDK      : $kit"
 Write-Host "  MSVC     : $msvc"
 Write-Host "  libclang : $libclang"
-cargo +stable-x86_64-pc-windows-msvc build --release --manifest-path "$root\Cargo.toml"
+cargo +stable-x86_64-pc-windows-msvc build --release --locked --manifest-path "$root\Cargo.toml"
 if ($LASTEXITCODE -ne 0) { throw "Kernel driver build failed" }
 
 Write-Host "`n=== 2. Packaging driver into $out ===" -ForegroundColor Cyan
