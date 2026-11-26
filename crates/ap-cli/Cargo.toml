@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 ap-core.workspace = true
+ap-stream-protocol.workspace = true
 ap-source.workspace = true
 ap-dsp.workspace = true
 ap-output-win.workspace = true
@@ -19,5 +20,4 @@ ap-control.workspace = true
 ap-upnp.workspace = true
 
 [dev-dependencies]
-ap-stream-protocol.workspace = true
 flac-codec = "1.3"

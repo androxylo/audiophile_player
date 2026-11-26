@@ -23,6 +23,7 @@ mod stream;
 use core::ffi::c_void;
 use core::mem::size_of;
 use core::ptr;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use ap_stream_protocol::{
     ApDriverConfig, ApDriverStatus, ApPcmChunkHeader, IOCTL_AP_GET_STATUS, IOCTL_AP_READ_PCM,
@@ -37,28 +38,42 @@ use sys::*;
 pub static AcxMinimumVersionRequired: u32 = 1;
 
 /// Stub required by prebuilt `libcore` on `x86_64-pc-windows-msvc` (never called with `panic = "abort"`).
+/// Returns `ExceptionContinueSearch` (1) instead of `ExceptionContinueExecution` (0) (Review #8 A14).
 #[unsafe(no_mangle)]
 pub extern "C" fn __CxxFrameHandler3() -> i32 {
-    0
+    1
 }
 
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    let (line, col) = match info.location() {
+        Some(loc) => (loc.line() as u64, loc.column() as u64),
+        None => (0, 0),
+    };
     unsafe {
-        KeBugCheckEx(0x0000_00E2, 0x4150_4558, 0, 0, 0);
+        // DRIVER_OVERRAN_STACK_BUFFER / driver-tagged bugcheck with panic line/col instead of
+        // misleading MANUALLY_INITIATED_CRASH (0xE2) (Review #8 A14).
+        KeBugCheckEx(0x0000_00F7, 0x4150_4558, line, col, 0);
     }
 }
 
 static mut G_DRIVER: WDFDRIVER = ptr::null_mut();
 static mut G_CONTROL_DEVICE: WDFDEVICE = ptr::null_mut();
 static mut G_RENDER_CIRCUIT: ACXCIRCUIT = ptr::null_mut();
+/// Guard enforcing a single active PnP instance (Review #8 A5).
+static G_PNP_DEVICE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-// SDDL: SYSTEM + Administrators full access; logged-in interactive users read/write (no admin needed to play).
+// SDDL: SYSTEM + Administrators full access; logged-in interactive users read/write ONLY at
+// Medium integrity or above (`S:(ML;;NWNRNX;;;ME)` blocks Low-IL / AppContainer readers),
+// combined with per-session isolation in `ring.rs` (Review #8 A1/D4).
+// "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)S:(ML;;NWNRNX;;;ME)"
 const SDDL_CONTROL: &[u16] = &[
     b'D' as u16, b':' as u16, b'P' as u16,
     b'(' as u16, b'A' as u16, b';' as u16, b';' as u16, b'G' as u16, b'A' as u16, b';' as u16, b';' as u16, b';' as u16, b'S' as u16, b'Y' as u16, b')' as u16,
     b'(' as u16, b'A' as u16, b';' as u16, b';' as u16, b'G' as u16, b'A' as u16, b';' as u16, b';' as u16, b';' as u16, b'B' as u16, b'A' as u16, b')' as u16,
     b'(' as u16, b'A' as u16, b';' as u16, b';' as u16, b'G' as u16, b'R' as u16, b'G' as u16, b'W' as u16, b';' as u16, b';' as u16, b';' as u16, b'I' as u16, b'U' as u16, b')' as u16,
+    b'S' as u16, b':' as u16,
+    b'(' as u16, b'M' as u16, b'L' as u16, b';' as u16, b';' as u16, b'N' as u16, b'W' as u16, b'N' as u16, b'R' as u16, b'N' as u16, b'X' as u16, b';' as u16, b';' as u16, b';' as u16, b'M' as u16, b'E' as u16, b')' as u16,
     0,
 ];
 // \Device\ApExclusiveAudio
@@ -68,11 +83,10 @@ const DEV_NAME_CONTROL: &[u16] = &[
     b'u' as u16, b's' as u16, b'i' as u16, b'v' as u16, b'e' as u16, b'A' as u16, b'u' as u16,
     b'd' as u16, b'i' as u16, b'o' as u16, 0,
 ];
-// \DosDevices\Global\ApExclusiveAudio -> \\.\ApExclusiveAudio
+// \DosDevices\ApExclusiveAudio -> \\.\ApExclusiveAudio
 const SYMLINK_CONTROL: &[u16] = &[
     b'\\' as u16, b'D' as u16, b'o' as u16, b's' as u16, b'D' as u16, b'e' as u16, b'v' as u16,
-    b'i' as u16, b'c' as u16, b'e' as u16, b's' as u16, b'\\' as u16, b'G' as u16, b'l' as u16,
-    b'o' as u16, b'b' as u16, b'a' as u16, b'l' as u16, b'\\' as u16, b'A' as u16, b'p' as u16,
+    b'i' as u16, b'c' as u16, b'e' as u16, b's' as u16, b'\\' as u16, b'A' as u16, b'p' as u16,
     b'E' as u16, b'x' as u16, b'c' as u16, b'l' as u16, b'u' as u16, b's' as u16, b'i' as u16,
     b'v' as u16, b'e' as u16, b'A' as u16, b'u' as u16, b'd' as u16, b'i' as u16, b'o' as u16,
     0,
@@ -127,14 +141,28 @@ unsafe extern "C" fn evt_control_create(
     _file_obj: WDFFILEOBJECT,
 ) {
     unsafe {
-        ring::set_reader_connected(true);
+        let mut session_id: ULONG = u32::MAX;
+        let irp = wdf_request_wdm_get_irp(request);
+        if !irp.is_null() {
+            let st = IoGetRequestorSessionId(irp, &mut session_id);
+            if !nt_success(st) {
+                session_id = u32::MAX;
+            }
+        }
+        if session_id == u32::MAX {
+            let eproc = IoGetCurrentProcess();
+            if !eproc.is_null() {
+                session_id = PsGetProcessSessionIdEx(eproc);
+            }
+        }
+        ring::set_reader_connected(true, session_id);
         wdf_request_complete(request, STATUS_SUCCESS_VAL);
     }
 }
 
 unsafe extern "C" fn evt_control_cleanup(_file_obj: WDFFILEOBJECT) {
     unsafe {
-        ring::set_reader_connected(false);
+        ring::set_reader_connected(false, u32::MAX);
     }
 }
 
@@ -163,8 +191,7 @@ unsafe extern "C" fn evt_control_ioctl(
                         &mut actual_len,
                     );
                     if nt_success(st) && !out_ptr.is_null() {
-                        let snap = ring::get_status_snapshot();
-                        ptr::write_unaligned(out_ptr.cast::<ApDriverStatus>(), snap);
+                        ring::write_status_snapshot(out_ptr.cast::<u8>());
                         info = size_of::<ApDriverStatus>() as ULONG_PTR;
                         status = STATUS_SUCCESS_VAL;
                     } else {
@@ -435,17 +462,27 @@ unsafe fn create_render_circuit(device: WDFDEVICE) -> Result<ACXCIRCUIT, NTSTATU
     }
 }
 
-// ---- PnP Device Lifecycle ----
+// ---- PnP Device & Driver Lifecycle (Review #8 A5/A6) ----
 
 unsafe extern "C" fn evt_audio_device_cleanup(_obj: WDFOBJECT) {
+    unsafe {
+        // Control device & global 4 MiB ring live for the full driver lifetime so PnP restart
+        // while a player holds \\.\ApExclusiveAudio never hits STATUS_OBJECT_NAME_COLLISION
+        // or re-initializes an active spinlock (Review #8 A5).
+        G_RENDER_CIRCUIT = ptr::null_mut();
+        G_PNP_DEVICE_ACTIVE.store(false, Ordering::Release);
+    }
+}
+
+unsafe extern "C" fn evt_driver_unload(_driver: WDFDRIVER) {
     unsafe {
         if !G_CONTROL_DEVICE.is_null() {
             let ctrl = G_CONTROL_DEVICE;
             G_CONTROL_DEVICE = ptr::null_mut();
             wdf_object_delete(ctrl as WDFOBJECT);
         }
-        G_RENDER_CIRCUIT = ptr::null_mut();
         ring::cleanup_global_ring();
+        G_DRIVER = ptr::null_mut();
     }
 }
 
@@ -475,17 +512,22 @@ unsafe extern "C" fn evt_device_release_hardware(
 }
 
 unsafe extern "C" fn evt_driver_device_add(
-    driver: WDFDRIVER,
+    _driver: WDFDRIVER,
     mut device_init: PWDFDEVICE_INIT,
 ) -> NTSTATUS {
-    unsafe {
-        if !ring::init_global_ring() {
-            return STATUS_INSUFFICIENT_RESOURCES_VAL;
-        }
+    // Reject a second concurrent ROOT\ApExclusiveAudio instance cleanly (Review #8 A5).
+    if G_PNP_DEVICE_ACTIVE
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return STATUS_DEVICE_CONFIGURATION_ERROR_VAL;
+    }
 
+    unsafe {
         let mut init_cfg = acx_deviceinit_config_init();
         let st = acx_device_init_initialize(device_init, &mut init_cfg);
         if !nt_success(st) {
+            G_PNP_DEVICE_ACTIVE.store(false, Ordering::Release);
             return st;
         }
 
@@ -499,14 +541,8 @@ unsafe extern "C" fn evt_driver_device_add(
         let mut device: WDFDEVICE = ptr::null_mut();
         let st = wdf_device_create(&mut device_init, &mut attrs, &mut device);
         if !nt_success(st) {
+            G_PNP_DEVICE_ACTIVE.store(false, Ordering::Release);
             return st;
-        }
-
-        if G_CONTROL_DEVICE.is_null() {
-            let st = create_control_device(driver);
-            if !nt_success(st) {
-                return st;
-            }
         }
 
         let mut dev_cfg = acx_device_config_init();
@@ -536,11 +572,9 @@ pub unsafe extern "system" fn driver_entry(
 ) -> NTSTATUS {
     unsafe {
         stream::init_stream_registry();
-        if !ring::init_global_ring() {
-            return STATUS_INSUFFICIENT_RESOURCES_VAL;
-        }
 
         let mut wdf_cfg = wdf_driver_config_init(Some(evt_driver_device_add));
+        wdf_cfg.EvtDriverUnload = Some(evt_driver_unload);
         let mut driver: WDFDRIVER = ptr::null_mut();
         let st = wdf_driver_create(
             driver_object,
@@ -554,7 +588,29 @@ pub unsafe extern "system" fn driver_entry(
         }
         G_DRIVER = driver;
 
+        // Allocate 4 MiB ring and singleton control device ONCE in DriverEntry (Review #8 A5/A6).
+        if !ring::init_global_ring() {
+            return STATUS_INSUFFICIENT_RESOURCES_VAL;
+        }
+
+        let st = create_control_device(driver);
+        if !nt_success(st) {
+            ring::cleanup_global_ring();
+            return st;
+        }
+
         let mut acx_cfg = acx_driver_config_init();
-        acx_driver_initialize(driver, &mut acx_cfg)
+        let st = acx_driver_initialize(driver, &mut acx_cfg);
+        if !nt_success(st) {
+            if !G_CONTROL_DEVICE.is_null() {
+                let ctrl = G_CONTROL_DEVICE;
+                G_CONTROL_DEVICE = ptr::null_mut();
+                wdf_object_delete(ctrl as WDFOBJECT);
+            }
+            ring::cleanup_global_ring();
+            return st;
+        }
+
+        STATUS_SUCCESS_VAL
     }
 }

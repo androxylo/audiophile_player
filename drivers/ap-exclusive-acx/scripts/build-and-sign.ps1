@@ -213,7 +213,7 @@ $signtool = @(
 & $stampinf -f $infPath -d * -a amd64 -k $kmdf -v $infVer
 if ($LASTEXITCODE -ne 0) { throw "stampinf failed" }
 
-& $inf2cat /driver:"$out" /os:10_VB_X64 /uselocaltime
+& $inf2cat /driver:"$out" /os:10_NI_X64 /uselocaltime
 if ($LASTEXITCODE -ne 0) { throw "Inf2Cat failed" }
 
 if (Test-Path $infverif) {

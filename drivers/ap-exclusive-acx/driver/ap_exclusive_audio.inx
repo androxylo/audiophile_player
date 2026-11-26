@@ -1,13 +1,14 @@
 ; Audiophile Player Exclusive-Mode Virtual ACX 1.1 Render Driver
 ; SPDX-License-Identifier: GPL-3.0-or-later
-; Root-enumerated virtual render endpoint (ROOT\ApExclusiveAudio). Zero APOs, event-driven WaveRT.
+; Root-enumerated virtual render endpoint (ROOT\ApExclusiveAudio) for Windows 11 22H2+ x64.
+; Zero APOs, event-driven WaveRT, LineLevel form factor.
 
 [Version]
 Signature   = "$WINDOWS NT$"
 Class       = MEDIA
 ClassGuid   = {4d36e96c-e325-11ce-bfc1-08002be10318}
 Provider    = %ProviderName%
-DriverVer   = 01/01/2026,1.0.0.0
+DriverVer   = 01/01/2026,0.1.0.0
 CatalogFile = ap_exclusive_audio.cat
 PnpLockdown = 1
 
@@ -15,18 +16,23 @@ PnpLockdown = 1
 DefaultDestDir = 13
 
 [Manufacturer]
-%ProviderName% = Standard,NT$ARCH$.10.0...19041
+; ACX 1.1 requires Windows 11 (22H2 / Build 22621+ x64, Review #8 D5)
+%ProviderName% = Standard,NT$ARCH$.10.0...22621
 
-[Standard.NT$ARCH$.10.0...19041]
+[Standard.NT$ARCH$.10.0...22621]
 %ApExcl.DeviceDesc% = ApExcl_Device, ROOT\ApExclusiveAudio
 
 [ApExcl_Device.NT]
+Include   = ks.inf, wdmaudio.inf
+Needs     = KS.Registration, WDMAUDIO.Registration
 CopyFiles = ApExcl_Device.NT.Copy
 
 [ApExcl_Device.NT.Copy]
 ap_exclusive_audio.sys
 
 [ApExcl_Device.NT.Services]
+Include    = ks.inf, wdmaudio.inf
+Needs      = KS.Registration.Services, WDMAUDIO.Registration.Services
 AddService = ap_exclusive_audio, %SPSVCINST_ASSOCSERVICE%, ApExcl_Service_Inst
 
 [ApExcl_Service_Inst]
@@ -55,8 +61,9 @@ AddReg = ApExcl_Device.I.Render.AddReg
 [ApExcl_Device.I.Render.AddReg]
 HKR,,CLSID,,%Proxy.CLSID%
 HKR,,FriendlyName,,%ApExcl.Render.szPname%
-; Opt in to event-driven WaveRT pull mode. ZERO APOs registered.
+; Opt in to event-driven WaveRT pull mode and LineLevel form factor. ZERO APOs registered.
 HKR,EP\0,%PKEY_AudioEndpoint_Association%,,%KSNODETYPE_ANY%
+HKR,EP\0,%PKEY_AudioEndpoint_FormFactor%,0x00010001,0x2
 HKR,EP\0,%PKEY_AudioEndpoint_Supports_EventDriven_Mode%,0x00010001,0x1
 
 [ApExcl_Device.NT.Interfaces]
@@ -76,6 +83,7 @@ KSCATEGORY_RENDER      = "{65E8773E-8F56-11D0-A3B9-00A0C9223196}"
 KSCATEGORY_REALTIME    = "{EB115FFC-10C8-4964-831D-6DCB02E6F23F}"
 KSNODETYPE_ANY         = "{00000000-0000-0000-0000-000000000000}"
 
+PKEY_AudioEndpoint_FormFactor                = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},0"
 PKEY_AudioEndpoint_Association               = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},2"
 PKEY_AudioEndpoint_Supports_EventDriven_Mode = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},7"
 

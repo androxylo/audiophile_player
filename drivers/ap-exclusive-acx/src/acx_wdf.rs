@@ -12,11 +12,15 @@ pub const POOL_FLAG_NON_PAGED: u64 = 0x0000_0000_0000_0040;
 
 unsafe extern "system" {
     pub fn PsGetCurrentProcessId() -> *mut c_void;
+    pub fn PsGetProcessSessionIdEx(process: PEPROCESS) -> ULONG;
+    pub fn IoGetRequestorSessionId(irp: PIRP, p_session_id: *mut ULONG) -> NTSTATUS;
+    pub fn KeGetCurrentIrql() -> KIRQL;
 }
 
 pub const STATUS_SUCCESS_VAL: NTSTATUS = 0x0000_0000_u32 as i32;
 pub const STATUS_NOT_SUPPORTED_VAL: NTSTATUS = 0xC000_00BB_u32 as i32;
 pub const STATUS_INVALID_PARAMETER_VAL: NTSTATUS = 0xC000_000D_u32 as i32;
+pub const STATUS_DEVICE_CONFIGURATION_ERROR_VAL: NTSTATUS = 0xC000_0182_u32 as i32;
 pub const STATUS_INVALID_DEVICE_STATE_VAL: NTSTATUS = 0xC000_0184_u32 as i32;
 pub const STATUS_INVALID_STATE_TRANSITION_VAL: NTSTATUS = 0xC000_0185_u32 as i32;
 pub const STATUS_INSUFFICIENT_RESOURCES_VAL: NTSTATUS = 0xC000_009A_u32 as i32;
@@ -431,6 +435,13 @@ pub unsafe fn wdf_object_delete(object: WDFOBJECT) {
     unsafe {
         let f: PFN_WDFOBJECTDELETE = wdf_fn(WdfObjectDeleteTableIndex);
         f.unwrap_unchecked()(WdfDriverGlobals, object);
+    }
+}
+
+pub unsafe fn wdf_request_wdm_get_irp(request: WDFREQUEST) -> PIRP {
+    unsafe {
+        let f: PFN_WDFREQUESTWDMGETIRP = wdf_fn(WdfRequestWdmGetIrpTableIndex);
+        f.unwrap_unchecked()(WdfDriverGlobals, request)
     }
 }
 

@@ -1,16 +1,22 @@
-// Non-paged spinlock-protected kernel ring buffer, telemetry, and audiodg.exe zero-mixer gate.
+// Non-paged spinlock-protected kernel ring buffer, session isolation, and audiodg.exe zero-mixer gate.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+use core::mem::size_of;
 use core::ptr;
 
 use ap_stream_protocol::{
     AP_STREAM_ABI_VERSION, ApDriverConfig, ApDriverStatus, ApPcmChunkHeader, ApStreamFormat,
     ApTraceEvent, CHUNK_FLAG_EOS, CHUNK_FLAG_SILENT_PACKET, CHUNK_FLAG_STREAM_RUNNING,
-    STAGE_ALLOC_RT_PACKETS, STAGE_CREATE_STREAM, STAGE_DESTROY, STAGE_PAUSE, STAGE_RUN,
-    STAGE_SET_RENDER_PACKET, TRACE_RING_LEN, is_audiodg_name,
+    MAX_READ_PCM_BYTES, STAGE_ALLOC_RT_PACKETS, STAGE_CREATE_STREAM, STAGE_DESTROY, STAGE_PAUSE,
+    STAGE_RUN, STAGE_SET_RENDER_PACKET, TRACE_RING_LEN,
+    clock_math::{align_down, update_slaving_ppm},
+    is_audiodg_name, is_system_or_idle_name,
 };
 
-use crate::acx_wdf::{POOL_FLAG_NON_PAGED, POOL_TAG, PsGetCurrentProcessId, STATUS_ACCESS_DENIED_VAL};
+use crate::acx_wdf::{
+    POOL_FLAG_NON_PAGED, POOL_TAG, PsGetCurrentProcessId, PsGetProcessSessionIdEx,
+    STATUS_ACCESS_DENIED_VAL,
+};
 use crate::sys::{
     ExAllocatePool2, ExFreePoolWithTag, IoGetCurrentProcess, KIRQL, KSPIN_LOCK,
     KeAcquireSpinLockRaiseToDpc, KeInitializeSpinLock, KeQueryPerformanceCounter,
@@ -20,6 +26,7 @@ use crate::sys::{
 /// 4 MiB non-paged circular buffer (power of two; holds ~1.36 s @ 384 kHz 32-bit stereo).
 pub const RING_CAPACITY: usize = 4 * 1024 * 1024;
 const RING_MASK: usize = RING_CAPACITY - 1;
+const INVALID_SESSION_ID: u32 = u32::MAX;
 
 pub struct GlobalRingState {
     lock: KSPIN_LOCK,
@@ -29,9 +36,14 @@ pub struct GlobalRingState {
     read_pos: usize,
     fill_bytes: usize,
     reader_connected: bool,
+    /// Windows session ID of the exclusive control handle holder (Review #8 A1/D4).
+    reader_session_id: u32,
+    /// Windows session ID of the process running the active render stream (Review #8 A1/D4).
+    stream_session_id: u32,
     last_read_qpc: i64,
     qpc_freq: i64,
     last_chunk_flags: u32,
+    smoothed_ppm_x256: i64,
     status: ApDriverStatus,
 }
 
@@ -45,15 +57,19 @@ static mut G_STATE: GlobalRingState = GlobalRingState {
     read_pos: 0,
     fill_bytes: 0,
     reader_connected: false,
+    reader_session_id: INVALID_SESSION_ID,
+    stream_session_id: INVALID_SESSION_ID,
     last_read_qpc: 0,
     qpc_freq: 10_000_000,
     last_chunk_flags: 0,
+    smoothed_ppm_x256: 0,
     status: ApDriverStatus {
         abi_version: AP_STREAM_ABI_VERSION,
         stream_generation: 0,
         stream_running: 0,
         exclusive_verified: 0,
         strict_reject_audiodg: 1,
+        _pad0: 0,
         format: ApStreamFormat {
             sample_rate: 0,
             channels: 0,
@@ -134,9 +150,10 @@ unsafe fn push_trace_locked(
     rejected: bool,
 ) {
     unsafe {
+        // Wrapping-safe index calculation (Review #8 A14 — never underflows at 2^32).
+        let idx = ((*st).status.trace_seq as usize) % TRACE_RING_LEN;
         let next_seq = (*st).status.trace_seq.wrapping_add(1);
         (*st).status.trace_seq = next_seq;
-        let idx = ((next_seq - 1) as usize) % TRACE_RING_LEN;
         (*st).status.trace[idx] = ApTraceEvent {
             seq: next_seq,
             stage,
@@ -149,11 +166,13 @@ unsafe fn push_trace_locked(
     }
 }
 
-pub unsafe fn capture_current_proc() -> (u32, [u8; 16]) {
+pub unsafe fn capture_current_proc() -> (u32, [u8; 16], u32) {
     let mut name = [0u8; 16];
     let pid = unsafe { PsGetCurrentProcessId() } as usize as u32;
     let eproc = unsafe { IoGetCurrentProcess() };
+    let mut session_id = INVALID_SESSION_ID;
     if !eproc.is_null() {
+        session_id = unsafe { PsGetProcessSessionIdEx(eproc) };
         let p = unsafe { PsGetProcessImageFileName(eproc) };
         if !p.is_null() {
             for i in 0..15 {
@@ -165,9 +184,10 @@ pub unsafe fn capture_current_proc() -> (u32, [u8; 16]) {
             }
         }
     }
-    (pid, name)
+    (pid, name, session_id)
 }
 
+/// Initialize the global spinlock and 4 MiB ring ONCE during `DriverEntry` (Review #8 A5/A6).
 pub unsafe fn init_global_ring() -> bool {
     unsafe {
         let st = ptr::addr_of_mut!(G_STATE);
@@ -190,6 +210,7 @@ pub unsafe fn init_global_ring() -> bool {
     }
 }
 
+/// Free the 4 MiB ring during `EvtDriverUnload` or `DriverEntry` failure (Review #8 A5/A6).
 pub unsafe fn cleanup_global_ring() {
     unsafe {
         let st = ptr::addr_of_mut!(G_STATE);
@@ -203,6 +224,9 @@ pub unsafe fn cleanup_global_ring() {
             (*st).fill_bytes = 0;
             (*st).status.ring_fill_bytes = 0;
             (*st).status.stream_running = 0;
+            (*st).reader_connected = false;
+            (*st).reader_session_id = INVALID_SESSION_ID;
+            (*st).stream_session_id = INVALID_SESSION_ID;
             let p = (*st).ring_ptr;
             (*st).ring_ptr = ptr::null_mut();
             p
@@ -218,11 +242,16 @@ pub unsafe fn qpc_frequency() -> i64 {
     unsafe { (*ptr::addr_of!(G_STATE)).qpc_freq }
 }
 
-pub unsafe fn set_reader_connected(connected: bool) {
+pub unsafe fn set_reader_connected(connected: bool, session_id: u32) {
     unsafe {
         let st = ptr::addr_of_mut!(G_STATE);
+        if !(*st).initialized {
+            return;
+        }
         let _g = SpinGuard::acquire(ptr::addr_of_mut!((*st).lock));
         (*st).reader_connected = connected;
+        (*st).reader_session_id = if connected { session_id } else { INVALID_SESSION_ID };
+        (*st).smoothed_ppm_x256 = 0;
         if connected {
             (*st).write_pos = 0;
             (*st).read_pos = 0;
@@ -239,6 +268,7 @@ pub unsafe fn reset_ring_and_counters(reset_all_counters: bool) {
         (*st).write_pos = 0;
         (*st).read_pos = 0;
         (*st).fill_bytes = 0;
+        (*st).smoothed_ppm_x256 = 0;
         (*st).status.ring_fill_bytes = 0;
         (*st).status.ring_overruns = 0;
         (*st).status.ring_underruns = 0;
@@ -252,11 +282,13 @@ pub unsafe fn reset_ring_and_counters(reset_all_counters: bool) {
     }
 }
 
+/// Apply user-mode config. Strict `audiodg.exe` rejection is permanently enforced by the kernel
+/// and can never be disabled via IOCTL (Review #8 A1/A7).
 pub unsafe fn apply_config(cfg: ApDriverConfig) {
     unsafe {
         let st = ptr::addr_of_mut!(G_STATE);
         let _g = SpinGuard::acquire(ptr::addr_of_mut!((*st).lock));
-        (*st).status.strict_reject_audiodg = if cfg.strict_reject_audiodg != 0 { 1 } else { 0 };
+        (*st).status.strict_reject_audiodg = 1;
         if cfg.reset_counters != 0 {
             (*st).status.rejected_shared_opens = 0;
             (*st).status.ring_overruns = 0;
@@ -267,24 +299,30 @@ pub unsafe fn apply_config(cfg: ApDriverConfig) {
     }
 }
 
-pub unsafe fn get_status_snapshot() -> ApDriverStatus {
+/// Zero-initialize output buffer and copy status snapshot without leaking stack padding bytes
+/// (Review #8 A13/B8).
+pub unsafe fn write_status_snapshot(dst: *mut u8) {
     unsafe {
+        ptr::write_bytes(dst, 0, size_of::<ApDriverStatus>());
         let st = ptr::addr_of_mut!(G_STATE);
         let _g = SpinGuard::acquire(ptr::addr_of_mut!((*st).lock));
-        let mut snap = (*st).status;
-        snap.ring_fill_bytes = (*st).fill_bytes as u32;
-        snap
+        (*st).status._pad0 = 0;
+        (*st).status.ring_fill_bytes = (*st).fill_bytes as u32;
+        ptr::copy_nonoverlapping(
+            ptr::addr_of!((*st).status).cast::<u8>(),
+            dst,
+            size_of::<ApDriverStatus>(),
+        );
     }
 }
 
 /// Hard zero-mixer gate:
 /// - `CreateStream` / endpoint-activation `AllocateRtPackets` may be brokered by `audiodg.exe`
 ///   or `svchost.exe` (zero audio flows until `Run`/`SetRenderPacket`).
-/// - `Run` and `SetRenderPacket` from `audiodg.exe` are ALWAYS rejected with `STATUS_ACCESS_DENIED`
-///   when `strict_reject_audiodg != 0`, so the Windows mixer can never start playback or deliver
-///   a single mixed sample.
+/// - `Run` and `SetRenderPacket` from `audiodg.exe` are ALWAYS rejected with `STATUS_ACCESS_DENIED`,
+///   so the Windows mixer can never start playback or deliver a single mixed sample.
 pub unsafe fn check_and_record_caller(stage: u32) -> Result<(u32, [u8; 16]), NTSTATUS> {
-    let (pid, proc_name) = unsafe { capture_current_proc() };
+    let (pid, proc_name, session_id) = unsafe { capture_current_proc() };
     let is_mixer = is_audiodg_name(&proc_name);
     let is_streaming_stage = stage == STAGE_RUN || stage == STAGE_SET_RENDER_PACKET;
 
@@ -310,11 +348,17 @@ pub unsafe fn check_and_record_caller(stage: u32) -> Result<(u32, [u8; 16]), NTS
             STAGE_ALLOC_RT_PACKETS => {
                 (*st).status.alloc_pid = pid;
                 (*st).status.alloc_proc = proc_name;
+                if pid > 4 && session_id != INVALID_SESSION_ID {
+                    (*st).stream_session_id = session_id;
+                }
                 push_trace_locked(st, stage, pid, proc_name, false);
             }
             STAGE_RUN => {
                 (*st).status.run_pid = pid;
                 (*st).status.run_proc = proc_name;
+                if pid > 4 && session_id != INVALID_SESSION_ID {
+                    (*st).stream_session_id = session_id;
+                }
                 push_trace_locked(st, stage, pid, proc_name, false);
             }
             STAGE_SET_RENDER_PACKET => {
@@ -350,6 +394,7 @@ pub unsafe fn on_stream_created(fmt: ApStreamFormat, proc_mode_guid: [u8; 16]) {
         (*st).status.packet_pid = 0;
         (*st).status.packet_proc = [0; 16];
         (*st).status.exclusive_verified = 0;
+        (*st).stream_session_id = INVALID_SESSION_ID;
     }
 }
 
@@ -372,42 +417,50 @@ pub unsafe fn on_stream_run(fmt: ApStreamFormat) {
         (*st).write_pos = 0;
         (*st).read_pos = 0;
         (*st).fill_bytes = 0;
+        (*st).smoothed_ppm_x256 = 0;
         (*st).status.ring_fill_bytes = 0;
+        (*st).status.timer_adjust_ppm = 0;
         (*st).last_chunk_flags = CHUNK_FLAG_STREAM_RUNNING;
-        let data_path_is_exclusive = (*st).status.alloc_pid != 0
-            && (*st).status.run_pid != 0
+        // Fail closed on System / Idle / PID <= 4 (deferred worker threads, Review #8 A7).
+        let data_path_is_exclusive = (*st).status.alloc_pid > 4
+            && (*st).status.run_pid > 4
             && !is_audiodg_name(&(*st).status.alloc_proc)
             && !is_audiodg_name(&(*st).status.run_proc)
+            && !is_system_or_idle_name(&(*st).status.alloc_proc)
+            && !is_system_or_idle_name(&(*st).status.run_proc)
             && fmt.is_float == 0;
         (*st).status.exclusive_verified = if data_path_is_exclusive { 1 } else { 0 };
     }
 }
 
 pub unsafe fn on_stream_paused() {
-    let (pid, proc_name) = unsafe { capture_current_proc() };
+    let (pid, proc_name, _) = unsafe { capture_current_proc() };
     unsafe {
         let st = ptr::addr_of_mut!(G_STATE);
         let _g = SpinGuard::acquire(ptr::addr_of_mut!((*st).lock));
         (*st).status.stream_running = 0;
         (*st).last_chunk_flags = 0;
+        (*st).smoothed_ppm_x256 = 0;
+        (*st).status.timer_adjust_ppm = 0;
         push_trace_locked(st, STAGE_PAUSE, pid, proc_name, false);
     }
 }
 
 pub unsafe fn on_stream_destroyed() {
-    let (pid, proc_name) = unsafe { capture_current_proc() };
+    let (pid, proc_name, _) = unsafe { capture_current_proc() };
     unsafe {
         let st = ptr::addr_of_mut!(G_STATE);
         let _g = SpinGuard::acquire(ptr::addr_of_mut!((*st).lock));
         (*st).status.streams_destroyed = (*st).status.streams_destroyed.wrapping_add(1);
         (*st).status.stream_running = 0;
+        (*st).stream_session_id = INVALID_SESSION_ID;
         push_trace_locked(st, STAGE_DESTROY, pid, proc_name, false);
     }
 }
 
 /// Push one completed WaveRT render packet into the 4 MiB ring buffer.
-/// Returns a smooth clock-slaving adjustment in ppm (-20,000..=+20,000) when the user-mode
-/// engine is actively pulling (slaves Tidal seamlessly to the DAC's hardware crystal clock).
+/// Returns a smooth low-pass filtered clock-slaving adjustment in ppm (-500..=+500) when the
+/// user-mode reader in the SAME Windows session is actively pulling (Review #8 A1/A3/A9).
 pub unsafe fn push_packet_bytes(
     src: *const u8,
     len: usize,
@@ -429,25 +482,37 @@ pub unsafe fn push_packet_bytes(
         }
         (*st).last_chunk_flags = flags;
 
-        if (*st).status.exclusive_verified == 0 || (*st).ring_ptr.is_null() || len == 0 {
+        // Enforce session isolation (Review #8 A1/D4): never expose audio across user sessions!
+        let same_session = (*st).reader_connected
+            && (*st).reader_session_id != INVALID_SESSION_ID
+            && (*st).stream_session_id != INVALID_SESSION_ID
+            && (*st).reader_session_id == (*st).stream_session_id;
+
+        if (*st).status.exclusive_verified == 0
+            || (*st).ring_ptr.is_null()
+            || len == 0
+            || !same_session
+        {
             return 0;
         }
 
-        let copy_len = len.min(RING_CAPACITY);
+        let block_align = ((*st).status.format.block_align as usize).max(1);
+        // Defence-in-depth frame alignment (Review #8 A9).
+        let copy_len = align_down(len.min(RING_CAPACITY), block_align);
+        if copy_len == 0 {
+            return 0;
+        }
+
         let space = RING_CAPACITY - (*st).fill_bytes;
         if copy_len > space {
-            let block_align = ((*st).status.format.block_align as usize).max(1);
             let mut drop_bytes = copy_len - space;
-            // Keep dropped prefix frame-aligned so stereo channels can NEVER swap on overrun!
             let rem = drop_bytes % block_align;
             if rem != 0 {
                 drop_bytes = (drop_bytes + (block_align - rem)).min((*st).fill_bytes);
             }
             (*st).read_pos = ((*st).read_pos + drop_bytes) & RING_MASK;
             (*st).fill_bytes -= drop_bytes;
-            if (*st).reader_connected {
-                (*st).status.ring_overruns = (*st).status.ring_overruns.wrapping_add(1);
-            }
+            (*st).status.ring_overruns = (*st).status.ring_overruns.wrapping_add(1);
         }
 
         let first = copy_len.min(RING_CAPACITY - (*st).write_pos);
@@ -476,9 +541,9 @@ pub unsafe fn push_packet_bytes(
             && (now_qpc - (*st).last_read_qpc) < ((*st).qpc_freq / 2);
 
         let adj_ppm = if reader_active && packet_size > 0 {
-            let target = (packet_size * 4).clamp(16_384, 524_288) as i64;
-            let err = ((*st).fill_bytes as i64) - target;
-            ((err * 20_000) / target).clamp(-20_000, 20_000) as i32
+            // Target fill derived from reader chunk size & packet size (Review #8 A3).
+            let target = (packet_size * 4).clamp(131_072, 1_048_576);
+            update_slaving_ppm(&mut (*st).smoothed_ppm_x256, (*st).fill_bytes, target)
         } else {
             0
         };
@@ -494,8 +559,9 @@ pub unsafe fn read_pcm_chunk(dst_pcm: *mut u8, max_pcm_bytes: usize) -> (ApPcmCh
 
         (*st).last_read_qpc = KeQueryPerformanceCounter(ptr::null_mut()).QuadPart;
         let block_align = ((*st).status.format.block_align as usize).max(1);
-        let mut to_read = (*st).fill_bytes.min(max_pcm_bytes);
-        to_read -= to_read % block_align;
+        // Cap per-IOCTL copy at 256 KiB to bound spinlock hold time at DISPATCH_LEVEL (Review #8 A12).
+        let capped = max_pcm_bytes.min(MAX_READ_PCM_BYTES);
+        let to_read = align_down((*st).fill_bytes.min(capped), block_align);
 
         if to_read > 0 && !(*st).ring_ptr.is_null() && !dst_pcm.is_null() {
             let first = to_read.min(RING_CAPACITY - (*st).read_pos);
@@ -520,7 +586,7 @@ pub unsafe fn read_pcm_chunk(dst_pcm: *mut u8, max_pcm_bytes: usize) -> (ApPcmCh
             pcm_bytes: to_read as u32,
             ring_fill_after: (*st).fill_bytes as u32,
             flags: (*st).last_chunk_flags,
-            reserved: 0,
+            ring_overruns_lo: ((*st).status.ring_overruns & 0xFFFF_FFFF) as u32,
         };
         (hdr, to_read)
     }

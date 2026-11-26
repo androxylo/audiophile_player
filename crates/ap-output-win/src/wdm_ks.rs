@@ -2114,12 +2114,6 @@ pub fn classify_ks_pin_error(
     }
 }
 
-/// Pure, unit-testable WDM-KS device selection policy.
-///
-/// - When `device_filter` is `Some(sub)`, selects the first device matching `sub` (case-insensitive).
-/// - When `device_filter` is `None` (zero-config default mode), prefers dedicated USB audiophile
-///   DACs (Schiit/Unison/Gungnir/USB UAC2 WaveRT endpoints) over monitor HDMI/DisplayPort audio,
-///   falling back gracefully to any available WDM-KS render device.
 /// Returns `true` if `dev` is Audiophile Player's own virtual exclusive ACX capture endpoint.
 /// Excluding it prevents an accidental audio feedback loop when selecting the output DAC.
 pub fn is_own_virtual_endpoint(dev: &KsRenderDevice) -> bool {
@@ -2130,6 +2124,12 @@ pub fn is_own_virtual_endpoint(dev: &KsRenderDevice) -> bool {
         || name.contains("audiophile player")
 }
 
+/// Pure, unit-testable WDM-KS device selection policy.
+///
+/// - When `device_filter` is `Some(sub)`, selects the first device matching `sub` (case-insensitive).
+/// - When `device_filter` is `None` (zero-config default mode), prefers dedicated USB audiophile
+///   DACs (Schiit/Unison/Gungnir/USB UAC2 WaveRT endpoints) over monitor HDMI/DisplayPort audio,
+///   falling back gracefully to any available WDM-KS render device.
 pub fn select_wdm_ks_device(
     devices: &[KsRenderDevice],
     device_filter: Option<&str>,

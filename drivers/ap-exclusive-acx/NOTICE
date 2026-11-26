@@ -1,23 +1,54 @@
-THIRD-PARTY NOTICES — Audiophile Player Exclusive ACX Virtual Audio Driver
+THIRD-PARTY NOTICES & ADDITIONAL LICENSING PERMISSION
+Audiophile Player Exclusive ACX Virtual Audio Driver (`ap-exclusive-acx`)
 
-This Rust `#![no_std]` KMDF + ACX 1.1 virtual render driver (`ap-exclusive-acx`)
-is licensed under GPL-3.0-or-later and draws architectural patterns from the
-following MIT-licensed open-source reference projects:
+===========================================================================
+1. GPLv3 Section 7 Additional Permission (Windows Driver Kit Linking)
+===========================================================================
 
-1. Microsoft Low-Latency Audio (`microsoft/low-latency-audio`, `src/uac2-driver`)
-   Copyright (c) Microsoft Corporation
-   Copyright (c) Yamaha Corporation
-   License: MIT License
-   Reference patterns: ACX render circuit/pin setup, `KSNODETYPE_LINE_CONNECTOR`
-   friendly-name preservation, page-aligned WaveRT `ACX_RTPACKET` MDL allocation,
-   and `EvtAcxStreamSetRenderPacket` stream handling.
+This driver is licensed under the GNU General Public License, version 3 or
+(at your option) any later version (GPL-3.0-or-later).
 
-2. Nezucloud acxmic (`nezucloud/acxmic`)
-   Copyright (c) 2026 Nezucloud
-   License: MIT License
-   Reference patterns: root-enumerated virtual KMDF + ACX device lifecycle,
-   exclusive `WdfControlDeviceInitAllocate` user-mode control interface, and
-   high-resolution `WDFTIMER` packet scheduling.
+As a special exception under Section 7 of the GNU General Public License
+version 3, the copyright holders give permission to link this driver with
+the Microsoft Windows Driver Kit (WDK), Kernel-Mode Driver Framework
+(KMDF), and Audio Class eXtension (ACX) static stub/support libraries
+(`WdfDriverEntry.lib`, `WdfLdr.lib`, `acxstub.lib`,
+`BufferOverflowFastFailK.lib`, `libcntpr.lib`) and to distribute the
+resulting combined executable binary (`ap_exclusive_audio.sys`) under the
+terms of GPL-3.0-or-later, provided that the source code of this driver
+remains available under GPL-3.0-or-later.
 
-No proprietary code, certificates, or private signing keys are included.
-Per-machine test certificates are generated locally by the user's install script.
+===========================================================================
+2. Open-Source Reference Attributions (MIT License)
+===========================================================================
+
+This clean-room Rust driver consulted the following MIT-licensed open-source
+projects for ACX 1.1 and KMDF API conventions (no proprietary code,
+certificates, or private signing keys are included):
+
+  (a) Microsoft Low-Latency Audio (`microsoft/low-latency-audio`)
+      Copyright (c) Microsoft Corporation
+      Copyright (c) Yamaha Corporation
+
+  (b) Nezucloud acxmic (`nezucloud/acxmic`)
+      Copyright (c) 2026 Nezucloud
+
+Both reference projects are licensed under the MIT License:
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.

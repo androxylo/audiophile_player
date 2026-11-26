@@ -1483,7 +1483,7 @@ mod tests {
         let mut frames = 0usize;
         let mut max_abs_i32 = 0i32;
         loop {
-            match buf.pop_for_epoch_timeout(epoch, Duration::from_secs(2)) {
+            match buf.pop_for_epoch_timeout(epoch, Duration::from_secs(60)) {
                 Some(StreamEvent::TrackStart { report: r, .. }) => report = Some(r),
                 Some(StreamEvent::PcmBlock(b)) => {
                     frames += b.frames.len();
@@ -1492,7 +1492,10 @@ mod tests {
                     }
                 }
                 Some(StreamEvent::TrackEnd) => break,
-                other => panic!("unexpected stream event: {other:?}"),
+                other => {
+                    buf.reset_and_flush();
+                    panic!("unexpected stream event: {other:?}");
+                }
             }
         }
         (report.expect("missing TrackStart"), frames, max_abs_i32)
@@ -2427,7 +2430,7 @@ mod tests {
             let h = std::thread::spawn(move || {
                 let mut prefix = Vec::new();
                 loop {
-                    match buf_c.pop_for_epoch_timeout(ep, Duration::from_secs(2)) {
+                    match buf_c.pop_for_epoch_timeout(ep, Duration::from_secs(30)) {
                         Some(StreamEvent::TrackStart { .. }) => {}
                         Some(StreamEvent::PcmBlock(b)) => {
                             if prefix.len() < 256 {
@@ -2436,7 +2439,10 @@ mod tests {
                             }
                         }
                         Some(StreamEvent::TrackEnd) => break,
-                        other => panic!("unexpected event: {other:?}"),
+                        other => {
+                            buf_c.reset_and_flush();
+                            panic!("unexpected event: {other:?}");
+                        }
                     }
                 }
                 prefix

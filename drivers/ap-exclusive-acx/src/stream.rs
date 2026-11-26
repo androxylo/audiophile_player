@@ -1,13 +1,19 @@
-// ACX 1.1 WaveRT Render Stream implementation in pure `#![no_std]` Rust with per-stream spinlock.
+// ACX 1.1 WaveRT Render Stream implementation in pure `#![no_std]` Rust with interior-mutable
+// per-stream spinlock guard (zero `&mut` aliasing UB, Review #8 A2/A3/A4/A8/A9/A10/A11).
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+use core::cell::UnsafeCell;
 use core::mem::size_of;
+use core::ops::{Deref, DerefMut};
 use core::ptr;
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 use ap_stream_protocol::{
     ApStreamFormat, STAGE_ALLOC_RT_PACKETS, STAGE_CREATE_STREAM, STAGE_RUN,
     STAGE_SET_RENDER_PACKET,
+    clock_math::{
+        HNS_PER_SEC, RenderPacketError, StreamClockState, align_down, validate_render_packet,
+    },
 };
 
 use crate::acx_wdf::*;
@@ -16,9 +22,9 @@ use crate::sys::*;
 
 const MAX_RT_PACKETS: usize = 8;
 const MAX_ACTIVE_STREAMS: usize = 8;
-const HNS_PER_SEC: u64 = 10_000_000;
 const AUDCLNT_BUFFERFLAGS_SILENT: u32 = 0x2;
 const KSSTREAM_EOS_FLAG: u32 = 0x40;
+const PASSIVE_LEVEL_IRQL: KIRQL = 0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -35,45 +41,83 @@ struct SlotMeta {
     valid: bool,
 }
 
-pub struct RenderStream {
-    lock: KSPIN_LOCK,
-    stream: ACXSTREAM,
+struct RenderStreamInner {
     format: ApStreamFormat,
-    avg_bytes_per_sec: u32,
-    block_align: u32,
     state: StreamState,
     timer: WDFTIMER,
     packet_count: u32,
     packet_size: u32,
     first_packet_offset: u32,
+    allocated_packets: PACX_RTPACKET,
+    allocated_packet_count: ULONG,
     packet_bases: [*mut u8; MAX_RT_PACKETS],
     packet_data_ptrs: [*mut u8; MAX_RT_PACKETS],
     slot_meta: [SlotMeta; MAX_RT_PACKETS],
+    clock: StreamClockState,
+}
+
+/// Shared per-stream state using interior mutability (`UnsafeCell` + `KSPIN_LOCK`) so concurrent
+/// ACX callbacks and the timer DPC only ever borrow `&RenderStream` (fixes Review #8 A10).
+pub struct RenderStream {
+    lock: UnsafeCell<KSPIN_LOCK>,
+    inner: UnsafeCell<RenderStreamInner>,
+    stream: ACXSTREAM,
+    avg_bytes_per_sec: u32,
+    block_align: u32,
+    qpc_freq: i64,
     current_packet: AtomicU32,
     bytes_consumed: AtomicU64,
-    start_time_hns: u64,
-    start_pos_bytes: u64,
-    glitch_adjust_hns: u64,
     clock_adj_ppm: AtomicI32,
-    qpc_freq: i64,
+}
+
+unsafe impl Sync for RenderStream {}
+
+struct StreamGuard<'a> {
+    lock: *mut KSPIN_LOCK,
+    old_irql: KIRQL,
+    inner: &'a mut RenderStreamInner,
+}
+
+impl<'a> Deref for StreamGuard<'a> {
+    type Target = RenderStreamInner;
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.inner
+    }
+}
+
+impl<'a> DerefMut for StreamGuard<'a> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.inner
+    }
+}
+
+impl Drop for StreamGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        unsafe {
+            KeReleaseSpinLock(self.lock, self.old_irql);
+        }
+    }
 }
 
 struct RegistrySlot {
     stream: ACXSTREAM,
     timer: WDFTIMER,
-    engine: *mut RenderStream,
+    engine: *const RenderStream,
 }
 
 static mut REG_LOCK: KSPIN_LOCK = 0;
 static mut REG_SLOTS: [RegistrySlot; MAX_ACTIVE_STREAMS] = [
-    RegistrySlot { stream: ptr::null_mut(), timer: ptr::null_mut(), engine: ptr::null_mut() },
-    RegistrySlot { stream: ptr::null_mut(), timer: ptr::null_mut(), engine: ptr::null_mut() },
-    RegistrySlot { stream: ptr::null_mut(), timer: ptr::null_mut(), engine: ptr::null_mut() },
-    RegistrySlot { stream: ptr::null_mut(), timer: ptr::null_mut(), engine: ptr::null_mut() },
-    RegistrySlot { stream: ptr::null_mut(), timer: ptr::null_mut(), engine: ptr::null_mut() },
-    RegistrySlot { stream: ptr::null_mut(), timer: ptr::null_mut(), engine: ptr::null_mut() },
-    RegistrySlot { stream: ptr::null_mut(), timer: ptr::null_mut(), engine: ptr::null_mut() },
-    RegistrySlot { stream: ptr::null_mut(), timer: ptr::null_mut(), engine: ptr::null_mut() },
+    RegistrySlot { stream: ptr::null_mut(), timer: ptr::null_mut(), engine: ptr::null() },
+    RegistrySlot { stream: ptr::null_mut(), timer: ptr::null_mut(), engine: ptr::null() },
+    RegistrySlot { stream: ptr::null_mut(), timer: ptr::null_mut(), engine: ptr::null() },
+    RegistrySlot { stream: ptr::null_mut(), timer: ptr::null_mut(), engine: ptr::null() },
+    RegistrySlot { stream: ptr::null_mut(), timer: ptr::null_mut(), engine: ptr::null() },
+    RegistrySlot { stream: ptr::null_mut(), timer: ptr::null_mut(), engine: ptr::null() },
+    RegistrySlot { stream: ptr::null_mut(), timer: ptr::null_mut(), engine: ptr::null() },
+    RegistrySlot { stream: ptr::null_mut(), timer: ptr::null_mut(), engine: ptr::null() },
 ];
 
 pub unsafe fn init_stream_registry() {
@@ -82,7 +126,7 @@ pub unsafe fn init_stream_registry() {
     }
 }
 
-unsafe fn register_stream(stream: ACXSTREAM, engine: *mut RenderStream) -> bool {
+unsafe fn register_stream(stream: ACXSTREAM, engine: *const RenderStream) -> bool {
     unsafe {
         let irql = KeAcquireSpinLockRaiseToDpc(ptr::addr_of_mut!(REG_LOCK));
         let mut ok = false;
@@ -115,10 +159,10 @@ unsafe fn bind_timer_to_stream(stream: ACXSTREAM, timer: WDFTIMER) {
     }
 }
 
-unsafe fn lookup_by_stream(stream: ACXSTREAM) -> *mut RenderStream {
+unsafe fn lookup_by_stream(stream: ACXSTREAM) -> *const RenderStream {
     unsafe {
         let irql = KeAcquireSpinLockRaiseToDpc(ptr::addr_of_mut!(REG_LOCK));
-        let mut found = ptr::null_mut();
+        let mut found = ptr::null();
         let slots = ptr::addr_of!(REG_SLOTS);
         for slot in (*slots).iter() {
             if slot.stream == stream {
@@ -131,10 +175,10 @@ unsafe fn lookup_by_stream(stream: ACXSTREAM) -> *mut RenderStream {
     }
 }
 
-unsafe fn lookup_by_timer(timer: WDFTIMER) -> *mut RenderStream {
+unsafe fn lookup_by_timer(timer: WDFTIMER) -> *const RenderStream {
     unsafe {
         let irql = KeAcquireSpinLockRaiseToDpc(ptr::addr_of_mut!(REG_LOCK));
-        let mut found = ptr::null_mut();
+        let mut found = ptr::null();
         let slots = ptr::addr_of!(REG_SLOTS);
         for slot in (*slots).iter() {
             if slot.timer == timer {
@@ -154,10 +198,10 @@ unsafe fn unregister_stream(stream: ACXSTREAM) -> *mut RenderStream {
         let slots = ptr::addr_of_mut!(REG_SLOTS);
         for slot in (*slots).iter_mut() {
             if slot.stream == stream {
-                found = slot.engine;
+                found = slot.engine as *mut RenderStream;
                 slot.stream = ptr::null_mut();
                 slot.timer = ptr::null_mut();
-                slot.engine = ptr::null_mut();
+                slot.engine = ptr::null();
                 break;
             }
         }
@@ -175,15 +219,32 @@ fn qpc_to_hns(qpc: i64, freq: i64) -> u64 {
 }
 
 impl RenderStream {
+    #[inline]
+    unsafe fn lock(&self) -> StreamGuard<'_> {
+        unsafe {
+            let lock_ptr = self.lock.get();
+            let old_irql = KeAcquireSpinLockRaiseToDpc(lock_ptr);
+            StreamGuard {
+                lock: lock_ptr,
+                old_irql,
+                inner: &mut *self.inner.get(),
+            }
+        }
+    }
+
     unsafe fn allocate_rt_packets(
-        &mut self,
+        &self,
         packet_count: ULONG,
         packet_size: ULONG,
         out_packets: *mut PACX_RTPACKET,
     ) -> NTSTATUS {
+        let ba = self.block_align.max(1);
+        // Reject unaligned or oversized packets (> RING_CAPACITY/2; Review #8 A9).
         if packet_count == 0
             || (packet_count as usize) > MAX_RT_PACKETS
             || packet_size == 0
+            || (packet_size % ba) != 0
+            || (packet_size as usize) > (ring::RING_CAPACITY / 2)
             || out_packets.is_null()
         {
             return STATUS_INVALID_PARAMETER_VAL;
@@ -200,6 +261,8 @@ impl RenderStream {
         let alloc_bytes = ((packet_size as usize) + page - 1) & !(page - 1);
         let first_offset = (alloc_bytes - packet_size as usize) as ULONG;
 
+        let mut bases = [ptr::null_mut::<u8>(); MAX_RT_PACKETS];
+        let mut data_ptrs = [ptr::null_mut::<u8>(); MAX_RT_PACKETS];
         let mut made = 0usize;
         let mut status = STATUS_SUCCESS_VAL;
         for i in 0..(packet_count as usize) {
@@ -210,7 +273,8 @@ impl RenderStream {
                     status = STATUS_INSUFFICIENT_RESOURCES_VAL;
                     break;
                 }
-                let mdl = IoAllocateMdl(buf, alloc_bytes as ULONG, 0, 1, ptr::null_mut());
+                // ChargeQuota = FALSE (0) per WDK contract (Review #8 A11).
+                let mdl = IoAllocateMdl(buf, alloc_bytes as ULONG, 0, 0, ptr::null_mut());
                 if mdl.is_null() {
                     ExFreePoolWithTag(buf, POOL_TAG);
                     status = STATUS_INSUFFICIENT_RESOURCES_VAL;
@@ -222,65 +286,103 @@ impl RenderStream {
                 pkt.RtPacketSize = packet_size;
                 pkt.RtPacketOffset = if i == 0 { first_offset } else { 0 };
 
-                self.packet_bases[i] = buf.cast::<u8>();
-                self.packet_data_ptrs[i] =
+                bases[i] = buf.cast::<u8>();
+                data_ptrs[i] =
                     buf.cast::<u8>().add(if i == 0 { first_offset as usize } else { 0 });
-                self.slot_meta[i] = SlotMeta::default();
             }
             made += 1;
         }
 
         if !nt_success(status) {
+            for i in 0..made {
+                unsafe {
+                    let pkt = &*packets.add(i);
+                    let mdl = pkt.RtPacketBuffer.u.MdlType.Mdl;
+                    if !mdl.is_null() {
+                        IoFreeMdl(mdl);
+                    }
+                    if !bases[i].is_null() {
+                        ExFreePoolWithTag(bases[i].cast(), POOL_TAG);
+                    }
+                }
+            }
             unsafe {
-                self.free_rt_packets(packets, made as ULONG);
+                ExFreePoolWithTag(packets.cast(), POOL_TAG);
             }
             return status;
         }
 
-        self.packet_count = packet_count;
-        self.packet_size = packet_size;
-        self.first_packet_offset = first_offset;
-        self.format.packet_count = packet_count;
-        self.format.packet_size_bytes = packet_size;
         unsafe {
+            let mut g = self.lock();
+            g.packet_count = packet_count;
+            g.packet_size = packet_size;
+            g.first_packet_offset = first_offset;
+            g.allocated_packets = packets;
+            g.allocated_packet_count = packet_count;
+            g.packet_bases = bases;
+            g.packet_data_ptrs = data_ptrs;
+            g.slot_meta = [SlotMeta::default(); MAX_RT_PACKETS];
+            g.format.packet_count = packet_count;
+            g.format.packet_size_bytes = packet_size;
+            drop(g);
             *out_packets = packets;
             ring::on_stream_packets_allocated(packet_count, packet_size);
         }
         STATUS_SUCCESS_VAL
     }
 
-    unsafe fn free_rt_packets(&mut self, packets: PACX_RTPACKET, packet_count: ULONG) {
-        if !packets.is_null() {
-            for i in 0..(packet_count as usize).min(MAX_RT_PACKETS) {
+    unsafe fn free_rt_packets(&self, packets: PACX_RTPACKET, packet_count: ULONG) {
+        let (pkts_to_free, count_to_free, bases) = unsafe {
+            let mut g = self.lock();
+            let p = if !packets.is_null() {
+                packets
+            } else {
+                g.allocated_packets
+            };
+            let c = if !packets.is_null() {
+                packet_count
+            } else {
+                g.allocated_packet_count
+            };
+            let bases = g.packet_bases;
+            g.allocated_packets = ptr::null_mut();
+            g.allocated_packet_count = 0;
+            g.packet_count = 0;
+            g.packet_size = 0;
+            g.packet_bases = [ptr::null_mut(); MAX_RT_PACKETS];
+            g.packet_data_ptrs = [ptr::null_mut(); MAX_RT_PACKETS];
+            g.slot_meta = [SlotMeta::default(); MAX_RT_PACKETS];
+            (p, c, bases)
+        };
+
+        if !pkts_to_free.is_null() {
+            for i in 0..(count_to_free as usize).min(MAX_RT_PACKETS) {
                 unsafe {
-                    let pkt = &*packets.add(i);
+                    let pkt = &*pkts_to_free.add(i);
                     let mdl = pkt.RtPacketBuffer.u.MdlType.Mdl;
                     if !mdl.is_null() {
-                        let base = self.packet_bases[i];
                         IoFreeMdl(mdl);
-                        if !base.is_null() {
-                            ExFreePoolWithTag(base.cast(), POOL_TAG);
-                        }
                     }
-                    self.packet_bases[i] = ptr::null_mut();
-                    self.packet_data_ptrs[i] = ptr::null_mut();
-                    self.slot_meta[i] = SlotMeta::default();
+                    if !bases[i].is_null() {
+                        ExFreePoolWithTag(bases[i].cast(), POOL_TAG);
+                    }
                 }
             }
             unsafe {
-                ExFreePoolWithTag(packets.cast(), POOL_TAG);
+                ExFreePoolWithTag(pkts_to_free.cast(), POOL_TAG);
             }
         }
-        self.packet_count = 0;
-        self.packet_size = 0;
     }
 
-    unsafe fn prepare_hardware(&mut self) -> NTSTATUS {
-        if self.state == StreamState::Pause {
-            return STATUS_SUCCESS_VAL;
-        }
-        if self.state != StreamState::Stop {
-            return STATUS_INVALID_STATE_TRANSITION_VAL;
+    unsafe fn prepare_hardware(&self) -> NTSTATUS {
+        {
+            let g = unsafe { self.lock() };
+            if g.state == StreamState::Pause {
+                return STATUS_SUCCESS_VAL;
+            }
+            if g.state != StreamState::Stop {
+                return STATUS_INVALID_STATE_TRANSITION_VAL;
+            }
         }
 
         let mut timer_cfg = wdf_timer_config_init(Some(evt_stream_timer));
@@ -292,32 +394,43 @@ impl RenderStream {
             return st;
         }
         unsafe {
-            let irql = KeAcquireSpinLockRaiseToDpc(&mut self.lock);
-            self.timer = timer;
-            self.state = StreamState::Pause;
-            KeReleaseSpinLock(&mut self.lock, irql);
+            {
+                let mut g = self.lock();
+                g.timer = timer;
+                g.state = StreamState::Pause;
+            }
             bind_timer_to_stream(self.stream, timer);
         }
         STATUS_SUCCESS_VAL
     }
 
-    unsafe fn release_hardware(&mut self) -> NTSTATUS {
+    /// Release hardware resources. `from_cleanup` avoids blocking waits / `KeFlushQueuedDpcs`
+    /// if invoked at DISPATCH_LEVEL (Review #8 A4).
+    unsafe fn release_hardware(&self, from_cleanup: bool) -> NTSTATUS {
         let (was_running, timer) = unsafe {
-            let irql = KeAcquireSpinLockRaiseToDpc(&mut self.lock);
-            let prev = self.state;
-            let t = self.timer;
-            self.state = StreamState::Stop;
-            self.timer = ptr::null_mut();
-            self.glitch_adjust_hns = 0;
-            KeReleaseSpinLock(&mut self.lock, irql);
+            let mut g = self.lock();
+            let prev = g.state;
+            let t = g.timer;
+            g.state = StreamState::Stop;
+            g.timer = ptr::null_mut();
+            g.clock.on_stop();
             (prev == StreamState::Run, t)
         };
         if !timer.is_null() {
             unsafe {
-                wdf_timer_stop(timer, 1);
-                KeFlushQueuedDpcs();
-                bind_timer_to_stream(self.stream, ptr::null_mut());
-                wdf_object_delete(timer as WDFOBJECT);
+                let is_passive = KeGetCurrentIrql() == PASSIVE_LEVEL_IRQL;
+                if from_cleanup {
+                    // In EvtCleanupCallback, stop non-blocking and let WDF child disposal flush.
+                    wdf_timer_stop(timer, 0);
+                    bind_timer_to_stream(self.stream, ptr::null_mut());
+                } else {
+                    wdf_timer_stop(timer, if is_passive { 1 } else { 0 });
+                    if is_passive {
+                        KeFlushQueuedDpcs();
+                    }
+                    bind_timer_to_stream(self.stream, ptr::null_mut());
+                    wdf_object_delete(timer as WDFOBJECT);
+                }
             }
         }
         if was_running {
@@ -327,29 +440,26 @@ impl RenderStream {
         }
         self.current_packet.store(0, Ordering::Release);
         self.bytes_consumed.store(0, Ordering::Release);
+        self.clock_adj_ppm.store(0, Ordering::Release);
         STATUS_SUCCESS_VAL
     }
 
-    unsafe fn run(&mut self) -> NTSTATUS {
+    unsafe fn run(&self) -> NTSTATUS {
         let now_qpc = unsafe { KeQueryPerformanceCounter(ptr::null_mut()).QuadPart };
+        let now_hns = qpc_to_hns(now_qpc, self.qpc_freq);
         let fmt = unsafe {
-            let irql = KeAcquireSpinLockRaiseToDpc(&mut self.lock);
-            if self.state == StreamState::Run {
-                KeReleaseSpinLock(&mut self.lock, irql);
+            let mut g = self.lock();
+            if g.state == StreamState::Run {
                 return STATUS_SUCCESS_VAL;
             }
-            if self.state != StreamState::Pause {
-                KeReleaseSpinLock(&mut self.lock, irql);
+            if g.state != StreamState::Pause {
                 return STATUS_INVALID_STATE_TRANSITION_VAL;
             }
-            self.start_time_hns = qpc_to_hns(now_qpc, self.qpc_freq);
-            self.start_pos_bytes = self.bytes_consumed.load(Ordering::Acquire);
-            self.glitch_adjust_hns = 0;
+            let consumed = self.bytes_consumed.load(Ordering::Acquire);
+            g.clock.on_run(now_hns, consumed);
             self.clock_adj_ppm.store(0, Ordering::Release);
-            self.state = StreamState::Run;
-            let f = self.format;
-            KeReleaseSpinLock(&mut self.lock, irql);
-            f
+            g.state = StreamState::Run;
+            g.format
         };
 
         unsafe {
@@ -359,25 +469,28 @@ impl RenderStream {
         STATUS_SUCCESS_VAL
     }
 
-    unsafe fn pause(&mut self) -> NTSTATUS {
+    unsafe fn pause(&self) -> NTSTATUS {
+        let now_qpc = unsafe { KeQueryPerformanceCounter(ptr::null_mut()).QuadPart };
+        let now_hns = qpc_to_hns(now_qpc, self.qpc_freq);
         let timer = unsafe {
-            let irql = KeAcquireSpinLockRaiseToDpc(&mut self.lock);
-            if self.state == StreamState::Pause {
-                KeReleaseSpinLock(&mut self.lock, irql);
+            let mut g = self.lock();
+            if g.state == StreamState::Pause {
                 return STATUS_SUCCESS_VAL;
             }
-            if self.state != StreamState::Run {
-                KeReleaseSpinLock(&mut self.lock, irql);
+            if g.state != StreamState::Run {
                 return STATUS_INVALID_STATE_TRANSITION_VAL;
             }
-            self.state = StreamState::Pause;
-            let t = self.timer;
-            KeReleaseSpinLock(&mut self.lock, irql);
-            t
+            let consumed = self.bytes_consumed.load(Ordering::Acquire);
+            let pkt_size = g.packet_size;
+            g.clock
+                .on_pause(now_hns, self.avg_bytes_per_sec, consumed, pkt_size);
+            g.state = StreamState::Pause;
+            g.timer
         };
         if !timer.is_null() {
             unsafe {
-                wdf_timer_stop(timer, 1);
+                let wait = if KeGetCurrentIrql() == PASSIVE_LEVEL_IRQL { 1 } else { 0 };
+                wdf_timer_stop(timer, wait);
             }
         }
         unsafe {
@@ -387,61 +500,54 @@ impl RenderStream {
     }
 
     unsafe fn set_render_packet(
-        &mut self,
+        &self,
         packet: ULONG,
         flags: ULONG,
         eos_length: ULONG,
     ) -> NTSTATUS {
         unsafe {
-            let irql = KeAcquireSpinLockRaiseToDpc(&mut self.lock);
+            let mut g = self.lock();
             let cur = self.current_packet.load(Ordering::Acquire);
-            if self.state == StreamState::Run && packet < cur {
-                KeReleaseSpinLock(&mut self.lock, irql);
-                return STATUS_DATA_LATE_ERROR_VAL;
+            match validate_render_packet(g.state == StreamState::Run, cur, g.packet_count, packet) {
+                Ok(idx) => {
+                    g.slot_meta[idx] = SlotMeta {
+                        flags,
+                        eos_len: eos_length,
+                        valid: true,
+                    };
+                    STATUS_SUCCESS_VAL
+                }
+                Err(RenderPacketError::InvalidState) => STATUS_INVALID_DEVICE_STATE_VAL,
+                Err(RenderPacketError::Late) => STATUS_DATA_LATE_ERROR_VAL,
+                Err(RenderPacketError::Overrun) => STATUS_DATA_OVERRUN_VAL,
             }
-            if self.packet_count == 0 {
-                KeReleaseSpinLock(&mut self.lock, irql);
-                return STATUS_INVALID_DEVICE_STATE_VAL;
-            }
-            if packet > cur.saturating_add(self.packet_count) {
-                KeReleaseSpinLock(&mut self.lock, irql);
-                return STATUS_DATA_OVERRUN_VAL;
-            }
-            let idx = (packet as usize) % (self.packet_count as usize);
-            self.slot_meta[idx] = SlotMeta {
-                flags,
-                eos_len: eos_length,
-                valid: true,
-            };
-            KeReleaseSpinLock(&mut self.lock, irql);
         }
-        STATUS_SUCCESS_VAL
     }
 
-    unsafe fn on_timer_tick(&mut self) {
+    unsafe fn on_timer_tick(&self) {
         let (cur, data_ptr, packet_size, meta) = unsafe {
-            let irql = KeAcquireSpinLockRaiseToDpc(&mut self.lock);
-            if self.state != StreamState::Run || self.packet_count == 0 || self.packet_size == 0 {
-                KeReleaseSpinLock(&mut self.lock, irql);
+            let mut g = self.lock();
+            if g.state != StreamState::Run || g.packet_count == 0 || g.packet_size == 0 {
                 return;
             }
             let cur = self.current_packet.load(Ordering::Acquire);
-            let idx = (cur as usize) % (self.packet_count as usize);
-            let data_ptr = self.packet_data_ptrs[idx];
-            let pkt_size = self.packet_size as usize;
-            let meta = self.slot_meta[idx];
-            self.slot_meta[idx].valid = false;
-            KeReleaseSpinLock(&mut self.lock, irql);
+            let idx = (cur as usize) % (g.packet_count as usize);
+            let data_ptr = g.packet_data_ptrs[idx];
+            let pkt_size = g.packet_size as usize;
+            let meta = g.slot_meta[idx];
+            g.slot_meta[idx].valid = false;
             (cur, data_ptr, pkt_size, meta)
         };
 
         let is_silent = meta.valid && ((meta.flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0);
         let is_eos = meta.valid && ((meta.flags & KSSTREAM_EOS_FLAG) != 0);
-        let valid_len = if is_eos && (meta.eos_len as usize) <= packet_size {
+        let raw_len = if is_eos && (meta.eos_len as usize) <= packet_size {
             meta.eos_len as usize
         } else {
             packet_size
         };
+        // Enforce strict frame alignment on EOS truncation (Review #8 A9).
+        let valid_len = align_down(raw_len, (self.block_align as usize).max(1));
 
         let adj_ppm = unsafe {
             ring::push_packet_bytes(data_ptr, valid_len, is_silent, is_eos, packet_size)
@@ -466,53 +572,26 @@ impl RenderStream {
         }
     }
 
-    unsafe fn schedule_next_tick(&mut self) {
+    unsafe fn schedule_next_tick(&self) {
+        let now_qpc = unsafe { KeQueryPerformanceCounter(ptr::null_mut()).QuadPart };
+        let now_hns = qpc_to_hns(now_qpc, self.qpc_freq);
         let (timer, due_hns) = unsafe {
-            let irql = KeAcquireSpinLockRaiseToDpc(&mut self.lock);
-            if self.state != StreamState::Run || self.timer.is_null() || self.avg_bytes_per_sec == 0
-            {
-                KeReleaseSpinLock(&mut self.lock, irql);
+            let mut g = self.lock();
+            if g.state != StreamState::Run || g.timer.is_null() || self.avg_bytes_per_sec == 0 {
                 return;
             }
             let next_pkt = self.current_packet.load(Ordering::Acquire) as u64 + 1;
-            let next_pos_bytes = next_pkt * (self.packet_size as u64);
-            let since_resume = next_pos_bytes.saturating_sub(self.start_pos_bytes);
-            let nominal_hns = ((since_resume as u128 * HNS_PER_SEC as u128)
-                / (self.avg_bytes_per_sec as u128)) as u64;
-
-            let target_hns = self
-                .start_time_hns
-                .saturating_add(self.glitch_adjust_hns)
-                .saturating_add(nominal_hns);
-
-            let now_qpc = KeQueryPerformanceCounter(ptr::null_mut()).QuadPart;
-            let now_hns = qpc_to_hns(now_qpc, self.qpc_freq);
-
-            let mut delta_hns: i64 = (target_hns as i64) - (now_hns as i64);
-            let pkt_hns = ((self.packet_size as u64 * HNS_PER_SEC) / (self.avg_bytes_per_sec as u64))
-                .max(10_000) as i64;
-
-            let adj_ppm = self.clock_adj_ppm.load(Ordering::Acquire) as i64;
-            if adj_ppm != 0 {
-                let nudge = (pkt_hns * adj_ppm) / 1_000_000;
-                delta_hns += nudge;
-                if nudge >= 0 {
-                    self.glitch_adjust_hns = self.glitch_adjust_hns.saturating_add(nudge as u64);
-                } else {
-                    self.glitch_adjust_hns =
-                        self.glitch_adjust_hns.saturating_sub((-nudge) as u64);
-                }
-            }
-
-            if delta_hns < 5_000 {
-                let late = (5_000 - delta_hns) as u64;
-                self.glitch_adjust_hns = self.glitch_adjust_hns.saturating_add(late);
-                delta_hns = 5_000;
-            }
-
-            let t = self.timer;
-            KeReleaseSpinLock(&mut self.lock, irql);
-            (t, delta_hns)
+            let next_pos_bytes = next_pkt * (g.packet_size as u64);
+            let adj_ppm = self.clock_adj_ppm.load(Ordering::Acquire);
+            let pkt_size = g.packet_size;
+            let due = g.clock.compute_next_due_hns(
+                now_hns,
+                next_pos_bytes,
+                self.avg_bytes_per_sec,
+                pkt_size,
+                adj_ppm,
+            );
+            (g.timer, due)
         };
 
         unsafe {
@@ -521,30 +600,27 @@ impl RenderStream {
     }
 
     unsafe fn get_presentation_position(
-        &mut self,
+        &self,
         pos_blocks: *mut ULONGLONG,
         qpc_pos: *mut ULONGLONG,
     ) -> NTSTATUS {
         let now_qpc = unsafe { KeQueryPerformanceCounter(ptr::null_mut()).QuadPart };
-        let (total_bytes, ba) = unsafe {
-            let irql = KeAcquireSpinLockRaiseToDpc(&mut self.lock);
-            let tb = if self.state == StreamState::Run && self.avg_bytes_per_sec > 0 {
-                let now_hns = qpc_to_hns(now_qpc, self.qpc_freq);
-                let elapsed_hns = now_hns
-                    .saturating_sub(self.start_time_hns)
-                    .saturating_sub(self.glitch_adjust_hns);
-                let interp = self.start_pos_bytes
-                    + ((elapsed_hns as u128 * self.avg_bytes_per_sec as u128)
-                        / (HNS_PER_SEC as u128)) as u64;
-                interp.max(self.bytes_consumed.load(Ordering::Acquire))
-            } else {
-                self.bytes_consumed.load(Ordering::Acquire)
-            };
-            let ba = (self.block_align as u64).max(1);
-            KeReleaseSpinLock(&mut self.lock, irql);
-            (tb, ba)
+        let now_hns = qpc_to_hns(now_qpc, self.qpc_freq);
+        let total_bytes = unsafe {
+            let mut g = self.lock();
+            let consumed = self.bytes_consumed.load(Ordering::Acquire);
+            let running = g.state == StreamState::Run;
+            let pkt_size = g.packet_size;
+            g.clock.presentation_position_bytes(
+                running,
+                now_hns,
+                self.avg_bytes_per_sec,
+                consumed,
+                pkt_size,
+            )
         };
 
+        let ba = (self.block_align as u64).max(1);
         unsafe {
             *pos_blocks = total_bytes / ba;
             *qpc_pos = now_qpc as u64;
@@ -580,7 +656,13 @@ pub unsafe extern "C" fn evt_circuit_create_stream(
         )
     };
     let is_pcm = guid_eq(&subformat, &GUID_KSDATAFORMAT_SUBTYPE_PCM);
-    if !is_pcm || channels != 2 || sample_rate < 44_100 || sample_rate > 384_000 {
+    if !is_pcm
+        || channels != 2
+        || sample_rate < 44_100
+        || sample_rate > 384_000
+        || !matches!(bits, 16 | 24 | 32)
+        || block_align != channels * (bits / 8)
+    {
         return STATUS_NOT_SUPPORTED_VAL;
     }
 
@@ -628,7 +710,10 @@ pub unsafe extern "C" fn evt_circuit_create_stream(
         acx_stream_init_set_rt_supports_notifications(stream_init);
     }
 
+    // EvtCleanupCallback runs BEFORE child WDFTIMER disposal; EvtDestroyCallback frees the
+    // RenderStream allocation strictly after all child objects have been disposed (Review #8 A4).
     let mut attrs = wdf_object_attributes_init();
+    attrs.EvtCleanupCallback = Some(evt_stream_cleanup);
     attrs.EvtDestroyCallback = Some(evt_stream_destroy);
     let mut stream: ACXSTREAM = ptr::null_mut();
     let st = unsafe { acx_rt_stream_create(device, circuit, &mut attrs, &mut stream_init, &mut stream) };
@@ -645,28 +730,30 @@ pub unsafe extern "C" fn evt_circuit_create_stream(
 
     unsafe {
         raw.write(RenderStream {
-            lock: 0,
+            lock: UnsafeCell::new(0),
+            inner: UnsafeCell::new(RenderStreamInner {
+                format: fmt,
+                state: StreamState::Stop,
+                timer: ptr::null_mut(),
+                packet_count: 0,
+                packet_size: 0,
+                first_packet_offset: 0,
+                allocated_packets: ptr::null_mut(),
+                allocated_packet_count: 0,
+                packet_bases: [ptr::null_mut(); MAX_RT_PACKETS],
+                packet_data_ptrs: [ptr::null_mut(); MAX_RT_PACKETS],
+                slot_meta: [SlotMeta::default(); MAX_RT_PACKETS],
+                clock: StreamClockState::default(),
+            }),
             stream,
-            format: fmt,
             avg_bytes_per_sec: avg_bytes,
             block_align: block_align as u32,
-            state: StreamState::Stop,
-            timer: ptr::null_mut(),
-            packet_count: 0,
-            packet_size: 0,
-            first_packet_offset: 0,
-            packet_bases: [ptr::null_mut(); MAX_RT_PACKETS],
-            packet_data_ptrs: [ptr::null_mut(); MAX_RT_PACKETS],
-            slot_meta: [SlotMeta::default(); MAX_RT_PACKETS],
+            qpc_freq: ring::qpc_frequency(),
             current_packet: AtomicU32::new(0),
             bytes_consumed: AtomicU64::new(0),
-            start_time_hns: 0,
-            start_pos_bytes: 0,
-            glitch_adjust_hns: 0,
             clock_adj_ppm: AtomicI32::new(0),
-            qpc_freq: ring::qpc_frequency(),
         });
-        KeInitializeSpinLock(ptr::addr_of_mut!((*raw).lock));
+        KeInitializeSpinLock((*raw).lock.get());
 
         if !register_stream(stream, raw) {
             ExFreePoolWithTag(raw.cast(), POOL_TAG);
@@ -678,12 +765,26 @@ pub unsafe extern "C" fn evt_circuit_create_stream(
     STATUS_SUCCESS_VAL
 }
 
+/// Runs BEFORE WDF deletes child objects (the WDFTIMER), safely stopping the timer without
+/// blocking at DISPATCH_LEVEL and freeing any leaked RT packet allocations (Review #8 A4).
+unsafe extern "C" fn evt_stream_cleanup(obj: WDFOBJECT) {
+    let stream = obj as ACXSTREAM;
+    let engine = unsafe { lookup_by_stream(stream) };
+    if !engine.is_null() {
+        unsafe {
+            let _ = (*engine).release_hardware(true);
+            (*engine).free_rt_packets(ptr::null_mut(), 0);
+        }
+    }
+}
+
+/// Runs AFTER child disposal completes: unregisters and frees `RenderStream` (Review #8 A4).
 unsafe extern "C" fn evt_stream_destroy(obj: WDFOBJECT) {
     let stream = obj as ACXSTREAM;
     let engine = unsafe { unregister_stream(stream) };
     if !engine.is_null() {
         unsafe {
-            let _ = (*engine).release_hardware();
+            (*engine).free_rt_packets(ptr::null_mut(), 0);
             ExFreePoolWithTag(engine.cast(), POOL_TAG);
             ring::on_stream_destroyed();
         }
@@ -748,7 +849,7 @@ unsafe extern "C" fn evt_stream_release_hardware(stream: ACXSTREAM) -> NTSTATUS 
     if engine.is_null() {
         return STATUS_SUCCESS_VAL;
     }
-    unsafe { (*engine).release_hardware() }
+    unsafe { (*engine).release_hardware(false) }
 }
 
 unsafe extern "C" fn evt_stream_run(stream: ACXSTREAM) -> NTSTATUS {

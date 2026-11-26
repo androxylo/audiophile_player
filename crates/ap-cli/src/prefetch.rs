@@ -174,6 +174,9 @@ struct BufferInner {
     terminal_markers: usize,
     max_buffered_frames: usize,
     max_buffered_duration_ns: u128,
+    /// Optional per-mode override capping buffered duration (e.g. ~3 s for live exclusive
+    /// capture so clock drift never accumulates into a 24-30 s queue, Review #8 B4).
+    epoch_duration_cap_ns: Option<u128>,
     /// Lowest remaining buffered duration observed while actively popping PCM blocks for the
     /// current track (resets on track start / flush; diagnostic headroom metric).
     track_min_buffered_ns: Option<u128>,
@@ -346,6 +349,7 @@ impl BoundedBlockStreamBuffer {
                 terminal_markers: 0,
                 max_buffered_frames: max_buffered_frames.max(65_536),
                 max_buffered_duration_ns: max_buffered_duration.as_nanos().max(1),
+                epoch_duration_cap_ns: None,
                 track_min_buffered_ns: None,
                 deferred_drops: Vec::with_capacity(INITIAL_DEFERRED_DROP_CAPACITY),
                 closed: false,
@@ -365,7 +369,16 @@ impl BoundedBlockStreamBuffer {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).epoch
     }
 
-    /// Current buffered audio duration in seconds ahead of the DAC (used by F9 W2 startup budget).
+    /// Set or clear a tighter per-mode duration cap (e.g. `Some(3 s)` for live capture,
+    /// `None` for normal 24 s / Ultimate 30 s local playback; Review #8 B4).
+    pub fn set_epoch_duration_cap(&self, cap: Option<Duration>) {
+        let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        st.epoch_duration_cap_ns = cap.map(|d| d.as_nanos().max(1));
+        self.cv.notify_all();
+    }
+
+    /// Current buffered audio duration in seconds ahead of the DAC (used by F9 W2 startup budget
+    /// and live capture clock-slaving throttle).
     pub fn buffered_duration_seconds(&self) -> f64 {
         let ns = self
             .inner
@@ -648,11 +661,13 @@ impl BoundedBlockStreamBuffer {
             }
             // Control markers pass immediately; PCM blocks respect both duration and RAM caps
             // (always allowing at least 1 block if no PCM frames are currently buffered).
+            let effective_dur_cap = st
+                .epoch_duration_cap_ns
+                .map_or(st.max_buffered_duration_ns, |c| c.min(st.max_buffered_duration_ns));
             if frames_in_event == 0
                 || st.buffered_frames == 0
                 || (st.buffered_frames + frames_in_event <= st.max_buffered_frames
-                    && st.buffered_duration_ns.saturating_add(dur_ns_in_event)
-                        <= st.max_buffered_duration_ns)
+                    && st.buffered_duration_ns.saturating_add(dur_ns_in_event) <= effective_dur_cap)
             {
                 if let Some((ptr_key, guard)) = pre_pinned.take() {
                     st.pinned_guards.insert(ptr_key, guard);
