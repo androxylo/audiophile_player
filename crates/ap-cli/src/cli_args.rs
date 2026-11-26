@@ -51,7 +51,8 @@ pub enum ConfigCommand {
     },
 }
 
-/// Explicit CLI overrides for `[quantizer]` in `config.toml` (`--dac-bits`, `--shaper`).
+/// Explicit CLI overrides for `[quantizer]` and `[player]` policy keys (`--dac-bits`, `--shaper`,
+/// `--filter`, `--max-taps`; Review #9 E3: `Option`s distinguish explicit defaults from omitted flags).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct QuantizerCliOverride {
     /// `Some(bits)` when `--dac-bits` was explicitly passed on the CLI.
@@ -59,6 +60,23 @@ pub struct QuantizerCliOverride {
     /// `Some(None)` = explicit `--shaper auto`; `Some(Some(p))` = explicit `--shaper <p>`;
     /// `None` = not passed on CLI (defer to `[quantizer] shaper` in `config.toml`).
     pub shaper: Option<Option<NoiseShaperProfile>>,
+    /// `Some(None)` = explicit `--filter auto`; `Some(Some(f))` = explicit `--filter <f>`;
+    /// `None` = not passed on CLI (defer to `[player] filter` in `config.toml`).
+    pub filter: Option<Option<FilterArchetype>>,
+    /// `Some(n)` when `--max-taps` was explicitly passed on the CLI.
+    pub max_taps: Option<usize>,
+}
+
+/// Parse an `--opt` / `[player] opt` optimization level string (`normal | high | extreme`, E12).
+pub fn parse_optimization_level(val: &str) -> Result<OptimizationLevel, String> {
+    match val.to_ascii_lowercase().as_str() {
+        "normal" => Ok(OptimizationLevel::Normal),
+        "high" => Ok(OptimizationLevel::High),
+        "extreme" => Ok(OptimizationLevel::Extreme),
+        other => Err(format!(
+            "invalid --opt '{other}'; expected normal, high, or extreme"
+        )),
+    }
 }
 
 /// Explicit CLI overrides for the built-in UPnP AV MediaRenderer (`--upnp-*` / `--no-upnp`).
@@ -346,8 +364,11 @@ where
                 let val_str = require_utf8_arg("--filter", val)?;
                 if val_str.eq_ignore_ascii_case("auto") {
                     upsampler_policy.filter_override = None;
+                    quantizer_override.filter = Some(None);
                 } else {
-                    upsampler_policy.filter_override = Some(FilterArchetype::from_str(&val_str)?);
+                    let parsed = FilterArchetype::from_str(&val_str)?;
+                    upsampler_policy.filter_override = Some(parsed);
+                    quantizer_override.filter = Some(Some(parsed));
                 }
             }
             "--shaper" => {
@@ -394,6 +415,7 @@ where
                     ));
                 }
                 upsampler_policy.max_taps = taps;
+                quantizer_override.max_taps = Some(taps);
             }
             "--conv-dir" => {
                 let val = iter
@@ -492,16 +514,7 @@ where
                     .next()
                     .ok_or_else(|| "--opt requires normal | high | extreme".to_string())?;
                 let val_str = require_utf8_arg("--opt", val)?;
-                optimization = match val_str.to_ascii_lowercase().as_str() {
-                    "normal" => OptimizationLevel::Normal,
-                    "high" => OptimizationLevel::High,
-                    "extreme" => OptimizationLevel::Extreme,
-                    other => {
-                        return Err(format!(
-                            "invalid --opt '{other}'; expected normal, high, or extreme"
-                        ));
-                    }
-                };
+                optimization = parse_optimization_level(&val_str)?;
                 optimization_explicit = true;
             }
             unknown => {
@@ -1255,6 +1268,8 @@ mod tests {
                 quantizer_override: QuantizerCliOverride {
                     dac_bits: Some(18),
                     shaper: Some(Some(NoiseShaperProfile::Lns15Smooth)),
+                    filter: Some(Some(FilterArchetype::SincSteep4M)),
+                    max_taps: Some(2_000_000),
                 },
                 rew_override: Some(ConvolutionConfig::explicit_file(
                     r"C:\Filters\room-384k.wav"

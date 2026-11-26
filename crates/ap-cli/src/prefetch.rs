@@ -5,15 +5,15 @@
 //!
 //! Designed for BOTH arbitrarily large FLAC files (multi-hour 32/384 masters) AND continuous
 //! Milestone 2 live streams (Tidal):
-//! - Strictly caps buffered PCM in RAM by BOTH duration (default: `12 s` at the active output
-//!   sample rate) and hard frame ceiling (`384 kHz * 12 s` ≈ 36 MB max RAM — NEVER grows
+//! - Strictly caps buffered PCM in RAM by BOTH duration (default: `24 s` at the active output
+//!   sample rate) and hard frame ceiling (`384 kHz * 24 s` ≈ 73.7 MB max RAM — NEVER grows
 //!   unbounded regardless of file length, and never leads by ~100 s at 44.1 kHz!).
-//! - Supports a configurable **prebuffer watermark** (e.g. `2.0 s` of PCM ready before starting
+//! - Supports a configurable **prebuffer watermark** (e.g. `4.0 s` of PCM ready before starting
 //!   WDM-KS hardware DMA) so playback starts cleanly with zero hiccups.
 //! - Epoch-guarded instant flush (`reset_and_flush`) on Pause or mode/folder switch drops stale
 //!   buffered blocks immediately and discards in-flight producer work cleanly.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -169,9 +169,6 @@ struct BufferInner {
     /// Pre-allocated spare guard vector swapped in O(1) under lock (Review #8 C7: zero heap
     /// allocation while holding `self.inner`).
     spare_guards: Vec<PinGuard>,
-    /// Pointer keys of PCM blocks currently popped and in-flight on the RT DMA thread (never
-    /// unlocked by `flush_locked` / `close` until `recycle_consumed_block` returns them).
-    in_flight_ptrs: HashSet<usize>,
     /// Queued `(event, precomputed_pcm_peak_u32)` tuples so the RT consumer updates live peak in
     /// O(1) without scanning PCM frames on the WaveRT thread.
     events: VecDeque<(StreamEvent, u32)>,
@@ -183,9 +180,6 @@ struct BufferInner {
     /// Optional per-mode override capping buffered duration (e.g. ~3 s for live exclusive
     /// capture so clock drift never accumulates into a 24-30 s queue, Review #8 B4).
     epoch_duration_cap_ns: Option<u128>,
-    /// Lowest remaining buffered duration observed while actively popping PCM blocks for the
-    /// current track (resets on track start / flush; diagnostic headroom metric).
-    track_min_buffered_ns: Option<u128>,
     /// Consumed PCM blocks handed off by the real-time WaveRT thread so large `Vec<[i32; 2]>`
     /// buffers are deallocated exclusively on the non-RT producer/control thread.
     deferred_drops: Vec<InterleavedInt32Buffer>,
@@ -275,7 +269,6 @@ impl BufferInner {
         self.buffered_frames = 0;
         self.buffered_duration_ns = 0;
         self.terminal_markers = 0;
-        self.track_min_buffered_ns = None;
 
         // Review #7 re-review R6: Use `drain(..)` instead of `std::mem::take` so `deferred_guards`
         // and `deferred_drops` permanently retain their pre-allocated capacity (>= 256) and the RT
@@ -285,20 +278,15 @@ impl BufferInner {
         } else {
             self.deferred_guards.drain(..).collect()
         };
-        // Remove and unlock ONLY guards for queued (non-in-flight) blocks; preserve the guard for
-        // any block currently being read by the RT DMA thread until `recycle_consumed_block`!
-        let mut release_keys = Vec::new();
+        // Remove and unlock ONLY guards for queued blocks (any block currently in-flight on the RT
+        // DMA thread was already popped out of `self.events`, so its guard remains safely pinned
+        // until `recycle_consumed_block` returns it; Review #9 E10).
         for (ev, _) in &events {
             if let StreamEvent::PcmBlock(b) = ev {
                 let ptr_key = b.frames.as_ptr() as usize;
-                if !self.in_flight_ptrs.contains(&ptr_key) {
-                    release_keys.push(ptr_key);
+                if let Some(g) = self.pinned_guards.remove(&ptr_key) {
+                    guards.push(g);
                 }
-            }
-        }
-        for key in release_keys {
-            if let Some(g) = self.pinned_guards.remove(&key) {
-                guards.push(g);
             }
         }
         let drops: Vec<InterleavedInt32Buffer> = if self.deferred_drops.is_empty() {
@@ -365,7 +353,7 @@ pub struct BoundedBlockStreamBuffer {
 }
 
 impl BoundedBlockStreamBuffer {
-    /// Create a bounded buffer capped by both `DEFAULT_MAX_BUFFERED_SECONDS` (12 s at the
+    /// Create a bounded buffer capped by both `DEFAULT_MAX_BUFFERED_SECONDS` (24 s at the
     /// active output sample rate) and the hard frame ceiling `max_buffered_frames`.
     pub fn new(max_buffered_frames: usize) -> Arc<Self> {
         Self::with_limits(
@@ -392,7 +380,6 @@ impl BoundedBlockStreamBuffer {
                 pinned_guards: HashMap::with_capacity(INITIAL_DEFERRED_DROP_CAPACITY),
                 deferred_guards: Vec::with_capacity(INITIAL_DEFERRED_DROP_CAPACITY),
                 spare_guards: Vec::with_capacity(INITIAL_DEFERRED_DROP_CAPACITY),
-                in_flight_ptrs: HashSet::with_capacity(8),
                 events: VecDeque::new(),
                 buffered_frames: 0,
                 buffered_duration_ns: 0,
@@ -400,7 +387,6 @@ impl BoundedBlockStreamBuffer {
                 max_buffered_frames: max_buffered_frames.max(65_536),
                 max_buffered_duration_ns: max_buffered_duration.as_nanos().max(1),
                 epoch_duration_cap_ns: None,
-                track_min_buffered_ns: None,
                 deferred_drops: Vec::with_capacity(INITIAL_DEFERRED_DROP_CAPACITY),
                 spare_drops: Vec::with_capacity(INITIAL_DEFERRED_DROP_CAPACITY),
                 closed: false,
@@ -439,29 +425,12 @@ impl BoundedBlockStreamBuffer {
         (ns as f64) / 1_000_000_000.0
     }
 
-    /// Reset per-track buffer low-water telemetry right before starting hardware DMA.
-    pub fn reset_track_low_water(&self) {
-        let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        st.track_min_buffered_ns = Some(st.buffered_duration_ns);
-    }
-
-    /// Lowest remaining buffered duration (ms) observed during the current track's RT pops.
-    #[allow(dead_code)]
-    pub fn track_min_buffered_ms(&self) -> Option<u64> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .track_min_buffered_ns
-            .map(|ns| (ns / 1_000_000) as u64)
-    }
-
     /// Hand a consumed PCM block off the real-time MMCSS WaveRT thread for deferred deallocation
     /// on a non-RT thread. NEVER runs `VirtualUnlock`, `HeapFree`, or `VirtualFree` on the caller
     /// (RT) thread even under sustained W2 producer stalls (Review #7 F10).
     pub fn recycle_consumed_block(&self, buf: InterleavedInt32Buffer) {
         let ptr_key = buf.frames.as_ptr() as usize;
         let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        st.in_flight_ptrs.remove(&ptr_key);
         if let Some(g) = st.pinned_guards.remove(&ptr_key) {
             st.deferred_guards.push(g);
         }
@@ -835,63 +804,9 @@ impl BoundedBlockStreamBuffer {
         if st.closed || st.epoch != expected_epoch {
             return (PopBlockResult::StaleOrClosed, 0);
         }
-        self.pop_track_pcm_locked(&mut st)
-    }
-
-    /// Consumer side (real-time WaveRT audio thread): immediately pop the next PCM block
-    /// for this track without ever sleeping on the condvar.
-    ///
-    /// Returns `PopBlockResult::Underrun` immediately when the queue is empty so the RT loop
-    /// can emit digital silence instead of blocking hardware DMA notifications.
-    #[allow(dead_code)]
-    pub fn try_pop_track_pcm_block(&self, expected_epoch: u64) -> PopBlockResult {
-        self.try_pop_track_pcm_block_with_peak(expected_epoch).0
-    }
-
-    /// Consumer side (inside active track playback): pop the next PCM block for this track.
-    ///
-    /// Explicitly distinguishes clean `TrackEnd` from `Underrun` (timeout while producer is
-    /// still decoding) and `StaleOrClosed` (epoch change / shutdown), so a temporary producer
-    /// stall never silently truncates a track.
-    #[allow(dead_code)]
-    pub fn pop_track_pcm_block(
-        &self,
-        expected_epoch: u64,
-        timeout: Duration,
-    ) -> PopBlockResult {
-        let st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if st.closed || st.epoch != expected_epoch {
-            return PopBlockResult::StaleOrClosed;
-        }
-        let (mut st, wait_res) = self
-            .cv
-            .wait_timeout_while(st, timeout, |s| {
-                !s.closed && s.epoch == expected_epoch && s.events.is_empty()
-            })
-            .unwrap_or_else(|e| e.into_inner());
-        if st.closed || st.epoch != expected_epoch {
-            return PopBlockResult::StaleOrClosed;
-        }
-        if st.events.is_empty() && wait_res.timed_out() {
-            return PopBlockResult::Underrun;
-        }
-        self.pop_track_pcm_locked(&mut st).0
-    }
-
-    fn pop_track_pcm_locked(&self, st: &mut BufferInner) -> (PopBlockResult, u32) {
         match st.events.front() {
             Some((StreamEvent::PcmBlock(_), _)) => {
                 if let Some((StreamEvent::PcmBlock(b), peak_u32)) = st.pop_front_event() {
-                    if !b.frames.is_empty() {
-                        st.in_flight_ptrs.insert(b.frames.as_ptr() as usize);
-                    }
-                    if st.terminal_markers == 0 {
-                        let rem = st.buffered_duration_ns;
-                        st.track_min_buffered_ns = Some(match st.track_min_buffered_ns {
-                            Some(prev) => prev.min(rem),
-                            None => rem,
-                        });
-                    }
                     self.cv.notify_all();
                     (PopBlockResult::Block(b), peak_u32)
                 } else {
@@ -905,10 +820,7 @@ impl BoundedBlockStreamBuffer {
             }
             // Leave next TrackStart / EndOfQueue / FatalError at the front for outer loop!
             Some(_) => (PopBlockResult::TrackEnd, 0),
-            None => {
-                st.track_min_buffered_ns = Some(0);
-                (PopBlockResult::Underrun, 0)
-            }
+            None => (PopBlockResult::Underrun, 0),
         }
     }
 }
@@ -917,6 +829,22 @@ impl BoundedBlockStreamBuffer {
 mod tests {
     use super::*;
     use std::thread;
+
+    fn try_pop(buf: &BoundedBlockStreamBuffer, epoch: u64) -> PopBlockResult {
+        buf.try_pop_track_pcm_block_with_peak(epoch).0
+    }
+
+    fn pop_wait(buf: &BoundedBlockStreamBuffer, epoch: u64, timeout: Duration) -> PopBlockResult {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match try_pop(buf, epoch) {
+                PopBlockResult::Underrun if std::time::Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                other => return other,
+            }
+        }
+    }
 
     fn make_block_at(rate_hz: u32, frames: usize) -> InterleavedInt32Buffer {
         InterleavedInt32Buffer {
@@ -953,7 +881,7 @@ mod tests {
         // Drain all 4 blocks cleanly until TrackEnd
         let mut total = 0;
         loop {
-            match buf.pop_track_pcm_block(ep, Duration::from_secs(1)) {
+            match pop_wait(&buf, ep, Duration::from_secs(1)) {
                 PopBlockResult::Block(blk) => total += blk.frames.len(),
                 PopBlockResult::TrackEnd => break,
                 other => panic!("unexpected pop result: {other:?}"),
@@ -1010,7 +938,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_block_recycling_and_low_water_telemetry_work_off_rt_thread() {
+    fn deferred_block_recycling_works_off_rt_thread() {
         let buf = BoundedBlockStreamBuffer::new(DEFAULT_MAX_BUFFERED_FRAMES);
         let ep = buf.current_epoch();
 
@@ -1018,18 +946,15 @@ mod tests {
         for _ in 0..4 {
             assert!(buf.push_for_epoch(ep, StreamEvent::PcmBlock(make_block(192_000))));
         }
-        buf.reset_track_low_water();
-        assert_eq!(buf.track_min_buffered_ms(), Some(2_000));
 
         // Pop 2 blocks and recycle them as the RT thread would; drops stay deferred until producer runs.
         for _ in 0..2 {
-            match buf.try_pop_track_pcm_block(ep) {
+            match try_pop(&buf, ep) {
                 PopBlockResult::Block(b) => buf.recycle_consumed_block(b),
                 other => panic!("expected Block, got {other:?}"),
             }
         }
         assert_eq!(buf.deferred_drop_count(), 2);
-        assert_eq!(buf.track_min_buffered_ms(), Some(1_000));
 
         // Next producer push automatically drains the deferred-drop queue off the RT thread.
         assert!(buf.push_for_epoch(ep, StreamEvent::PcmBlock(make_block(192_000))));
@@ -1041,30 +966,30 @@ mod tests {
         let buf = BoundedBlockStreamBuffer::new(200_000);
         let ep = buf.current_epoch();
 
-        // Empty queue -> timeout yields Underrun, NOT TrackEnd.
+        // Empty queue yields Underrun, NOT TrackEnd.
         assert!(matches!(
-            buf.pop_track_pcm_block(ep, Duration::from_millis(15)),
+            pop_wait(&buf, ep, Duration::from_millis(15)),
             PopBlockResult::Underrun
         ));
 
         // Pushing a block afterwards still delivers it cleanly.
         assert!(buf.push_for_epoch(ep, StreamEvent::PcmBlock(make_block(10_000))));
         assert!(matches!(
-            buf.pop_track_pcm_block(ep, Duration::from_millis(50)),
+            pop_wait(&buf, ep, Duration::from_millis(50)),
             PopBlockResult::Block(ref b) if b.frames.len() == 10_000
         ));
 
         // Pushing TrackEnd yields TrackEnd.
         assert!(buf.push_for_epoch(ep, StreamEvent::TrackEnd));
         assert!(matches!(
-            buf.pop_track_pcm_block(ep, Duration::from_millis(50)),
+            pop_wait(&buf, ep, Duration::from_millis(50)),
             PopBlockResult::TrackEnd
         ));
 
         // Epoch change yields StaleOrClosed.
         let _ep1 = buf.reset_and_flush();
         assert!(matches!(
-            buf.pop_track_pcm_block(ep, Duration::from_millis(50)),
+            pop_wait(&buf, ep, Duration::from_millis(50)),
             PopBlockResult::StaleOrClosed
         ));
     }
@@ -1140,31 +1065,22 @@ mod tests {
 
         // Empty queue returns Underrun immediately (no condvar sleep).
         let started = std::time::Instant::now();
-        assert!(matches!(
-            buf.try_pop_track_pcm_block(ep),
-            PopBlockResult::Underrun
-        ));
+        assert!(matches!(try_pop(&buf, ep), PopBlockResult::Underrun));
         assert!(started.elapsed() < Duration::from_millis(20));
 
         // Once producer pushes a block and TrackEnd, non-blocking pops drain them in order.
         assert!(buf.push_for_epoch(ep, StreamEvent::PcmBlock(make_block(128))));
         assert!(buf.push_for_epoch(ep, StreamEvent::TrackEnd));
 
-        match buf.try_pop_track_pcm_block(ep) {
+        match try_pop(&buf, ep) {
             PopBlockResult::Block(b) => assert_eq!(b.frames.len(), 128),
             other => panic!("expected Block, got {other:?}"),
         }
-        assert!(matches!(
-            buf.try_pop_track_pcm_block(ep),
-            PopBlockResult::TrackEnd
-        ));
+        assert!(matches!(try_pop(&buf, ep), PopBlockResult::TrackEnd));
 
         // Epoch mismatch or close reports StaleOrClosed immediately.
         let _ = buf.reset_and_flush();
-        assert!(matches!(
-            buf.try_pop_track_pcm_block(ep),
-            PopBlockResult::StaleOrClosed
-        ));
+        assert!(matches!(try_pop(&buf, ep), PopBlockResult::StaleOrClosed));
     }
 
     #[test]
@@ -1179,7 +1095,7 @@ mod tests {
         // Push 2 blocks of 1 s @ 44.1 kHz, pop & recycle -> deferred drops + guards clean up cleanly.
         assert!(buf.push_for_epoch(ep, StreamEvent::PcmBlock(make_block_at(44_100, 44_100))));
         assert!(buf.push_for_epoch(ep, StreamEvent::PcmBlock(make_block_at(44_100, 44_100))));
-        if let PopBlockResult::Block(b) = buf.try_pop_track_pcm_block(ep) {
+        if let PopBlockResult::Block(b) = try_pop(&buf, ep) {
             buf.recycle_consumed_block(b);
         } else {
             panic!("expected pinned block");
@@ -1206,16 +1122,13 @@ mod tests {
         }));
 
         let ep = buf.current_epoch();
-        // Push, pop, and recycle 64 blocks (far above old 16-block cap) without draining:
-        // ZERO unlocks/drops may run on the recycling (RT) thread!
         for _ in 0..64 {
             assert!(buf.push_for_epoch(ep, StreamEvent::PcmBlock(make_block_at(44_100, 1_024))));
-            if let PopBlockResult::Block(b) = buf.try_pop_track_pcm_block(ep) {
+            if let PopBlockResult::Block(b) = try_pop(&buf, ep) {
                 buf.recycle_consumed_block(b);
             } else {
                 panic!("expected block");
             }
-            // Note: push_for_epoch drains deferred drops on producer side, so push 64 first instead!
         }
         buf.drain_deferred_drops();
         unlocks.store(0, Ordering::SeqCst);
@@ -1226,7 +1139,7 @@ mod tests {
         }
         assert_eq!(unlocks.load(Ordering::SeqCst), 0);
         for _ in 0..64 {
-            if let PopBlockResult::Block(b) = buf.try_pop_track_pcm_block(ep) {
+            if let PopBlockResult::Block(b) = try_pop(&buf, ep) {
                 buf.recycle_consumed_block(b);
             } else {
                 panic!("expected block");
@@ -1267,7 +1180,7 @@ mod tests {
         assert!(buf.push_for_epoch(ep, StreamEvent::PcmBlock(b_queued)));
 
         // RT thread pops the first block (now in-flight!).
-        let popped = match buf.try_pop_track_pcm_block(ep) {
+        let popped = match try_pop(&buf, ep) {
             PopBlockResult::Block(b) => b,
             other => panic!("expected block, got {other:?}"),
         };
@@ -1303,7 +1216,6 @@ mod tests {
         let flag = Arc::clone(&saw_unlocked);
         *buf.test_on_lock.lock().unwrap() = Some(Arc::new(move || {
             if let Some(b) = buf_weak.upgrade() {
-                // `try_lock()` MUST succeed from inside `lock_slice`, proving `inner` is NOT held!
                 if b.inner.try_lock().is_ok() {
                     flag.store(true, Ordering::SeqCst);
                 }
@@ -1337,7 +1249,7 @@ mod tests {
         assert!(buf.push_for_epoch(ep, StreamEvent::PcmBlock(blk)));
 
         // Non-RT control loop pops an orphaned PcmBlock via `pop_for_epoch_timeout`:
-        // guard MUST be unlocked BEFORE `ev` is returned/dropped, and `in_flight_ptrs` stays empty!
+        // guard MUST be unlocked BEFORE `ev` is returned/dropped!
         let ev = buf
             .pop_for_epoch_timeout(ep, Duration::from_millis(50))
             .expect("expected orphan PcmBlock");
@@ -1347,10 +1259,6 @@ mod tests {
         );
         {
             let st = buf.inner.lock().unwrap();
-            assert!(
-                st.in_flight_ptrs.is_empty(),
-                "R1: pop_for_epoch_timeout must never leak keys into in_flight_ptrs"
-            );
             assert!(
                 st.pinned_guards.is_empty(),
                 "R1: pinned_guards must not retain orphan block guard"
@@ -1412,34 +1320,21 @@ mod tests {
             assert!(buf.push_for_epoch(ep, StreamEvent::PcmBlock(make_block_at(44_100, 1_024))));
         }
         for _ in 0..4 {
-            if let PopBlockResult::Block(b) = buf.try_pop_track_pcm_block(ep) {
+            if let PopBlockResult::Block(b) = try_pop(&buf, ep) {
                 buf.recycle_consumed_block(b);
             }
         }
         buf.drain_deferred_drops();
         {
             let st = buf.inner.lock().unwrap();
-            assert!(
-                st.deferred_guards.capacity() >= INITIAL_DEFERRED_DROP_CAPACITY,
-                "R6: deferred_guards lost pre-allocated capacity after drain_deferred_drops"
-            );
-            assert!(
-                st.deferred_drops.capacity() >= INITIAL_DEFERRED_DROP_CAPACITY,
-                "R6: deferred_drops lost pre-allocated capacity after drain_deferred_drops"
-            );
-            assert!(
-                st.spare_guards.capacity() >= INITIAL_DEFERRED_DROP_CAPACITY,
-                "C7: spare_guards lost pre-allocated capacity after swap-and-restore"
-            );
-            assert!(
-                st.spare_drops.capacity() >= INITIAL_DEFERRED_DROP_CAPACITY,
-                "C7: spare_drops lost pre-allocated capacity after swap-and-restore"
-            );
+            assert!(st.deferred_guards.capacity() >= INITIAL_DEFERRED_DROP_CAPACITY);
+            assert!(st.deferred_drops.capacity() >= INITIAL_DEFERRED_DROP_CAPACITY);
+            assert!(st.spare_guards.capacity() >= INITIAL_DEFERRED_DROP_CAPACITY);
+            assert!(st.spare_drops.capacity() >= INITIAL_DEFERRED_DROP_CAPACITY);
         }
 
-        // Next push drains any recycled blocks and flush drains remaining blocks — capacity MUST stick!
         for _ in 0..2 {
-            if let PopBlockResult::Block(b) = buf.try_pop_track_pcm_block(ep) {
+            if let PopBlockResult::Block(b) = try_pop(&buf, ep) {
                 buf.recycle_consumed_block(b);
             }
         }
@@ -1447,14 +1342,8 @@ mod tests {
         let _ = buf.reset_and_flush();
         {
             let st = buf.inner.lock().unwrap();
-            assert!(
-                st.deferred_guards.capacity() >= INITIAL_DEFERRED_DROP_CAPACITY,
-                "R6: deferred_guards lost pre-allocated capacity after push/flush"
-            );
-            assert!(
-                st.deferred_drops.capacity() >= INITIAL_DEFERRED_DROP_CAPACITY,
-                "R6: deferred_drops lost pre-allocated capacity after push/flush"
-            );
+            assert!(st.deferred_guards.capacity() >= INITIAL_DEFERRED_DROP_CAPACITY);
+            assert!(st.deferred_drops.capacity() >= INITIAL_DEFERRED_DROP_CAPACITY);
         }
     }
 }

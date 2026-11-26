@@ -290,6 +290,27 @@ enum DispatchOutcome {
     Rejected,
 }
 
+fn effective_valid_bits(valid_bits: u16, bits_per_sample: u16) -> u16 {
+    if valid_bits > 0 {
+        valid_bits
+    } else {
+        bits_per_sample
+    }
+}
+
+impl PlayDirective {
+    /// True for multi-track directives (`Random`, `Sequential`, `ResumeThen`) where a `Next`
+    /// arriving before Track 1 starts should skip Track 1 rather than replaying it (E9).
+    fn awaits_first_track(&self) -> bool {
+        !matches!(
+            self,
+            PlayDirective::SingleFile { .. }
+                | PlayDirective::UpnpStream { .. }
+                | PlayDirective::StreamCapture { .. }
+        )
+    }
+}
+
 impl<'a> EngineState<'a> {
     #[cfg(test)]
     fn new(
@@ -335,12 +356,7 @@ impl<'a> EngineState<'a> {
             PlayDirective::Sequential { seq_gen, .. } => seq_gen.wrapping_add(1),
             _ => 1,
         };
-        let awaiting_first = !matches!(
-            initial_dir,
-            PlayDirective::SingleFile { .. }
-                | PlayDirective::UpnpStream { .. }
-                | PlayDirective::StreamCapture { .. }
-        );
+        let awaiting_first = initial_dir.awaits_first_track();
         Self {
             is_paused: false,
             active_epoch: initial_epoch,
@@ -453,12 +469,7 @@ impl<'a> EngineState<'a> {
         // first track yet, so a Next arriving before Track 1 plays should advance past Track 1
         // (dropping any buffered TrackStart(01) or restarting with skip_count=1) rather than
         // replaying Track 1. SingleFile handles Next explicitly in dispatch().
-        let awaiting_first = !matches!(
-            dir,
-            PlayDirective::SingleFile { .. }
-                | PlayDirective::UpnpStream { .. }
-                | PlayDirective::StreamCapture { .. }
-        );
+        let awaiting_first = dir.awaits_first_track();
         self.pending_flush_skips = 0;
         self.awaiting_post_skip_start = awaiting_first;
         self.last_play = dir.clone();
@@ -466,6 +477,45 @@ impl<'a> EngineState<'a> {
         self.is_paused = false;
         self.just_skipped_track = awaiting_first;
         self.prod_ctrl.set(ep, ProducerDirective::Active(dir));
+    }
+
+    /// Re-anchor `self.last_play` to a fresh `Sequential` cursor after `last_started_track` (E9).
+    fn reanchor_last_play(&mut self, skip_count: usize) -> PlayDirective {
+        match self.last_play.clone() {
+            PlayDirective::Sequential {
+                root, folder_only, ..
+            } => self.sequential_after_last_started(root, folder_only, skip_count),
+            PlayDirective::ResumeThen { then, .. } => match *then {
+                PlayDirective::Sequential {
+                    root, folder_only, ..
+                } => self.sequential_after_last_started(root, folder_only, skip_count),
+                other => other,
+            },
+            other => other,
+        }
+    }
+
+    /// Resume a running exclusive capture generation if one is active (shared by `Next` and `Resume`, E9).
+    fn try_resume_running_capture(&mut self, base_req: &StreamCaptureRequest) -> bool {
+        let Some(ref cap) = self.capture_transport else {
+            return false;
+        };
+        let Ok(st) = cap.get_status() else {
+            return false;
+        };
+        if st.stream_running == 0 || verify_status_exclusive(&st).is_err() {
+            return false;
+        }
+        let mut resumed = base_req.clone();
+        resumed.generation = st.stream_generation;
+        resumed.sample_rate_hz = st.format.sample_rate;
+        resumed.channels = st.format.channels;
+        resumed.bits_per_sample = st.format.bits_per_sample;
+        resumed.valid_bits_per_sample =
+            effective_valid_bits(st.format.valid_bits_per_sample, st.format.bits_per_sample);
+        cap.clear_user_paused();
+        self.start_directive(PlayDirective::StreamCapture { request: resumed }, true);
+        true
     }
 
     fn pause_with_message(&mut self, msg: impl Into<String>) {
@@ -568,32 +618,9 @@ impl<'a> EngineState<'a> {
                 DispatchOutcome::Applied
             }
             ControlCommand::Next => {
-                if let PlayDirective::StreamCapture { ref request } = self.last_play {
-                    // Review #8 B5: when paused in AP during an active exclusive stream, allow
-                    // Next to resume the current running capture generation from AP!
-                    if self.is_paused {
-                        if let Some(ref cap) = self.capture_transport {
-                            if let Ok(st) = cap.get_status() {
-                                if st.stream_running != 0 && verify_status_exclusive(&st).is_ok() {
-                                    let mut resumed = request.clone();
-                                    resumed.generation = st.stream_generation;
-                                    resumed.sample_rate_hz = st.format.sample_rate;
-                                    resumed.channels = st.format.channels;
-                                    resumed.bits_per_sample = st.format.bits_per_sample;
-                                    resumed.valid_bits_per_sample = if st.format.valid_bits_per_sample > 0 {
-                                        st.format.valid_bits_per_sample
-                                    } else {
-                                        st.format.bits_per_sample
-                                    };
-                                    cap.clear_user_paused();
-                                    self.start_directive(
-                                        PlayDirective::StreamCapture { request: resumed },
-                                        true,
-                                    );
-                                    return DispatchOutcome::Applied;
-                                }
-                            }
-                        }
+                if let PlayDirective::StreamCapture { ref request } = self.last_play.clone() {
+                    if self.is_paused && self.try_resume_running_capture(request) {
+                        return DispatchOutcome::Applied;
                     }
                     // While actively streaming live capture, tracks are controlled in the host app.
                     return DispatchOutcome::Rejected;
@@ -664,18 +691,7 @@ impl<'a> EngineState<'a> {
                         self.awaiting_post_skip_start = true;
                     }
                     let skip_count = self.pending_flush_skips;
-                    let restart_dir = match self.last_play.clone() {
-                        PlayDirective::Sequential {
-                            root, folder_only, ..
-                        } => self.sequential_after_last_started(root, folder_only, skip_count),
-                        PlayDirective::ResumeThen { then, .. } => match *then {
-                            PlayDirective::Sequential {
-                                root, folder_only, ..
-                            } => self.sequential_after_last_started(root, folder_only, skip_count),
-                            other => other,
-                        },
-                        other => other,
-                    };
+                    let restart_dir = self.reanchor_last_play(skip_count);
                     self.last_play = restart_dir.clone();
                     self.prod_ctrl.set(ep, ProducerDirective::Active(restart_dir));
                     return DispatchOutcome::Applied;
@@ -684,18 +700,7 @@ impl<'a> EngineState<'a> {
                 // Paused -> Next: resume the next track in the last active mode/folder, anchored
                 // at `last_started_track` for Sequential so prefetched tracks discarded on Pause
                 // are played instead of skipped (and error-threshold pauses resume past bad runs).
-                let resume_dir = match self.last_play.clone() {
-                    PlayDirective::Sequential {
-                        root, folder_only, ..
-                    } => self.sequential_after_last_started(root, folder_only, 0),
-                    PlayDirective::ResumeThen { then, .. } => match *then {
-                        PlayDirective::Sequential {
-                            root, folder_only, ..
-                        } => self.sequential_after_last_started(root, folder_only, 0),
-                        other => other,
-                    },
-                    other => other,
-                };
+                let resume_dir = self.reanchor_last_play(0);
                 self.start_directive(resume_dir, false);
                 self.awaiting_post_skip_start = true;
                 self.just_skipped_track = true;
@@ -738,28 +743,8 @@ impl<'a> EngineState<'a> {
                 };
                 match base_play {
                     PlayDirective::StreamCapture { request } => {
-                        if let Some(ref cap) = self.capture_transport {
-                            if let Ok(st) = cap.get_status() {
-                                if st.stream_running != 0 && verify_status_exclusive(&st).is_ok() {
-                                    let mut resumed = request;
-                                    resumed.generation = st.stream_generation;
-                                    resumed.sample_rate_hz = st.format.sample_rate;
-                                    resumed.channels = st.format.channels;
-                                    resumed.bits_per_sample = st.format.bits_per_sample;
-                                    resumed.valid_bits_per_sample =
-                                        if st.format.valid_bits_per_sample > 0 {
-                                            st.format.valid_bits_per_sample
-                                        } else {
-                                            st.format.bits_per_sample
-                                        };
-                                    cap.clear_user_paused();
-                                    self.start_directive(
-                                        PlayDirective::StreamCapture { request: resumed },
-                                        true,
-                                    );
-                                    return DispatchOutcome::Applied;
-                                }
-                            }
+                        if self.try_resume_running_capture(&request) {
+                            return DispatchOutcome::Applied;
                         }
                         self.shared.record_action(
                             "Resume ignored: exclusive stream is not running (press Play in Tidal, or choose a folder)",
@@ -905,6 +890,7 @@ mod quantizer_policy_tests {
             QuantizerCliOverride {
                 dac_bits: Some(20),
                 shaper: Some(None),
+                ..QuantizerCliOverride::default()
             },
             &cfg,
         )
@@ -928,6 +914,90 @@ mod quantizer_policy_tests {
         // Non-8fS --filter null pass-through stays responsive (~0.25 s).
         assert_eq!(source_block_frames_for_rates(44_100, 44_100), 11_025);
     }
+}
+
+/// Build the effective runtime options JSON exposed by `/api/v1/status` and `run.json` (E12).
+#[allow(clippy::too_many_arguments)]
+fn build_effective_options_json(
+    dac_name: &str,
+    music_dir: &Path,
+    optimization: OptimizationLevel,
+    effective_max_rate: Option<u32>,
+    dac_caps: &ap_core::format::DacOutputCapabilities,
+    effective_policy: &UpsamplerPolicy,
+    ultimate_enabled: bool,
+    filters_mode_label: &str,
+    upnp_enabled: bool,
+    capture_enabled: bool,
+) -> JsonValue {
+    JsonValue::obj(vec![
+        ("dac", JsonValue::from(dac_name)),
+        (
+            "music_dir",
+            JsonValue::from(music_dir.to_string_lossy().into_owned()),
+        ),
+        (
+            "opt",
+            JsonValue::from(format!("{optimization:?}").to_ascii_lowercase()),
+        ),
+        (
+            "max_rate",
+            effective_max_rate
+                .map(JsonValue::from)
+                .unwrap_or_else(|| JsonValue::from("auto")),
+        ),
+        (
+            "dac_rate_44k",
+            dac_caps
+                .target_for_352800
+                .map(|t| JsonValue::from(t.sample_rate_hz))
+                .unwrap_or(JsonValue::Null),
+        ),
+        (
+            "dac_rate_48k",
+            dac_caps
+                .target_for_384000
+                .map(|t| JsonValue::from(t.sample_rate_hz))
+                .unwrap_or(JsonValue::Null),
+        ),
+        (
+            "dac_wire_format",
+            JsonValue::from(
+                dac_caps
+                    .target_for_384000
+                    .or(dac_caps.target_for_352800)
+                    .map(|t| t.wire_format.label())
+                    .unwrap_or("Int32"),
+            ),
+        ),
+        (
+            "filter",
+            JsonValue::from(
+                effective_policy
+                    .filter_override
+                    .map(|f| f.to_string())
+                    .unwrap_or_else(|| "auto".to_string()),
+            ),
+        ),
+        (
+            "shaper",
+            JsonValue::from(
+                effective_policy
+                    .shaper_override
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "auto".to_string()),
+            ),
+        ),
+        (
+            "dac_bits",
+            JsonValue::from(u32::from(effective_policy.dac_bits)),
+        ),
+        ("max_taps", JsonValue::from(effective_policy.max_taps)),
+        ("ultimate", JsonValue::from(ultimate_enabled)),
+        ("filters_mode", JsonValue::from(filters_mode_label)),
+        ("upnp_enabled", JsonValue::from(upnp_enabled)),
+        ("capture_enabled", JsonValue::from(capture_enabled)),
+    ])
 }
 
 /// Run default zero-config random FLAC playback via bounded-memory block streaming,
@@ -959,20 +1029,22 @@ pub fn run_random_music_player(
     let effective_conv = rew_override.unwrap_or_else(|| loaded_cfg.config.convolution.clone());
     effective_conv.validate_paths().map_err(CliError::config)?;
 
-    // Merge `[player]` saved defaults with explicit CLI flags (CLI always wins).
+    // Merge `[player]` saved defaults with explicit CLI flags (CLI always wins, including explicit
+    // `--filter auto` and `--max-taps <default>`; Review #9 E3).
     let mut merged_policy = upsampler_policy;
-    if merged_policy.filter_override.is_none() {
-        if let Some(ref cfg_f) = loaded_cfg.config.player.filter {
-            if !cfg_f.eq_ignore_ascii_case("auto") {
-                merged_policy.filter_override =
-                    Some(FilterArchetype::from_str(cfg_f).map_err(CliError::config)?);
+    merged_policy.filter_override = match quantizer_override.filter {
+        Some(explicit) => explicit,
+        None => match loaded_cfg.config.player.filter.as_deref() {
+            Some(cfg_f) if !cfg_f.eq_ignore_ascii_case("auto") => {
+                Some(FilterArchetype::from_str(cfg_f).map_err(CliError::config)?)
             }
-        }
-    }
-    if merged_policy.max_taps == ap_dsp::MAX_FILTER_TAPS {
-        if let Some(cfg_taps) = loaded_cfg.config.player.max_taps {
-            merged_policy.max_taps = cfg_taps;
-        }
+            _ => None,
+        },
+    };
+    if let Some(cli_taps) = quantizer_override.max_taps {
+        merged_policy.max_taps = cli_taps;
+    } else if let Some(cfg_taps) = loaded_cfg.config.player.max_taps {
+        merged_policy.max_taps = cfg_taps;
     }
     let effective_policy = resolve_upsampler_policy(
         merged_policy,
@@ -986,12 +1058,10 @@ pub fn run_random_music_player(
     let http_port = http_port.or(loaded_cfg.config.player.port);
     let (optimization, optimization_explicit) = if !optimization_explicit {
         if let Some(ref cfg_opt) = loaded_cfg.config.player.opt {
-            let lvl = match cfg_opt.to_ascii_lowercase().as_str() {
-                "normal" => OptimizationLevel::Normal,
-                "extreme" => OptimizationLevel::Extreme,
-                _ => OptimizationLevel::High,
-            };
-            (lvl, true)
+            (
+                crate::cli_args::parse_optimization_level(cfg_opt).map_err(CliError::config)?,
+                true,
+            )
         } else {
             (optimization, false)
         }
@@ -1118,73 +1188,22 @@ pub fn run_random_music_player(
     .with_shared_dac_capabilities(Arc::clone(&shared_dac_caps));
 
     let api_token = generate_api_token_hex()?;
-    let effective_options_json = JsonValue::obj(vec![
-        ("dac", JsonValue::from(dac_name.clone())),
-        ("music_dir", JsonValue::from(music_dir.to_string_lossy().into_owned())),
-        ("opt", JsonValue::from(format!("{optimization:?}").to_ascii_lowercase())),
-        (
-            "max_rate",
-            effective_max_rate
-                .map(JsonValue::from)
-                .unwrap_or_else(|| JsonValue::from("auto")),
-        ),
-        (
-            "dac_rate_44k",
-            dac_caps
-                .target_for_352800
-                .map(|t| JsonValue::from(t.sample_rate_hz))
-                .unwrap_or(JsonValue::Null),
-        ),
-        (
-            "dac_rate_48k",
-            dac_caps
-                .target_for_384000
-                .map(|t| JsonValue::from(t.sample_rate_hz))
-                .unwrap_or(JsonValue::Null),
-        ),
-        (
-            "dac_wire_format",
-            JsonValue::from(
-                dac_caps
-                    .target_for_384000
-                    .or(dac_caps.target_for_352800)
-                    .map(|t| t.wire_format.label())
-                    .unwrap_or("Int32"),
-            ),
-        ),
-        (
-            "filter",
-            JsonValue::from(
-                effective_policy
-                    .filter_override
-                    .map(|f| f.to_string())
-                    .unwrap_or_else(|| "auto".to_string()),
-            ),
-        ),
-        (
-            "shaper",
-            JsonValue::from(
-                effective_policy
-                    .shaper_override
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "auto".to_string()),
-            ),
-        ),
-        ("dac_bits", JsonValue::from(u32::from(effective_policy.dac_bits))),
-        ("max_taps", JsonValue::from(effective_policy.max_taps)),
-        ("ultimate", JsonValue::from(effective_ultimate.enabled)),
-        (
-            "filters_mode",
-            JsonValue::from(
-                ultimate_ctx
-                    .as_ref()
-                    .map(|u| u.filter_mode.resolve(u.user_filters.path().is_file()).as_str())
-                    .unwrap_or("off"),
-            ),
-        ),
-        ("upnp_enabled", JsonValue::from(upnp_enabled)),
-        ("capture_enabled", JsonValue::from(loaded_cfg.config.capture.enabled && !capture_disabled)),
-    ]);
+    let resolved_filters_mode = ultimate_ctx
+        .as_ref()
+        .map(|u| u.filter_mode.resolve(u.user_filters.path().is_file()));
+    let capture_enabled = loaded_cfg.config.capture.enabled && !capture_disabled;
+    let effective_options_json = build_effective_options_json(
+        &dac_name,
+        &music_dir,
+        optimization,
+        effective_max_rate,
+        &dac_caps,
+        &effective_policy,
+        effective_ultimate.enabled,
+        resolved_filters_mode.map_or("off", |m| m.as_str()),
+        upnp_enabled,
+        capture_enabled,
+    );
 
     let shared = SharedControl::new(music_dir.clone(), dac_name.clone());
     shared.set_api_token(api_token.clone());
@@ -1233,7 +1252,6 @@ pub fn run_random_music_player(
     // Start opt-in exclusive kernel stream capture watcher (\\.\ApExclusiveAudio).
     // Quietly parks if the virtual ACX driver is not installed; preempts automatically when Tidal
     // Desktop opens in Exclusive Mode (hard zero-mixer gate enforced in kernel & user mode).
-    let capture_enabled = loaded_cfg.config.capture.enabled && !capture_disabled;
     let capture_monitor = if capture_enabled {
         let shared_for_cap = Arc::clone(&shared);
         let shared_for_blk = Arc::clone(&shared);
@@ -1316,15 +1334,13 @@ pub fn run_random_music_player(
         }
     }
     if let Some(ref ult) = ultimate_ctx {
-        let eff_mode = ult
-            .filter_mode
-            .resolve(ult.user_filters.path().is_file());
+        let eff_mode = resolved_filters_mode.map_or("off", |m| m.as_str());
         println!(
             "Ultimate mode: ENABLED ({}s look-ahead, full-tail REW, VirtualLock RAM, genre_rules={}, learn_on_play={}, filters={}, filterdb='{}')",
             ULTIMATE_MAX_BUFFERED_SECONDS,
             ult.config.genre_rules,
             ult.config.learn_on_play,
-            eff_mode.as_str(),
+            eff_mode,
             ult.filter_db.root_dir().display()
         );
     }
@@ -1512,6 +1528,12 @@ enum ConsumerStepResult {
     Exit,
 }
 
+fn handle_producer_died(state: &mut EngineState<'_>) {
+    let msg = "DSP producer thread stopped unexpectedly — paused & DAC released";
+    eprintln!("  [error] {msg}");
+    state.pause_with_message(msg);
+}
+
 /// Execute one iteration of the playback consumer loop (command handling, TrackStart prebuffer
 /// with re-queue protection, `stop_flag` arming, streaming playback, and seamless resume on
 /// rejected commands).
@@ -1549,9 +1571,7 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
         stream_buf.pop_for_epoch_timeout(state.active_epoch, Duration::from_millis(50))
     else {
         if producer_finished() && controller.current_signal().is_none() {
-            let msg = "DSP producer thread stopped unexpectedly — paused & DAC released";
-            eprintln!("  [error] {msg}");
-            state.pause_with_message(msg);
+            handle_producer_died(state);
         }
         return ConsumerStepResult::Continue;
     };
@@ -1570,8 +1590,6 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
     match event {
         StreamEvent::EndOfQueue(msg) => {
             if matches!(state.last_play, PlayDirective::UpnpStream { .. }) {
-                // Review #5 Finding #6: if a late SetNextAVTransportURI arrived after the
-                // producer already hit EOF and pushed EndOfQueue, promote & start it now!
                 if let Some(next_req) = state
                     .upnp_state
                     .as_deref()
@@ -1610,17 +1628,14 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
         StreamEvent::PcmBlock(_) | StreamEvent::TrackEnd => {
             // Orphaned block/marker from an interrupted track — ignore safely.
         }
-        StreamEvent::TrackStart {
-            path,
-            upnp_uri,
-            upnp_next_gen,
-            mode_label,
-            report,
-            total_duration_s,
-            had_gapless_carryover,
-        } => {
-            let out_rate = report.output_rate_hz;
-            let watermark_frames = match mode_label {
+        start_ev @ StreamEvent::TrackStart { .. } => {
+            let (out_rate, mode_label_pre) = match &start_ev {
+                StreamEvent::TrackStart {
+                    report, mode_label, ..
+                } => (report.output_rate_hz, *mode_label),
+                _ => unreachable!(),
+            };
+            let watermark_frames = match mode_label_pre {
                 PlayModeLabel::StreamCapture => {
                     ((out_rate as usize) * STREAM_CAPTURE_PREBUFFER_MS) / 1_000
                 }
@@ -1630,7 +1645,8 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
                 _ => (out_rate as usize) * (PREBUFFER_SECONDS as usize),
             };
 
-            // Wait until ~2 seconds of PCM are pre-buffered in RAM (or TrackEnd for short clips)
+            // Wait until the prebuffer watermark (`PREBUFFER_SECONDS` = 4 s for local, 1 s for
+            // UPnP, 500 ms for live capture; E13) is buffered in RAM (or TrackEnd for short clips)
             // while remaining immediately responsive to Pause / Next / Ctrl+C.
             let mut aborted_prebuffer = false;
             let mut pending_cmd: Option<ControlCommand> = None;
@@ -1652,10 +1668,7 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
                     Some(true) => break,
                     Some(false) => {
                         if producer_finished() {
-                            let msg =
-                                "DSP producer thread stopped unexpectedly — paused & DAC released";
-                            eprintln!("  [error] {msg}");
-                            state.pause_with_message(msg);
+                            handle_producer_died(state);
                             aborted_prebuffer = true;
                             break;
                         }
@@ -1667,21 +1680,9 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
                 }
             }
 
-            // Re-queue the popped TrackStart before dispatching so skip_to_next_track_or_flush
-            // applies identical just_skipped_track protection across all arrival windows.
+            // Re-queue the intact `TrackStart` before dispatching (Review #9 E11).
             if let Some(cmd) = pending_cmd {
-                let _ = stream_buf.push_front_for_epoch(
-                    state.active_epoch,
-                    StreamEvent::TrackStart {
-                        path,
-                        upnp_uri,
-                        upnp_next_gen,
-                        mode_label,
-                        report,
-                        total_duration_s,
-                        had_gapless_carryover,
-                    },
-                );
+                let _ = stream_buf.push_front_for_epoch(state.active_epoch, start_ev);
                 let _ = state.dispatch(cmd);
                 return ConsumerStepResult::Continue;
             }
@@ -1698,21 +1699,23 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
                 return ConsumerStepResult::Exit;
             }
             if let Some(cmd) = shared.take_pending_command() {
-                let _ = stream_buf.push_front_for_epoch(
-                    state.active_epoch,
-                    StreamEvent::TrackStart {
-                        path,
-                        upnp_uri,
-                        upnp_next_gen,
-                        mode_label,
-                        report,
-                        total_duration_s,
-                        had_gapless_carryover,
-                    },
-                );
+                let _ = stream_buf.push_front_for_epoch(state.active_epoch, start_ev);
                 let _ = state.dispatch(cmd);
                 return ConsumerStepResult::Continue;
             }
+
+            let StreamEvent::TrackStart {
+                path,
+                upnp_uri,
+                upnp_next_gen,
+                mode_label,
+                report,
+                total_duration_s,
+                had_gapless_carryover: _,
+            } = start_ev
+            else {
+                unreachable!()
+            };
 
             // Review #9 E2: if the startup DAC rate probe was deferred due to `DeviceBusy`,
             // re-probe now (before opening the pin) so `< 8fS` DACs discover their true rate and
@@ -1804,7 +1807,6 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
             // rejected command (e.g. TOCTOU-invalidated PlayFile), drain any remaining queued
             // commands (e.g. a trailing Next or Pause) before clearing stop_handle, and re-check
             // immediately after clearing stop_handle so no command ever loses its stop signal.
-            stream_buf.reset_track_low_water();
             loop {
                 let ep_for_stream = state.active_epoch;
                 let buf_for_stream = Arc::clone(stream_buf);
@@ -1978,22 +1980,105 @@ fn join_producer_bounded(
     }
 }
 
-/// Outcome of decoding and streaming one chosen FLAC track inside `producer_loop`.
+/// Outcome of decoding and streaming one chosen FLAC track or stream inside `producer_loop`.
 #[derive(Debug)]
 enum TrackStreamOutcome {
     /// At least one non-empty PCM block was pushed and the track completed cleanly (or reached EOF).
     Played,
     /// Epoch changed or buffer closed mid-track — caller should simply re-check control state.
     Aborted,
-    /// Valid FLAC whose channel layout is unsupported (e.g. 5.1 surround); distinct from corruption.
+    /// Valid FLAC whose channel layout or sample rate is unsupported; distinct from corruption.
     Unsupported(String),
-    /// Track failed to open, failed DSP setup, panicked, or yielded 0 PCM frames.
+    /// Source cleanly produced 0 audio/PCM frames (typed variant so capture doesn't match strings, E4).
+    Empty(String),
+    /// Track failed to open, failed DSP setup, or panicked.
     Failed(String),
 }
 
-/// Background streaming DSP Producer: reads bounded blocks from `FlacBlockReader` or
-/// `HttpAudioSource` (UPnP), processes them incrementally through `StreamingPipelineSession`,
-/// and feeds `BoundedBlockStreamBuffer` with automatic backpressure (strictly bounded RAM).
+#[derive(Default)]
+struct GaplessState {
+    carried_tail: Option<GaplessCarryover>,
+    pending_track_end: bool,
+}
+
+impl GaplessState {
+    fn clear(&mut self) {
+        self.carried_tail = None;
+        self.pending_track_end = false;
+    }
+
+    fn update(&mut self, carry: Option<GaplessCarryover>, pending_end: bool) {
+        self.carried_tail = carry;
+        self.pending_track_end = pending_end;
+    }
+}
+
+/// Shared producer-thread handles bundled to eliminate 6-8 repeated parameters across helpers (E6).
+struct ProducerCtx {
+    pipeline: AudioPipeline,
+    ctrl: Arc<ProducerControl>,
+    buf: Arc<BoundedBlockStreamBuffer>,
+    shared: Arc<SharedControl>,
+    upnp_state: Option<Arc<UpnpRendererState>>,
+    capture_transport: Option<SharedCaptureTransport>,
+    ultimate_ctx: Option<UltimateRuntimeContext>,
+}
+
+impl ProducerCtx {
+    /// Drain any carried gapless tail and emit a pending `TrackEnd` for `epoch`.
+    /// Returns `false` if the buffer epoch changed/closed mid-push.
+    fn finalize_prev(&self, epoch: u64, gapless: &mut GaplessState) -> bool {
+        if let Some(tail) = gapless.carried_tail.take() {
+            if let Ok((pcm, drain_stats)) = self.pipeline.drain_gapless_carryover_with_stats(tail) {
+                if drain_stats.overs_count > 0 {
+                    eprintln!(
+                        "  [clip warn] drained gapless tail: {} pre-quantizer sample overs (max {:.2} dBFS)",
+                        drain_stats.overs_count,
+                        drain_stats.max_pre_quant_peak_dbfs()
+                    );
+                }
+                if !pcm.is_empty() && !self.buf.push_for_epoch(epoch, StreamEvent::PcmBlock(pcm)) {
+                    gapless.pending_track_end = false;
+                    return false;
+                }
+            }
+        }
+        if gapless.pending_track_end {
+            gapless.pending_track_end = false;
+            if !self.buf.push_for_epoch(epoch, StreamEvent::TrackEnd) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Finalize any carried previous track, push a terminal `StreamEvent`, and pause `epoch` (E6).
+    fn end_epoch(&self, epoch: u64, gapless: &mut GaplessState, event: StreamEvent) {
+        let _ = self.finalize_prev(epoch, gapless);
+        let _ = self.buf.push_for_epoch(epoch, event);
+        self.ctrl.pause_if_epoch(epoch);
+    }
+
+    /// Run a track-streaming closure inside `catch_unwind`, restoring any backed-up Track A
+    /// carryover and draining Track A's full REW tail cleanly on panic (Review #8 C5 / E6).
+    fn run_guarded<R, F>(&self, epoch: u64, gapless: &mut GaplessState, f: F) -> Result<R, ()>
+    where
+        F: FnOnce(&mut GaplessState, &mut Option<GaplessCarryover>) -> R,
+    {
+        let mut panic_backup_carry: Option<GaplessCarryover> = None;
+        match catch_unwind(AssertUnwindSafe(|| f(gapless, &mut panic_backup_carry))) {
+            Ok(res) => Ok(res),
+            Err(_) => {
+                if gapless.carried_tail.is_none() {
+                    gapless.carried_tail = panic_backup_carry.take();
+                }
+                let _ = self.finalize_prev(epoch, gapless);
+                Err(())
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 fn producer_loop(
     pipeline: AudioPipeline,
@@ -2002,50 +2087,6 @@ fn producer_loop(
     shared: Arc<SharedControl>,
 ) {
     producer_loop_with_upnp(pipeline, ctrl, buf, shared, None, None);
-}
-
-fn finalize_prev_track(
-    pipeline: &AudioPipeline,
-    buf: &BoundedBlockStreamBuffer,
-    epoch: u64,
-    carried: &mut Option<GaplessCarryover>,
-    pending_end: &mut bool,
-) {
-    if let Some(tail) = carried.take() {
-        if let Ok((pcm, drain_stats)) = pipeline.drain_gapless_carryover_with_stats(tail) {
-            if drain_stats.overs_count > 0 {
-                eprintln!(
-                    "  [clip warn] drained gapless tail: {} pre-quantizer sample overs (max {:.2} dBFS)",
-                    drain_stats.overs_count,
-                    drain_stats.max_pre_quant_peak_dbfs()
-                );
-            }
-            if !pcm.is_empty() {
-                let _ = buf.push_for_epoch(epoch, StreamEvent::PcmBlock(pcm));
-            }
-        }
-    }
-    if *pending_end {
-        *pending_end = false;
-        let _ = buf.push_for_epoch(epoch, StreamEvent::TrackEnd);
-    }
-}
-
-/// Shared panic-recovery helper used by all three `catch_unwind` sites in the producer loop
-/// (Review #8 C5 / Review #7 F8): restores Track A's backup carryover if Track B panicked after
-/// taking it but before pushing PCM, then drains Track A's full REW tail and emits `TrackEnd`.
-fn recover_after_track_panic(
-    pipeline: &AudioPipeline,
-    buf: &BoundedBlockStreamBuffer,
-    epoch: u64,
-    carried: &mut Option<GaplessCarryover>,
-    backup: &mut Option<GaplessCarryover>,
-    pending_end: &mut bool,
-) {
-    if carried.is_none() {
-        *carried = backup.take();
-    }
-    finalize_prev_track(pipeline, buf, epoch, carried, pending_end);
 }
 
 #[cfg(test)]
@@ -2060,6 +2101,9 @@ fn producer_loop_with_upnp(
     producer_loop_with_sources(pipeline, ctrl, buf, shared, upnp_state, None, ultimate_ctx);
 }
 
+/// Background streaming DSP Producer: reads bounded blocks from `FlacBlockReader`,
+/// `HttpAudioSource` (UPnP), or `StreamCaptureSource`, processes them incrementally through
+/// `StreamingPipelineSession`, and feeds `BoundedBlockStreamBuffer` with strictly bounded RAM.
 fn producer_loop_with_sources(
     pipeline: AudioPipeline,
     ctrl: Arc<ProducerControl>,
@@ -2071,29 +2115,337 @@ fn producer_loop_with_sources(
 ) {
     // Review #8 C9: Run the real-time playback producer on the high-priority DSP worker pool lane
     // so stereo/MAC jobs always jump ahead of any background scan/analysis work.
-    ap_dsp::worker_pool::with_high_priority_dsp(|| {
-        producer_loop_with_sources_inner(
-            pipeline,
-            ctrl,
-            buf,
-            shared,
-            upnp_state,
-            capture_transport,
-            ultimate_ctx,
-        );
-    });
+    let ctx = ProducerCtx {
+        pipeline,
+        ctrl,
+        buf,
+        shared,
+        upnp_state,
+        capture_transport,
+        ultimate_ctx,
+    };
+    ap_dsp::worker_pool::with_high_priority_dsp(|| producer_loop_inner(ctx));
 }
 
-fn producer_loop_with_sources_inner(
-    pipeline: AudioPipeline,
-    ctrl: Arc<ProducerControl>,
-    buf: Arc<BoundedBlockStreamBuffer>,
-    shared: Arc<SharedControl>,
-    upnp_state: Option<Arc<UpnpRendererState>>,
-    capture_transport: Option<SharedCaptureTransport>,
-    ultimate_ctx: Option<UltimateRuntimeContext>,
+/// Handle a `PlayDirective::StreamCapture` session inside one epoch (Review #8 B1–B6, Review #9 E6).
+fn run_capture_directive(
+    ctx: &ProducerCtx,
+    epoch: u64,
+    request: StreamCaptureRequest,
+    cancel_flag: &Arc<AtomicBool>,
+    gapless: &mut GaplessState,
+    capture_consumed_epoch: &mut Option<u64>,
 ) {
+    if *capture_consumed_epoch == Some(epoch) {
+        ctx.end_epoch(
+            epoch,
+            gapless,
+            StreamEvent::EndOfQueue("Exclusive stream paused — DAC released".into()),
+        );
+        return;
+    }
+    let Some(ref transport) = ctx.capture_transport else {
+        ctx.end_epoch(
+            epoch,
+            gapless,
+            StreamEvent::FatalError("Exclusive capture transport not available".into()),
+        );
+        return;
+    };
+
+    struct ActiveGenGuard {
+        transport: SharedCaptureTransport,
+    }
+    impl Drop for ActiveGenGuard {
+        fn drop(&mut self) {
+            self.transport.set_active_generation(0);
+        }
+    }
+    let _active_guard = ActiveGenGuard {
+        transport: transport.clone(),
+    };
+
+    let mut cur_gen = request.generation;
+    let mut cur_caller = request.caller_name;
+    let mut aborted = false;
+
+    loop {
+        if ctx.ctrl.epoch() != epoch
+            || ctx.buf.current_epoch() != epoch
+            || cancel_flag.load(Ordering::Acquire)
+        {
+            aborted = true;
+            break;
+        }
+
+        let st = match transport.get_status() {
+            Ok(s) => s,
+            Err(err) => {
+                let msg = format!("Exclusive stream status error: {err}");
+                transport.mark_dispatch_failed(cur_gen);
+                eprintln!("  [capture error] {msg}");
+                ctx.shared.record_action(msg.clone());
+                ctx.end_epoch(epoch, gapless, StreamEvent::FatalError(msg));
+                aborted = true;
+                break;
+            }
+        };
+
+        if st.stream_generation != cur_gen {
+            if st.stream_running != 0 && verify_status_exclusive(&st).is_ok() {
+                cur_gen = st.stream_generation;
+            } else {
+                break;
+            }
+        }
+
+        let valid_bits =
+            effective_valid_bits(st.format.valid_bits_per_sample, st.format.bits_per_sample);
+        let caller_str = if st.run_pid != 0 {
+            ap_stream_protocol::proc_name_str(&st.run_proc).to_string()
+        } else if !cur_caller.is_empty() {
+            cur_caller.clone()
+        } else {
+            "Live Exclusive Stream".to_string()
+        };
+        cur_caller = caller_str.clone();
+        let label = format!(
+            "{caller_str} (Exclusive {} Hz {}-in-{}b)",
+            st.format.sample_rate, valid_bits, st.format.bits_per_sample
+        );
+
+        transport.set_active_generation(cur_gen);
+
+        let buf_fill_probe = Arc::clone(&ctx.buf);
+        let fill_fn: Arc<dyn Fn() -> Duration + Send + Sync> = Arc::new(move || {
+            Duration::from_secs_f64(buf_fill_probe.buffered_duration_seconds().max(0.0))
+        });
+        let shared_ov = Arc::clone(&ctx.shared);
+        let ov_fn: Arc<dyn Fn(u64) + Send + Sync> = Arc::new(move |delta| {
+            let msg = format!(
+                "Kernel capture ring overrun x{delta} — audio dropped (check CPU/DSP load)"
+            );
+            eprintln!("  [capture warn] {msg}");
+            shared_ov.record_action(msg);
+        });
+
+        let (outcome, next_carry, next_pend, end_reason) = ctx
+            .run_guarded(epoch, gapless, |g, backup| {
+                match StreamCaptureSource::open_generation_with_hooks(
+                    transport.clone(),
+                    cur_gen,
+                    Arc::clone(cancel_flag),
+                    Some(fill_fn),
+                    Some(ov_fn),
+                ) {
+                    Ok(mut src) => {
+                        let (out, c, p) = stream_open_audio_source(
+                            ctx,
+                            epoch,
+                            &mut src,
+                            &PathBuf::from(&label),
+                            None,
+                            None,
+                            PlayModeLabel::StreamCapture,
+                            None,
+                            g,
+                            backup,
+                            true,
+                        );
+                        (out, c, p, src.end_reason())
+                    }
+                    Err(err) => (
+                        TrackStreamOutcome::Failed(format!(
+                            "Exclusive stream open failed for '{label}': {err}"
+                        )),
+                        None,
+                        false,
+                        CaptureEndReason::Error,
+                    ),
+                }
+            })
+            .unwrap_or_else(|()| {
+                (
+                    TrackStreamOutcome::Failed(format!(
+                        "Internal panic while streaming exclusive capture '{label}'"
+                    )),
+                    None,
+                    false,
+                    CaptureEndReason::Error,
+                )
+            });
+
+        match outcome {
+            TrackStreamOutcome::Played => {
+                gapless.update(next_carry, next_pend);
+                if matches!(end_reason, CaptureEndReason::GenerationChanged(_)) {
+                    let mut ready = false;
+                    let deadline = Instant::now() + Duration::from_millis(500);
+                    while Instant::now() < deadline
+                        && ctx.ctrl.epoch() == epoch
+                        && !cancel_flag.load(Ordering::Acquire)
+                    {
+                        if let Ok(nst) = transport.get_status() {
+                            if nst.stream_running != 0 && verify_status_exclusive(&nst).is_ok() {
+                                cur_gen = nst.stream_generation;
+                                ready = true;
+                                break;
+                            }
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    if ready {
+                        continue;
+                    }
+                }
+                break;
+            }
+            TrackStreamOutcome::Aborted => {
+                gapless.clear();
+                aborted = true;
+                break;
+            }
+            TrackStreamOutcome::Empty(_) => {
+                gapless.update(next_carry, next_pend);
+                if let CaptureEndReason::GenerationChanged(next_gen) = end_reason {
+                    cur_gen = next_gen;
+                    continue;
+                }
+                if let Ok(nst) = transport.get_status() {
+                    if nst.stream_running != 0
+                        && nst.stream_generation != cur_gen
+                        && verify_status_exclusive(&nst).is_ok()
+                    {
+                        cur_gen = nst.stream_generation;
+                        continue;
+                    }
+                }
+                break;
+            }
+            TrackStreamOutcome::Unsupported(msg) | TrackStreamOutcome::Failed(msg) => {
+                gapless.update(next_carry, next_pend);
+                if let CaptureEndReason::GenerationChanged(next_gen) = end_reason {
+                    cur_gen = next_gen;
+                    continue;
+                }
+                if msg.contains("generation already advanced") {
+                    if let Ok(nst) = transport.get_status() {
+                        if nst.stream_running != 0
+                            && nst.stream_generation != cur_gen
+                            && verify_status_exclusive(&nst).is_ok()
+                        {
+                            cur_gen = nst.stream_generation;
+                            continue;
+                        }
+                    }
+                    break;
+                }
+                transport.mark_dispatch_failed(cur_gen);
+                eprintln!("  [capture error] {msg}");
+                ctx.shared.record_action(msg.clone());
+                ctx.end_epoch(epoch, gapless, StreamEvent::FatalError(msg));
+                aborted = true;
+                break;
+            }
+        }
+    }
+
+    if !aborted {
+        *capture_consumed_epoch = Some(epoch);
+        ctx.end_epoch(
+            epoch,
+            gapless,
+            StreamEvent::EndOfQueue("Exclusive stream paused — DAC released".into()),
+        );
+    }
+}
+
+/// Handle a `PlayDirective::UpnpStream` queue (chained Ogg FLAC + gapless NextURI prefetch, E6).
+fn run_upnp_directive(
+    ctx: &ProducerCtx,
+    epoch: u64,
+    request: UpnpPlayRequest,
+    cancel_flag: &Arc<AtomicBool>,
+    gapless: &mut GaplessState,
+    upnp_consumed_epoch: &mut Option<u64>,
+) {
+    if *upnp_consumed_epoch == Some(epoch) {
+        ctx.end_epoch(
+            epoch,
+            gapless,
+            StreamEvent::EndOfQueue("Finished UPnP stream — DAC released".into()),
+        );
+        return;
+    }
+
+    let mut cur_req = request;
+    let mut last_prefetched_gen: Option<u64> = cur_req.prefetched_next_gen;
+    let mut aborted = false;
+    loop {
+        if ctx.ctrl.epoch() != epoch || ctx.buf.current_epoch() != epoch {
+            aborted = true;
+            break;
+        }
+        let (outcome, next_carry, next_pend) = ctx
+            .run_guarded(epoch, gapless, |g, backup| {
+                stream_upnp_request(ctx, epoch, &cur_req, cancel_flag, g, backup)
+            })
+            .unwrap_or_else(|()| {
+                (
+                    TrackStreamOutcome::Failed(format!(
+                        "Internal panic while streaming UPnP '{}'",
+                        cur_req.uri
+                    )),
+                    None,
+                    false,
+                )
+            });
+
+        match outcome {
+            TrackStreamOutcome::Played => {
+                gapless.update(next_carry, next_pend);
+                if let Some(next_req) = ctx
+                    .upnp_state
+                    .as_deref()
+                    .and_then(|u| u.engine_peek_next_for_prefetch(last_prefetched_gen))
+                {
+                    last_prefetched_gen = next_req.prefetched_next_gen;
+                    cur_req = next_req;
+                    continue;
+                }
+                break;
+            }
+            TrackStreamOutcome::Aborted => {
+                gapless.clear();
+                aborted = true;
+                break;
+            }
+            TrackStreamOutcome::Empty(msg)
+            | TrackStreamOutcome::Unsupported(msg)
+            | TrackStreamOutcome::Failed(msg) => {
+                gapless.update(next_carry, next_pend);
+                eprintln!("  [upnp error] {msg}");
+                ctx.shared.record_action(msg.clone());
+                ctx.end_epoch(epoch, gapless, StreamEvent::FatalError(msg));
+                aborted = true;
+                break;
+            }
+        }
+    }
+
+    if !aborted {
+        *upnp_consumed_epoch = Some(epoch);
+        ctx.end_epoch(
+            epoch,
+            gapless,
+            StreamEvent::EndOfQueue("Finished UPnP stream — DAC released".into()),
+        );
+    }
+}
+
+fn producer_loop_inner(ctx: ProducerCtx) {
     const MAX_CONSECUTIVE_UNSUPPORTED: u32 = 50;
+    const MAX_CONSECUTIVE_ERRORS: u32 = 10;
 
     let mut seq_cursor: Option<(u64, SequentialFlacCursor)> = None;
     let mut single_consumed_epoch: Option<u64> = None;
@@ -2104,420 +2456,44 @@ fn producer_loop_with_sources_inner(
     let mut last_seen_epoch: Option<u64> = None;
     let mut consecutive_errors: u32 = 0;
     let mut consecutive_unsupported: u32 = 0;
-    let mut carried_tail: Option<GaplessCarryover> = None;
-    let mut pending_track_end = false;
+    let mut gapless = GaplessState::default();
 
-    while let Some((epoch, directive, cancel_flag)) = ctrl.wait_active_with_cancel() {
-        // Guard against the brief window where `buf.reset_and_flush()` bumped the buffer epoch
-        // right before `prod_ctrl.set()` published the matching new directive.
-        if buf.current_epoch() != epoch {
+    while let Some((epoch, directive, cancel_flag)) = ctx.ctrl.wait_active_with_cancel() {
+        if ctx.buf.current_epoch() != epoch {
             thread::yield_now();
             continue;
         }
-        if ctrl.epoch() != epoch {
+        if ctx.ctrl.epoch() != epoch {
             continue;
         }
         if last_seen_epoch != Some(epoch) {
             consecutive_errors = 0;
             consecutive_unsupported = 0;
-            carried_tail = None;
-            pending_track_end = false;
+            gapless.clear();
             last_seen_epoch = Some(epoch);
         }
 
-        // Handle live exclusive kernel stream capture (e.g. vanilla Tidal Desktop Exclusive Mode).
-        // Never uses the 30 s W0 look-ahead window (real-time 1x push stream); feeds directly
-        // through the pure-f64 5-stage AudioPipeline with -3 dB unknown-peak headroom, rate-following
-        // Gaussian upsampling (352.8/384 kHz), full-tail REW convolution, and WDM-KS output.
-        //
-        // Review #8 B1/B2/B4/B5/B6: follows stream generations seamlessly inside ONE epoch (zero
-        // buffer flush on rate change/track boundary; gapless on same-rate switches, full REW tail
-        // drain on rate switches), throttles kernel draining against engine cushion fill, and
-        // reports any kernel ring overrun deltas.
         if let PlayDirective::StreamCapture { request } = directive {
-            if capture_consumed_epoch == Some(epoch) {
-                finalize_prev_track(
-                    &pipeline,
-                    &buf,
-                    epoch,
-                    &mut carried_tail,
-                    &mut pending_track_end,
-                );
-                let _ = buf.push_for_epoch(
-                    epoch,
-                    StreamEvent::EndOfQueue("Exclusive stream paused — DAC released".into()),
-                );
-                ctrl.pause_if_epoch(epoch);
-                continue;
-            }
-            let Some(ref transport) = capture_transport else {
-                let msg = "Exclusive capture transport not available".to_string();
-                let _ = buf.push_for_epoch(epoch, StreamEvent::FatalError(msg));
-                ctrl.pause_if_epoch(epoch);
-                continue;
-            };
-
-            struct ActiveGenGuard {
-                transport: SharedCaptureTransport,
-            }
-            impl Drop for ActiveGenGuard {
-                fn drop(&mut self) {
-                    self.transport.set_active_generation(0);
-                }
-            }
-            let _active_guard = ActiveGenGuard {
-                transport: transport.clone(),
-            };
-
-            let mut cur_gen = request.generation;
-            let mut cur_caller = request.caller_name.clone();
-            let mut aborted = false;
-
-            loop {
-                if ctrl.epoch() != epoch || buf.current_epoch() != epoch || cancel_flag.load(Ordering::Acquire) {
-                    aborted = true;
-                    break;
-                }
-
-                // Wait briefly for `cur_gen` to report verified status if transitioning mid-stream.
-                let st = match transport.get_status() {
-                    Ok(s) => s,
-                    Err(err) => {
-                        let msg = format!("Exclusive stream status error: {err}");
-                        transport.mark_dispatch_failed(cur_gen);
-                        finalize_prev_track(&pipeline, &buf, epoch, &mut carried_tail, &mut pending_track_end);
-                        eprintln!("  [capture error] {msg}");
-                        shared.record_action(msg.clone());
-                        let _ = buf.push_for_epoch(epoch, StreamEvent::FatalError(msg));
-                        ctrl.pause_if_epoch(epoch);
-                        aborted = true;
-                        break;
-                    }
-                };
-
-                // Review #8 B5: if generation already advanced while dispatching, follow it cleanly!
-                if st.stream_generation != cur_gen {
-                    if st.stream_running != 0 && verify_status_exclusive(&st).is_ok() {
-                        cur_gen = st.stream_generation;
-                    } else {
-                        // Stream already paused before open -> benign end (no FatalError).
-                        break;
-                    }
-                }
-
-                let valid_bits = if st.format.valid_bits_per_sample > 0 {
-                    st.format.valid_bits_per_sample
-                } else {
-                    st.format.bits_per_sample
-                };
-                let caller_str = if st.run_pid != 0 {
-                    ap_stream_protocol::proc_name_str(&st.run_proc).to_string()
-                } else if !cur_caller.is_empty() {
-                    cur_caller.clone()
-                } else {
-                    "Live Exclusive Stream".to_string()
-                };
-                cur_caller = caller_str.clone();
-                let label = format!(
-                    "{caller_str} (Exclusive {} Hz {}-in-{}b)",
-                    st.format.sample_rate, valid_bits, st.format.bits_per_sample
-                );
-
-                transport.set_active_generation(cur_gen);
-
-                let buf_fill_probe = Arc::clone(&buf);
-                let fill_fn: Arc<dyn Fn() -> Duration + Send + Sync> = Arc::new(move || {
-                    Duration::from_secs_f64(buf_fill_probe.buffered_duration_seconds().max(0.0))
-                });
-                let shared_ov = Arc::clone(&shared);
-                let ov_fn: Arc<dyn Fn(u64) + Send + Sync> = Arc::new(move |delta| {
-                    let msg = format!(
-                        "Kernel capture ring overrun x{delta} — audio dropped (check CPU/DSP load)"
-                    );
-                    eprintln!("  [capture warn] {msg}");
-                    shared_ov.record_action(msg);
-                });
-
-                let mut panic_backup_carry: Option<GaplessCarryover> = None;
-                let (outcome, next_carry, next_pend, end_reason) =
-                    match catch_unwind(AssertUnwindSafe(|| {
-                        match StreamCaptureSource::open_generation_with_hooks(
-                            transport.clone(),
-                            cur_gen,
-                            Arc::clone(&cancel_flag),
-                            Some(fill_fn),
-                            Some(ov_fn),
-                        ) {
-                            Ok(mut src) => {
-                                let (out, c, p) = stream_open_audio_source(
-                                    &pipeline,
-                                    &ctrl,
-                                    &buf,
-                                    &shared,
-                                    epoch,
-                                    &mut src,
-                                    &PathBuf::from(&label),
-                                    None,
-                                    None,
-                                    PlayModeLabel::StreamCapture,
-                                    None,
-                                    None,
-                                    &mut carried_tail,
-                                    &mut panic_backup_carry,
-                                    &mut pending_track_end,
-                                    true,
-                                );
-                                (out, c, p, src.end_reason())
-                            }
-                            Err(err) => (
-                                TrackStreamOutcome::Failed(format!(
-                                    "Exclusive stream open failed for '{label}': {err}"
-                                )),
-                                None,
-                                false,
-                                CaptureEndReason::Error,
-                            ),
-                        }
-                    })) {
-                        Ok(res) => res,
-                        Err(_) => {
-                            recover_after_track_panic(
-                                &pipeline,
-                                &buf,
-                                epoch,
-                                &mut carried_tail,
-                                &mut panic_backup_carry,
-                                &mut pending_track_end,
-                            );
-                            (
-                                TrackStreamOutcome::Failed(format!(
-                                    "Internal panic while streaming exclusive capture '{label}'"
-                                )),
-                                None,
-                                false,
-                                CaptureEndReason::Error,
-                            )
-                        }
-                    };
-
-                match outcome {
-                    TrackStreamOutcome::Played => {
-                        carried_tail = next_carry;
-                        pending_track_end = next_pend;
-                        if let CaptureEndReason::GenerationChanged(next_gen) = end_reason {
-                            // Review #8 B1: wait briefly for next_gen to stabilize, then follow
-                            // seamlessly inside the SAME epoch without flushing previous tail!
-                            let mut ready = false;
-                            let deadline = Instant::now() + Duration::from_millis(500);
-                            while Instant::now() < deadline
-                                && ctrl.epoch() == epoch
-                                && !cancel_flag.load(Ordering::Acquire)
-                            {
-                                if let Ok(nst) = transport.get_status() {
-                                    if nst.stream_running != 0
-                                        && verify_status_exclusive(&nst).is_ok()
-                                    {
-                                        cur_gen = nst.stream_generation;
-                                        ready = true;
-                                        break;
-                                    }
-                                }
-                                thread::sleep(Duration::from_millis(10));
-                            }
-                            if ready {
-                                continue;
-                            }
-                            // Next gen didn't start running -> finish cleanly.
-                            let _ = next_gen;
-                        }
-                        break;
-                    }
-                    TrackStreamOutcome::Aborted => {
-                        carried_tail = None;
-                        pending_track_end = false;
-                        aborted = true;
-                        break;
-                    }
-                    TrackStreamOutcome::Unsupported(msg) | TrackStreamOutcome::Failed(msg) => {
-                        carried_tail = next_carry;
-                        pending_track_end = next_pend;
-                        // Review #8 B5: benign 0-frame or generation-advanced race -> check if a
-                        // newer generation is running and follow it instead of emitting FatalError!
-                        if let CaptureEndReason::GenerationChanged(next_gen) = end_reason {
-                            cur_gen = next_gen;
-                            continue;
-                        }
-                        if msg.contains("ended with 0 audio frames")
-                            || msg.contains("generation already advanced")
-                        {
-                            if let Ok(nst) = transport.get_status() {
-                                if nst.stream_running != 0
-                                    && nst.stream_generation != cur_gen
-                                    && verify_status_exclusive(&nst).is_ok()
-                                {
-                                    cur_gen = nst.stream_generation;
-                                    continue;
-                                }
-                            }
-                            break;
-                        }
-                        transport.mark_dispatch_failed(cur_gen);
-                        finalize_prev_track(
-                            &pipeline,
-                            &buf,
-                            epoch,
-                            &mut carried_tail,
-                            &mut pending_track_end,
-                        );
-                        eprintln!("  [capture error] {msg}");
-                        shared.record_action(msg.clone());
-                        let _ = buf.push_for_epoch(epoch, StreamEvent::FatalError(msg));
-                        ctrl.pause_if_epoch(epoch);
-                        aborted = true;
-                        break;
-                    }
-                }
-            }
-
-            if !aborted {
-                capture_consumed_epoch = Some(epoch);
-                finalize_prev_track(
-                    &pipeline,
-                    &buf,
-                    epoch,
-                    &mut carried_tail,
-                    &mut pending_track_end,
-                );
-                let _ = buf.push_for_epoch(
-                    epoch,
-                    StreamEvent::EndOfQueue("Exclusive stream paused — DAC released".into()),
-                );
-                ctrl.pause_if_epoch(epoch);
-            }
+            run_capture_directive(
+                &ctx,
+                epoch,
+                request,
+                &cancel_flag,
+                &mut gapless,
+                &mut capture_consumed_epoch,
+            );
             continue;
         }
 
-        // Handle UPnP MediaRenderer streaming queue (including chained Ogg FLAC & gapless
-        // `SetNextAVTransportURI` handoff).
         if let PlayDirective::UpnpStream { request } = directive {
-            if upnp_consumed_epoch == Some(epoch) {
-                finalize_prev_track(
-                    &pipeline,
-                    &buf,
-                    epoch,
-                    &mut carried_tail,
-                    &mut pending_track_end,
-                );
-                let _ = buf.push_for_epoch(
-                    epoch,
-                    StreamEvent::EndOfQueue("Finished UPnP stream — DAC released".into()),
-                );
-                ctrl.pause_if_epoch(epoch);
-                continue;
-            }
-
-            let mut cur_req = request;
-            let mut last_prefetched_gen: Option<u64> = cur_req.prefetched_next_gen;
-            let mut aborted = false;
-            loop {
-                if ctrl.epoch() != epoch || buf.current_epoch() != epoch {
-                    aborted = true;
-                    break;
-                }
-                let mut panic_backup_carry: Option<GaplessCarryover> = None;
-                let (outcome, next_carry, next_pend) = match catch_unwind(AssertUnwindSafe(|| {
-                    stream_upnp_request(
-                        &pipeline,
-                        &ctrl,
-                        &buf,
-                        &shared,
-                        epoch,
-                        &cur_req,
-                        &cancel_flag,
-                        &mut carried_tail,
-                        &mut panic_backup_carry,
-                        &mut pending_track_end,
-                        ultimate_ctx.as_ref(),
-                    )
-                })) {
-                    Ok(res) => res,
-                    Err(_) => {
-                        recover_after_track_panic(
-                            &pipeline,
-                            &buf,
-                            epoch,
-                            &mut carried_tail,
-                            &mut panic_backup_carry,
-                            &mut pending_track_end,
-                        );
-                        (
-                            TrackStreamOutcome::Failed(format!(
-                                "Internal panic while streaming UPnP '{}'",
-                                cur_req.uri
-                            )),
-                            None,
-                            false,
-                        )
-                    }
-                };
-
-                match outcome {
-                    TrackStreamOutcome::Played => {
-                        carried_tail = next_carry;
-                        pending_track_end = next_pend;
-                        // Review #5 #5 & Review #6 #8: peek NextURI by generation token WITHOUT
-                        // mutating CurrentURI or resetting RelTime; consumer promotes it strictly
-                        // when TrackStart becomes audible on the DAC (and repeat-one prefetches!).
-                        if let Some(next_req) = upnp_state.as_deref().and_then(|u| {
-                            u.engine_peek_next_for_prefetch(last_prefetched_gen)
-                        }) {
-                            last_prefetched_gen = next_req.prefetched_next_gen;
-                            cur_req = next_req;
-                            continue;
-                        }
-                        break;
-                    }
-                    TrackStreamOutcome::Aborted => {
-                        carried_tail = None;
-                        pending_track_end = false;
-                        aborted = true;
-                        break;
-                    }
-                    TrackStreamOutcome::Unsupported(msg) | TrackStreamOutcome::Failed(msg) => {
-                        carried_tail = next_carry;
-                        pending_track_end = next_pend;
-                        finalize_prev_track(
-                            &pipeline,
-                            &buf,
-                            epoch,
-                            &mut carried_tail,
-                            &mut pending_track_end,
-                        );
-                        eprintln!("  [upnp error] {msg}");
-                        shared.record_action(msg.clone());
-                        let _ = buf.push_for_epoch(epoch, StreamEvent::FatalError(msg));
-                        ctrl.pause_if_epoch(epoch);
-                        aborted = true;
-                        break;
-                    }
-                }
-            }
-
-            if !aborted {
-                upnp_consumed_epoch = Some(epoch);
-                finalize_prev_track(
-                    &pipeline,
-                    &buf,
-                    epoch,
-                    &mut carried_tail,
-                    &mut pending_track_end,
-                );
-                let _ = buf.push_for_epoch(
-                    epoch,
-                    StreamEvent::EndOfQueue("Finished UPnP stream — DAC released".into()),
-                );
-                ctrl.pause_if_epoch(epoch);
-            }
+            run_upnp_directive(
+                &ctx,
+                epoch,
+                request,
+                &cancel_flag,
+                &mut gapless,
+                &mut upnp_consumed_epoch,
+            );
             continue;
         }
 
@@ -2550,22 +2526,12 @@ fn producer_loop_with_sources_inner(
             match directive {
                 PlayDirective::UpnpStream { .. }
                 | PlayDirective::StreamCapture { .. }
-                | PlayDirective::ResumeThen { .. } => {
-                    unreachable!()
-                }
+                | PlayDirective::ResumeThen { .. } => unreachable!(),
                 PlayDirective::Random { root } => {
                     let mut picked = match pick_random_flac_walk(&root) {
                         Ok(p) => p,
                         Err(err) => {
-                            finalize_prev_track(
-                                &pipeline,
-                                &buf,
-                                epoch,
-                                &mut carried_tail,
-                                &mut pending_track_end,
-                            );
-                            let _ = buf.push_for_epoch(epoch, StreamEvent::FatalError(err));
-                            ctrl.pause_if_epoch(epoch);
+                            ctx.end_epoch(epoch, &mut gapless, StreamEvent::FatalError(err));
                             continue;
                         }
                     };
@@ -2611,15 +2577,7 @@ fn producer_loop_with_sources_inner(
                                 seq_cursor = Some((seq_gen, c));
                             }
                             Err(err) => {
-                                finalize_prev_track(
-                                    &pipeline,
-                                    &buf,
-                                    epoch,
-                                    &mut carried_tail,
-                                    &mut pending_track_end,
-                                );
-                                let _ = buf.push_for_epoch(epoch, StreamEvent::FatalError(err));
-                                ctrl.pause_if_epoch(epoch);
+                                ctx.end_epoch(epoch, &mut gapless, StreamEvent::FatalError(err));
                                 continue;
                             }
                         }
@@ -2628,39 +2586,25 @@ fn producer_loop_with_sources_inner(
                     match next {
                         Some(p) => (p, PlayModeLabel::Sequential),
                         None => {
-                            finalize_prev_track(
-                                &pipeline,
-                                &buf,
+                            ctx.end_epoch(
                                 epoch,
-                                &mut carried_tail,
-                                &mut pending_track_end,
-                            );
-                            let _ = buf.push_for_epoch(
-                                epoch,
+                                &mut gapless,
                                 StreamEvent::EndOfQueue(format!(
                                     "Finished sequential playback of '{}' — DAC released",
                                     root.display()
                                 )),
                             );
-                            ctrl.pause_if_epoch(epoch);
                             continue;
                         }
                     }
                 }
                 PlayDirective::SingleFile { file } => {
                     if single_consumed_epoch == Some(epoch) {
-                        finalize_prev_track(
-                            &pipeline,
-                            &buf,
+                        ctx.end_epoch(
                             epoch,
-                            &mut carried_tail,
-                            &mut pending_track_end,
-                        );
-                        let _ = buf.push_for_epoch(
-                            epoch,
+                            &mut gapless,
                             StreamEvent::EndOfQueue("Finished single track — DAC released".into()),
                         );
-                        ctrl.pause_if_epoch(epoch);
                         continue;
                     }
                     single_consumed_epoch = Some(epoch);
@@ -2669,53 +2613,19 @@ fn producer_loop_with_sources_inner(
             }
         };
 
-        if ctrl.epoch() != epoch || buf.current_epoch() != epoch {
+        if ctx.ctrl.epoch() != epoch || ctx.buf.current_epoch() != epoch {
             continue;
         }
 
-        // Isolate per-track decode & DSP in `catch_unwind` so a malformed FLAC panic never kills
-        // the producer thread or wedges the UI. Passing `&mut carried_tail` / `&mut pending_track_end`
-        // preserves the previous track's carryover if a panic occurs before handoff so `finalize_prev_track`
-        // still drains it cleanly onto the previous track.
         if is_single_file {
-            finalize_prev_track(
-                &pipeline,
-                &buf,
-                epoch,
-                &mut carried_tail,
-                &mut pending_track_end,
-            );
+            let _ = ctx.finalize_prev(epoch, &mut gapless);
         }
 
-        let mut panic_backup_carry: Option<GaplessCarryover> = None;
-        let (outcome, next_carryover, next_pending_end) = match catch_unwind(AssertUnwindSafe(|| {
-            stream_single_track(
-                &pipeline,
-                &ctrl,
-                &buf,
-                &shared,
-                epoch,
-                &chosen,
-                mode_label,
-                &mut carried_tail,
-                &mut panic_backup_carry,
-                &mut pending_track_end,
-                !is_single_file,
-                ultimate_ctx.as_ref(),
-            )
-        })) {
-            Ok(res) => res,
-            Err(_) => {
-                // Review #5 Finding #20 + Review #8 C5: shared panic recovery restores backup
-                // carryover and drains Track A's full REW tail cleanly.
-                recover_after_track_panic(
-                    &pipeline,
-                    &buf,
-                    epoch,
-                    &mut carried_tail,
-                    &mut panic_backup_carry,
-                    &mut pending_track_end,
-                );
+        let (outcome, next_carryover, next_pending_end) = ctx
+            .run_guarded(epoch, &mut gapless, |g, backup| {
+                stream_single_track(&ctx, epoch, &chosen, mode_label, g, backup, !is_single_file)
+            })
+            .unwrap_or_else(|()| {
                 (
                     TrackStreamOutcome::Failed(format!(
                         "Internal panic while decoding/processing '{}'",
@@ -2724,134 +2634,141 @@ fn producer_loop_with_sources_inner(
                     None,
                     false,
                 )
-            }
-        };
+            });
 
         match outcome {
             TrackStreamOutcome::Played => {
                 consecutive_errors = 0;
                 consecutive_unsupported = 0;
-                carried_tail = next_carryover;
-                pending_track_end = next_pending_end;
+                gapless.update(next_carryover, next_pending_end);
             }
             TrackStreamOutcome::Aborted => {
-                carried_tail = None;
-                pending_track_end = false;
+                gapless.clear();
             }
-            TrackStreamOutcome::Unsupported(msg) => {
-                carried_tail = next_carryover;
-                pending_track_end = next_pending_end;
+            TrackStreamOutcome::Unsupported(ref msg)
+            | TrackStreamOutcome::Empty(ref msg)
+            | TrackStreamOutcome::Failed(ref msg) => {
+                let is_unsupported = matches!(outcome, TrackStreamOutcome::Unsupported(_));
+                gapless.update(next_carryover, next_pending_end);
                 eprintln!("  [skip] {msg}");
-                shared.record_action(msg.clone());
+                ctx.shared.record_action(msg.clone());
                 if is_single_file {
-                    let _ = buf.push_for_epoch(epoch, StreamEvent::FatalError(msg));
-                    ctrl.pause_if_epoch(epoch);
+                    let _ = ctx.buf.push_for_epoch(epoch, StreamEvent::FatalError(msg.clone()));
+                    ctx.ctrl.pause_if_epoch(epoch);
                     continue;
                 }
-                consecutive_unsupported += 1;
-                if consecutive_unsupported >= MAX_CONSECUTIVE_UNSUPPORTED {
-                    finalize_prev_track(
-                        &pipeline,
-                        &buf,
+                let (counter, limit, kind_label) = if is_unsupported {
+                    (
+                        &mut consecutive_unsupported,
+                        MAX_CONSECUTIVE_UNSUPPORTED,
+                        "unsupported",
+                    )
+                } else {
+                    (
+                        &mut consecutive_errors,
+                        MAX_CONSECUTIVE_ERRORS,
+                        "unreadable/unplayable",
+                    )
+                };
+                *counter += 1;
+                if *counter >= limit {
+                    ctx.end_epoch(
                         epoch,
-                        &mut carried_tail,
-                        &mut pending_track_end,
-                    );
-                    let _ = buf.push_for_epoch(
-                        epoch,
+                        &mut gapless,
                         StreamEvent::ErrorThresholdPause {
                             message: format!(
-                                "Paused after {MAX_CONSECUTIVE_UNSUPPORTED} consecutive unsupported FLACs — DAC released"
+                                "Paused after {limit} consecutive {kind_label} FLACs — DAC released"
                             ),
                             last_attempted: chosen.clone(),
                         },
                     );
-                    ctrl.pause_if_epoch(epoch);
-                    consecutive_unsupported = 0;
-                }
-            }
-            TrackStreamOutcome::Failed(msg) => {
-                carried_tail = next_carryover;
-                pending_track_end = next_pending_end;
-                eprintln!("  [skip] {msg}");
-                shared.record_action(msg.clone());
-                if is_single_file {
-                    let _ = buf.push_for_epoch(epoch, StreamEvent::FatalError(msg));
-                    ctrl.pause_if_epoch(epoch);
-                    continue;
-                }
-                consecutive_errors += 1;
-                if consecutive_errors >= 10 {
-                    finalize_prev_track(
-                        &pipeline,
-                        &buf,
-                        epoch,
-                        &mut carried_tail,
-                        &mut pending_track_end,
-                    );
-                    let _ = buf.push_for_epoch(
-                        epoch,
-                        StreamEvent::ErrorThresholdPause {
-                            message:
-                                "Paused after 10 consecutive unreadable/unplayable FLACs — DAC released"
-                                    .into(),
-                            last_attempted: chosen.clone(),
-                        },
-                    );
-                    ctrl.pause_if_epoch(epoch);
-                    consecutive_errors = 0;
+                    *counter = 0;
                 }
             }
         }
     }
 }
 
-/// Decode and stream one FLAC track through `pipeline` into `buf`.
-///
-/// Defers BOTH gapless carryover handoff AND `TrackStart` emission until the next track produces
-/// a real non-empty decoded block, so 0-frame or immediately-corrupt tracks never drop the
-/// previous track's REW convolution tail / upsampler history or open the DAC pin unnecessarily.
-/// When `*had_pending_prev_end` is true, flushes `*incoming_carryover` onto the previous track
-/// before closing it whenever this track fails before producing PCM or changes output rate.
+/// Shared Ultimate Mode dispatch helper used by both local FLAC and UPnP HTTP sources (Review #9 E8).
+/// Uses `ap_dsp::selector::select_target_rate` so chunk sizing matches the real internal rate at
+/// every sample rate (including 11,025 Hz).
 #[allow(clippy::too_many_arguments)]
+fn dispatch_ultimate_source<S, F>(
+    ctx: &ProducerCtx,
+    ult: &UltimateRuntimeContext,
+    epoch: u64,
+    is_aborted: F,
+    source: &mut S,
+    display_path: &Path,
+    local_path: Option<&Path>,
+    upnp_uri: Option<String>,
+    upnp_next_gen: Option<u64>,
+    mode_label: PlayModeLabel,
+    total_duration_s: Option<f64>,
+    gapless: &mut GaplessState,
+    panic_backup_carry: &mut Option<GaplessCarryover>,
+    gapless_carryover: bool,
+) -> (TrackStreamOutcome, Option<GaplessCarryover>, bool)
+where
+    S: AudioBlockSource,
+    F: Fn() -> bool,
+{
+    let spec = source.spec();
+    let (internal_rate_hint, _) = ap_dsp::selector::select_target_rate(spec.sample_rate_hz);
+    let internal_rate_hz = match internal_rate_hint {
+        ap_core::format::TargetDspRate::Hz352800 => 352_800,
+        ap_core::format::TargetDspRate::Hz384000 => 384_000,
+    };
+    let src_block_frames = source_block_frames_for_rates(spec.sample_rate_hz, internal_rate_hz);
+    match stream_track_ultimate(
+        &ctx.pipeline,
+        ult,
+        &ctx.buf,
+        epoch,
+        is_aborted,
+        source,
+        display_path,
+        local_path,
+        upnp_uri,
+        upnp_next_gen,
+        mode_label,
+        total_duration_s,
+        &mut gapless.carried_tail,
+        panic_backup_carry,
+        &mut gapless.pending_track_end,
+        gapless_carryover,
+        src_block_frames,
+    ) {
+        UltimateStreamResult::Played {
+            next_carryover,
+            next_pending_end,
+            warning,
+            ..
+        } => {
+            if let Some(msg) = warning {
+                ctx.shared.record_action(msg);
+            }
+            (TrackStreamOutcome::Played, next_carryover, next_pending_end)
+        }
+        UltimateStreamResult::Aborted => (TrackStreamOutcome::Aborted, None, false),
+        UltimateStreamResult::Failed(msg) => (TrackStreamOutcome::Failed(msg), None, false),
+    }
+}
+
+/// Validate and open one local FLAC file, then delegate to Ultimate Mode or unified
+/// [`stream_open_audio_source`] (Review #9 E5: eliminates ~300 lines of duplicated streaming logic).
 fn stream_single_track(
-    pipeline: &AudioPipeline,
-    ctrl: &ProducerControl,
-    buf: &BoundedBlockStreamBuffer,
-    shared: &SharedControl,
+    ctx: &ProducerCtx,
     epoch: u64,
     chosen: &Path,
     mode_label: PlayModeLabel,
-    incoming_carryover: &mut Option<GaplessCarryover>,
+    gapless: &mut GaplessState,
     panic_backup_carry: &mut Option<GaplessCarryover>,
-    had_pending_prev_end: &mut bool,
     gapless_carryover: bool,
-    ultimate_ctx: Option<&UltimateRuntimeContext>,
 ) -> (TrackStreamOutcome, Option<GaplessCarryover>, bool) {
-    let flush_prev_on_incompatible = |buf: &BoundedBlockStreamBuffer,
-                                      carry: &mut Option<GaplessCarryover>,
-                                      pending_end: &mut bool|
-     -> bool {
-        if let Some(tail) = carry.take() {
-            if let Ok(pcm) = pipeline.drain_gapless_carryover(tail) {
-                if !pcm.is_empty() && !buf.push_for_epoch(epoch, StreamEvent::PcmBlock(pcm)) {
-                    *pending_end = false;
-                    return false;
-                }
-            }
-        }
-        if *pending_end {
-            *pending_end = false;
-            if !buf.push_for_epoch(epoch, StreamEvent::TrackEnd) {
-                return false;
-            }
-        }
-        true
-    };
-
-    let allowed_root = shared.allowed_root();
+    let allowed_root = ctx.shared.allowed_root();
     if let Err(reason) = validate_playable_flac_path(chosen, Some(&allowed_root)) {
-        if !flush_prev_on_incompatible(buf, incoming_carryover, had_pending_prev_end) {
+        if !ctx.finalize_prev(epoch, gapless) {
             return (TrackStreamOutcome::Aborted, None, false);
         }
         return (
@@ -2867,7 +2784,7 @@ fn stream_single_track(
     let mut source = match FlacBlockReader::open(chosen) {
         Ok(s) => s,
         Err(err) => {
-            if !flush_prev_on_incompatible(buf, incoming_carryover, had_pending_prev_end) {
+            if !ctx.finalize_prev(epoch, gapless) {
                 return (TrackStreamOutcome::Aborted, None, false);
             }
             if err.starts_with(UNSUPPORTED_CHANNEL_LAYOUT_PREFIX) {
@@ -2892,24 +2809,16 @@ fn stream_single_track(
     };
 
     let spec = source.spec();
-    let peak_meta = source.peak_meta();
     let total_duration_s = source
         .total_frames()
         .map(|f| f as f64 / spec.sample_rate_hz as f64);
 
-    if let Some(ult) = ultimate_ctx {
-        let out_rate_hint = if spec.sample_rate_hz % 44_100 == 0 {
-            352_800
-        } else {
-            384_000
-        };
-        let src_block_frames = source_block_frames_for_rates(spec.sample_rate_hz, out_rate_hint);
-        return match stream_track_ultimate(
-            pipeline,
+    if let Some(ref ult) = ctx.ultimate_ctx {
+        return dispatch_ultimate_source(
+            ctx,
             ult,
-            buf,
             epoch,
-            || ctrl.epoch() != epoch,
+            || ctx.ctrl.epoch() != epoch,
             &mut source,
             chosen,
             Some(chosen),
@@ -2917,395 +2826,36 @@ fn stream_single_track(
             None,
             mode_label,
             total_duration_s,
-            incoming_carryover,
+            gapless,
             panic_backup_carry,
-            had_pending_prev_end,
             gapless_carryover,
-            src_block_frames,
-        ) {
-            UltimateStreamResult::Played {
-                next_carryover,
-                next_pending_end,
-                warning,
-                ..
-            } => {
-                if let Some(msg) = warning {
-                    shared.record_action(msg);
-                }
-                (TrackStreamOutcome::Played, next_carryover, next_pending_end)
-            }
-            UltimateStreamResult::Aborted => (TrackStreamOutcome::Aborted, None, false),
-            UltimateStreamResult::Failed(msg) => (TrackStreamOutcome::Failed(msg), None, false),
-        };
-    }
-
-    let mut session = match pipeline.start_track_for_carryover(
-        spec,
-        &peak_meta,
-        source.is_streaming(),
-        incoming_carryover.as_ref(),
-    ) {
-        Ok(s) => s,
-        Err(err) => {
-            if !flush_prev_on_incompatible(buf, incoming_carryover, had_pending_prev_end) {
-                return (TrackStreamOutcome::Aborted, None, false);
-            }
-            if err.starts_with(UNSUPPORTED_SAMPLE_RATE_PREFIX) {
-                return (
-                    TrackStreamOutcome::Unsupported(format!(
-                        "Skipped unsupported sample rate on '{}': {err}",
-                        chosen.display()
-                    )),
-                    None,
-                    false,
-                );
-            }
-            return (
-                TrackStreamOutcome::Failed(format!(
-                    "DSP pipeline error on '{}': {err}",
-                    chosen.display()
-                )),
-                None,
-                false,
-            );
-        }
-    };
-
-    let src_block_frames =
-        source_block_frames_for_rates(spec.sample_rate_hz, session.report().internal_rate_hz);
-
-    // Review #3 Finding #3: decode and validate the first non-empty block BEFORE touching
-    // `incoming_carryover` or closing `TrackEnd(prev)`. If this track is 0-frame or corrupt on
-    // its first block, `incoming_carryover` is drained intact onto the previous track!
-    let first_src = loop {
-        if ctrl.epoch() != epoch {
-            return (TrackStreamOutcome::Aborted, None, false);
-        }
-        match source.read_next_block(src_block_frames) {
-            Ok(Some(b)) if b.is_empty() => continue,
-            Ok(Some(b)) => break b,
-            Ok(None) => {
-                if !flush_prev_on_incompatible(buf, incoming_carryover, had_pending_prev_end) {
-                    return (TrackStreamOutcome::Aborted, None, false);
-                }
-                return (
-                    TrackStreamOutcome::Failed(format!(
-                        "Skipped empty (0-frame) FLAC '{}'",
-                        chosen.display()
-                    )),
-                    None,
-                    false,
-                );
-            }
-            Err(err) => {
-                if !flush_prev_on_incompatible(buf, incoming_carryover, had_pending_prev_end) {
-                    return (TrackStreamOutcome::Aborted, None, false);
-                }
-                return (
-                    TrackStreamOutcome::Failed(format!(
-                        "FLAC stream error in '{}': {err}",
-                        chosen.display()
-                    )),
-                    None,
-                    false,
-                );
-            }
-        }
-    };
-    if first_src.sample_rate_hz != spec.sample_rate_hz
-        || first_src.left.len() != first_src.right.len()
-    {
-        if !flush_prev_on_incompatible(buf, incoming_carryover, had_pending_prev_end) {
-            return (TrackStreamOutcome::Aborted, None, false);
-        }
-        return (
-            TrackStreamOutcome::Failed(format!(
-                "Invalid first audio block in '{}'",
-                chosen.display()
-            )),
-            None,
-            false,
         );
     }
 
-    // Commit the gapless carryover handoff now that Track B has a real validated first block,
-    // while keeping `*had_pending_prev_end` open until Track B actually yields its first non-empty
-    // PCM block (Review #4 Finding #2). If Track B fails after handoff but before producing any
-    // PCM (e.g., short valid prefix < UPOLS B=65536 followed by decode error, or DSP block error),
-    // we flush `session` directly onto Track A before closing `TrackEnd(prev)` so Track A's REW
-    // reverb tail and upsampler history are NEVER dropped!
-    let mut had_gapless_carryover = false;
-    let mut attached_carryover_into_session = false;
-    if let Some(carry) = incoming_carryover.take() {
-        let had_active_tail = !carry.is_empty();
-        // Review #5 Finding #20: keep backup clone until Track B pushes its first PCM block.
-        *panic_backup_carry = Some(carry.clone());
-        match pipeline.attach_gapless_carryover(&mut session, carry) {
-            Ok(GaplessAttachOutcome::FullHandoff) => {
-                had_gapless_carryover = had_active_tail;
-                attached_carryover_into_session = had_active_tail;
-            }
-            Ok(GaplessAttachOutcome::ConvolverOnlyHandoff {
-                upsampler_tail_pcm,
-                attached_convolver_tail,
-                upsampler_tail_stats,
-            }) => {
-                if upsampler_tail_stats.overs_count > 0 {
-                    eprintln!(
-                        "  [clip warn] previous track gapless tail: {} pre-quantizer sample overs (max {:.2} dBFS)",
-                        upsampler_tail_stats.overs_count,
-                        upsampler_tail_stats.max_pre_quant_peak_dbfs()
-                    );
-                }
-                had_gapless_carryover = attached_convolver_tail;
-                attached_carryover_into_session = attached_convolver_tail;
-                if !upsampler_tail_pcm.is_empty()
-                    && !buf.push_for_epoch(epoch, StreamEvent::PcmBlock(upsampler_tail_pcm))
-                {
-                    *panic_backup_carry = None;
-                    *had_pending_prev_end = false;
-                    return (TrackStreamOutcome::Aborted, None, false);
-                }
-            }
-            Ok(GaplessAttachOutcome::IncompatibleRate(rejected)) => {
-                *panic_backup_carry = None;
-                *incoming_carryover = Some(rejected);
-                if !flush_prev_on_incompatible(buf, incoming_carryover, had_pending_prev_end) {
-                    return (TrackStreamOutcome::Aborted, None, false);
-                }
-            }
-            Err(err) => {
-                // Review #5 Finding #20: drain A's backup tail cleanly and still play Track B!
-                eprintln!(
-                    "  [gapless warn] carryover attach failed on '{}': {err}; draining previous tail and continuing cleanly",
-                    chosen.display()
-                );
-                *incoming_carryover = panic_backup_carry.take();
-                if !flush_prev_on_incompatible(buf, incoming_carryover, had_pending_prev_end) {
-                    return (TrackStreamOutcome::Aborted, None, false);
-                }
-            }
-        }
-    } else if *had_pending_prev_end {
-        *had_pending_prev_end = false;
-        if !buf.push_for_epoch(epoch, StreamEvent::TrackEnd) {
-            return (TrackStreamOutcome::Aborted, None, false);
-        }
-    }
-
-    let mut pending_start = Some(StreamEvent::TrackStart {
-        path: chosen.to_path_buf(),
-        upnp_uri: None,
-        upnp_next_gen: None,
+    stream_open_audio_source(
+        ctx,
+        epoch,
+        &mut source,
+        chosen,
+        None,
+        None,
         mode_label,
-        report: session.report().clone(),
         total_duration_s,
-        had_gapless_carryover,
-    });
-    let mut pushed_any_pcm = false;
-    let mut source_frames_read: usize = 0;
-    let mut first_block_error: Option<String> = None;
-    let mut pending_first_block = Some(first_src);
-
-    // Helper closing TrackEnd(prev) right before TrackStart(B) + PcmBlock(B).
-    let emit_track_b_pcm = |buf: &BoundedBlockStreamBuffer,
-                            pending_prev_end: &mut bool,
-                            pending_start: &mut Option<StreamEvent>,
-                            pcm: ap_core::buffer::InterleavedInt32Buffer|
-     -> bool {
-        if *pending_prev_end {
-            *pending_prev_end = false;
-            if !buf.push_for_epoch(epoch, StreamEvent::TrackEnd) {
-                return false;
-            }
-        }
-        if let Some(start_ev) = pending_start.take() {
-            if !buf.push_for_epoch(epoch, start_ev) {
-                return false;
-            }
-        }
-        buf.push_for_epoch(epoch, StreamEvent::PcmBlock(pcm))
-    };
-
-    // Helper draining an already-attached carryover from `session` onto Track A when Track B
-    // errors before emitting any PCM (closes TrackEnd(prev) without opening TrackStart(B)).
-    let drain_attached_tail_onto_prev = |session: &mut ap_dsp::pipeline::StreamingPipelineSession,
-                                         buf: &BoundedBlockStreamBuffer,
-                                         pending_prev_end: &mut bool,
-                                         attached: bool|
-     -> bool {
-        if attached {
-            if let Ok(tail_pcm) = session.flush() {
-                if !tail_pcm.is_empty() && !buf.push_for_epoch(epoch, StreamEvent::PcmBlock(tail_pcm))
-                {
-                    *pending_prev_end = false;
-                    return false;
-                }
-            }
-        }
-        if *pending_prev_end {
-            *pending_prev_end = false;
-            if !buf.push_for_epoch(epoch, StreamEvent::TrackEnd) {
-                return false;
-            }
-        }
-        true
-    };
-
-    loop {
-        if ctrl.epoch() != epoch {
-            return (TrackStreamOutcome::Aborted, None, false);
-        }
-        let next_src = if let Some(b) = pending_first_block.take() {
-            b
-        } else {
-            match source.read_next_block(src_block_frames) {
-                Ok(Some(b)) => b,
-                Ok(None) => break, // clean EOF
-                Err(err) => {
-                    let msg = format!("FLAC stream error in '{}': {err}", chosen.display());
-                    if !pushed_any_pcm {
-                        first_block_error = Some(msg);
-                    } else {
-                        eprintln!("  [stream err] {msg}");
-                        shared.record_action(msg);
-                    }
-                    break;
-                }
-            }
-        };
-        source_frames_read += next_src.len();
-
-        let pcm_block = match session.process_block(next_src) {
-            Ok(b) => b,
-            Err(err) => {
-                let msg = format!("DSP block error on '{}': {err}", chosen.display());
-                if !pushed_any_pcm {
-                    if !drain_attached_tail_onto_prev(
-                        &mut session,
-                        buf,
-                        had_pending_prev_end,
-                        attached_carryover_into_session,
-                    ) {
-                        return (TrackStreamOutcome::Aborted, None, false);
-                    }
-                    return (TrackStreamOutcome::Failed(msg), None, false);
-                }
-                eprintln!("  [dsp] {msg}");
-                shared.record_action(msg);
-                let _ = buf.push_for_epoch(epoch, StreamEvent::TrackEnd);
-                return (TrackStreamOutcome::Played, None, false);
-            }
-        };
-
-        if !pcm_block.is_empty() {
-            if !emit_track_b_pcm(buf, had_pending_prev_end, &mut pending_start, pcm_block) {
-                return (TrackStreamOutcome::Aborted, None, false);
-            }
-            pushed_any_pcm = true;
-            *panic_backup_carry = None;
-        }
-    }
-
-    if ctrl.epoch() != epoch {
-        return (TrackStreamOutcome::Aborted, None, false);
-    }
-
-    // Flush DSP tail (only if there wasn't a pre-first-block stream error).
-    let mut next_carryover: Option<GaplessCarryover> = None;
-    if first_block_error.is_none() && source_frames_read > 0 {
-        let flushed = if gapless_carryover {
-            session.flush_for_gapless()
-        } else {
-            session.flush().map(|pcm| (pcm, None))
-        };
-        if let Ok((tail_pcm, carry)) = flushed {
-            next_carryover = carry;
-            if !tail_pcm.is_empty() {
-                if !emit_track_b_pcm(buf, had_pending_prev_end, &mut pending_start, tail_pcm) {
-                    return (TrackStreamOutcome::Aborted, None, false);
-                }
-                pushed_any_pcm = true;
-            }
-        }
-    }
-
-    if !pushed_any_pcm {
-        // Ultra-short track (< upsampler half-window) where all samples landed cleanly in carryover:
-        // flush immediately so it still plays as its own track rather than being dropped.
-        if first_block_error.is_none() && source_frames_read > 0 {
-            if let Some(carry) = next_carryover.take() {
-                if let Ok(pcm) = pipeline.drain_gapless_carryover(carry) {
-                    if !pcm.is_empty() {
-                        if !emit_track_b_pcm(buf, had_pending_prev_end, &mut pending_start, pcm) {
-                            return (TrackStreamOutcome::Aborted, None, false);
-                        }
-                        if !buf.push_for_epoch(epoch, StreamEvent::TrackEnd) {
-                            return (TrackStreamOutcome::Aborted, None, false);
-                        }
-                        return (TrackStreamOutcome::Played, None, false);
-                    }
-                }
-            }
-        }
-        // Track B errored (or produced zero output) before emitting any PCM: drain any already-
-        // attached REW tail & upsampler history onto Track A and close TrackEnd(prev) cleanly!
-        if !drain_attached_tail_onto_prev(
-            &mut session,
-            buf,
-            had_pending_prev_end,
-            attached_carryover_into_session,
-        ) {
-            return (TrackStreamOutcome::Aborted, None, false);
-        }
-        return (
-            TrackStreamOutcome::Failed(first_block_error.unwrap_or_else(|| {
-                format!("Skipped empty (0-frame) FLAC '{}'", chosen.display())
-            })),
-            None,
-            false,
-        );
-    }
-
-    let qstats = session.quantizer_stats();
-    if qstats.overs_count > 0 {
-        let warn_msg = format!(
-            "Quantizer clipped {} sample(s) on '{}' (pre-quant peak {:+.2} dBFS)",
-            qstats.overs_count,
-            chosen.display(),
-            qstats.max_pre_quant_peak_dbfs()
-        );
-        eprintln!("  [clip warn] {warn_msg}");
-        shared.record_action(warn_msg);
-    }
-
-    if next_carryover.is_some() {
-        // Keep TrackEnd open until we know whether the next track accepts the gapless carryover;
-        // if not (EndOfQueue, rate change, or error), we drain the tail right before TrackEnd.
-        return (TrackStreamOutcome::Played, next_carryover, true);
-    }
-
-    if !buf.push_for_epoch(epoch, StreamEvent::TrackEnd) {
-        return (TrackStreamOutcome::Aborted, None, false);
-    }
-    (TrackStreamOutcome::Played, None, false)
+        gapless,
+        panic_backup_carry,
+        gapless_carryover,
+    )
 }
 
 /// Open and stream one UPnP HTTP audio request (including any chained Ogg FLAC segments
 /// with sample-rate switches) through the pure-`f64` `AudioPipeline`.
-#[allow(clippy::too_many_arguments)]
 fn stream_upnp_request(
-    pipeline: &AudioPipeline,
-    ctrl: &ProducerControl,
-    buf: &BoundedBlockStreamBuffer,
-    shared: &SharedControl,
+    ctx: &ProducerCtx,
     epoch: u64,
     req: &UpnpPlayRequest,
     cancel: &Arc<AtomicBool>,
-    incoming_carryover: &mut Option<GaplessCarryover>,
+    gapless: &mut GaplessState,
     panic_backup_carry: &mut Option<GaplessCarryover>,
-    had_pending_prev_end: &mut bool,
-    ultimate_ctx: Option<&UltimateRuntimeContext>,
 ) -> (TrackStreamOutcome, Option<GaplessCarryover>, bool) {
     let hints = HttpStreamHints {
         protocol_info: req.protocol_info.clone(),
@@ -3322,7 +2872,7 @@ fn stream_upnp_request(
     ) {
         Ok(s) => s,
         Err(err) => {
-            if ctrl.epoch() != epoch || cancel.load(Ordering::Acquire) {
+            if ctx.ctrl.epoch() != epoch || cancel.load(Ordering::Acquire) {
                 return (TrackStreamOutcome::Aborted, None, false);
             }
             return (
@@ -3330,15 +2880,15 @@ fn stream_upnp_request(
                     "UPnP stream open failed for '{}': {err}",
                     req.uri
                 )),
-                incoming_carryover.take(),
-                *had_pending_prev_end,
+                gapless.carried_tail.take(),
+                gapless.pending_track_end,
             );
         }
     };
 
     let mut seg_idx = 0usize;
     loop {
-        if ctrl.epoch() != epoch || cancel.load(Ordering::Acquire) {
+        if ctx.ctrl.epoch() != epoch || cancel.load(Ordering::Acquire) {
             return (TrackStreamOutcome::Aborted, None, false);
         }
         let seg_duration = cur_source
@@ -3359,79 +2909,46 @@ fn stream_upnp_request(
                 seg_idx + 1
             )
         };
-        let (outcome, next_carry, next_pend) = if let Some(ult) = ultimate_ctx {
-            let sp = cur_source.spec();
-            let out_rate_hint = if sp.sample_rate_hz % 44_100 == 0 {
-                352_800
-            } else {
-                384_000
-            };
-            let src_block_frames = source_block_frames_for_rates(sp.sample_rate_hz, out_rate_hint);
-            match stream_track_ultimate(
-                pipeline,
+        let next_gen = if seg_idx == 0 {
+            req.prefetched_next_gen
+        } else {
+            None
+        };
+        let (outcome, next_carry, next_pend) = if let Some(ref ult) = ctx.ultimate_ctx {
+            dispatch_ultimate_source(
+                ctx,
                 ult,
-                buf,
                 epoch,
-                || ctrl.epoch() != epoch || cancel.load(Ordering::Acquire),
+                || ctx.ctrl.epoch() != epoch || cancel.load(Ordering::Acquire),
                 &mut cur_source,
                 &PathBuf::from(&seg_label),
                 None,
                 Some(req.uri.clone()),
-                if seg_idx == 0 {
-                    req.prefetched_next_gen
-                } else {
-                    None
-                },
+                next_gen,
                 PlayModeLabel::UpnpRenderer,
                 seg_duration,
-                incoming_carryover,
+                gapless,
                 panic_backup_carry,
-                had_pending_prev_end,
                 true,
-                src_block_frames,
-            ) {
-                UltimateStreamResult::Played {
-                    next_carryover,
-                    next_pending_end,
-                    warning,
-                    ..
-                } => {
-                    if let Some(msg) = warning {
-                        shared.record_action(msg);
-                    }
-                    (TrackStreamOutcome::Played, next_carryover, next_pending_end)
-                }
-                UltimateStreamResult::Aborted => (TrackStreamOutcome::Aborted, None, false),
-                UltimateStreamResult::Failed(msg) => (TrackStreamOutcome::Failed(msg), None, false),
-            }
+            )
         } else {
             stream_open_audio_source(
-                pipeline,
-                ctrl,
-                buf,
-                shared,
+                ctx,
                 epoch,
                 &mut cur_source,
                 &PathBuf::from(&seg_label),
                 Some(&req.uri),
-                if seg_idx == 0 {
-                    req.prefetched_next_gen
-                } else {
-                    None
-                },
+                next_gen,
                 PlayModeLabel::UpnpRenderer,
                 seg_duration,
-                None,
-                incoming_carryover,
+                gapless,
                 panic_backup_carry,
-                had_pending_prev_end,
                 true,
             )
         };
         match outcome {
             TrackStreamOutcome::Played => {
-                *incoming_carryover = next_carry;
-                *had_pending_prev_end = next_pend;
+                gapless.update(next_carry, next_pend);
                 if let Some(next_seg) = cur_source.take_next_chained_segment() {
                     cur_source = next_seg;
                     seg_idx += 1;
@@ -3439,8 +2956,8 @@ fn stream_upnp_request(
                 }
                 return (
                     TrackStreamOutcome::Played,
-                    incoming_carryover.take(),
-                    std::mem::take(had_pending_prev_end),
+                    gapless.carried_tail.take(),
+                    std::mem::take(&mut gapless.pending_track_end),
                 );
             }
             other => {
@@ -3450,15 +2967,16 @@ fn stream_upnp_request(
     }
 }
 
-/// Generic streaming helper for an already-opened [`AudioBlockSource`] (used by UPnP HTTP
-/// streams and chained Ogg FLAC segments). Preserves full `GaplessCarryover` /
-/// `ConvolverOnlyHandoff` semantics identical to [`stream_single_track`].
+/// Unified streaming helper for any opened [`AudioBlockSource`] (local FLAC, UPnP HTTP/Ogg,
+/// and live exclusive capture; Review #9 E4 + E5).
+///
+/// Defers BOTH gapless carryover handoff AND `TrackStart` emission until the track produces a
+/// validated non-empty decoded block, keeps stricter first-block rate/L-R validation and checked
+/// `push_for_epoch` returns across all sources, and preserves Track A's full REW tail on any
+/// pre-PCM failure.
 #[allow(clippy::too_many_arguments)]
 fn stream_open_audio_source<S: AudioBlockSource>(
-    pipeline: &AudioPipeline,
-    ctrl: &ProducerControl,
-    buf: &BoundedBlockStreamBuffer,
-    shared: &SharedControl,
+    ctx: &ProducerCtx,
     epoch: u64,
     source: &mut S,
     label_path: &Path,
@@ -3466,44 +2984,21 @@ fn stream_open_audio_source<S: AudioBlockSource>(
     upnp_next_gen: Option<u64>,
     mode_label: PlayModeLabel,
     total_duration_s: Option<f64>,
-    block_frames_override: Option<usize>,
-    incoming_carryover: &mut Option<GaplessCarryover>,
+    gapless: &mut GaplessState,
     panic_backup_carry: &mut Option<GaplessCarryover>,
-    had_pending_prev_end: &mut bool,
     gapless_carryover: bool,
 ) -> (TrackStreamOutcome, Option<GaplessCarryover>, bool) {
-    let flush_prev_on_incompatible = |buf: &BoundedBlockStreamBuffer,
-                                      carry: &mut Option<GaplessCarryover>,
-                                      pending_end: &mut bool|
-     -> bool {
-        if let Some(tail) = carry.take() {
-            if let Ok(pcm) = pipeline.drain_gapless_carryover(tail) {
-                if !pcm.is_empty() && !buf.push_for_epoch(epoch, StreamEvent::PcmBlock(pcm)) {
-                    *pending_end = false;
-                    return false;
-                }
-            }
-        }
-        if *pending_end {
-            *pending_end = false;
-            if !buf.push_for_epoch(epoch, StreamEvent::TrackEnd) {
-                return false;
-            }
-        }
-        true
-    };
-
     let spec = source.spec();
     let peak_meta = source.peak_meta();
-    let mut session = match pipeline.start_track_for_carryover(
+    let mut session = match ctx.pipeline.start_track_for_carryover(
         spec,
         &peak_meta,
         source.is_streaming(),
-        incoming_carryover.as_ref(),
+        gapless.carried_tail.as_ref(),
     ) {
         Ok(s) => s,
         Err(err) => {
-            if !flush_prev_on_incompatible(buf, incoming_carryover, had_pending_prev_end) {
+            if !ctx.finalize_prev(epoch, gapless) {
                 return (TrackStreamOutcome::Aborted, None, false);
             }
             if err.starts_with(UNSUPPORTED_SAMPLE_RATE_PREFIX) {
@@ -3527,24 +3022,25 @@ fn stream_open_audio_source<S: AudioBlockSource>(
         }
     };
 
-    let block_frames = block_frames_override.unwrap_or_else(|| {
-        source_block_frames_for_rates(spec.sample_rate_hz, session.report().internal_rate_hz)
-    });
+    let block_frames =
+        source_block_frames_for_rates(spec.sample_rate_hz, session.report().internal_rate_hz);
 
+    // Decode and validate the first non-empty block BEFORE touching `gapless.carried_tail` or
+    // closing `TrackEnd(prev)`.
     let first_src = loop {
-        if ctrl.epoch() != epoch {
+        if ctx.ctrl.epoch() != epoch {
             return (TrackStreamOutcome::Aborted, None, false);
         }
         match source.read_next_block(block_frames) {
             Ok(Some(b)) if b.is_empty() => continue,
             Ok(Some(b)) => break b,
             Ok(None) => {
-                if !flush_prev_on_incompatible(buf, incoming_carryover, had_pending_prev_end) {
+                if !ctx.finalize_prev(epoch, gapless) {
                     return (TrackStreamOutcome::Aborted, None, false);
                 }
                 return (
-                    TrackStreamOutcome::Failed(format!(
-                        "Stream '{}' ended with 0 audio frames",
+                    TrackStreamOutcome::Empty(format!(
+                        "Skipped empty (0-frame) source '{}'",
                         label_path.display()
                     )),
                     None,
@@ -3552,10 +3048,10 @@ fn stream_open_audio_source<S: AudioBlockSource>(
                 );
             }
             Err(err) => {
-                if ctrl.epoch() != epoch {
+                if ctx.ctrl.epoch() != epoch {
                     return (TrackStreamOutcome::Aborted, None, false);
                 }
-                if !flush_prev_on_incompatible(buf, incoming_carryover, had_pending_prev_end) {
+                if !ctx.finalize_prev(epoch, gapless) {
                     return (TrackStreamOutcome::Aborted, None, false);
                 }
                 return (
@@ -3569,13 +3065,28 @@ fn stream_open_audio_source<S: AudioBlockSource>(
             }
         }
     };
+    if first_src.sample_rate_hz != spec.sample_rate_hz
+        || first_src.left.len() != first_src.right.len()
+    {
+        if !ctx.finalize_prev(epoch, gapless) {
+            return (TrackStreamOutcome::Aborted, None, false);
+        }
+        return (
+            TrackStreamOutcome::Failed(format!(
+                "Invalid first audio block in '{}'",
+                label_path.display()
+            )),
+            None,
+            false,
+        );
+    }
 
     let mut had_gapless_carryover = false;
     let mut attached_carryover_into_session = false;
-    if let Some(carry) = incoming_carryover.take() {
+    if let Some(carry) = gapless.carried_tail.take() {
         let had_active_tail = !carry.is_empty();
         *panic_backup_carry = Some(carry.clone());
-        match pipeline.attach_gapless_carryover(&mut session, carry) {
+        match ctx.pipeline.attach_gapless_carryover(&mut session, carry) {
             Ok(GaplessAttachOutcome::FullHandoff) => {
                 had_gapless_carryover = had_active_tail;
                 attached_carryover_into_session = had_active_tail;
@@ -3595,17 +3106,19 @@ fn stream_open_audio_source<S: AudioBlockSource>(
                 had_gapless_carryover = attached_convolver_tail;
                 attached_carryover_into_session = attached_convolver_tail;
                 if !upsampler_tail_pcm.is_empty()
-                    && !buf.push_for_epoch(epoch, StreamEvent::PcmBlock(upsampler_tail_pcm))
+                    && !ctx
+                        .buf
+                        .push_for_epoch(epoch, StreamEvent::PcmBlock(upsampler_tail_pcm))
                 {
                     *panic_backup_carry = None;
-                    *had_pending_prev_end = false;
+                    gapless.pending_track_end = false;
                     return (TrackStreamOutcome::Aborted, None, false);
                 }
             }
             Ok(GaplessAttachOutcome::IncompatibleRate(rejected)) => {
                 *panic_backup_carry = None;
-                *incoming_carryover = Some(rejected);
-                if !flush_prev_on_incompatible(buf, incoming_carryover, had_pending_prev_end) {
+                gapless.carried_tail = Some(rejected);
+                if !ctx.finalize_prev(epoch, gapless) {
                     return (TrackStreamOutcome::Aborted, None, false);
                 }
             }
@@ -3614,15 +3127,15 @@ fn stream_open_audio_source<S: AudioBlockSource>(
                     "  [gapless warn] carryover attach failed on '{}': {err}; draining previous tail and continuing cleanly",
                     label_path.display()
                 );
-                *incoming_carryover = panic_backup_carry.take();
-                if !flush_prev_on_incompatible(buf, incoming_carryover, had_pending_prev_end) {
+                gapless.carried_tail = panic_backup_carry.take();
+                if !ctx.finalize_prev(epoch, gapless) {
                     return (TrackStreamOutcome::Aborted, None, false);
                 }
             }
         }
-    } else if *had_pending_prev_end {
-        *had_pending_prev_end = false;
-        if !buf.push_for_epoch(epoch, StreamEvent::TrackEnd) {
+    } else if gapless.pending_track_end {
+        gapless.pending_track_end = false;
+        if !ctx.buf.push_for_epoch(epoch, StreamEvent::TrackEnd) {
             return (TrackStreamOutcome::Aborted, None, false);
         }
     }
@@ -3641,27 +3154,49 @@ fn stream_open_audio_source<S: AudioBlockSource>(
     let mut first_block_error: Option<String> = None;
     let mut pending_first_block = Some(first_src);
 
-    let emit_pcm = |buf: &BoundedBlockStreamBuffer,
-                    pending_prev_end: &mut bool,
+    let emit_pcm = |pending_prev_end: &mut bool,
                     pending_start: &mut Option<StreamEvent>,
                     pcm: ap_core::buffer::InterleavedInt32Buffer|
      -> bool {
         if *pending_prev_end {
             *pending_prev_end = false;
-            if !buf.push_for_epoch(epoch, StreamEvent::TrackEnd) {
+            if !ctx.buf.push_for_epoch(epoch, StreamEvent::TrackEnd) {
                 return false;
             }
         }
         if let Some(start_ev) = pending_start.take() {
-            if !buf.push_for_epoch(epoch, start_ev) {
+            if !ctx.buf.push_for_epoch(epoch, start_ev) {
                 return false;
             }
         }
-        buf.push_for_epoch(epoch, StreamEvent::PcmBlock(pcm))
+        ctx.buf.push_for_epoch(epoch, StreamEvent::PcmBlock(pcm))
+    };
+
+    let drain_attached_tail_onto_prev = |session: &mut ap_dsp::pipeline::StreamingPipelineSession,
+                                         pending_prev_end: &mut bool,
+                                         attached: bool|
+     -> bool {
+        if attached {
+            if let Ok(tail_pcm) = session.flush() {
+                if !tail_pcm.is_empty()
+                    && !ctx.buf.push_for_epoch(epoch, StreamEvent::PcmBlock(tail_pcm))
+                {
+                    *pending_prev_end = false;
+                    return false;
+                }
+            }
+        }
+        if *pending_prev_end {
+            *pending_prev_end = false;
+            if !ctx.buf.push_for_epoch(epoch, StreamEvent::TrackEnd) {
+                return false;
+            }
+        }
+        true
     };
 
     loop {
-        if ctrl.epoch() != epoch {
+        if ctx.ctrl.epoch() != epoch {
             return (TrackStreamOutcome::Aborted, None, false);
         }
         let next_src = if let Some(b) = pending_first_block.take() {
@@ -3671,7 +3206,7 @@ fn stream_open_audio_source<S: AudioBlockSource>(
                 Ok(Some(b)) => b,
                 Ok(None) => break,
                 Err(err) => {
-                    if ctrl.epoch() != epoch {
+                    if ctx.ctrl.epoch() != epoch {
                         return (TrackStreamOutcome::Aborted, None, false);
                     }
                     let msg = format!("Stream error in '{}': {err}", label_path.display());
@@ -3679,7 +3214,7 @@ fn stream_open_audio_source<S: AudioBlockSource>(
                         first_block_error = Some(msg);
                     } else {
                         eprintln!("  [stream err] {msg}");
-                        shared.record_action(msg);
+                        ctx.shared.record_action(msg);
                     }
                     break;
                 }
@@ -3692,28 +3227,24 @@ fn stream_open_audio_source<S: AudioBlockSource>(
             Err(err) => {
                 let msg = format!("DSP block error on '{}': {err}", label_path.display());
                 if !pushed_any_pcm {
-                    if attached_carryover_into_session {
-                        if let Ok(tail_pcm) = session.flush() {
-                            if !tail_pcm.is_empty() {
-                                let _ = buf.push_for_epoch(epoch, StreamEvent::PcmBlock(tail_pcm));
-                            }
-                        }
-                    }
-                    if *had_pending_prev_end {
-                        *had_pending_prev_end = false;
-                        let _ = buf.push_for_epoch(epoch, StreamEvent::TrackEnd);
+                    if !drain_attached_tail_onto_prev(
+                        &mut session,
+                        &mut gapless.pending_track_end,
+                        attached_carryover_into_session,
+                    ) {
+                        return (TrackStreamOutcome::Aborted, None, false);
                     }
                     return (TrackStreamOutcome::Failed(msg), None, false);
                 }
                 eprintln!("  [dsp] {msg}");
-                shared.record_action(msg);
-                let _ = buf.push_for_epoch(epoch, StreamEvent::TrackEnd);
+                ctx.shared.record_action(msg);
+                let _ = ctx.buf.push_for_epoch(epoch, StreamEvent::TrackEnd);
                 return (TrackStreamOutcome::Played, None, false);
             }
         };
 
         if !pcm_block.is_empty() {
-            if !emit_pcm(buf, had_pending_prev_end, &mut pending_start, pcm_block) {
+            if !emit_pcm(&mut gapless.pending_track_end, &mut pending_start, pcm_block) {
                 return (TrackStreamOutcome::Aborted, None, false);
             }
             pushed_any_pcm = true;
@@ -3721,7 +3252,7 @@ fn stream_open_audio_source<S: AudioBlockSource>(
         }
     }
 
-    if ctrl.epoch() != epoch {
+    if ctx.ctrl.epoch() != epoch {
         return (TrackStreamOutcome::Aborted, None, false);
     }
 
@@ -3735,7 +3266,7 @@ fn stream_open_audio_source<S: AudioBlockSource>(
         if let Ok((tail_pcm, carry)) = flushed {
             next_carryover = carry;
             if !tail_pcm.is_empty() {
-                if !emit_pcm(buf, had_pending_prev_end, &mut pending_start, tail_pcm) {
+                if !emit_pcm(&mut gapless.pending_track_end, &mut pending_start, tail_pcm) {
                     return (TrackStreamOutcome::Aborted, None, false);
                 }
                 pushed_any_pcm = true;
@@ -3744,14 +3275,16 @@ fn stream_open_audio_source<S: AudioBlockSource>(
     }
 
     if !pushed_any_pcm {
+        // Ultra-short track (< upsampler half-window) where all samples landed in carryover:
+        // flush immediately so it still plays as its own track rather than being dropped.
         if first_block_error.is_none() && source_frames_read > 0 {
             if let Some(carry) = next_carryover.take() {
-                if let Ok(pcm) = pipeline.drain_gapless_carryover(carry) {
+                if let Ok(pcm) = ctx.pipeline.drain_gapless_carryover(carry) {
                     if !pcm.is_empty() {
-                        if !emit_pcm(buf, had_pending_prev_end, &mut pending_start, pcm) {
+                        if !emit_pcm(&mut gapless.pending_track_end, &mut pending_start, pcm) {
                             return (TrackStreamOutcome::Aborted, None, false);
                         }
-                        if !buf.push_for_epoch(epoch, StreamEvent::TrackEnd) {
+                        if !ctx.buf.push_for_epoch(epoch, StreamEvent::TrackEnd) {
                             return (TrackStreamOutcome::Aborted, None, false);
                         }
                         return (TrackStreamOutcome::Played, None, false);
@@ -3759,24 +3292,21 @@ fn stream_open_audio_source<S: AudioBlockSource>(
                 }
             }
         }
-        if attached_carryover_into_session {
-            if let Ok(tail_pcm) = session.flush() {
-                if !tail_pcm.is_empty() {
-                    let _ = buf.push_for_epoch(epoch, StreamEvent::PcmBlock(tail_pcm));
-                }
-            }
+        if !drain_attached_tail_onto_prev(
+            &mut session,
+            &mut gapless.pending_track_end,
+            attached_carryover_into_session,
+        ) {
+            return (TrackStreamOutcome::Aborted, None, false);
         }
-        if *had_pending_prev_end {
-            *had_pending_prev_end = false;
-            let _ = buf.push_for_epoch(epoch, StreamEvent::TrackEnd);
-        }
-        return (
-            TrackStreamOutcome::Failed(first_block_error.unwrap_or_else(|| {
-                format!("Stream '{}' produced 0 PCM frames", label_path.display())
-            })),
-            None,
-            false,
-        );
+        let outcome = match first_block_error {
+            Some(err) => TrackStreamOutcome::Failed(err),
+            None => TrackStreamOutcome::Empty(format!(
+                "Source '{}' produced 0 PCM frames",
+                label_path.display()
+            )),
+        };
+        return (outcome, None, false);
     }
 
     let qstats = session.quantizer_stats();
@@ -3788,14 +3318,14 @@ fn stream_open_audio_source<S: AudioBlockSource>(
             qstats.max_pre_quant_peak_dbfs()
         );
         eprintln!("  [clip warn] {warn_msg}");
-        shared.record_action(warn_msg);
+        ctx.shared.record_action(warn_msg);
     }
 
     if next_carryover.is_some() {
         return (TrackStreamOutcome::Played, next_carryover, true);
     }
 
-    if !buf.push_for_epoch(epoch, StreamEvent::TrackEnd) {
+    if !ctx.buf.push_for_epoch(epoch, StreamEvent::TrackEnd) {
         return (TrackStreamOutcome::Aborted, None, false);
     }
     (TrackStreamOutcome::Played, None, false)
@@ -4053,7 +3583,7 @@ mod tests {
                     saw_01 = true;
                     // Drain 01.flac PCM until TrackEnd.
                     loop {
-                        match buf.try_pop_track_pcm_block(state.active_epoch) {
+                        match buf.try_pop_track_pcm_block_with_peak(state.active_epoch).0 {
                             PopBlockResult::Block(_) => {}
                             PopBlockResult::Underrun => thread::sleep(Duration::from_millis(2)),
                             PopBlockResult::TrackEnd | PopBlockResult::StaleOrClosed => break,
@@ -4247,6 +3777,15 @@ mod tests {
         let pipeline = AudioPipeline::new(UpsamplerPolicy::default()).unwrap();
 
         let mut state = EngineState::new(ep0, init, &buf, &ctrl, &shared);
+        let test_ctx = ProducerCtx {
+            pipeline,
+            ctrl: Arc::clone(&ctrl),
+            buf: Arc::clone(&buf),
+            shared: Arc::clone(&shared),
+            upnp_state: None,
+            capture_transport: None,
+            ultimate_ctx: None,
+        };
 
         for bad in [
             PathBuf::from("CONIN$"),
@@ -4261,22 +3800,16 @@ mod tests {
             assert_eq!(state.active_epoch, ep0);
 
             // Direct producer-side guard must also reject without blocking on open().
-            let mut no_tail = None;
+            let mut gapless = GaplessState::default();
             let mut no_backup = None;
-            let mut no_pending = false;
             let (outcome, next_tail, pending_end) = stream_single_track(
-                &pipeline,
-                &ctrl,
-                &buf,
-                &shared,
+                &test_ctx,
                 ep0,
                 &bad,
                 PlayModeLabel::SingleFile,
-                &mut no_tail,
+                &mut gapless,
                 &mut no_backup,
-                &mut no_pending,
                 false,
-                None,
             );
             assert!(next_tail.is_none());
             assert!(!pending_end);
@@ -4381,7 +3914,7 @@ mod tests {
                     let rate = report.output_rate_hz;
                     let mut frames = 0_usize;
                     loop {
-                        match buf.try_pop_track_pcm_block(ep) {
+                        match buf.try_pop_track_pcm_block_with_peak(ep).0 {
                             PopBlockResult::Block(b) => {
                                 assert_eq!(b.sample_rate_hz, rate);
                                 frames += b.frames.len();
@@ -4583,7 +4116,7 @@ mod tests {
                 }) => {
                     let mut frames = 0_usize;
                     loop {
-                        match buf.try_pop_track_pcm_block(ep) {
+                        match buf.try_pop_track_pcm_block_with_peak(ep).0 {
                             PopBlockResult::Block(b) => frames += b.frames.len(),
                             PopBlockResult::Underrun => thread::sleep(Duration::from_millis(2)),
                             PopBlockResult::TrackEnd | PopBlockResult::StaleOrClosed => break,
@@ -5065,7 +4598,7 @@ mod tests {
                 Some(StreamEvent::TrackStart { path, .. }) => {
                     started_paths.push(path);
                     loop {
-                        match buf.try_pop_track_pcm_block(ep) {
+                        match buf.try_pop_track_pcm_block_with_peak(ep).0 {
                             PopBlockResult::Block(b) => {
                                 if started_paths.len() == 1 {
                                     track_a_frames.extend_from_slice(&b.frames);
@@ -5169,7 +4702,7 @@ mod tests {
                 }) => {
                     starts.push((path, had_gapless_carryover));
                     loop {
-                        match buf.try_pop_track_pcm_block(ep) {
+                        match buf.try_pop_track_pcm_block_with_peak(ep).0 {
                             PopBlockResult::Block(_) => {}
                             PopBlockResult::Underrun => thread::sleep(Duration::from_millis(2)),
                             PopBlockResult::TrackEnd | PopBlockResult::StaleOrClosed => break,
@@ -6165,17 +5698,28 @@ mod tests {
         assert!(carried_tail.is_none());
         assert!(panic_backup_carry.is_some());
 
-        // Exercise the shared production `recover_after_track_panic` helper directly (Review #8 C5).
-        recover_after_track_panic(
-            &pipeline,
-            &buf,
-            ep,
-            &mut carried_tail,
-            &mut panic_backup_carry,
-            &mut pending_track_end,
-        );
-        assert!(carried_tail.is_none());
-        assert!(!pending_track_end);
+        // Exercise the shared production `ProducerCtx::run_guarded` panic recovery (Review #8 C5 / E6).
+        let shared_test = SharedControl::new(root.clone(), "Mock DAC".to_string());
+        let ctrl_test = ProducerControl::new(ep, ProducerDirective::Paused);
+        let test_ctx = ProducerCtx {
+            pipeline,
+            ctrl: ctrl_test,
+            buf: Arc::clone(&buf),
+            shared: shared_test,
+            upnp_state: None,
+            capture_transport: None,
+            ultimate_ctx: None,
+        };
+        let mut gapless = GaplessState {
+            carried_tail,
+            pending_track_end,
+        };
+        if gapless.carried_tail.is_none() {
+            gapless.carried_tail = panic_backup_carry.take();
+        }
+        let _ = test_ctx.finalize_prev(ep, &mut gapless);
+        assert!(gapless.carried_tail.is_none());
+        assert!(!gapless.pending_track_end);
 
         let mut saw_tail_pcm = false;
         let mut saw_track_end = false;
