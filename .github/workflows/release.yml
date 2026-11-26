@@ -115,37 +115,37 @@ jobs:
             )
           }
 
-          $notes = @"
-## Install (Windows 10/11 x64)
-
-**Recommended — build from source** (transparent, verifiable):
-``````powershell
-irm https://github.com/androxylo/audiophile_player/releases/latest/download/bootstrap.ps1 | iex
-``````
-
-**Opt-in verified prebuilt binary** (no compiler, no admin prompt, zero kernel `.sys` files):
-``````powershell
-& ([scriptblock]::Create((irm https://github.com/androxylo/audiophile_player/releases/latest/download/bootstrap.ps1))) -Binary
-``````
-
-## Release Assets
-
-| Asset | Contents |
-|---|---|
-| ``bootstrap.ps1`` | One-line Windows installer (builds from source by default; ``-Binary`` verifies SHA-256 + GitHub provenance attestation) |
-| ``audiophile-player-v$ver-win-x64.zip`` | Standalone Windows x64 player, docs, shortcuts, and third-party notices (no kernel driver) |
-| ``audiophile-player-driver-v$ver-win-x64.zip`` | **Opt-in** unsigned ACX 1.1 virtual render driver for Tidal Desktop Exclusive Mode (Windows 11 22H2+ x64 only; requires Secure Boot OFF + Test Mode ON — read [Getting Started](https://github.com/androxylo/audiophile_player/blob/$tag/docs/GETTING_STARTED.md#tidal-desktop-exclusive-mode-opt-in) first) |
-| ``SHA256SUMS`` | SHA-256 checksums for all downloadable assets (also individually attested via GitHub Build Provenance) |
-
-Verify provenance with GitHub CLI:
-``````powershell
-gh attestation verify audiophile-player-v$ver-win-x64.zip -R androxylo/audiophile_player
-``````
-
-Full setup guide: [Quick Start](https://github.com/androxylo/audiophile_player/blob/$tag/docs/QUICK_START.md) · [Getting Started](https://github.com/androxylo/audiophile_player/blob/$tag/docs/GETTING_STARTED.md) · [What's New](https://github.com/androxylo/audiophile_player/blob/$tag/docs/WHATS_NEW.md)
-"@
+          $noteLines = @(
+            "## Install (Windows 10/11 x64)",
+            "",
+            "**Recommended — build from source** (transparent, verifiable):",
+            '```powershell',
+            "irm https://github.com/androxylo/audiophile_player/releases/latest/download/bootstrap.ps1 | iex",
+            '```',
+            "",
+            "**Opt-in verified prebuilt binary** (no compiler, no admin prompt, zero kernel `.sys` files):",
+            '```powershell',
+            "& ([scriptblock]::Create((irm https://github.com/androxylo/audiophile_player/releases/latest/download/bootstrap.ps1))) -Binary",
+            '```',
+            "",
+            "## Release Assets",
+            "",
+            "| Asset | Contents |",
+            "|---|---|",
+            "| ``bootstrap.ps1`` | One-line Windows installer (builds from source by default; ``-Binary`` verifies SHA-256 + GitHub provenance attestation) |",
+            "| ``audiophile-player-v$ver-win-x64.zip`` | Standalone Windows x64 player, docs, shortcuts, and third-party notices (no kernel driver) |",
+            "| ``audiophile-player-driver-v$ver-win-x64.zip`` | **Opt-in** unsigned ACX 1.1 virtual render driver for Tidal Desktop Exclusive Mode (Windows 11 22H2+ x64 only; requires Secure Boot OFF + Test Mode ON — read [Getting Started](https://github.com/androxylo/audiophile_player/blob/$tag/docs/GETTING_STARTED.md#tidal-desktop-exclusive-mode-opt-in) first) |",
+            "| ``SHA256SUMS`` | SHA-256 checksums for all downloadable assets (also individually attested via GitHub Build Provenance) |",
+            "",
+            "Verify provenance with GitHub CLI:",
+            '```powershell',
+            "gh attestation verify audiophile-player-v$ver-win-x64.zip -R androxylo/audiophile_player",
+            '```',
+            "",
+            "Full setup guide: [Quick Start](https://github.com/androxylo/audiophile_player/blob/$tag/docs/QUICK_START.md) · [Getting Started](https://github.com/androxylo/audiophile_player/blob/$tag/docs/GETTING_STARTED.md) · [What's New](https://github.com/androxylo/audiophile_player/blob/$tag/docs/WHATS_NEW.md)"
+          )
           $notesFile = "dist\RELEASE_NOTES.md"
-          Set-Content -LiteralPath $notesFile -Value $notes -Encoding UTF8
+          Set-Content -LiteralPath $notesFile -Value ($noteLines -join "`n") -Encoding UTF8
 
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
