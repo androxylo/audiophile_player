@@ -1011,68 +1011,49 @@ impl ChannelUpolsState {
         .map_err(|e| format!("UPOLS forward FFT failed: {e}"))?;
 
         // 3. Complex MAC across all non-zero IR partitions via persistent worker pool (F12).
+        // Review #9 D9: `for_each_mac_slice` runs inline on the caller thread when `slices == 1`,
+        // so one unified loop handles both parallel and serial execution bit-identically.
         let p_count = self.num_partitions;
         let spec_len = self.acc_spec.len();
         let fdl = &self.fdl;
         let mac_slices = crate::worker_pool::mac_slice_count(true);
-
-        if nonzero_count >= REW_PARALLEL_MAC_MIN_PARTITIONS
+        let slices = if nonzero_count >= REW_PARALLEL_MAC_MIN_PARTITIONS
             && nonzero_count.saturating_mul(spec_len) >= crate::worker_pool::MAC_PARALLEL_MIN_WORK
             && mac_slices > 1
             && spec_len >= mac_slices * 256
         {
-            // Bit-identical disjoint bin-slice parallelism on persistent MAC pool: slice 0 runs
-            // inline on caller thread and each slice sums 0..p_count in exact order (0 ULPs diff).
-            crate::worker_pool::for_each_mac_slice(
-                &mut self.acc_spec,
-                mac_slices.min(REW_PARALLEL_MAC_SLICES),
-                |_slice_idx, bin_start, acc_chunk| {
-                    let bin_end = bin_start + acc_chunk.len();
-                    for c in acc_chunk.iter_mut() {
-                        *c = Complex::new(0.0, 0.0);
-                    }
-                    for p in 0..p_count {
-                        if !nonzero[p] {
-                            continue;
-                        }
-                        let fdl_idx = if head >= p {
-                            head - p
-                        } else {
-                            head + p_count - p
-                        };
-                        let x_slice = &fdl[fdl_idx][bin_start..bin_end];
-                        let h_slice = &ir_spectra[p][bin_start..bin_end];
-                        for ((acc, &x), &h) in
-                            acc_chunk.iter_mut().zip(x_slice.iter()).zip(h_slice.iter())
-                        {
-                            acc.re += x.re * h.re - x.im * h.im;
-                            acc.im += x.re * h.im + x.im * h.re;
-                        }
-                    }
-                },
-            );
+            mac_slices.min(REW_PARALLEL_MAC_SLICES)
         } else {
-            for c in &mut self.acc_spec {
-                *c = Complex::new(0.0, 0.0);
-            }
-            for p in 0..p_count {
-                if !nonzero[p] {
-                    continue;
+            1
+        };
+        crate::worker_pool::for_each_mac_slice(
+            &mut self.acc_spec,
+            slices,
+            |_slice_idx, bin_start, acc_chunk| {
+                let bin_end = bin_start + acc_chunk.len();
+                for c in acc_chunk.iter_mut() {
+                    *c = Complex::new(0.0, 0.0);
                 }
-                let fdl_idx = if head >= p {
-                    head - p
-                } else {
-                    head + p_count - p
-                };
-                let x_spec = &fdl[fdl_idx];
-                let h_spec = &ir_spectra[p];
-                for ((acc, &x), &h) in self.acc_spec.iter_mut().zip(x_spec.iter()).zip(h_spec.iter())
-                {
-                    acc.re += x.re * h.re - x.im * h.im;
-                    acc.im += x.re * h.im + x.im * h.re;
+                for p in 0..p_count {
+                    if !nonzero[p] {
+                        continue;
+                    }
+                    let fdl_idx = if head >= p {
+                        head - p
+                    } else {
+                        head + p_count - p
+                    };
+                    let x_slice = &fdl[fdl_idx][bin_start..bin_end];
+                    let h_slice = &ir_spectra[p][bin_start..bin_end];
+                    for ((acc, &x), &h) in
+                        acc_chunk.iter_mut().zip(x_slice.iter()).zip(h_slice.iter())
+                    {
+                        acc.re += x.re * h.re - x.im * h.im;
+                        acc.im += x.re * h.im + x.im * h.re;
+                    }
                 }
-            }
-        }
+            },
+        );
 
         // Guard realfft DC & Nyquist imaginary-zero invariant against -0.0 / tiny rounding.
         self.acc_spec[0].im = 0.0;

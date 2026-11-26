@@ -96,7 +96,7 @@ impl TruePeakMeter4x {
     fn new() -> Self {
         let mut bank = [[0.0_f64; 12]; 4];
         let beta = 7.0_f64;
-        let i0_beta = bessel_i0_f64(beta);
+        let i0_beta = crate::upsampler::bessel_i0_f64(beta);
         for (p, coeffs) in bank.iter_mut().enumerate() {
             let frac = (p as f64) / 4.0;
             let mut sum = 0.0;
@@ -109,7 +109,7 @@ impl TruePeakMeter4x {
                 };
                 let x = j / 6.0;
                 let win = if x.abs() < 1.0 {
-                    bessel_i0_f64(beta * (1.0 - x * x).sqrt()) / i0_beta
+                    crate::upsampler::bessel_i0_f64(beta * (1.0 - x * x).sqrt()) / i0_beta
                 } else {
                     0.0
                 };
@@ -157,21 +157,6 @@ impl TruePeakMeter4x {
             self.peak = self.peak.max(acc_l.abs()).max(acc_r.abs());
         }
     }
-}
-
-fn bessel_i0_f64(x: f64) -> f64 {
-    let y = 0.25 * x * x;
-    let mut sum = 1.0;
-    let mut term = 1.0;
-    for k in 1..=40 {
-        let kf = k as f64;
-        term *= y / (kf * kf);
-        sum += term;
-        if term <= sum * 1e-16 {
-            break;
-        }
-    }
-    sum
 }
 
 /// Pure-`f64` Direct Form II Transposed biquad for ITU-R BS.1770-4 K-weighting at any sample rate.

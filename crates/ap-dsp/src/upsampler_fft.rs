@@ -355,71 +355,50 @@ impl ChannelTiledUpolsState {
             .map_err(|e| format!("FFT upsampler forward RFFT failed: {e}"))?;
 
         // 3. Tiled complex MAC across all non-zero IR partitions via persistent worker pool (F12).
+        // Review #9 D9: `for_each_mac_slice` runs inline on the caller thread when `slices == 1`.
         let p_count = self.num_partitions;
         let spec_out_len = b_out + 1;
         let ir_spectra = &kernel.ir_spectra;
         let nonzero = &kernel.nonzero;
         let fdl = &self.fdl;
         let mac_slices = crate::worker_pool::mac_slice_count(true);
-
-        if kernel.nonzero_partitions >= PARALLEL_MAC_MIN_PARTITIONS
+        let slices = if kernel.nonzero_partitions >= PARALLEL_MAC_MIN_PARTITIONS
             && kernel.nonzero_partitions.saturating_mul(spec_out_len)
                 >= crate::worker_pool::MAC_PARALLEL_MIN_WORK
             && mac_slices > 1
             && spec_out_len >= mac_slices * 256
         {
-            // Bit-identical bin-slice parallelism on persistent MAC pool: slice 0 runs inline on
-            // caller thread and each slice sums 0..p_count in exact order (0 ULPs diff).
-            crate::worker_pool::for_each_mac_slice(
-                &mut self.acc_spec,
-                mac_slices.min(PARALLEL_MAC_SLICES),
-                |_slice_idx, bin_start, acc_chunk| {
-                    for c in acc_chunk.iter_mut() {
-                        *c = Complex::new(0.0, 0.0);
-                    }
-                    for p in 0..p_count {
-                        if !nonzero[p] {
-                            continue;
-                        }
-                        let fdl_idx = if head >= p {
-                            head - p
-                        } else {
-                            head + p_count - p
-                        };
-                        accumulate_tiled_partition_slice(
-                            acc_chunk,
-                            &ir_spectra[p],
-                            &fdl[fdl_idx],
-                            n_in,
-                            b_in,
-                            bin_start,
-                        );
-                    }
-                },
-            );
+            mac_slices.min(PARALLEL_MAC_SLICES)
         } else {
-            for c in &mut self.acc_spec {
-                *c = Complex::new(0.0, 0.0);
-            }
-            for p in 0..p_count {
-                if !nonzero[p] {
-                    continue;
+            1
+        };
+        crate::worker_pool::for_each_mac_slice(
+            &mut self.acc_spec,
+            slices,
+            |_slice_idx, bin_start, acc_chunk| {
+                for c in acc_chunk.iter_mut() {
+                    *c = Complex::new(0.0, 0.0);
                 }
-                let fdl_idx = if head >= p {
-                    head - p
-                } else {
-                    head + p_count - p
-                };
-                accumulate_tiled_partition_slice(
-                    &mut self.acc_spec,
-                    &ir_spectra[p],
-                    &fdl[fdl_idx],
-                    n_in,
-                    b_in,
-                    0,
-                );
-            }
-        }
+                for p in 0..p_count {
+                    if !nonzero[p] {
+                        continue;
+                    }
+                    let fdl_idx = if head >= p {
+                        head - p
+                    } else {
+                        head + p_count - p
+                    };
+                    accumulate_tiled_partition_slice(
+                        acc_chunk,
+                        &ir_spectra[p],
+                        &fdl[fdl_idx],
+                        n_in,
+                        b_in,
+                        bin_start,
+                    );
+                }
+            },
+        );
 
         // Guard realfft DC & Nyquist real-only invariant.
         self.acc_spec[0].im = 0.0;

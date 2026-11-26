@@ -665,7 +665,15 @@ fn apply_incoming_carryover(
         }
         let _ = display_path;
         let rate = session.report().output_rate_hz;
-        if carry.output_rate_hz == rate && carry.upsampler.is_none() {
+        let is_ultimate_additive = carry.output_rate_hz == rate
+            && carry.upsampler.is_none()
+            && carry.convolver.is_none()
+            && carry.downsampler.is_none()
+            && carry
+                .additive_output_tail
+                .as_ref()
+                .is_none_or(|ct| ct.sample_rate_hz == rate);
+        if is_ultimate_additive {
             if let Some(q_st) = carry.quantizer_state {
                 session.restore_quantizer_state_if_compatible(
                     q_st,
@@ -673,7 +681,7 @@ fn apply_incoming_carryover(
                     carry.output_bits,
                 );
             }
-            if let Some(ct) = carry.convolver {
+            if let Some(ct) = carry.additive_output_tail {
                 if !ct.left.is_empty() {
                     additive_tail = Some((ct, 0));
                     had_gapless_carryover = true;
@@ -2498,7 +2506,8 @@ mod tests {
                     effective_shaper: ap_dsp::selector::NoiseShaperProfile::Bypass,
                     upsampler: None,
                     deemphasis: None,
-                    convolver: Some(ConvolutionTail {
+                    convolver: None,
+                    additive_output_tail: Some(ConvolutionTail {
                         sample_rate_hz: 44_100,
                         left: vec![0.95; 512],
                         right: vec![0.95; 512],
@@ -2749,7 +2758,8 @@ mod tests {
             effective_shaper: NoiseShaperProfile::TpdfDither,
             upsampler: None,
             deemphasis: None,
-            convolver: Some(ConvolutionTail {
+            convolver: None,
+            additive_output_tail: Some(ConvolutionTail {
                 sample_rate_hz: 44_100,
                 left: vec![0.4; 256],
                 right: vec![0.4; 256],
@@ -2809,7 +2819,8 @@ mod tests {
             effective_shaper: NoiseShaperProfile::TpdfDither,
             upsampler: None,
             deemphasis: None,
-            convolver: Some(ConvolutionTail {
+            convolver: None,
+            additive_output_tail: Some(ConvolutionTail {
                 sample_rate_hz: 44_100,
                 left: vec![0.3; 128],
                 right: vec![0.3; 128],
@@ -3043,7 +3054,8 @@ mod tests {
                     effective_shaper: NoiseShaperProfile::TpdfDither,
                     upsampler: None,
                     deemphasis: None,
-                    convolver: Some(ConvolutionTail {
+                    convolver: None,
+                    additive_output_tail: Some(ConvolutionTail {
                         sample_rate_hz: 44_100,
                         left: vec![0.35; 256],
                         right: vec![0.35; 256],
@@ -3222,7 +3234,8 @@ mod tests {
                 effective_shaper: NoiseShaperProfile::TpdfDither,
                 upsampler: None,
                 deemphasis: None,
-                convolver: Some(ConvolutionTail {
+                convolver: None,
+                additive_output_tail: Some(ConvolutionTail {
                     sample_rate_hz: 352_800,
                     left: vec![0.2; 256],
                     right: vec![-0.2; 256],

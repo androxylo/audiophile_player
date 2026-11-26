@@ -6114,7 +6114,8 @@ mod tests {
             effective_shaper: NoiseShaperProfile::TpdfDither,
             upsampler: None,
             deemphasis: None,
-            convolver: Some(ConvolutionTail {
+            convolver: None,
+            additive_output_tail: Some(ConvolutionTail {
                 sample_rate_hz: 44_100,
                 left: vec![0.25; 512],
                 right: vec![-0.25; 512],

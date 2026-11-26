@@ -68,6 +68,43 @@ pub const KAISER_STEEP_ATTENUATION_DB: f64 = 200.0;
 /// Kaiser beta for `A = 200 dB`: `0.1102 * (200.0 - 8.7) = 21.08126`.
 pub const KAISER_STEEP_BETA: f64 = 0.1102 * (KAISER_STEEP_ATTENUATION_DB - 8.7);
 
+/// Empirical Kaiser normalized transition width `delta_f / fs` for stopband attenuation `a_db`
+/// and odd length `num_taps` (`UPSAMPLING_RESEARCH.md` §4.1, Review #9 D7).
+#[inline]
+pub(crate) fn kaiser_transition_width_norm(attenuation_db: f64, num_taps: usize) -> f64 {
+    (attenuation_db - 7.95) / (14.36 * (num_taps.max(2) as f64))
+}
+
+/// Evaluate a double-double (`Dd`) Kaiser-windowed sinc sample `sinc(2*fc*tau) * I0(beta*sqrt(1-(tau/half)^2))/I0(beta)`
+/// at normalized offset `tau` (shared by steep upsamplers and anti-aliasing decimators, D7).
+#[inline]
+pub(crate) fn kaiser_sinc_dd(
+    tau: Dd,
+    fc_dd: Dd,
+    half_dd: Dd,
+    beta_dd: Dd,
+    inv_i0_beta: Dd,
+) -> Dd {
+    let sinc_dd = if tau.to_f64().abs() < 1e-15 {
+        fc_dd.add(fc_dd)
+    } else {
+        let x = DD_TWO_PI.mul(fc_dd).mul(tau);
+        let (sin_x, _) = x.sin_cos();
+        sin_x.div(DD_PI.mul(tau))
+    };
+    let r = tau.div(half_dd);
+    if r.to_f64().abs() >= 1.0 {
+        return Dd::from_f64(0.0);
+    }
+    let rad = DD_ONE.sub(r.sqr());
+    let win = if rad.hi > 0.0 {
+        dd_bessel_i0(beta_dd.mul(rad.sqrt())).mul(inv_i0_beta)
+    } else {
+        inv_i0_beta
+    };
+    sinc_dd.mul(win)
+}
+
 /// Direct polyphase vs FFT/UPOLS crossover threshold in taps per phase (`UPSAMPLING_RESEARCH.md` §4.2).
 pub const DIRECT_POLYPHASE_MAX_TAPS_PER_PHASE: usize = 2_048;
 
@@ -665,7 +702,7 @@ impl KaiserFilterSpec {
         let beta = KAISER_STEEP_BETA;
 
         // Empirical Kaiser transition width (UPS §4.1) with slight margin so -200 dB hits <= f_stop.
-        let delta_f = (a_db - 7.95) * fs_out / (14.36 * (num_taps as f64));
+        let delta_f = kaiser_transition_width_norm(a_db, num_taps) * fs_out;
         let mut effective_nyquist_hz = effective_nyquist_hz.filter(|&f| {
             !(source_rate_hz >= DR1_MIN_SOURCE_RATE_HZ && (f as f64) <= DR1_MIN_PASSBAND_HZ * 1.02)
         });
@@ -1038,29 +1075,19 @@ pub fn design_kaiser_filter(spec: KaiserFilterSpec) -> DesignedFilter {
     let ratio = spec.ratio;
 
     let ratio_dd = Dd::from_f64(ratio as f64);
-    let fc_dd = Dd::from_f64(spec.fc_hz);
-    let fs_out_dd = Dd::from_f64(fs_out);
-    let omega_c = DD_TWO_PI.mul(fc_dd).div(fs_out_dd);
+    let fc_norm_dd = Dd::from_f64(spec.fc_hz).div(Dd::from_f64(fs_out));
     let beta_dd = Dd::from_f64(spec.beta);
     let inv_i0_beta = DD_ONE.div(dd_bessel_i0(beta_dd));
-    let inv_center_dd = DD_ONE.div(Dd::from_f64(center as f64));
+    let center_dd = Dd::from_f64(center as f64);
 
     let mut half_vals = vec![0.0_f64; center + 1];
-    half_vals[0] = ratio_dd.mul(fc_dd.mul_f64(2.0).div(fs_out_dd)).to_f64();
+    half_vals[0] = ratio_dd.mul(fc_norm_dd.mul_f64(2.0)).to_f64();
 
     let eval_slice = |out: &mut [f64], k_start: usize| {
         for (idx, slot) in out.iter_mut().enumerate() {
-            let k = (k_start + idx) as f64;
-            let k_dd = Dd::from_f64(k);
-            let sinc_val = omega_c.mul_f64(k).sin().div(DD_PI.mul(k_dd));
-            let x = k_dd.mul(inv_center_dd);
-            let rad = DD_ONE.sub(x.sqr());
-            let win = if rad.hi > 0.0 {
-                dd_bessel_i0(beta_dd.mul(rad.sqrt())).mul(inv_i0_beta)
-            } else {
-                inv_i0_beta
-            };
-            *slot = ratio_dd.mul(sinc_val).mul(win).to_f64();
+            let k_dd = Dd::from_f64((k_start + idx) as f64);
+            let sample = kaiser_sinc_dd(k_dd, fc_norm_dd, center_dd, beta_dd, inv_i0_beta);
+            *slot = ratio_dd.mul(sample).to_f64();
         }
     };
 
@@ -1837,9 +1864,10 @@ pub struct PolyphaseFirUpsampler {
     target_rate_hz: u32,
     ratio: usize,
     taps_per_phase: usize,
+    total_taps: usize,
     pad_tail: usize,
     bank: Arc<Vec<Vec<f64>>>,
-    metrics: FilterDesignMetrics,
+    metrics: Option<FilterDesignMetrics>,
     identity: FilterIdentity,
     hist_l: Vec<f64>,
     hist_r: Vec<f64>,
@@ -1861,9 +1889,10 @@ impl PolyphaseFirUpsampler {
             target_rate_hz: designed.target_rate_hz,
             ratio: designed.ratio,
             taps_per_phase: designed.taps_per_phase,
+            total_taps: designed.metrics.num_taps,
             pad_tail: designed.pad_tail,
             bank: Arc::clone(&designed.bank),
-            metrics: designed.metrics,
+            metrics: Some(designed.metrics),
             identity: designed.identity,
             hist_l: vec![0.0_f64; lead],
             hist_r: vec![0.0_f64; lead],
@@ -1885,11 +1914,11 @@ impl Upsampler for PolyphaseFirUpsampler {
     }
 
     fn total_taps(&self) -> usize {
-        self.metrics.num_taps
+        self.total_taps
     }
 
     fn design_metrics(&self) -> Option<FilterDesignMetrics> {
-        Some(self.metrics)
+        self.metrics
     }
 
     fn identity(&self) -> FilterIdentity {
@@ -2015,21 +2044,10 @@ impl Upsampler for PolyphaseFirUpsampler {
 
 /// Legacy test-only stateful polyphase Kaiser-windowed sinc `f64` upsampler (`--filter simple-test`).
 ///
-/// Retained strictly for regression/comparison testing now that `gauss-long-lp` and
-/// `gauss-hires-lp` are the active default upsamplers.
+/// Review #9 D8: delegates directly to [`PolyphaseFirUpsampler`] rather than duplicating its
+/// streaming/gapless state machine.
 #[derive(Debug)]
-pub struct SimpleWindowedSincUpsampler {
-    source_rate_hz: u32,
-    ratio: usize,
-    taps_per_phase: usize,
-    bank: Arc<Vec<Vec<f64>>>,
-    identity: FilterIdentity,
-    hist_l: Vec<f64>,
-    hist_r: Vec<f64>,
-    total_in_frames: usize,
-    has_incoming_carryover: bool,
-    flushed: bool,
-}
+pub struct SimpleWindowedSincUpsampler(PolyphaseFirUpsampler);
 
 impl SimpleWindowedSincUpsampler {
     pub fn new(source_rate_hz: u32, ratio: usize, taps_per_phase: usize) -> Self {
@@ -2049,163 +2067,67 @@ impl SimpleWindowedSincUpsampler {
             sigma_f_hz_bits: beta.to_bits(),
             effective_nyquist_hz: None,
         };
-        // Pre-seed history with `half - 1` leading zeros so tap `j = 0` (`k = half - 1`) aligns
-        // strictly with `x[0]`, and taps `j in -half + 1 ..= half` are centered symmetrically.
+        // Pre-seed history with `half - 1` leading zeros (`pad_tail = half`, so
+        // `(half - 1) + half = m - 1` -> exact `total_in_frames * ratio` output samples).
         let lead = half - 1;
-        Self {
+        Self(PolyphaseFirUpsampler {
+            name: "simple-test",
             source_rate_hz,
+            target_rate_hz,
             ratio,
             taps_per_phase: m,
+            total_taps: ratio * m,
+            pad_tail: half,
             bank,
+            metrics: None,
             identity,
             hist_l: vec![0.0_f64; lead],
             hist_r: vec![0.0_f64; lead],
             total_in_frames: 0,
             has_incoming_carryover: false,
             flushed: false,
-        }
+        })
     }
 
     /// Expose polyphase coefficient bank for mathematical symmetry & response inspection.
     pub fn polyphase_bank(&self) -> &[Vec<f64>] {
-        &self.bank
+        self.0.polyphase_bank()
     }
 }
 
 impl Upsampler for SimpleWindowedSincUpsampler {
     fn name(&self) -> &'static str {
-        "simple-test"
+        self.0.name()
     }
-
     fn total_taps(&self) -> usize {
-        self.ratio * self.taps_per_phase
+        self.0.total_taps()
     }
-
+    fn design_metrics(&self) -> Option<FilterDesignMetrics> {
+        self.0.design_metrics()
+    }
     fn identity(&self) -> FilterIdentity {
-        self.identity
+        self.0.identity()
     }
-
     fn process_block(&mut self, input: StereoF64Buffer) -> Result<StereoF64Buffer, String> {
-        if self.flushed {
-            return Err("simple-test upsampler cannot accept blocks after flush()".to_string());
-        }
-        if input.left.len() != input.right.len() {
-            return Err("stereo f64 buffer L/R length mismatch".to_string());
-        }
-        if input.sample_rate_hz != self.source_rate_hz {
-            return Err(format!(
-                "simple-test upsampler sample rate mismatch: expected {} Hz, got {} Hz",
-                self.source_rate_hz, input.sample_rate_hz
-            ));
-        }
-        let out_rate = self.source_rate_hz * (self.ratio as u32);
-        if input.is_empty() {
-            return Ok(StereoF64Buffer::empty(out_rate));
-        }
-
-        self.total_in_frames += input.left.len();
-        self.hist_l.extend_from_slice(&input.left);
-        self.hist_r.extend_from_slice(&input.right);
-
-        let (left, right) = convolve_polyphase_bank(
-            &self.bank,
-            self.ratio,
-            self.taps_per_phase,
-            &mut self.hist_l,
-            &mut self.hist_r,
-        );
-        Ok(StereoF64Buffer {
-            sample_rate_hz: out_rate,
-            left,
-            right,
-        })
+        self.0.process_block(input)
     }
-
     fn flush(&mut self) -> Result<StereoF64Buffer, String> {
-        let out_rate = self.source_rate_hz * (self.ratio as u32);
-        if self.flushed || (self.total_in_frames == 0 && !self.has_incoming_carryover) {
-            self.flushed = true;
-            return Ok(StereoF64Buffer::empty(out_rate));
-        }
-        self.flushed = true;
-
-        // Append `half` trailing zeros (`half - 1` leading + `half` trailing = `m - 1`
-        // -> exact `total_in_frames` windows -> exact `total_in_frames * ratio` output samples).
-        let pad_tail = self.taps_per_phase / 2;
-        if pad_tail > 0 {
-            self.hist_l.resize(self.hist_l.len() + pad_tail, 0.0_f64);
-            self.hist_r.resize(self.hist_r.len() + pad_tail, 0.0_f64);
-        }
-
-        let (left, right) = convolve_polyphase_bank(
-            &self.bank,
-            self.ratio,
-            self.taps_per_phase,
-            &mut self.hist_l,
-            &mut self.hist_r,
-        );
-        self.hist_l.clear();
-        self.hist_r.clear();
-        Ok(StereoF64Buffer {
-            sample_rate_hz: out_rate,
-            left,
-            right,
-        })
+        self.0.flush()
     }
-
     fn set_incoming_carryover(
         &mut self,
         carryover: UpsamplerCarryover,
     ) -> Result<(), UpsamplerCarryover> {
-        if self.flushed
-            || self.total_in_frames != 0
-            || carryover.identity != self.identity
-            || carryover.source_rate_hz != self.source_rate_hz
-            || carryover.ratio != self.ratio
-            || carryover.taps_per_phase != self.taps_per_phase
-            || carryover.hist_l.len() != carryover.hist_r.len()
-            || carryover.hist_l.len() >= self.taps_per_phase
-        {
-            return Err(carryover);
-        }
-        self.hist_l = carryover.hist_l;
-        self.hist_r = carryover.hist_r;
-        self.has_incoming_carryover = true;
-        Ok(())
+        self.0.set_incoming_carryover(carryover)
     }
-
     fn flush_for_gapless(&mut self) -> Result<(StereoF64Buffer, Option<UpsamplerCarryover>), String> {
-        let out_rate = self.source_rate_hz * (self.ratio as u32);
-        if self.flushed || (self.total_in_frames == 0 && !self.has_incoming_carryover) {
-            self.flushed = true;
-            return Ok((StereoF64Buffer::empty(out_rate), None));
-        }
-        self.flushed = true;
-        let hist_l = core::mem::take(&mut self.hist_l);
-        let hist_r = core::mem::take(&mut self.hist_r);
-        if hist_l.is_empty() {
-            return Ok((StereoF64Buffer::empty(out_rate), None));
-        }
-        Ok((
-            StereoF64Buffer::empty(out_rate),
-            Some(UpsamplerCarryover {
-                identity: self.identity,
-                source_rate_hz: self.source_rate_hz,
-                target_rate_hz: out_rate,
-                ratio: self.ratio,
-                taps_per_phase: self.taps_per_phase,
-                pad_tail: self.taps_per_phase / 2,
-                bank: Arc::clone(&self.bank),
-                hist_l,
-                hist_r,
-            }),
-        ))
+        self.0.flush_for_gapless()
     }
 }
 
 /// Zeroth-order modified Bessel function of the first kind `I_0(x)` computed in pure `f64`
-/// to full machine precision (`~1e-16` relative accuracy).
-fn bessel_i0(x: f64) -> f64 {
+/// to full machine precision (`~1e-16` relative accuracy; shared with `analysis.rs`, D7).
+pub(crate) fn bessel_i0_f64(x: f64) -> f64 {
     let half_x = 0.5 * x;
     let y = half_x * half_x;
     let mut sum = 1.0_f64;
@@ -2246,7 +2168,7 @@ fn kaiser_params_for_taps_per_phase(m: usize) -> (f64, f64) {
 fn build_polyphase_bank(ratio: usize, m: usize) -> Vec<Vec<f64>> {
     let half = (m / 2) as isize;
     let (cutoff, beta) = kaiser_params_for_taps_per_phase(m);
-    let inv_i0_beta = 1.0 / bessel_i0(beta);
+    let inv_i0_beta = 1.0 / bessel_i0_f64(beta);
     let radius = (m as f64) * 0.5;
 
     let mut bank = Vec::with_capacity(ratio);
@@ -2267,7 +2189,7 @@ fn build_polyphase_bank(ratio: usize, m: usize) -> Vec<Vec<f64>> {
             let win = if dt.abs() < radius {
                 let x = dt / radius;
                 let arg = beta * (1.0 - x * x).max(0.0).sqrt();
-                bessel_i0(arg) * inv_i0_beta
+                bessel_i0_f64(arg) * inv_i0_beta
             } else {
                 0.0
             };

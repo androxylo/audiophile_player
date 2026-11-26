@@ -56,7 +56,12 @@ pub struct GaplessCarryover {
     pub upsampler: Option<UpsamplerCarryover>,
     /// Optional 50/15 µs de-emphasis IIR state carried across equal-rate gapless transitions.
     pub deemphasis: Option<DeemphasisCarryover>,
+    /// Internal `8fS` REW convolution tail (normal-mode gapless handoff into next track's convolver).
     pub convolver: Option<ConvolutionTail>,
+    /// Pre-scaled output-rate (`output_rate_hz`) strictly additive tail `z_A[n]` exported by
+    /// Ultimate Mode (`OQ-40`) to overlap-add right before quantization without touching Track B's
+    /// convolver or downsampler (Review #9 D6: kept strictly separate from `convolver`).
+    pub additive_output_tail: Option<ConvolutionTail>,
     /// Optional last-stage `f64` downsampler FIR state carried across equal-rate gapless transitions.
     pub downsampler: Option<DownsamplerCarryover>,
     /// Continuous PRNG + per-channel error-feedback shaper state preserved across equal-rate
@@ -66,14 +71,23 @@ pub struct GaplessCarryover {
 
 impl GaplessCarryover {
     pub fn is_empty(&self) -> bool {
-        self.upsampler.is_none() && self.convolver.is_none() && self.downsampler.is_none()
+        self.upsampler.is_none()
+            && self.convolver.is_none()
+            && self.additive_output_tail.is_none()
+            && self.downsampler.is_none()
     }
 
-    /// Maximum absolute amplitude (`0.0` if absent) of any carried REW convolution tail.
+    /// Maximum absolute amplitude (`0.0` if absent) of any carried REW / additive convolution tail.
     pub fn convolver_tail_peak_linear(&self) -> f64 {
-        self.convolver
+        let c = self
+            .convolver
             .as_ref()
-            .map_or(0.0, ConvolutionTail::peak_linear)
+            .map_or(0.0, ConvolutionTail::peak_linear);
+        let a = self
+            .additive_output_tail
+            .as_ref()
+            .map_or(0.0, ConvolutionTail::peak_linear);
+        c.max(a)
     }
 
     /// Maximum absolute amplitude (`0.0` if absent) of any carried unpadded upsampler FIR history.
@@ -401,25 +415,8 @@ impl StreamingPipelineSession {
         }
     }
 
-    /// Run Stages 2 -> 2.5 -> 3 -> 4 -> 4.5 (`upsampler -> deemphasis -> convolver -> delayer ->
-    /// last-stage downsampler`) at **unity gain (`1.0`)** in pure `f64`, without quantizing yet.
-    ///
-    /// Used by Ultimate Mode `W2` and `W4` so the exact unity-gain post-chain peak (`M30` / `M`)
-    /// is measured in a **single linear pass** right before the single quantizer (zero double-rendering!)
-    /// and Track B's calculations remain 100% independent of Track A (`OQ-40`).
-    pub fn process_block_unity_f64(
-        &mut self,
-        block: StereoF64Buffer,
-    ) -> Result<StereoF64Buffer, String> {
-        if block.is_empty() {
-            return Ok(StereoF64Buffer::empty(self.report.output_rate_hz));
-        }
-        let block = self.upsampler.process_block(block)?;
-        if block.is_empty() {
-            return Ok(StereoF64Buffer::empty(self.report.output_rate_hz));
-        }
-        let block = self.deemphasis.process_block(block)?;
-        let block = self.convolver.process_block(block)?;
+    /// Shared Stage 4 -> 4.5 (`delayer -> downsampler`) post-convolver chain helper (Review #9 D4).
+    fn post_conv(&mut self, block: StereoF64Buffer) -> Result<StereoF64Buffer, String> {
         if block.is_empty() {
             return Ok(StereoF64Buffer::empty(self.report.output_rate_hz));
         }
@@ -430,45 +427,88 @@ impl StreamingPipelineSession {
         self.downsampler.process_block(block)
     }
 
+    /// Shared Stage 2.5 -> 3 -> 4 -> 4.5 (`deemph -> convolver -> delayer -> downsampler`) helper (D4).
+    fn post_upsampler(&mut self, block: StereoF64Buffer) -> Result<StereoF64Buffer, String> {
+        if block.is_empty() {
+            return Ok(StereoF64Buffer::empty(self.report.output_rate_hz));
+        }
+        let block = self.deemphasis.process_block(block)?;
+        let block = self.convolver.process_block(block)?;
+        self.post_conv(block)
+    }
+
+    /// Shared `GaplessCarryover` constructor (Review #9 D4 + D6).
+    fn build_carryover(
+        &self,
+        upsampler: Option<UpsamplerCarryover>,
+        deemphasis: Option<DeemphasisCarryover>,
+        convolver: Option<ConvolutionTail>,
+        additive_output_tail: Option<ConvolutionTail>,
+        downsampler: Option<DownsamplerCarryover>,
+    ) -> Option<GaplessCarryover> {
+        let has_shaper_state = !self.quantizer.coeffs().is_empty();
+        if upsampler.is_none()
+            && convolver.is_none()
+            && additive_output_tail.is_none()
+            && downsampler.is_none()
+            && deemphasis.is_none()
+            && !has_shaper_state
+        {
+            return None;
+        }
+        let quantizer_state = if self.report.effective_shaper != NoiseShaperProfile::Bypass {
+            Some(self.quantizer.export_state())
+        } else {
+            None
+        };
+        Some(GaplessCarryover {
+            internal_rate_hz: self.report.internal_rate_hz,
+            output_rate_hz: self.report.output_rate_hz,
+            output_bits: self.report.output_bits,
+            effective_shaper: self.report.effective_shaper,
+            upsampler,
+            deemphasis,
+            convolver,
+            additive_output_tail,
+            downsampler,
+            quantizer_state,
+        })
+    }
+
+    /// Run Stages 2 -> 2.5 -> 3 -> 4 -> 4.5 (`upsampler -> deemphasis -> convolver -> delayer ->
+    /// last-stage downsampler`) at **unity gain (`1.0`)** in pure `f64`, without quantizing yet.
+    pub fn process_block_unity_f64(
+        &mut self,
+        block: StereoF64Buffer,
+    ) -> Result<StereoF64Buffer, String> {
+        if block.is_empty() {
+            return Ok(StereoF64Buffer::empty(self.report.output_rate_hz));
+        }
+        let block = self.upsampler.process_block(block)?;
+        self.post_upsampler(block)
+    }
+
     /// Flush the unity-gain linear chain cleanly at EOF (non-gapless single-track or end-of-queue).
     pub fn flush_unity_f64(&mut self) -> Result<StereoF64Buffer, String> {
         let rate = self.report.output_rate_hz;
         let mut out_l = Vec::new();
         let mut out_r = Vec::new();
+        let mut emit = |buf: StereoF64Buffer| {
+            if !buf.is_empty() {
+                out_l.extend_from_slice(&buf.left);
+                out_r.extend_from_slice(&buf.right);
+            }
+        };
 
         let up_tail = self.upsampler.flush()?;
-        if !up_tail.is_empty() {
-            let de_out = self.deemphasis.process_block(up_tail)?;
-            let c_out = self.convolver.process_block(de_out)?;
-            if !c_out.is_empty() {
-                let d_out = self.delayer.process_block(c_out)?;
-                if !d_out.is_empty() {
-                    let ds_out = self.downsampler.process_block(d_out)?;
-                    out_l.extend_from_slice(&ds_out.left);
-                    out_r.extend_from_slice(&ds_out.right);
-                }
-            }
-        }
+        emit(self.post_upsampler(up_tail)?);
         let conv_tail = self.convolver.flush()?;
-        if !conv_tail.is_empty() {
-            let d_out = self.delayer.process_block(conv_tail)?;
-            if !d_out.is_empty() {
-                let ds_out = self.downsampler.process_block(d_out)?;
-                out_l.extend_from_slice(&ds_out.left);
-                out_r.extend_from_slice(&ds_out.right);
-            }
-        }
+        emit(self.post_conv(conv_tail)?);
         let delay_tail = self.delayer.flush()?;
         if !delay_tail.is_empty() {
-            let ds_out = self.downsampler.process_block(delay_tail)?;
-            out_l.extend_from_slice(&ds_out.left);
-            out_r.extend_from_slice(&ds_out.right);
+            emit(self.downsampler.process_block(delay_tail)?);
         }
-        let down_tail = self.downsampler.flush()?;
-        if !down_tail.is_empty() {
-            out_l.extend_from_slice(&down_tail.left);
-            out_r.extend_from_slice(&down_tail.right);
-        }
+        emit(self.downsampler.flush()?);
         Ok(StereoF64Buffer {
             sample_rate_hz: rate,
             left: out_l,
@@ -478,10 +518,9 @@ impl StreamingPipelineSession {
 
     /// Flush the unity-gain linear chain at EOF for gapless continuity (`OQ-40` strict independence):
     /// - Returns `(ending_unity_f64, peak_over_ending_and_tail_unity, Option<GaplessCarryover>)`.
-    /// - Any exported `ConvolutionTail` is pre-scaled by THIS track's fixed whole-track `fixed_gain_db`
-    ///   (and decimated to `output_rate_hz` when last-stage downsampling is active) so the next track
-    ///   receives Track A's exact already-gained decay `z_A[n]` as strictly additive output-only audio
-    ///   right before quantization.
+    /// - Any exported tail is pre-scaled by THIS track's fixed whole-track `fixed_gain_db` (and
+    ///   decimated to `output_rate_hz` when last-stage downsampling is active) and stored in
+    ///   `GaplessCarryover::additive_output_tail` (D6) so Track B adds `z_A[n]` strictly at output rate.
     pub fn flush_for_gapless_unity_f64(
         &mut self,
         fixed_gain_db: f64,
@@ -490,47 +529,28 @@ impl StreamingPipelineSession {
         let out_rate = self.report.output_rate_hz;
         let mut out_l = Vec::new();
         let mut out_r = Vec::new();
+        let mut emit = |buf: StereoF64Buffer| {
+            if !buf.is_empty() {
+                out_l.extend_from_slice(&buf.left);
+                out_r.extend_from_slice(&buf.right);
+            }
+        };
 
         // Flush upsampler completely at track boundary so Track A and Track B never splice FIR
         // histories when their independent filters or fixed gains differ (`OQ-40`).
         let up_tail = self.upsampler.flush()?;
-        if !up_tail.is_empty() {
-            let de_out = self.deemphasis.process_block(up_tail)?;
-            let c_out = self.convolver.process_block(de_out)?;
-            if !c_out.is_empty() {
-                let d_out = self.delayer.process_block(c_out)?;
-                if !d_out.is_empty() {
-                    let ds_out = self.downsampler.process_block(d_out)?;
-                    out_l.extend_from_slice(&ds_out.left);
-                    out_r.extend_from_slice(&ds_out.right);
-                }
-            }
-        }
+        emit(self.post_upsampler(up_tail)?);
         let (track_end, mut conv_tail) = self.convolver.flush_split_tail()?;
-        if !track_end.is_empty() {
-            let d_out = self.delayer.process_block(track_end)?;
-            if !d_out.is_empty() {
-                let ds_out = self.downsampler.process_block(d_out)?;
-                out_l.extend_from_slice(&ds_out.left);
-                out_r.extend_from_slice(&ds_out.right);
-            }
-        }
+        emit(self.post_conv(track_end)?);
         let delay_tail = self.delayer.flush()?;
         if !delay_tail.is_empty() {
-            let ds_out = self.downsampler.process_block(delay_tail)?;
-            out_l.extend_from_slice(&ds_out.left);
-            out_r.extend_from_slice(&ds_out.right);
+            emit(self.downsampler.process_block(delay_tail)?);
         }
 
-        // When last-stage downsampling is active, render Track A's decaying REW tail through
-        // Track A's own downsampler into `output_rate_hz` so Track B receives a strictly additive
-        // `z_A[n]` at `output_rate_hz` with zero cross-track coupling.
-        //
-        // Review #9 D1: the decimator lags its input by `half` samples, so before feeding
-        // `conv_tail` we record `pending_a_out` — the exact number of output frames belonging to
-        // Track A's own already-pushed samples (`ceil(N_A * L / M)` total). Only the outputs
-        // AFTER `pending_a_out` (driven by `conv_tail`) become the additive tail `z_A[n]`!
-        if !self.downsampler.is_bypass() {
+        // Review #9 D1: when last-stage downsampling is active, split combined decimator output at
+        // `pending_a_out` so Track A's own trailing `half/D` samples stay in `out_l/out_r` and only
+        // outputs driven by `conv_tail` enter `additive_tail` at `out_rate`!
+        let mut additive_tail = if !self.downsampler.is_bypass() {
             let pending_a_out = self.downsampler.pending_flush_frames();
             let mut combined_l = Vec::new();
             let mut combined_r = Vec::new();
@@ -551,26 +571,32 @@ impl StreamingPipelineSession {
             out_l.extend_from_slice(&combined_l[..split]);
             out_r.extend_from_slice(&combined_r[..split]);
             if split < combined_l.len() {
-                conv_tail = Some(ConvolutionTail {
+                Some(ConvolutionTail {
                     sample_rate_hz: out_rate,
                     left: combined_l[split..].to_vec(),
                     right: combined_r[split..].to_vec(),
-                });
+                })
+            } else {
+                None
             }
-        }
+        } else {
+            conv_tail.map(|mut ct| {
+                ct.sample_rate_hz = out_rate;
+                ct
+            })
+        };
 
-        // Measure unity-gain peak over BOTH ending frames and the unscaled convolution/downsampler tail
-        // so cached whole-track `M` covers the entire impulse response!
+        // Measure unity-gain peak over BOTH ending frames and the unscaled additive tail.
         let mut tail_peak_unity = 0.0_f64;
         for &s in out_l.iter().chain(out_r.iter()) {
             tail_peak_unity = tail_peak_unity.max(s.abs());
         }
-        if let Some(ref ct) = conv_tail {
+        if let Some(ref ct) = additive_tail {
             tail_peak_unity = tail_peak_unity.max(ct.peak_linear());
         }
 
-        // Pre-scale exported `conv_tail` by this track's fixed gain `G` so it becomes `z_A[n]`.
-        if let Some(ref mut ct) = conv_tail {
+        // Pre-scale exported `additive_tail` by this track's fixed gain `G` so it becomes `z_A[n]`.
+        if let Some(ref mut ct) = additive_tail {
             let g_lin = if fixed_gain_db.is_finite() && fixed_gain_db < 0.0 {
                 10.0_f64.powf(fixed_gain_db / 20.0)
             } else {
@@ -586,28 +612,7 @@ impl StreamingPipelineSession {
             }
         }
 
-        let has_shaper_state = !self.quantizer.coeffs().is_empty();
-        let carryover = if conv_tail.is_some() || has_shaper_state {
-            let quantizer_state = if self.report.effective_shaper != NoiseShaperProfile::Bypass {
-                Some(self.quantizer.export_state())
-            } else {
-                None
-            };
-            Some(GaplessCarryover {
-                internal_rate_hz: internal_rate,
-                output_rate_hz: out_rate,
-                output_bits: self.report.output_bits,
-                effective_shaper: self.report.effective_shaper,
-                upsampler: None,
-                deemphasis: None,
-                convolver: conv_tail,
-                downsampler: None,
-                quantizer_state,
-            })
-        } else {
-            None
-        };
-
+        let carryover = self.build_carryover(None, None, None, additive_tail, None);
         Ok((
             StereoF64Buffer {
                 sample_rate_hz: out_rate,
@@ -658,41 +663,12 @@ impl StreamingPipelineSession {
         if block.is_empty() {
             return Ok(InterleavedInt32Buffer::empty(self.report.output_rate_hz));
         }
-
-        // Stage 1: Hardcoded -3 dB / 0 dB headroom (`G_up`) + excess-only scaling (`S` / `S_B`)
-        // folded in pure `f64` before the linear upsampler and convolver (Review #5 Findings #4 &
-        // #14: guarantees Track A's carried upsampler history and REW tail carry A's exact gain
-        // across FullHandoff / ConvolverOnlyHandoff / drain AND applies `S` for NullConvolver).
         apply_safe_gain_f64(&mut block, self.report.headroom.total_gain_db())?;
-
-        // Stage 2: Dynamic per-track stateful f64 upsampler (or zero-copy NullUpsampler).
         let block = self.upsampler.process_block(block)?;
+        let block = self.post_upsampler(block)?;
         if block.is_empty() {
             return Ok(InterleavedInt32Buffer::empty(self.report.output_rate_hz));
         }
-
-        // Stage 2.5 (§4.1): Optional zero-latency f64 50/15 µs de-emphasis (post-upsampler, pre-REW).
-        let block = self.deemphasis.process_block(block)?;
-
-        // Stage 3: Stateful REW stereo convolution in f64 (currently NullConvolver).
-        let block = self.convolver.process_block(block)?;
-        if block.is_empty() {
-            return Ok(InterleavedInt32Buffer::empty(self.report.output_rate_hz));
-        }
-
-        // Stage 4: Stateful per-channel room delay in f64 (currently NullChannelDelayer).
-        let block = self.delayer.process_block(block)?;
-        if block.is_empty() {
-            return Ok(InterleavedInt32Buffer::empty(self.report.output_rate_hz));
-        }
-
-        // Stage 4.5: Optional last-stage pure-f64 anti-aliasing downsampler (zero-copy bypass at 8fS).
-        let block = self.downsampler.process_block(block)?;
-        if block.is_empty() {
-            return Ok(InterleavedInt32Buffer::empty(self.report.output_rate_hz));
-        }
-
-        // Stage 5: Single final f64 -> i32 quantization at the DAC wire sample rate.
         Ok(self.quantizer.quantize_block(&block))
     }
 
@@ -710,11 +686,14 @@ impl StreamingPipelineSession {
     ) -> Result<(), GaplessCarryover> {
         if carryover.internal_rate_hz != self.report.internal_rate_hz
             || carryover.output_rate_hz != self.report.output_rate_hz
+            || carryover.additive_output_tail.is_some()
         {
             return Err(carryover);
         }
-        if carryover.convolver.is_some() && !self.convolver.accepts_tail() {
-            return Err(carryover);
+        if let Some(ref ct) = carryover.convolver {
+            if !self.convolver.accepts_tail() || ct.sample_rate_hz != self.report.internal_rate_hz {
+                return Err(carryover);
+            }
         }
         if let Some(up) = carryover.upsampler.take() {
             if let Err(rejected_up) = self.upsampler.set_incoming_carryover(up) {
@@ -734,8 +713,6 @@ impl StreamingPipelineSession {
         if let Some(conv) = carryover.convolver.take() {
             self.convolver.set_incoming_tail(conv);
         }
-        // §6.4: Preserve PRNG + error-feedback shaper state across equal-rate gapless transitions
-        // when the effective shaper profile and bit depth match; reset cleanly otherwise.
         if let Some(q_state) = carryover.quantizer_state.take() {
             if carryover.effective_shaper == self.report.effective_shaper
                 && carryover.output_bits == self.report.output_bits
@@ -746,55 +723,31 @@ impl StreamingPipelineSession {
         Ok(())
     }
 
-    /// Flush all stateful FIR / convolution / delay / downsampler tails cleanly at end-of-track
-    /// (emits the full decaying convolution tail — ideal for single-file playback and end-of-queue).
+    /// Flush all stateful FIR / convolution / delay / downsampler tails cleanly at end-of-track.
     pub fn flush(&mut self) -> Result<InterleavedInt32Buffer, String> {
         let mut frames = Vec::new();
         let rate = self.report.output_rate_hz;
-
-        // 1. Flush upsampler tail -> de-emphasis -> convolver -> delayer -> downsampler -> quantizer.
         let up_tail = self.upsampler.flush()?;
-        if !up_tail.is_empty() {
-            let de_out = self.deemphasis.process_block(up_tail)?;
-            let c_out = self.convolver.process_block(de_out)?;
-            if !c_out.is_empty() {
-                let d_out = self.delayer.process_block(c_out)?;
-                if !d_out.is_empty() {
-                    let ds_out = self.downsampler.process_block(d_out)?;
-                    if !ds_out.is_empty() {
-                        frames.extend(self.quantizer.quantize_block(&ds_out).frames);
-                    }
-                }
-            }
+        let b1 = self.post_upsampler(up_tail)?;
+        if !b1.is_empty() {
+            frames.extend(self.quantizer.quantize_block(&b1).frames);
         }
-
-        // 2. Flush convolver tail -> delayer -> downsampler -> quantizer.
         let conv_tail = self.convolver.flush()?;
-        if !conv_tail.is_empty() {
-            let d_out = self.delayer.process_block(conv_tail)?;
-            if !d_out.is_empty() {
-                let ds_out = self.downsampler.process_block(d_out)?;
-                if !ds_out.is_empty() {
-                    frames.extend(self.quantizer.quantize_block(&ds_out).frames);
-                }
-            }
+        let b2 = self.post_conv(conv_tail)?;
+        if !b2.is_empty() {
+            frames.extend(self.quantizer.quantize_block(&b2).frames);
         }
-
-        // 3. Flush delayer tail -> downsampler -> quantizer.
         let delay_tail = self.delayer.flush()?;
         if !delay_tail.is_empty() {
-            let ds_out = self.downsampler.process_block(delay_tail)?;
-            if !ds_out.is_empty() {
-                frames.extend(self.quantizer.quantize_block(&ds_out).frames);
+            let b3 = self.downsampler.process_block(delay_tail)?;
+            if !b3.is_empty() {
+                frames.extend(self.quantizer.quantize_block(&b3).frames);
             }
         }
-
-        // 4. Flush last-stage downsampler tail -> quantizer.
         let down_tail = self.downsampler.flush()?;
         if !down_tail.is_empty() {
             frames.extend(self.quantizer.quantize_block(&down_tail).frames);
         }
-
         Ok(InterleavedInt32Buffer {
             sample_rate_hz: rate,
             frames,
@@ -802,87 +755,38 @@ impl StreamingPipelineSession {
     }
 
     /// Flush end-of-track audio for gapless album continuity: skips trailing zero-padding on the
-    /// polyphase upsampler and optional last-stage downsampler, emits the exact convolved frames
-    /// ready so far, and returns the unpadded FIR histories + decaying REW convolution tail as
-    /// [`GaplessCarryover`] so the next equal-rate track continues with zero boundary dip or click.
+    /// polyphase upsampler and optional last-stage downsampler, emits ready frames, and returns
+    /// unpadded FIR histories + decaying REW convolution tail as [`GaplessCarryover`].
     pub fn flush_for_gapless(
         &mut self,
     ) -> Result<(InterleavedInt32Buffer, Option<GaplessCarryover>), String> {
         let mut frames = Vec::new();
-        let internal_rate = self.report.internal_rate_hz;
         let out_rate = self.report.output_rate_hz;
 
-        // 1. Hand off unpadded upsampler FIR history (no trailing zero-pad for equal-rate gapless).
         let (up_tail, up_carry) = self.upsampler.flush_for_gapless()?;
-        if !up_tail.is_empty() {
-            let de_out = self.deemphasis.process_block(up_tail)?;
-            let c_out = self.convolver.process_block(de_out)?;
-            if !c_out.is_empty() {
-                let d_out = self.delayer.process_block(c_out)?;
-                if !d_out.is_empty() {
-                    let ds_out = self.downsampler.process_block(d_out)?;
-                    if !ds_out.is_empty() {
-                        frames.extend(self.quantizer.quantize_block(&ds_out).frames);
-                    }
-                }
-            }
+        let b1 = self.post_upsampler(up_tail)?;
+        if !b1.is_empty() {
+            frames.extend(self.quantizer.quantize_block(&b1).frames);
         }
-
-        // 2. Complete the already-fed sample count through the convolver and split off its tail.
         let (track_end, conv_tail) = self.convolver.flush_split_tail()?;
-        if !track_end.is_empty() {
-            let d_out = self.delayer.process_block(track_end)?;
-            if !d_out.is_empty() {
-                let ds_out = self.downsampler.process_block(d_out)?;
-                if !ds_out.is_empty() {
-                    frames.extend(self.quantizer.quantize_block(&ds_out).frames);
-                }
-            }
+        let b2 = self.post_conv(track_end)?;
+        if !b2.is_empty() {
+            frames.extend(self.quantizer.quantize_block(&b2).frames);
         }
-
-        // 3. Flush delayer tail -> downsampler -> quantizer.
         let delay_tail = self.delayer.flush()?;
         if !delay_tail.is_empty() {
-            let ds_out = self.downsampler.process_block(delay_tail)?;
-            if !ds_out.is_empty() {
-                frames.extend(self.quantizer.quantize_block(&ds_out).frames);
+            let b3 = self.downsampler.process_block(delay_tail)?;
+            if !b3.is_empty() {
+                frames.extend(self.quantizer.quantize_block(&b3).frames);
             }
         }
-
-        // 4. Hand off unpadded downsampler FIR history (None when bypass at 8fS).
         let (ds_tail, down_carry) = self.downsampler.flush_for_gapless()?;
         if !ds_tail.is_empty() {
             frames.extend(self.quantizer.quantize_block(&ds_tail).frames);
         }
 
         let deemph_state = self.deemphasis.export_state();
-        let has_shaper_state = !self.quantizer.coeffs().is_empty();
-        let carryover = if up_carry.is_some()
-            || conv_tail.is_some()
-            || down_carry.is_some()
-            || deemph_state.is_some()
-            || has_shaper_state
-        {
-            let quantizer_state = if self.report.effective_shaper != NoiseShaperProfile::Bypass {
-                Some(self.quantizer.export_state())
-            } else {
-                None
-            };
-            Some(GaplessCarryover {
-                internal_rate_hz: internal_rate,
-                output_rate_hz: out_rate,
-                output_bits: self.report.output_bits,
-                effective_shaper: self.report.effective_shaper,
-                upsampler: up_carry,
-                deemphasis: deemph_state,
-                convolver: conv_tail,
-                downsampler: down_carry,
-                quantizer_state,
-            })
-        } else {
-            None
-        };
-
+        let carryover = self.build_carryover(up_carry, deemph_state, conv_tail, None, down_carry);
         Ok((
             InterleavedInt32Buffer {
                 sample_rate_hz: out_rate,
@@ -980,91 +884,7 @@ impl AudioPipeline {
         dsp_plan: SelectedDspPlan,
         headroom: HeadroomDecision,
     ) -> Result<StreamingPipelineSession, String> {
-        if !(MIN_SUPPORTED_SOURCE_RATE_HZ..=MAX_SUPPORTED_SOURCE_RATE_HZ)
-            .contains(&spec.sample_rate_hz)
-        {
-            return Err(format!(
-                "{UNSUPPORTED_SAMPLE_RATE_PREFIX} {} Hz is outside the supported {}..={} Hz range",
-                spec.sample_rate_hz, MIN_SUPPORTED_SOURCE_RATE_HZ, MAX_SUPPORTED_SOURCE_RATE_HZ
-            ));
-        }
-
-        let internal_rate = dsp_plan.target_rate_hz;
-        let dac_target = self
-            .dac_capabilities()
-            .resolve_for_internal_rate(internal_rate)?;
-        let out_rate = dac_target.sample_rate_hz;
-        let wire_format = dac_target.wire_format;
-
-        let upsampler = build_upsampler(&dsp_plan)?;
-        let deemphasis = if dsp_plan.deemphasis {
-            StereoDeemphasis::new_50_15us(internal_rate)?
-        } else {
-            StereoDeemphasis::bypass(internal_rate)
-        };
-        let mut convolver = self.convolver_factory.create_for_rate(internal_rate)?;
-        let delayer = self.delayer_factory.create_for_rate(internal_rate)?;
-        let downsampler = build_downsampler(internal_rate, out_rate)?;
-
-        convolver.set_output_scale(1.0);
-
-        let (requested_shaper, output_bits) = resolve_quantizer_profile(
-            &dsp_plan,
-            spec.bits_per_sample,
-            deemphasis.is_enabled(),
-            &headroom,
-            convolver.name(),
-            delayer.name(),
-            out_rate,
-            wire_format,
-            !downsampler.is_bypass(),
-        );
-
-        let quantizer = StreamingQuantizer::with_rate_options(
-            requested_shaper,
-            output_bits,
-            out_rate,
-            dsp_plan.shaper_overridden,
-        )?;
-        let effective_shaper = quantizer.effective_shaper();
-        let conv_desc = if headroom.convolution_scale_db < -1e-6 {
-            format!(
-                "{} [scale {:.2} dB]",
-                convolver.description(),
-                headroom.convolution_scale_db
-            )
-        } else {
-            convolver.description()
-        };
-
-        let report = PipelineReport {
-            source_spec: spec,
-            internal_rate_hz: internal_rate,
-            output_rate_hz: out_rate,
-            wire_format,
-            output_bits,
-            headroom,
-            dsp_plan,
-            filter_metrics: upsampler.design_metrics(),
-            deemphasis_name: deemphasis.name(),
-            convolver_name: convolver.name(),
-            convolver_description: conv_desc,
-            convolver_content_hash: convolver.content_hash().map(str::to_string),
-            delayer_name: delayer.name(),
-            downsampler_name: downsampler.name(),
-            effective_shaper,
-            ultimate_report: None,
-        };
-
-        Ok(StreamingPipelineSession {
-            report,
-            upsampler,
-            deemphasis,
-            convolver,
-            delayer,
-            downsampler,
-            quantizer,
-        })
+        self.build_session(spec, dsp_plan, Some(headroom), None, false)
     }
 
     /// Construct a pipeline with explicit convolver and channel delayer factories.
@@ -1090,48 +910,36 @@ impl AudioPipeline {
         peak_meta: &TrackPeakMetadata,
         is_streaming_source: bool,
     ) -> Result<StreamingPipelineSession, String> {
-        self.start_track_with_tail_hint(spec, peak_meta, is_streaming_source, None)
+        let mut source_info = TrackSourceInfo::from_stream_spec(spec);
+        source_info.is_streaming_source = is_streaming_source;
+        self.start_track_with_source_info(spec, source_info, peak_meta)
     }
 
-    /// Open a fresh stateful [`StreamingPipelineSession`], inspecting an optional incoming
-    /// [`GaplessCarryover`] so Track B's `0 dB` headroom decision accurately accounts for BOTH
-    /// any carried REW convolution tail AND any carried upsampler FIR history that will be
-    /// convolved onto Track B's opening — and never penalizes Track B when output rates differ.
+    /// Open a fresh stateful [`StreamingPipelineSession`] for a gapless continuation track.
+    ///
+    /// Per Review #6 Finding #1, Track B's whole-track gain is kept independent of Track A's
+    /// decaying tail (relying on the pre-dither backstop rather than attenuating all of Track B),
+    /// so this delegates directly to [`Self::start_track`].
     pub fn start_track_for_carryover(
         &self,
         spec: StreamSpec,
         peak_meta: &TrackPeakMetadata,
         is_streaming_source: bool,
-        incoming: Option<&GaplessCarryover>,
+        _incoming: Option<&GaplessCarryover>,
     ) -> Result<StreamingPipelineSession, String> {
-        let hint = incoming.and_then(|c| {
-            let conv_peak = c.convolver_tail_peak_linear();
-            let up_peak = c.upsampler_history_peak_linear();
-            if conv_peak <= 0.0 && up_peak <= 0.0 {
-                return None;
-            }
-            // Conservative combined tail bound: if a REW convolver tail is present, also include
-            // the carried upsampler history peak (scaled by active convolver L1 inside
-            // start_track_with_tail_hint) so Track A's un-convolved final ~half-window samples
-            // cannot push a 0 dB Track B over full scale.
-            Some((c.output_rate_hz, conv_peak, up_peak, c.convolver.is_some()))
-        });
-        self.start_track_internal(spec, peak_meta, is_streaming_source, hint)
+        self.start_track(spec, peak_meta, is_streaming_source)
     }
 
-    /// Open a fresh stateful [`StreamingPipelineSession`], accounting for an optional incoming
-    /// gapless REW convolution tail `(tail_rate_hz, tail_peak_linear)` so Track B's `0 dB`
-    /// headroom decision cannot clip when Track A's decaying tail overlap-adds onto Track B's
-    /// opening samples.
+    /// Open a fresh stateful [`StreamingPipelineSession`] (legacy alias for [`Self::start_track`];
+    /// whole-track `S_B` tail attenuation is intentionally omitted per Review #6 Finding #1).
     pub fn start_track_with_tail_hint(
         &self,
         spec: StreamSpec,
         peak_meta: &TrackPeakMetadata,
         is_streaming_source: bool,
-        incoming_tail_hint: Option<(u32, f64)>,
+        _incoming_tail_hint: Option<(u32, f64)>,
     ) -> Result<StreamingPipelineSession, String> {
-        let hint = incoming_tail_hint.map(|(rate, peak)| (rate, peak, 0.0, peak > 0.0));
-        self.start_track_internal(spec, peak_meta, is_streaming_source, hint)
+        self.start_track(spec, peak_meta, is_streaming_source)
     }
 
     /// Open a fresh stateful [`StreamingPipelineSession`] with full [`TrackSourceInfo`] hooks
@@ -1142,27 +950,19 @@ impl AudioPipeline {
         source_info: TrackSourceInfo,
         peak_meta: &TrackPeakMetadata,
     ) -> Result<StreamingPipelineSession, String> {
-        self.start_track_with_opts(spec, source_info, peak_meta)
+        let is_streaming_source = source_info.is_streaming_source;
+        let dsp_plan = self.picker.select(&source_info);
+        self.build_session(spec, dsp_plan, None, Some(peak_meta), is_streaming_source)
     }
 
-    fn start_track_internal(
+    /// Single shared session constructor used by both normal mode and Ultimate Mode (Review #9 D5).
+    fn build_session(
         &self,
         spec: StreamSpec,
-        peak_meta: &TrackPeakMetadata,
+        dsp_plan: SelectedDspPlan,
+        explicit_headroom: Option<HeadroomDecision>,
+        peak_meta: Option<&TrackPeakMetadata>,
         is_streaming_source: bool,
-        incoming_tail_hint: Option<(u32, f64, f64, bool)>,
-    ) -> Result<StreamingPipelineSession, String> {
-        let _ = incoming_tail_hint;
-        let mut source_info = TrackSourceInfo::from_stream_spec(spec);
-        source_info.is_streaming_source = is_streaming_source;
-        self.start_track_with_opts(spec, source_info, peak_meta)
-    }
-
-    fn start_track_with_opts(
-        &self,
-        spec: StreamSpec,
-        source_info: TrackSourceInfo,
-        peak_meta: &TrackPeakMetadata,
     ) -> Result<StreamingPipelineSession, String> {
         if !(MIN_SUPPORTED_SOURCE_RATE_HZ..=MAX_SUPPORTED_SOURCE_RATE_HZ)
             .contains(&spec.sample_rate_hz)
@@ -1173,8 +973,6 @@ impl AudioPipeline {
             ));
         }
 
-        let is_streaming_source = source_info.is_streaming_source;
-        let dsp_plan = self.picker.select(&source_info);
         let internal_rate = dsp_plan.target_rate_hz;
         let dac_target = self
             .dac_capabilities()
@@ -1192,21 +990,26 @@ impl AudioPipeline {
         let delayer = self.delayer_factory.create_for_rate(internal_rate)?;
         let downsampler = build_downsampler(internal_rate, out_rate)?;
 
-        let conv_boost_db = if convolver.accepts_tail() {
-            convolver.max_boost_db()
-        } else {
-            0.0
+        let headroom = match explicit_headroom {
+            Some(hr) => hr,
+            None => {
+                let conv_boost_db = if convolver.accepts_tail() {
+                    convolver.max_boost_db()
+                } else {
+                    0.0
+                };
+                let empty_meta = TrackPeakMetadata::default();
+                select_headroom_for_bits(
+                    peak_meta.unwrap_or(&empty_meta),
+                    spec.bits_per_sample,
+                    is_streaming_source,
+                    Some(conv_boost_db),
+                    None,
+                )
+            }
         };
-        let headroom = select_headroom_for_bits(
-            peak_meta,
-            spec.bits_per_sample,
-            is_streaming_source,
-            Some(conv_boost_db),
-            None,
-        );
 
-        // Scale `S` / `S_B` is folded into Stage 1's linear f64 gain (Finding #4 & #14), so
-        // the convolver itself runs at unity scale (1.0) and carried tails always match Track A.
+        // Scale `S` is folded into Stage 1's linear f64 gain, so the convolver runs at unity (1.0).
         convolver.set_output_scale(1.0);
 
         let (requested_shaper, output_bits) = resolve_quantizer_profile(
@@ -1285,7 +1088,10 @@ impl AudioPipeline {
         let out_rate = session.report().output_rate_hz;
         if carryover.internal_rate_hz != internal_rate
             || carryover.output_rate_hz != out_rate
-            || (carryover.convolver.is_some() && !session.accepts_convolver_tail())
+            || carryover.additive_output_tail.is_some()
+            || carryover.convolver.as_ref().is_some_and(|ct| {
+                !session.accepts_convolver_tail() || ct.sample_rate_hz != internal_rate
+            })
         {
             return Ok(GaplessAttachOutcome::IncompatibleRate(carryover));
         }
@@ -1539,18 +1345,9 @@ impl AudioPipeline {
             quantizer.restore_state(q_state);
         }
 
-        // Note: Ultimate Mode exports an already-decimated `ConvolutionTail` at `out_rate` when
-        // downsampling is active (`upsampler.is_none() && downsampler.is_none()` and
-        // `conv_tail.sample_rate_hz == out_rate != internal_rate`). Quantize it directly!
-        if carryover.upsampler.is_none()
-            && carryover.deemphasis.is_none()
-            && internal_rate != out_rate
-            && carryover
-                .convolver
-                .as_ref()
-                .is_some_and(|c| c.sample_rate_hz == out_rate)
-        {
-            let ct = carryover.convolver.unwrap();
+        // Review #9 D6: Ultimate Mode exports its pre-scaled, already-decimated output-rate tail
+        // explicitly in `additive_output_tail` (never conflated with 8fS `convolver`!).
+        if let Some(ct) = carryover.additive_output_tail {
             let buf = StereoF64Buffer {
                 sample_rate_hz: out_rate,
                 left: ct.left,
@@ -1562,6 +1359,25 @@ impl AudioPipeline {
         }
 
         let mut frames = Vec::new();
+        let mut push_post_conv = |buf: StereoF64Buffer,
+                                  delayer: &mut Box<dyn ChannelDelayer>,
+                                  downsampler: &mut Box<dyn Downsampler>,
+                                  quantizer: &mut StreamingQuantizer|
+         -> Result<(), String> {
+            if buf.is_empty() {
+                return Ok(());
+            }
+            let d_out = delayer.process_block(buf)?;
+            if d_out.is_empty() {
+                return Ok(());
+            }
+            let ds_out = downsampler.process_block(d_out)?;
+            if !ds_out.is_empty() {
+                frames.extend(quantizer.quantize_block(&ds_out).frames);
+            }
+            Ok(())
+        };
+
         let conv_opt = self.convolver_factory.create_for_rate(internal_rate).ok();
         let use_active_conv = conv_opt.as_ref().is_some_and(|c| c.accepts_tail());
 
@@ -1581,28 +1397,11 @@ impl AudioPipeline {
                         up_tail
                     };
                     let c_out = convolver.process_block(de_out)?;
-                    if !c_out.is_empty() {
-                        let d_out = delayer.process_block(c_out)?;
-                        if !d_out.is_empty() {
-                            let ds_out = downsampler.process_block(d_out)?;
-                            if !ds_out.is_empty() {
-                                frames.extend(quantizer.quantize_block(&ds_out).frames);
-                            }
-                        }
-                    }
+                    push_post_conv(c_out, &mut delayer, &mut downsampler, &mut quantizer)?;
                 }
             }
-
             let conv_tail = convolver.flush()?;
-            if !conv_tail.is_empty() {
-                let d_out = delayer.process_block(conv_tail)?;
-                if !d_out.is_empty() {
-                    let ds_out = downsampler.process_block(d_out)?;
-                    if !ds_out.is_empty() {
-                        frames.extend(quantizer.quantize_block(&ds_out).frames);
-                    }
-                }
-            }
+            push_post_conv(conv_tail, &mut delayer, &mut downsampler, &mut quantizer)?;
         } else {
             let mut combined = match carryover.upsampler {
                 Some(up_carry) => {
@@ -1627,15 +1426,7 @@ impl AudioPipeline {
                     combined.right[i] += r;
                 }
             }
-            if !combined.is_empty() {
-                let d_out = delayer.process_block(combined)?;
-                if !d_out.is_empty() {
-                    let ds_out = downsampler.process_block(d_out)?;
-                    if !ds_out.is_empty() {
-                        frames.extend(quantizer.quantize_block(&ds_out).frames);
-                    }
-                }
-            }
+            push_post_conv(combined, &mut delayer, &mut downsampler, &mut quantizer)?;
         }
 
         let delay_tail = delayer.flush()?;
@@ -1645,7 +1436,6 @@ impl AudioPipeline {
                 frames.extend(quantizer.quantize_block(&ds_out).frames);
             }
         }
-
         let down_tail = downsampler.flush()?;
         if !down_tail.is_empty() {
             frames.extend(quantizer.quantize_block(&down_tail).frames);
@@ -1720,7 +1510,11 @@ fn resolve_quantizer_profile(
         (shaper, out_bits)
     } else if dsp_plan.shaper == NoiseShaperProfile::Bypass {
         let fallback = if !dsp_plan.shaper_overridden
-            && matches!(output_rate_hz, 176_400 | 192_000 | 352_800 | 384_000)
+            && crate::shaper_design::frozen_shaper_coeffs(
+                NoiseShaperProfile::NsGentle2,
+                output_rate_hz,
+            )
+            .is_some()
         {
             NoiseShaperProfile::NsGentle2
         } else {
@@ -1937,7 +1731,8 @@ mod tests {
                 out_a.left.len()
             );
             assert!(
-                carry_a.as_ref().and_then(|c| c.convolver.as_ref()).is_none(),
+                carry_a.as_ref().and_then(|c| c.additive_output_tail.as_ref()).is_none()
+                    && carry_a.as_ref().and_then(|c| c.convolver.as_ref()).is_none(),
                 "D1 dac_rate={dac_rate}: without REW convolver, Track A's end must NOT leak into additive tail z_A"
             );
             // Verify Track A's final 2 ms actually contain the burst (not cut off!).
@@ -1965,7 +1760,10 @@ mod tests {
             let (tail_b, _peak_b, carry_b) = sess_b.flush_for_gapless_unity_f64(0.0).unwrap();
             out_b.left.extend_from_slice(&tail_b.left);
             assert_eq!(out_b.left.len(), (n_internal_b * up_l).div_ceil(down_m));
-            assert!(carry_b.as_ref().and_then(|c| c.convolver.as_ref()).is_none());
+            assert!(
+                carry_b.as_ref().and_then(|c| c.additive_output_tail.as_ref()).is_none()
+                    && carry_b.as_ref().and_then(|c| c.convolver.as_ref()).is_none()
+            );
             assert_eq!(
                 out_a.left.len() + out_b.left.len(),
                 expected_a + (n_internal_b * up_l).div_ceil(down_m)
