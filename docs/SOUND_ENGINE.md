@@ -10,7 +10,7 @@ This page assumes you already know the vocabulary: poly-sinc, apodizing, closed-
 
 | Choice | Why |
 |---|---|
-| **8fS only** (352.8 kHz for the 44.1 kHz family, 384 kHz for the 48 kHz family) | Every filter, shaper and test is tuned for exactly two output rates, using integer ratios only (2×–8×) |
+| **8fS main pipeline** (352.8 kHz for the 44.1 kHz family, 384 kHz for the 48 kHz family) | The main DSP engine (upsampling, de-emphasis, REW convolution) never changes operating rate. On 352.8/384 kHz DACs, output is zero-copy native 8fS; on lower-rate DACs (`<= 192 kHz`), a pure-`f64` Kaiser anti-aliasing downsampler runs strictly at the very last stage right before the single quantizer (with clean-room 4fS noise shaping at `176.4/192 kHz` and flat TPDF dither at `<= 96 kHz`) |
 | **f64 from decoder to quantizer** | Rounding happens once, at the end, with dither |
 | **≤ 4M taps** | No credible evidence of audible benefit beyond that, and it bounds memory |
 | **No volume, no EQ, no effects** | Gain is used only to prevent clipping. Room correction is your REW filter, nothing else |

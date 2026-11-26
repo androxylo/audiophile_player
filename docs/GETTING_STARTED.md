@@ -17,11 +17,11 @@ flowchart LR
 | | |
 |---|---|
 | 💻 **PC** | Windows 10/11, 64-bit. A fast multi-core CPU makes Ultimate mode start sooner |
-| 🔊 **DAC** | USB DAC that accepts **32-bit, 352.8 and 384 kHz**. Reference: Schiit Gungnir 2 |
+| 🔊 **DAC** | WDM-KS USB DAC — **32-bit, 352.8 / 384 kHz native preferred** (reference: Schiit Gungnir 2). DACs limited to `192 / 176.4 / 96 / 88.2 / 48 / 44.1 kHz` (32/24/16-bit) are supported automatically via last-stage pure-`f64` downsampling |
 | 🎵 **Music** | FLAC files (any rate from 44.1 to 384 kHz), a UPnP controller app, or Tidal Desktop (opt-in driver) |
 | 🛠️ **To build from source** | [Rust](https://rustup.rs) (stable) and Git *(not needed if using a pre-built release archive)* |
 
-> DACs limited to 192 kHz are not supported. The player has no fallback rate, so the DAC will refuse the stream and playback pauses with a message.
+> The main DSP chain (upsampling, de-emphasis, REW room convolution) **always** runs at locked **8fS** (`352.8 / 384 kHz`) in `f64`. On a 384 kHz DAC there is zero downsampling. On a lower-rate DAC (or when capped with `--max-rate`), a linear-phase Kaiser anti-aliasing downsampler runs strictly at the very last stage right before the single quantizer.
 
 ---
 
@@ -265,7 +265,7 @@ Options on the command line always win over the file. Unknown sections or keys a
 
 | Section | Keys (default) |
 |---|---|
-| `[player]` | `device`, `music_dir`, `filter` (auto), `max_taps` (4000000), `port` (auto 8085..8199), `opt` (high) |
+| `[player]` | `device`, `music_dir`, `filter` (auto), `max_taps` (4000000), `max_rate` (auto), `port` (auto 8085..8199), `opt` (high) |
 | `[convolution]` | `enabled`, `dir`, `file`, `file_352800`, `file_384000` |
 | `[quantizer]` | `dac_bits` (24), `shaper` (auto) |
 | `[ultimate]` | `enabled` (false), `genre_rules` (true), `learn_on_play` (true) |

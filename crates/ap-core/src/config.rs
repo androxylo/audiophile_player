@@ -317,6 +317,9 @@ pub struct PlayerSectionConfig {
     pub filter: Option<String>,
     /// Optional upsampling tap ceiling (`1..=4_000_000`; `None` = `4_000_000`).
     pub max_taps: Option<usize>,
+    /// Optional DAC output sample-rate ceiling in Hz (`44100|48000|88200|96000|176400|192000|352800|384000`;
+    /// `None` = auto-probe highest supported rate on the DAC).
+    pub max_rate: Option<u32>,
     /// Optional local HTTP control UI port (`1..=65535`; `None` = auto `8085..=8199`).
     pub port: Option<u16>,
     /// Optional KS priority tier (`normal | high | extreme`).
@@ -336,6 +339,13 @@ impl PlayerSectionConfig {
             if t == 0 || t > 4_000_000 {
                 return Err(format!(
                     "[player] invalid 'max_taps' ({t}); expected 1..=4000000"
+                ));
+            }
+        }
+        if let Some(r) = self.max_rate {
+            if !crate::format::is_valid_max_rate(r) {
+                return Err(format!(
+                    "[player] invalid 'max_rate' ({r}); expected one of 44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000"
                 ));
             }
         }
@@ -374,6 +384,7 @@ pub const ALL_KNOWN_CONFIG_KEYS: &[&str] = &[
     "player.music_dir",
     "player.filter",
     "player.max_taps",
+    "player.max_rate",
     "player.port",
     "player.opt",
     "convolution.enabled",
@@ -412,6 +423,7 @@ pub fn canonicalize_config_key(raw: &str) -> Option<&'static str> {
         "music_dir" | "music-dir" => Some("player.music_dir"),
         "filter" => Some("player.filter"),
         "max_taps" | "max-taps" => Some("player.max_taps"),
+        "max_rate" | "max-rate" => Some("player.max_rate"),
         "port" => Some("player.port"),
         "opt" => Some("player.opt"),
         "dac_bits" | "dac-bits" => Some("quantizer.dac_bits"),
@@ -670,6 +682,38 @@ impl PlayerConfig {
                                 ));
                             }
                             player.max_taps = Some(taps);
+                        }
+                        "max_rate" => {
+                            if val.starts_with('"') || val.starts_with('\'') {
+                                let s = parse_toml_string(val, line_no, "max_rate")?;
+                                if s.trim().is_empty() || s.trim().eq_ignore_ascii_case("auto") {
+                                    player.max_rate = None;
+                                } else {
+                                    let rate = s.trim().parse::<u32>().map_err(|_| {
+                                        format!(
+                                            "config line {line_no}: invalid 'max_rate' in [player]: '{s}'"
+                                        )
+                                    })?;
+                                    if !crate::format::is_valid_max_rate(rate) {
+                                        return Err(format!(
+                                            "config line {line_no}: unsupported 'max_rate' ({rate}) in [player]"
+                                        ));
+                                    }
+                                    player.max_rate = Some(rate);
+                                }
+                            } else {
+                                let rate = val.parse::<u32>().map_err(|_| {
+                                    format!(
+                                        "config line {line_no}: invalid integer for 'max_rate' in [player]: '{val}'"
+                                    )
+                                })?;
+                                if !crate::format::is_valid_max_rate(rate) {
+                                    return Err(format!(
+                                        "config line {line_no}: unsupported 'max_rate' ({rate}) in [player] (expected 44100|48000|88200|96000|176400|192000|352800|384000)"
+                                    ));
+                                }
+                                player.max_rate = Some(rate);
+                            }
                         }
                         "port" => {
                             let port = val.parse::<u16>().map_err(|_| {
@@ -1166,6 +1210,7 @@ impl PlayerConfig {
                 .map(|p| p.to_string_lossy().into_owned()),
             "player.filter" => self.player.filter.clone(),
             "player.max_taps" => self.player.max_taps.map(|n| n.to_string()),
+            "player.max_rate" => self.player.max_rate.map(|r| r.to_string()),
             "player.port" => self.player.port.map(|p| p.to_string()),
             "player.opt" => self.player.opt.clone(),
             "convolution.enabled" => Some(self.convolution.enabled.to_string()),
@@ -1264,6 +1309,22 @@ pub fn format_toml_value_for_key(canonical_key: &str, raw_value: &str) -> Result
                 return Err(format!("max_taps must be in 1..=4000000, got {taps}"));
             }
             Ok(taps.to_string())
+        }
+        "player.max_rate" => {
+            if val.eq_ignore_ascii_case("auto") {
+                return Ok("\"auto\"".to_string());
+            }
+            let rate = val.parse::<u32>().map_err(|_| {
+                format!(
+                    "invalid max_rate '{raw_value}' (expected auto or one of 44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000)"
+                )
+            })?;
+            if !crate::format::is_valid_max_rate(rate) {
+                return Err(format!(
+                    "unsupported max_rate {rate} (expected auto or one of 44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000)"
+                ));
+            }
+            Ok(rate.to_string())
         }
         "player.port" | "upnp.port" => {
             let port = val

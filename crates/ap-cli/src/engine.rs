@@ -878,6 +878,7 @@ pub fn run_random_music_player(
     config_path: Option<PathBuf>,
     music_dir_override: Option<PathBuf>,
     device_filter: Option<String>,
+    max_rate_override: Option<u32>,
     optimization: OptimizationLevel,
     optimization_explicit: bool,
     http_port: Option<u16>,
@@ -921,6 +922,7 @@ pub fn run_random_music_player(
     .map_err(CliError::config)?;
 
     let device_filter = device_filter.or(loaded_cfg.config.player.device);
+    let effective_max_rate = max_rate_override.or(loaded_cfg.config.player.max_rate);
     let http_port = http_port.or(loaded_cfg.config.player.port);
     let (optimization, optimization_explicit) = if !optimization_explicit {
         if let Some(ref cfg_opt) = loaded_cfg.config.player.opt {
@@ -1037,22 +1039,76 @@ pub fn run_random_music_player(
         enable_ssdp: true,
     };
 
-    let pipeline = AudioPipeline::with_rew_config_full_tail(
-        effective_policy,
-        effective_conv,
-        effective_ultimate.enabled,
-    )?;
-
     let mut sink = WdmKsSink::open_best(device_filter.as_deref(), optimization)
         .map_err(|e| CliError::device(e.to_string()))?;
     let dac_name = sink.device().friendly_name.clone();
     let stop_handle = sink.stop_handle();
+
+    // Probe DAC output capabilities (native 352.8/384 kHz tried first -> 2 probes, zero downsampling
+    // on 8fS DACs; < 8fS DACs automatically get last-stage pure-f64 anti-aliasing downsampling).
+    let dac_caps = match ap_output_win::wdm_ks::probe_ks_device_capabilities(
+        sink.device(),
+        effective_max_rate,
+    ) {
+        Ok(caps) => {
+            if !caps.has_any_supported_rate() {
+                return Err(CliError::device(format!(
+                    "DAC '{dac_name}' did not accept any standard WDM-KS PCM format (44.1..=384 kHz)"
+                )));
+            }
+            caps
+        }
+        Err(OutputError::DeviceBusy { .. }) => {
+            eprintln!(
+                "  [dac] '{dac_name}' is currently busy; deferring rate probe and defaulting to native 8fS"
+            );
+            ap_core::format::DacOutputCapabilities::native_8fs()
+        }
+        Err(err) => return Err(CliError::device(err.to_string())),
+    };
+
+    let pipeline = AudioPipeline::with_rew_config_full_tail(
+        effective_policy,
+        effective_conv,
+        effective_ultimate.enabled,
+    )?
+    .with_dac_capabilities(dac_caps);
 
     let api_token = generate_api_token_hex();
     let effective_options_json = JsonValue::obj(vec![
         ("dac", JsonValue::from(dac_name.clone())),
         ("music_dir", JsonValue::from(music_dir.to_string_lossy().into_owned())),
         ("opt", JsonValue::from(format!("{optimization:?}").to_ascii_lowercase())),
+        (
+            "max_rate",
+            effective_max_rate
+                .map(JsonValue::from)
+                .unwrap_or_else(|| JsonValue::from("auto")),
+        ),
+        (
+            "dac_rate_44k",
+            dac_caps
+                .target_for_352800
+                .map(|t| JsonValue::from(t.sample_rate_hz))
+                .unwrap_or(JsonValue::Null),
+        ),
+        (
+            "dac_rate_48k",
+            dac_caps
+                .target_for_384000
+                .map(|t| JsonValue::from(t.sample_rate_hz))
+                .unwrap_or(JsonValue::Null),
+        ),
+        (
+            "dac_wire_format",
+            JsonValue::from(
+                dac_caps
+                    .target_for_384000
+                    .or(dac_caps.target_for_352800)
+                    .map(|t| t.wire_format.label())
+                    .unwrap_or("Int32"),
+            ),
+        ),
         (
             "filter",
             JsonValue::from(
@@ -1170,6 +1226,24 @@ pub fn run_random_music_player(
         env!("CARGO_PKG_VERSION"),
         music_dir.display()
     );
+    if !dac_caps.is_native_8fs()
+        || dac_caps
+            .target_for_352800
+            .is_some_and(|t| t.wire_format != DacWireFormat::Int32)
+        || dac_caps
+            .target_for_384000
+            .is_some_and(|t| t.wire_format != DacWireFormat::Int32)
+    {
+        let fmt_t = |t: Option<ap_core::format::DacRateTarget>| match t {
+            Some(v) => format!("{} Hz {}", v.sample_rate_hz, v.wire_format.label()),
+            None => "unsupported".to_string(),
+        };
+        println!(
+            "DAC output ceiling (main DSP locked at 8fS f64, last-stage f64 downsample): 352.8k -> {}, 384k -> {}",
+            fmt_t(dac_caps.target_for_352800),
+            fmt_t(dac_caps.target_for_384000),
+        );
+    }
     match &loaded_cfg.source_path {
         Some(path) => println!("Config file: {}", path.display()),
         None => println!("Config file: none (using built-in defaults; convolution disabled)"),
@@ -1648,7 +1722,7 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
                 let hit_end_cb = Arc::clone(&hit_track_end);
                 let play_res = sink.play_block_stream_with_recycler(
                     out_rate,
-                    DacWireFormat::Int32,
+                    report.wire_format,
                     move || match buf_for_stream.try_pop_track_pcm_block_with_peak(ep_for_stream) {
                         (PopBlockResult::Block(b), peak_u32) => {
                             if peak_u32 > 0 {
@@ -5943,6 +6017,7 @@ mod tests {
         let ep = buf.current_epoch();
 
         let mut carried_tail = Some(GaplessCarryover {
+            internal_rate_hz: 44_100,
             output_rate_hz: 44_100,
             output_bits: 24,
             effective_shaper: NoiseShaperProfile::TpdfDither,
@@ -5953,6 +6028,7 @@ mod tests {
                 left: vec![0.25; 512],
                 right: vec![-0.25; 512],
             }),
+            downsampler: None,
             quantizer_state: None,
         });
         let mut panic_backup_carry: Option<GaplessCarryover> = None;

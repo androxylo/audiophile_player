@@ -23,7 +23,8 @@ use ap_core::format::DacWireFormat;
 use ap_core::json::JsonValue;
 use ap_output_win::sink::OutputError;
 use ap_output_win::wdm_ks::{
-    KsRenderDevice, enumerate_wdm_ks_render_devices, probe_ks_device_format, select_wdm_ks_device,
+    KsRenderDevice, enumerate_wdm_ks_render_devices, probe_ks_device_capabilities,
+    probe_ks_device_format, select_wdm_ks_device,
 };
 use ap_source::library::{default_user_music_dir, discover_flac_files};
 
@@ -84,6 +85,12 @@ pub struct ProbedDeviceInfo {
     pub rate_352800: String,
     pub rate_384000: String,
     pub supports_8fs: bool,
+    pub max_rate_44k: Option<u32>,
+    pub wire_format_44k: Option<&'static str>,
+    pub max_rate_48k: Option<u32>,
+    pub wire_format_48k: Option<&'static str>,
+    pub supports_any_rate: bool,
+    pub downsampling_needed: bool,
     pub auto_selected: bool,
 }
 
@@ -106,9 +113,32 @@ pub fn probe_all_render_devices() -> Result<Vec<ProbedDeviceInfo>, String> {
     for dev in devices {
         let r352 = probe_rate_status(&dev, 352_800);
         let r384 = probe_rate_status(&dev, 384_000);
-        // If device is busy (e.g. player itself is holding it), treat 8fS as "busy" rather than unsupported.
-        let supports_8fs = (r352 == "supported" && r384 == "supported")
-            || (r352 == "busy" && r384 == "busy");
+        // If device is busy (e.g. player itself is holding it), treat 8fS as busy rather than unsupported.
+        let busy_8fs = r352 == "busy" && r384 == "busy";
+        let supports_8fs = (r352 == "supported" && r384 == "supported") || busy_8fs;
+
+        let (max_rate_44k, wire_format_44k, max_rate_48k, wire_format_48k) = if supports_8fs {
+            (
+                Some(352_800),
+                Some(DacWireFormat::Int32.label()),
+                Some(384_000),
+                Some(DacWireFormat::Int32.label()),
+            )
+        } else {
+            match probe_ks_device_capabilities(&dev, None) {
+                Ok(caps) => (
+                    caps.target_for_352800.map(|t| t.sample_rate_hz),
+                    caps.target_for_352800.map(|t| t.wire_format.label()),
+                    caps.target_for_384000.map(|t| t.sample_rate_hz),
+                    caps.target_for_384000.map(|t| t.wire_format.label()),
+                ),
+                Err(OutputError::DeviceBusy { .. }) => (None, None, None, None),
+                Err(_) => (None, None, None, None),
+            }
+        };
+
+        let supports_any_rate = supports_8fs || max_rate_44k.is_some() || max_rate_48k.is_some();
+        let downsampling_needed = supports_any_rate && !supports_8fs;
         let auto_selected = auto_pick_path
             .as_deref()
             .is_some_and(|p| p == dev.device_path);
@@ -120,6 +150,12 @@ pub fn probe_all_render_devices() -> Result<Vec<ProbedDeviceInfo>, String> {
             rate_352800: r352,
             rate_384000: r384,
             supports_8fs,
+            max_rate_44k,
+            wire_format_44k,
+            max_rate_48k,
+            wire_format_48k,
+            supports_any_rate,
+            downsampling_needed,
             auto_selected,
         });
     }
@@ -140,6 +176,18 @@ pub fn devices_report_json() -> Result<JsonValue, CliError> {
                 ("rate_352800", JsonValue::from(d.rate_352800.clone())),
                 ("rate_384000", JsonValue::from(d.rate_384000.clone())),
                 ("supports_8fs", JsonValue::from(d.supports_8fs)),
+                (
+                    "max_rate_44k",
+                    d.max_rate_44k.map(JsonValue::from).unwrap_or(JsonValue::Null),
+                ),
+                ("wire_format_44k", JsonValue::opt_str(d.wire_format_44k)),
+                (
+                    "max_rate_48k",
+                    d.max_rate_48k.map(JsonValue::from).unwrap_or(JsonValue::Null),
+                ),
+                ("wire_format_48k", JsonValue::opt_str(d.wire_format_48k)),
+                ("supports_any_rate", JsonValue::from(d.supports_any_rate)),
+                ("downsampling_needed", JsonValue::from(d.downsampling_needed)),
                 ("auto_selected", JsonValue::from(d.auto_selected)),
             ])
         })
@@ -176,9 +224,30 @@ pub fn run_devices_cli(as_json: bool) -> Result<(), CliError> {
             .get("auto_selected")
             .and_then(JsonValue::as_bool)
             .unwrap_or(false);
+        let ds_needed = d
+            .get("downsampling_needed")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false);
         let mark = if auto { " [AUTO-SELECTED]" } else { "" };
         println!("  - {name}{mark}");
         println!("      352.8 kHz Int32: {r352}  |  384 kHz Int32: {r384}");
+        if ds_needed {
+            let m44 = d
+                .get("max_rate_44k")
+                .and_then(JsonValue::as_u64)
+                .map(|r| format!("{r} Hz"))
+                .unwrap_or_else(|| "none".to_string());
+            let w44 = d.get("wire_format_44k").and_then(JsonValue::as_str).unwrap_or("-");
+            let m48 = d
+                .get("max_rate_48k")
+                .and_then(JsonValue::as_u64)
+                .map(|r| format!("{r} Hz"))
+                .unwrap_or_else(|| "none".to_string());
+            let w48 = d.get("wire_format_48k").and_then(JsonValue::as_str).unwrap_or("-");
+            println!(
+                "      Last-stage f64 downsample ceiling: 44.1k family -> {m44} ({w44})  |  48k family -> {m48} ({w48})"
+            );
+        }
     }
     Ok(())
 }
@@ -366,7 +435,7 @@ pub fn doctor_report_json(config_path: Option<&Path>) -> (JsonValue, bool) {
         }
     }
 
-    // 5. DAC enumeration & 8fS (352.8 / 384 kHz) capability check
+    // 5. DAC enumeration & capability check (native 8fS preferred; < 8fS supported via last-stage f64 downsampling)
     match probe_all_render_devices() {
         Ok(devs) if devs.is_empty() => {
             checks.push(DoctorCheck::fail(
@@ -374,12 +443,17 @@ pub fn doctor_report_json(config_path: Option<&Path>) -> (JsonValue, bool) {
                 "error",
                 "0 WDM-KS render devices found",
                 "No USB/WDM-KS audio DAC detected",
-                "Connect a 32-bit 352.8/384 kHz USB DAC and run `audiophile-player devices`",
+                "Connect a WDM-KS USB DAC (352.8/384 kHz native preferred; 44.1..192 kHz supported via last-stage f64 downsampling) and run `audiophile-player devices`",
             ));
         }
         Ok(devs) => {
-            let cap_8fs: Vec<&ProbedDeviceInfo> = devs.iter().filter(|d| d.supports_8fs).collect();
-            if let Some(chosen) = devs.iter().find(|d| d.auto_selected).or_else(|| cap_8fs.first().copied()) {
+            let cap_any: Vec<&ProbedDeviceInfo> =
+                devs.iter().filter(|d| d.supports_any_rate).collect();
+            if let Some(chosen) = devs
+                .iter()
+                .find(|d| d.auto_selected)
+                .or_else(|| cap_any.first().copied())
+            {
                 if chosen.supports_8fs {
                     let note = if chosen.rate_352800 == "busy" {
                         " (currently open/busy by an exclusive player)"
@@ -390,24 +464,44 @@ pub fn doctor_report_json(config_path: Option<&Path>) -> (JsonValue, bool) {
                         "dac",
                         format!("'{}'{note}", chosen.friendly_name),
                     ));
+                } else if chosen.supports_any_rate {
+                    let r44 = chosen
+                        .max_rate_44k
+                        .map(|r| format!("{r} Hz"))
+                        .unwrap_or_else(|| "none".to_string());
+                    let r48 = chosen
+                        .max_rate_48k
+                        .map(|r| format!("{r} Hz"))
+                        .unwrap_or_else(|| "none".to_string());
+                    let wf = chosen
+                        .wire_format_48k
+                        .or(chosen.wire_format_44k)
+                        .unwrap_or("Int32");
+                    checks.push(DoctorCheck::pass(
+                        "dac",
+                        format!(
+                            "'{}' (max 44.1k={r44}, 48k={r48}, {wf}; last-stage f64 downsampling from locked 8fS)",
+                            chosen.friendly_name
+                        ),
+                    ));
                 } else {
                     checks.push(DoctorCheck::fail(
                         "dac",
                         "error",
                         format!(
-                            "'{}' (352.8k={}, 384k={})",
+                            "'{}' (352.8k={}, 384k={}, no usable WDM-KS PCM rate found)",
                             chosen.friendly_name, chosen.rate_352800, chosen.rate_384000
                         ),
-                        "Auto-selected DAC does not report 32-bit 352.8/384 kHz support",
-                        "Run `audiophile-player devices` and select an 8fS DAC with `audiophile-player config set device \"<NAME>\"`",
+                        "Auto-selected DAC did not accept any standard WDM-KS PCM rate (44.1..=384 kHz)",
+                        "Run `audiophile-player devices` and select a working DAC with `audiophile-player config set device \"<NAME>\"`",
                     ));
                 }
             } else {
                 checks.push(DoctorCheck::fail(
                     "dac",
                     "error",
-                    format!("{} device(s), none 8fS-capable", devs.len()),
-                    "No DAC supporting 32-bit 352.8/384 kHz was found",
+                    format!("{} device(s), none usable", devs.len()),
+                    "No WDM-KS DAC accepting standard PCM rates was found",
                     "Run `audiophile-player devices` to inspect device capabilities",
                 ));
             }

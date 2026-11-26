@@ -176,21 +176,118 @@ pub const COEFFS_WIDE40_9_384000: [f64; 9] = [
     0.29468735200422286,
 ];
 
+/// Frozen `ns-gentle-2` (`N = 2`, 20 kHz, `+6 dB` ceiling) taps at `176,400 Hz` (`4fS`).
+pub const COEFFS_NS_GENTLE_2_176400: [f64; 2] = [-0.8889758800409757, 0.10628644790626748];
+
+/// Frozen `ns-gentle-2` (`N = 2`, 20 kHz, `+6 dB` ceiling) taps at `192,000 Hz` (`4fS`).
+pub const COEFFS_NS_GENTLE_2_192000: [f64; 2] = [-0.9037707216668668, 0.09149160576272607];
+
+/// Frozen `ns5-class` (`N = 5`, 20 kHz, `+20 dB` ceiling) taps at `176,400 Hz` (`4fS`).
+pub const COEFFS_NS5_176400: [f64; 5] = [
+    -3.207492133272697,
+    3.971088568456903,
+    -2.0056438453480294,
+    0.0412739210813452,
+    0.22549835957112183,
+];
+
+/// Frozen `ns5-class` (`N = 5`, 20 kHz, `+20 dB` ceiling) taps at `192,000 Hz` (`4fS`).
+pub const COEFFS_NS5_192000: [f64; 5] = [
+    -3.268162170731663,
+    4.044418745120229,
+    -1.9711846692247346,
+    -0.03531293952807324,
+    0.24845255063053076,
+];
+
+/// Frozen `lns15-class` (`N = 15`, 20 kHz + 40 kHz taper -> 60 kHz, `+15 dB` ceiling) taps at `176,400 Hz` (`4fS`).
+pub const COEFFS_LNS15_176400: [f64; 15] = [
+    -2.168716597171538,
+    2.113013086541712,
+    -0.8982653796298233,
+    -0.19345297601427122,
+    0.5121109842337194,
+    -0.2599572175898408,
+    -0.08521630711397542,
+    0.20451217978786893,
+    -0.1112827193169121,
+    -0.032492269892441646,
+    0.09699297053539932,
+    -0.060463189288228206,
+    0.00016309730265893704,
+    0.02398275841478084,
+    -0.013927010634295014,
+];
+
+/// Frozen `lns15-class` (`N = 15`, 20 kHz + 40 kHz taper -> 60 kHz, `+15 dB` ceiling) taps at `192,000 Hz` (`4fS`).
+pub const COEFFS_LNS15_192000: [f64; 15] = [
+    -2.315228009576652,
+    2.2054467572612726,
+    -0.6844938968827368,
+    -0.5154699592180122,
+    0.5554353727139866,
+    -0.010881383353742039,
+    -0.29744316079694005,
+    0.16011563648541569,
+    0.08689343615851018,
+    -0.1492707643296264,
+    0.03900793219733831,
+    0.06980160838730509,
+    -0.07730410652393774,
+    0.03482570463313453,
+    -0.006974778660709156,
+];
+
+/// Frozen `wide40-9` (`pggb-optimal` class: `N = 9`, 40 kHz, `+18 dB` ceiling) taps at `176,400 Hz` (`4fS`).
+pub const COEFFS_WIDE40_9_176400: [f64; 9] = [
+    -2.3932634749932147,
+    2.833546396944659,
+    -1.477880796956254,
+    -0.4758408481516197,
+    1.154836709581247,
+    -0.3237165369846372,
+    -0.6279272832382781,
+    0.706857957433721,
+    -0.2661641700027518,
+];
+
+/// Frozen `wide40-9` (`pggb-optimal` class: `N = 9`, 40 kHz, `+18 dB` ceiling) taps at `192,000 Hz` (`4fS`).
+pub const COEFFS_WIDE40_9_192000: [f64; 9] = [
+    -2.482501848188318,
+    2.806954512353321,
+    -1.1401083904464906,
+    -0.8431093768735973,
+    1.0936477758966758,
+    0.08682524279130394,
+    -0.8974631978214308,
+    0.6705771607718537,
+    -0.17283814009252277,
+];
+
 /// Look up the frozen error-feedback tap slice `c[1..=N]` for `(profile, sample_rate_hz)`.
 ///
-/// Returns `None` for non-shaped profiles (`Bypass`, `TpdfDither`) and for any sample rate
-/// other than `352,800 Hz` or `384,000 Hz` (`8fS` tables must never be reused at other rates).
+/// Supports native `8fS` (`352,800` / `384,000 Hz`) and `4fS` (`176,400` / `192,000 Hz`, used when
+/// last-stage downsampling feeds a 192 kHz-class DAC). Returns `None` for non-shaped profiles
+/// (`Bypass`, `TpdfDither`) and for `<= 2fS` (`<= 96 kHz`) rates where flat TPDF dither is used.
 pub const fn frozen_shaper_coeffs(
     profile: NoiseShaperProfile,
     sample_rate_hz: u32,
 ) -> Option<&'static [f64]> {
     match (profile, sample_rate_hz) {
+        (NoiseShaperProfile::NsGentle2, 176_400) => Some(&COEFFS_NS_GENTLE_2_176400),
+        (NoiseShaperProfile::NsGentle2, 192_000) => Some(&COEFFS_NS_GENTLE_2_192000),
         (NoiseShaperProfile::NsGentle2, 352_800) => Some(&COEFFS_NS_GENTLE_2_352800),
         (NoiseShaperProfile::NsGentle2, 384_000) => Some(&COEFFS_NS_GENTLE_2_384000),
+        (NoiseShaperProfile::Ns5Multibit, 176_400) => Some(&COEFFS_NS5_176400),
+        (NoiseShaperProfile::Ns5Multibit, 192_000) => Some(&COEFFS_NS5_192000),
         (NoiseShaperProfile::Ns5Multibit, 352_800) => Some(&COEFFS_NS5_352800),
         (NoiseShaperProfile::Ns5Multibit, 384_000) => Some(&COEFFS_NS5_384000),
+        (NoiseShaperProfile::Lns15Smooth, 176_400) => Some(&COEFFS_LNS15_176400),
+        (NoiseShaperProfile::Lns15Smooth, 192_000) => Some(&COEFFS_LNS15_192000),
         (NoiseShaperProfile::Lns15Smooth, 352_800) => Some(&COEFFS_LNS15_352800),
         (NoiseShaperProfile::Lns15Smooth, 384_000) => Some(&COEFFS_LNS15_384000),
+        (NoiseShaperProfile::PggbOptimal, 176_400) => Some(&COEFFS_WIDE40_9_176400),
+        (NoiseShaperProfile::PggbOptimal, 192_000) => Some(&COEFFS_WIDE40_9_192000),
         (NoiseShaperProfile::PggbOptimal, 352_800) => Some(&COEFFS_WIDE40_9_352800),
         (NoiseShaperProfile::PggbOptimal, 384_000) => Some(&COEFFS_WIDE40_9_384000),
         _ => None,
@@ -437,11 +534,11 @@ mod tests {
 
     #[test]
     fn frozen_tables_match_runtime_levinson_durbin_solver_within_1e9() {
-        for &rate in &[352_800_u32, 384_000_u32] {
+        for &rate in &[176_400_u32, 192_000_u32, 352_800_u32, 384_000_u32] {
             for &profile in &SHAPED_PROFILES {
                 let spec = shaper_design_spec(profile).expect("shaped profile must have spec");
                 let frozen = frozen_shaper_coeffs(profile, rate)
-                    .expect("8fS rate must return frozen table");
+                    .expect("4fS/8fS rate must return frozen table");
                 let designed = design_error_feedback_taps(spec, f64::from(rate));
 
                 assert_eq!(
@@ -541,16 +638,16 @@ mod tests {
     }
 
     #[test]
-    fn non_8fs_and_unshaped_profiles_return_none() {
-        for &rate in &[44_100_u32, 48_000, 88_200, 96_000, 176_400, 192_000, 768_000] {
+    fn non_4fs_8fs_and_unshaped_profiles_return_none() {
+        for &rate in &[44_100_u32, 48_000, 88_200, 96_000, 768_000] {
             for &profile in &SHAPED_PROFILES {
                 assert!(
                     frozen_shaper_coeffs(profile, rate).is_none(),
-                    "{profile} must not return 8fS coefficients at {rate} Hz"
+                    "{profile} must not return 4fS/8fS coefficients at {rate} Hz"
                 );
             }
         }
-        for &rate in &[352_800_u32, 384_000] {
+        for &rate in &[176_400_u32, 192_000, 352_800, 384_000] {
             assert!(frozen_shaper_coeffs(NoiseShaperProfile::Bypass, rate).is_none());
             assert!(frozen_shaper_coeffs(NoiseShaperProfile::TpdfDither, rate).is_none());
         }

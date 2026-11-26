@@ -31,6 +31,7 @@
 |---|---|---|---|---|---|
 | `--device NAME` | `player.device` | `auto (best USB DAC)` | play, restart | restart | WDM-KS DAC name substring (default: auto-select best USB DAC) |
 | `--dac-bits N` | `quantizer.dac_bits` | `24` | play, restart | restart | Quantizer DAC bit depth: 16 \| 18 \| 20 \| 24 |
+| `--max-rate HZ` | `player.max_rate` | `auto (highest DAC rate)` | play, restart | restart | Cap DAC output sample rate (Hz); main DSP stays locked at 8fS (352.8/384 kHz) |
 | `--opt LEVEL` | `player.opt` | `high (extreme in --ultimate)` | play, restart | restart | Windows kernel-streaming priority tier: normal \| high \| extreme |
 
 ### DSP, Filters & Room Correction

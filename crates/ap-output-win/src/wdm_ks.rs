@@ -21,7 +21,10 @@ use std::time::Duration;
 use std::time::Instant;
 
 use ap_core::buffer::InterleavedInt32Buffer;
-use ap_core::format::DacWireFormat;
+use ap_core::format::{
+    DacOutputCapabilities, DacRateTarget, DacWireFormat, STANDARD_DAC_RATES_44K,
+    STANDARD_DAC_RATES_48K, WIRE_FORMAT_PREFERENCE,
+};
 
 use crate::hygiene::{MemoryLockGuard, MmcssGuard, OptimizationLevel};
 use crate::sink::{OutputError, PlaybackStats, ZeroMixerAudioSink};
@@ -103,6 +106,54 @@ pub fn probe_ks_device_format(
     Err(OutputError::Other(
         "WDM-KS probing is only supported on Windows".to_string(),
     ))
+}
+
+/// Probe a WDM-KS render device to find its highest supported output `(sample_rate_hz, wire_format)`
+/// for both the 44.1 kHz (`352,800 Hz`) and 48 kHz (`384,000 Hz`) DSP clock families, honoring an
+/// optional user `max_rate_hz` ceiling.
+///
+/// Fast path for `8fS` DACs: when `max_rate_hz` allows `352,800` & `384,000 Hz` and both succeed
+/// with `Int32`, probing finishes in just 2 pin checks with zero extra driver probes.
+/// If any probe reports `DeviceBusy`, returns `Err(OutputError::DeviceBusy { .. })` immediately so
+/// a temporarily busy 384 kHz DAC is never misclassified as a lower-rate DAC.
+pub fn probe_ks_device_capabilities(
+    device: &KsRenderDevice,
+    max_rate_hz: Option<u32>,
+) -> Result<DacOutputCapabilities, OutputError> {
+    let ceiling = max_rate_hz.unwrap_or(u32::MAX);
+
+    let probe_family = |rates: &[u32]| -> Result<Option<DacRateTarget>, OutputError> {
+        for &rate in rates {
+            if rate > ceiling {
+                continue;
+            }
+            for &fmt in &WIRE_FORMAT_PREFERENCE {
+                match probe_ks_device_format(device, rate, fmt) {
+                    Ok(()) => {
+                        return Ok(Some(DacRateTarget {
+                            sample_rate_hz: rate,
+                            wire_format: fmt,
+                        }));
+                    }
+                    Err(e @ OutputError::DeviceBusy { .. }) => return Err(e),
+                    Err(_) => continue,
+                }
+            }
+        }
+        Ok(None)
+    };
+
+    let same_44 = probe_family(&STANDARD_DAC_RATES_44K)?;
+    let same_48 = probe_family(&STANDARD_DAC_RATES_48K)?;
+
+    let target_for_352800 = same_44.or(same_48);
+    let target_for_384000 = same_48.or(same_44);
+
+    Ok(DacOutputCapabilities {
+        target_for_352800,
+        target_for_384000,
+        max_rate_hz,
+    })
 }
 
 /// Discovered Windows WDM-KS audio render filter and pin.

@@ -30,7 +30,7 @@ This file is the authoritative runbook for AI assistants helping a user install,
    audiophile-player devices --json
    ```
 4. **Configure DAC, music folder, and optional REW room correction**:
-   - Inspect discovered DACs from `devices --json`; prefer a DAC where `supports_8fs` is `true` (`rate_352800` and `rate_384000` both `"supported"`).
+   - Inspect discovered DACs from `devices --json`; prefer a DAC where `supports_8fs` is `true` (`rate_352800` and `rate_384000` both `"supported"`). DACs limited to `< 352.8 / 384 kHz` (`supports_any_rate: true`) are also supported automatically via last-stage pure-`f64` downsampling from the locked 8fS pipeline.
    - Persist defaults via:
      ```powershell
      audiophile-player config set device "<DAC substring>"

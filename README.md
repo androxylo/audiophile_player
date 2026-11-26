@@ -132,8 +132,8 @@ mindmap
 **Status and honest limits**
 - 🟢 **Works today:** local FLAC (random or sequential, gapless), UPnP renderer (gapless), **Tidal Desktop Exclusive Mode** via our opt-in Rust ACX virtual driver (zero Windows mixer), normal and ultimate modes, REW convolution, offline library scan, local web page.
 - 🟡 **Planned:** WASAPI exclusive output, per-channel delay.
-- 🔴 **Not supported, by design:** Windows shared mode, volume control, DSP effects, macOS / Linux playback, DACs without 352.8 / 384 kHz input.
-- Reference DAC: **Schiit Gungnir 2** (Unison USB, NOS). Any DAC that accepts 32-bit 352.8 / 384 kHz over a kernel-streaming driver should work.
+- 🔴 **Not supported, by design:** Windows shared mode, volume control, DSP effects, macOS / Linux playback.
+- Reference DAC: **Schiit Gungnir 2** (Unison USB, NOS, 352.8 / 384 kHz). The main DSP pipeline always operates at locked **8fS** (`352.8 / 384 kHz`, `f64`). DACs limited to lower rates (`192 / 176.4 / 96 / 88.2 / 48 / 44.1 kHz`, 32/24/16-bit) are supported automatically via a strictly last-stage pure-`f64` anti-aliasing downsampler right before the single quantizer.
 
 ## License
 

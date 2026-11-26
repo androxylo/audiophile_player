@@ -147,13 +147,24 @@ impl StreamingQuantizer {
 
     /// Construct a quantizer bound to `sample_rate_hz`.
     ///
-    /// Shaped profiles (`ns-gentle-2`, `ns5`, `lns15`, `pggb-optimal`) load their frozen `8fS`
-    /// coefficient table for `352,800 Hz` or `384,000 Hz`. At any other sample rate, shaped
-    /// profiles fall back cleanly to `TpdfDither` with a warning (`04-noise-shapers.md` §6.2).
+    /// Shaped profiles (`ns-gentle-2`, `ns5`, `lns15`, `pggb-optimal`) load their frozen `4fS`/`8fS`
+    /// coefficient table for `176,400`, `192,000`, `352,800`, or `384,000 Hz`. At any other sample
+    /// rate (`<= 96 kHz`), shaped profiles fall back cleanly to `TpdfDither` (`04-noise-shapers.md` §6.2).
     pub fn with_rate(
         shaper: NoiseShaperProfile,
         dac_bits: u8,
         sample_rate_hz: u32,
+    ) -> Result<Self, String> {
+        Self::with_rate_options(shaper, dac_bits, sample_rate_hz, true)
+    }
+
+    /// Construct a quantizer bound to `sample_rate_hz`, optionally suppressing stderr warnings when
+    /// an automatic shaper profile cleanly degrades to flat `TpdfDither` on a `<= 96 kHz` DAC.
+    pub fn with_rate_options(
+        shaper: NoiseShaperProfile,
+        dac_bits: u8,
+        sample_rate_hz: u32,
+        warn_on_fallback: bool,
     ) -> Result<Self, String> {
         let (effective_shaper, coeffs): (NoiseShaperProfile, &'static [f64]) = match shaper {
             NoiseShaperProfile::Bypass => (NoiseShaperProfile::Bypass, &[]),
@@ -165,10 +176,12 @@ impl StreamingQuantizer {
                 if let Some(table) = frozen_shaper_coeffs(shaper, sample_rate_hz) {
                     (shaper, table)
                 } else {
-                    eprintln!(
-                        "[shaper warn] noise shaper '{shaper}' requires 8fS (352.8/384 kHz), \
-                         got {sample_rate_hz} Hz; falling back to tpdf"
-                    );
+                    if warn_on_fallback {
+                        eprintln!(
+                            "[shaper warn] noise shaper '{shaper}' requires 4fS/8fS (176.4/192/352.8/384 kHz), \
+                             got {sample_rate_hz} Hz; falling back to tpdf"
+                        );
+                    }
                     (NoiseShaperProfile::TpdfDither, &[])
                 }
             }

@@ -18,6 +18,9 @@
 # music_dir = 'D:\Music'
 # filter = 'auto'
 # max_taps = 4000000
+# Optional DAC output rate ceiling in Hz (omit or 'auto' = highest rate supported by your DAC,
+# preferring native 352.8/384 kHz; e.g. 192000 or 96000 caps output via last-stage f64 downsampling):
+# max_rate = 192000
 # port = 8085
 # opt = 'high'
 

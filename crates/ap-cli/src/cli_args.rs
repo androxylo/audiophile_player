@@ -138,6 +138,7 @@ pub enum RunMode {
         config_path: Option<PathBuf>,
         music_dir: Option<PathBuf>,
         device_filter: Option<String>,
+        max_rate_hz: Option<u32>,
         optimization: OptimizationLevel,
         optimization_explicit: bool,
         http_port: Option<u16>,
@@ -260,6 +261,7 @@ where
     let mut config_path: Option<PathBuf> = None;
     let mut music_dir: Option<PathBuf> = None;
     let mut device_filter: Option<String> = None;
+    let mut max_rate_hz: Option<u32> = None;
     let mut optimization = OptimizationLevel::High;
     let mut optimization_explicit = false;
     let mut http_port: Option<u16> = None;
@@ -302,6 +304,29 @@ where
                     .next()
                     .ok_or_else(|| "--device requires a DAC name substring".to_string())?;
                 device_filter = Some(require_utf8_arg("--device", val)?);
+            }
+            "--max-rate" => {
+                let val = iter.next().ok_or_else(|| {
+                    "--max-rate requires 'auto' or a standard sample rate (44100|48000|88200|96000|176400|192000|352800|384000)"
+                        .to_string()
+                })?;
+                let val_str = require_utf8_arg("--max-rate", val)?;
+                let trimmed = val_str.trim();
+                if trimmed.eq_ignore_ascii_case("auto") {
+                    max_rate_hz = None;
+                } else {
+                    let rate = trimmed.parse::<u32>().map_err(|_| {
+                        format!(
+                            "invalid --max-rate '{val_str}'; expected auto or one of 44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000"
+                        )
+                    })?;
+                    if !ap_core::format::is_valid_max_rate(rate) {
+                        return Err(format!(
+                            "unsupported --max-rate {rate}; expected auto or one of 44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000"
+                        ));
+                    }
+                    max_rate_hz = Some(rate);
+                }
             }
             "--port" => {
                 let val = iter
@@ -513,6 +538,7 @@ where
         config_path,
         music_dir,
         device_filter,
+        max_rate_hz,
         optimization,
         optimization_explicit,
         http_port,
@@ -1128,6 +1154,7 @@ mod tests {
                 config_path: None,
                 music_dir: None,
                 device_filter: None,
+                max_rate_hz: None,
                 optimization: OptimizationLevel::High,
                 optimization_explicit: false,
                 http_port: None,
@@ -1151,6 +1178,8 @@ mod tests {
             r"D:\Audio",
             "--device",
             "Gungnir 2",
+            "--max-rate",
+            "192000",
             "--port",
             "8090",
             "--upnp-name",
@@ -1184,6 +1213,7 @@ mod tests {
                 config_path: Some(PathBuf::from(r"C:\Cfg\player.toml")),
                 music_dir: Some(PathBuf::from(r"D:\Audio")),
                 device_filter: Some("Gungnir 2".to_string()),
+                max_rate_hz: Some(192_000),
                 optimization: OptimizationLevel::Extreme,
                 optimization_explicit: true,
                 http_port: Some(8090),

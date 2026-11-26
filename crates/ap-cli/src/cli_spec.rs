@@ -232,6 +232,9 @@ pub const SHAPER_VALUES: &[&str] = &[
 ];
 
 pub const OPT_VALUES: &[&str] = &["normal", "high", "extreme"];
+pub const MAX_RATE_VALUES: &[&str] = &[
+    "auto", "44100", "48000", "88200", "96000", "176400", "192000", "352800", "384000",
+];
 pub const FILTER_MODE_VALUES: &[&str] = &["auto", "suggested", "mine"];
 pub const WHEN_VALUES: &[&str] = &["after-track", "now"];
 
@@ -398,9 +401,30 @@ pub static OPTIONS: &[OptSpec] = &[
         group: Group::Output,
         restart: Restart::Always,
         summary: "Quantizer DAC bit depth: 16 | 18 | 20 | 24",
-        details: "Target quantization resolution on the 32-bit WDM-KS wire. Allowed values are strictly 16, 18, 20, or 24. Leave at 24 unless matching a specific R-2R NOS DAC datasheet.",
+        details: "Target quantization resolution (automatically capped to the DAC's wire bit depth so quantization still occurs strictly once). Allowed values are strictly 16, 18, 20, or 24. Leave at 24 unless matching a specific R-2R NOS DAC datasheet.",
         examples: &["audiophile-player --dac-bits 20"],
         since: "0.1.0",
+    },
+    OptSpec {
+        name: "--max-rate",
+        short: None,
+        value: ValueKind::Enum {
+            placeholder: "HZ",
+            values: MAX_RATE_VALUES,
+        },
+        default: Some("auto (highest DAC rate)"),
+        config_key: Some("player.max_rate"),
+        scope: &[Cmd::Play, Cmd::Restart],
+        group: Group::Output,
+        restart: Restart::Always,
+        summary: "Cap DAC output sample rate (Hz); main DSP stays locked at 8fS (352.8/384 kHz)",
+        details: "By default (`auto`), Audiophile Player probes your DAC and picks its highest supported rate in each clock family (preferring native 352.8 / 384 kHz with zero downsampling). On DACs below 352.8/384 kHz — or when capped with `--max-rate` — the entire main DSP chain (upsampling, de-emphasis, REW room convolution) still runs at locked 8fS in pure f64, and a linear-phase Kaiser anti-aliasing downsampler runs strictly at the very last stage right before the single quantizer.",
+        examples: &[
+            "audiophile-player --max-rate 192000",
+            "audiophile-player --max-rate 96000",
+            "audiophile-player --max-rate auto",
+        ],
+        since: "0.2.0",
     },
     OptSpec {
         name: "--opt",

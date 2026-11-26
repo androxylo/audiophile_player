@@ -13,6 +13,7 @@ pub mod convolution;
 pub mod dd;
 pub mod deemphasis;
 pub mod delay;
+pub mod downsampler;
 pub mod fusion;
 pub mod phase;
 pub mod pipeline;

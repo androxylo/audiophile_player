@@ -2405,6 +2405,7 @@ mod tests {
             src_b.computed_md5_at_eof = Some([0xEE; 16]);
             let mut inc = if with_tail {
                 Some(GaplessCarryover {
+                    internal_rate_hz: 44_100,
                     output_rate_hz: 44_100,
                     output_bits: 16,
                     effective_shaper: ap_dsp::selector::NoiseShaperProfile::Bypass,
@@ -2415,6 +2416,7 @@ mod tests {
                         left: vec![0.95; 512],
                         right: vec![0.95; 512],
                     }),
+                    downsampler: None,
                     quantizer_state: None,
                 })
             } else {
@@ -2654,6 +2656,7 @@ mod tests {
         let mut src = SyntheticSource::sine(44_100, 40.0, 0.5, false);
         src.fail_at_frame = Some(44_100 * 35);
         let mut carry = Some(GaplessCarryover {
+            internal_rate_hz: 44_100,
             output_rate_hz: 44_100,
             output_bits: 24,
             effective_shaper: NoiseShaperProfile::TpdfDither,
@@ -2664,6 +2667,7 @@ mod tests {
                 left: vec![0.4; 256],
                 right: vec![0.4; 256],
             }),
+            downsampler: None,
             quantizer_state: None,
         });
         let mut backup = None;
@@ -2712,6 +2716,7 @@ mod tests {
         // 2. F8: Panic injected right after incoming_carryover.take() preserves `panic_backup_carry`!
         let mut src_p = SyntheticSource::sine(44_100, 31.0, 0.5, false);
         let mut carry_p = Some(GaplessCarryover {
+            internal_rate_hz: 44_100,
             output_rate_hz: 44_100,
             output_bits: 24,
             effective_shaper: NoiseShaperProfile::TpdfDither,
@@ -2722,6 +2727,7 @@ mod tests {
                 left: vec![0.3; 128],
                 right: vec![0.3; 128],
             }),
+            downsampler: None,
             quantizer_state: None,
         });
         let mut backup_p = None;
@@ -2944,6 +2950,7 @@ mod tests {
             src.fail_at_frame = Some(44_100 * 31);
             let mut carry = if with_tail {
                 Some(GaplessCarryover {
+                    internal_rate_hz: 44_100,
                     output_rate_hz: 44_100,
                     output_bits: 24,
                     effective_shaper: NoiseShaperProfile::TpdfDither,
@@ -2954,6 +2961,7 @@ mod tests {
                         left: vec![0.35; 256],
                         right: vec![0.35; 256],
                     }),
+                    downsampler: None,
                     quantizer_state: None,
                 })
             } else {
@@ -3121,6 +3129,7 @@ mod tests {
             fs::write(&p_w3, b"w3").unwrap();
             let mut src = SyntheticSource::sine(44_100, 32.0, 0.3, false);
             let mut carry = Some(GaplessCarryover {
+                internal_rate_hz: 352_800,
                 output_rate_hz: 352_800,
                 output_bits: 24,
                 effective_shaper: NoiseShaperProfile::TpdfDither,
@@ -3131,6 +3140,7 @@ mod tests {
                     left: vec![0.2; 256],
                     right: vec![-0.2; 256],
                 }),
+                downsampler: None,
                 quantizer_state: None,
             });
             let mut backup = None;
