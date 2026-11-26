@@ -105,6 +105,9 @@ pub trait Downsampler: Send {
         self.input_rate_hz() == self.output_rate_hz()
     }
     fn process_block(&mut self, input: StereoF64Buffer) -> Result<StereoF64Buffer, String>;
+    /// Exact number of output frames that `flush()` would emit for inputs already pushed so far
+    /// (excluding any future convolution tail appended after this point).
+    fn pending_flush_frames(&self) -> usize;
     fn flush(&mut self) -> Result<StereoF64Buffer, String>;
     fn flush_for_gapless(
         &mut self,
@@ -137,7 +140,23 @@ impl Downsampler for NullDownsampler {
         self.rate_hz
     }
     fn process_block(&mut self, input: StereoF64Buffer) -> Result<StereoF64Buffer, String> {
+        if input.left.len() != input.right.len() {
+            return Err(format!(
+                "NullDownsampler channel length mismatch: left={} right={}",
+                input.left.len(),
+                input.right.len()
+            ));
+        }
+        if input.sample_rate_hz != self.rate_hz {
+            return Err(format!(
+                "NullDownsampler rate mismatch: expected {} Hz, got {} Hz",
+                self.rate_hz, input.sample_rate_hz
+            ));
+        }
         Ok(input)
+    }
+    fn pending_flush_frames(&self) -> usize {
+        0
     }
     fn flush(&mut self) -> Result<StereoF64Buffer, String> {
         Ok(StereoF64Buffer::empty(self.rate_hz))
@@ -342,6 +361,19 @@ impl Downsampler for IntegerDecimator {
     }
 
     fn process_block(&mut self, input: StereoF64Buffer) -> Result<StereoF64Buffer, String> {
+        if input.left.len() != input.right.len() {
+            return Err(format!(
+                "IntegerDecimator channel length mismatch: left={} right={}",
+                input.left.len(),
+                input.right.len()
+            ));
+        }
+        if input.sample_rate_hz != self.input_rate_hz {
+            return Err(format!(
+                "IntegerDecimator rate mismatch: expected {} Hz, got {} Hz",
+                self.input_rate_hz, input.sample_rate_hz
+            ));
+        }
         if input.is_empty() {
             return Ok(StereoF64Buffer::empty(self.output_rate_hz));
         }
@@ -353,6 +385,16 @@ impl Downsampler for IntegerDecimator {
             left,
             right,
         })
+    }
+
+    fn pending_flush_frames(&self) -> usize {
+        let total = self.hist_l.len() + self.pad_tail;
+        let need = self.phase_rem + self.taps.len();
+        if total < need {
+            0
+        } else {
+            (total - need) / self.factor + 1
+        }
     }
 
     fn flush(&mut self) -> Result<StereoF64Buffer, String> {
@@ -569,7 +611,7 @@ impl RationalDecimator {
             hist_l: vec![0.0_f64; half_tpp],
             hist_r: vec![0.0_f64; half_tpp],
             phase_m: 0,
-            pad_tail: half_tpp + 1,
+            pad_tail: half_tpp,
         })
     }
 
@@ -633,6 +675,19 @@ impl Downsampler for RationalDecimator {
     }
 
     fn process_block(&mut self, input: StereoF64Buffer) -> Result<StereoF64Buffer, String> {
+        if input.left.len() != input.right.len() {
+            return Err(format!(
+                "RationalDecimator channel length mismatch: left={} right={}",
+                input.left.len(),
+                input.right.len()
+            ));
+        }
+        if input.sample_rate_hz != self.input_rate_hz {
+            return Err(format!(
+                "RationalDecimator rate mismatch: expected {} Hz, got {} Hz",
+                self.input_rate_hz, input.sample_rate_hz
+            ));
+        }
         if input.is_empty() {
             return Ok(StereoF64Buffer::empty(self.output_rate_hz));
         }
@@ -644,6 +699,21 @@ impl Downsampler for RationalDecimator {
             left,
             right,
         })
+    }
+
+    fn pending_flush_frames(&self) -> usize {
+        let total = self.hist_l.len() + self.pad_tail;
+        let tpp = self.taps_per_phase;
+        let mut base = 0_usize;
+        let mut p = self.phase_m;
+        let mut count = 0_usize;
+        while base + tpp <= total {
+            count += 1;
+            let next_p = p + self.down_m;
+            base += next_p / self.up_l;
+            p = next_p % self.up_l;
+        }
+        count
     }
 
     fn flush(&mut self) -> Result<StereoF64Buffer, String> {
@@ -948,6 +1018,56 @@ mod tests {
                 alias_db < -170.0,
                 "rational {in_rate}->{out_rate} stopband {alias_hz} Hz rejection {alias_db:.1} dB"
             );
+        }
+    }
+
+    #[test]
+    fn rational_decimator_exact_output_length_and_process_block_validation() {
+        // D10: output length for any N_in must equal ceil(N_in * L / M) (zero +1 overrun).
+        for &(in_rate, out_rate, up_l, down_m) in &[
+            (352_800_u32, 192_000_u32, 80_usize, 147_usize),
+            (352_800, 96_000, 40, 147),
+            (352_800, 48_000, 20, 147),
+        ] {
+            for &n_in in &[0_usize, 1, 7, 147, 1000, 4096, 8193] {
+                let mut dec = build_downsampler(in_rate, out_rate).unwrap();
+                let mut total_out = 0_usize;
+                if n_in > 0 {
+                    let o = dec.process_block(sine_buf(in_rate, 1_000.0, n_in)).unwrap();
+                    total_out += o.len();
+                }
+                let pending = dec.pending_flush_frames();
+                let tail = dec.flush().unwrap();
+                assert_eq!(tail.len(), pending, "{in_rate}->{out_rate} n_in={n_in} pending mismatch");
+                total_out += tail.len();
+                let expected = if n_in == 0 {
+                    0
+                } else {
+                    (n_in * up_l).div_ceil(down_m)
+                };
+                assert_eq!(
+                    total_out, expected,
+                    "D10 rational {in_rate}->{out_rate} n_in={n_in}: got {total_out}, expected {expected}"
+                );
+            }
+        }
+
+        // D11: process_block validates sample rate and matching L/R lengths on all downsamplers.
+        for &(in_rate, out_rate) in &[(384_000_u32, 384_000_u32), (384_000, 48_000), (352_800, 48_000)] {
+            let mut dec = build_downsampler(in_rate, out_rate).unwrap();
+            let bad_rate = StereoF64Buffer {
+                sample_rate_hz: 44_100,
+                left: vec![0.0; 16],
+                right: vec![0.0; 16],
+            };
+            assert!(dec.process_block(bad_rate).is_err());
+
+            let bad_len = StereoF64Buffer {
+                sample_rate_hz: in_rate,
+                left: vec![0.0; 16],
+                right: vec![0.0; 15],
+            };
+            assert!(dec.process_block(bad_len).is_err());
         }
     }
 }

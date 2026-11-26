@@ -275,6 +275,13 @@ struct EngineState<'a> {
     shared: &'a SharedControl,
     upnp_state: Option<Arc<UpnpRendererState>>,
     capture_transport: Option<SharedCaptureTransport>,
+    /// Review #9 E2: when startup DAC rate probing hits `DeviceBusy`, keep a handle to the
+    /// shared `DacOutputCapabilities` + configured `max_rate_hz` so the consumer re-probes on the
+    /// first free open and re-renders the current track if the DAC's real capabilities differ.
+    deferred_dac_probe: Option<(
+        Arc<std::sync::RwLock<ap_core::format::DacOutputCapabilities>>,
+        Option<u32>,
+    )>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -351,6 +358,60 @@ impl<'a> EngineState<'a> {
             shared,
             upnp_state,
             capture_transport,
+            deferred_dac_probe: None,
+        }
+    }
+
+    fn with_deferred_dac_probe(
+        mut self,
+        shared_caps: Arc<std::sync::RwLock<ap_core::format::DacOutputCapabilities>>,
+        max_rate_hz: Option<u32>,
+    ) -> Self {
+        self.deferred_dac_probe = Some((shared_caps, max_rate_hz));
+        self
+    }
+
+    /// Re-render `track` under the active directive after a deferred DAC capability probe updates
+    /// the target sample rate / wire format (Review #9 E2).
+    fn rerender_current_track(&mut self, track: PathBuf) {
+        let base_play = match self.last_play.clone() {
+            PlayDirective::ResumeThen { then, .. } => *then,
+            other => other,
+        };
+        match base_play {
+            PlayDirective::Random { root } => {
+                self.start_directive(
+                    PlayDirective::ResumeThen {
+                        track,
+                        then: Box::new(PlayDirective::Random { root }),
+                    },
+                    false,
+                );
+            }
+            PlayDirective::Sequential {
+                root, folder_only, ..
+            } => {
+                self.last_started_track = Some(track.clone());
+                let after = self.sequential_after_last_started(root, folder_only, 0);
+                self.start_directive(
+                    PlayDirective::ResumeThen {
+                        track,
+                        then: Box::new(after),
+                    },
+                    false,
+                );
+            }
+            PlayDirective::SingleFile { file } => {
+                self.start_directive(PlayDirective::SingleFile { file }, true);
+            }
+            PlayDirective::UpnpStream { mut request } => {
+                request.prefetched_next_gen = None;
+                self.start_directive(PlayDirective::UpnpStream { request }, true);
+            }
+            PlayDirective::StreamCapture { request } => {
+                self.start_directive(PlayDirective::StreamCapture { request }, true);
+            }
+            PlayDirective::ResumeThen { .. } => unreachable!(),
         }
     }
 
@@ -1046,6 +1107,7 @@ pub fn run_random_music_player(
 
     // Probe DAC output capabilities (native 352.8/384 kHz tried first -> 2 probes, zero downsampling
     // on 8fS DACs; < 8fS DACs automatically get last-stage pure-f64 anti-aliasing downsampling).
+    let mut deferred_probe_needed = false;
     let dac_caps = match ap_output_win::wdm_ks::probe_ks_device_capabilities(
         sink.device(),
         effective_max_rate,
@@ -1059,20 +1121,24 @@ pub fn run_random_music_player(
             caps
         }
         Err(OutputError::DeviceBusy { .. }) => {
+            deferred_probe_needed = true;
+            let fallback =
+                ap_core::format::DacOutputCapabilities::native_8fs_capped(effective_max_rate);
             eprintln!(
-                "  [dac] '{dac_name}' is currently busy; deferring rate probe and defaulting to native 8fS"
+                "  [dac] '{dac_name}' is currently busy; deferring rate probe (will re-probe when free)"
             );
-            ap_core::format::DacOutputCapabilities::native_8fs()
+            fallback
         }
         Err(err) => return Err(CliError::device(err.to_string())),
     };
+    let shared_dac_caps = Arc::new(std::sync::RwLock::new(dac_caps));
 
     let pipeline = AudioPipeline::with_rew_config_full_tail(
         effective_policy,
         effective_conv,
         effective_ultimate.enabled,
     )?
-    .with_dac_capabilities(dac_caps);
+    .with_shared_dac_capabilities(Arc::clone(&shared_dac_caps));
 
     let api_token = generate_api_token_hex();
     let effective_options_json = JsonValue::obj(vec![
@@ -1334,6 +1400,9 @@ pub fn run_random_music_player(
         upnp_state,
         capture_transport,
     );
+    if deferred_probe_needed {
+        state = state.with_deferred_dac_probe(Arc::clone(&shared_dac_caps), effective_max_rate);
+    }
 
     while controller.current_signal().is_none() {
         match step_consumer_once(
@@ -1405,6 +1474,15 @@ trait BlockStreamAudioSink {
     {
         self.play_block_stream(sample_rate_hz, wire_format, next_block)
     }
+
+    /// Optional live hardware capability re-probe (used by Review #9 E2 when the DAC was busy at
+    /// startup). Returns `None` for mock sinks that do not implement live probing.
+    fn probe_capabilities(
+        &self,
+        _max_rate_hz: Option<u32>,
+    ) -> Option<Result<ap_core::format::DacOutputCapabilities, OutputError>> {
+        None
+    }
 }
 
 impl BlockStreamAudioSink for WdmKsSink {
@@ -1438,6 +1516,16 @@ impl BlockStreamAudioSink for WdmKsSink {
             next_block,
             recycle_block,
         )
+    }
+
+    fn probe_capabilities(
+        &self,
+        max_rate_hz: Option<u32>,
+    ) -> Option<Result<ap_core::format::DacOutputCapabilities, OutputError>> {
+        Some(ap_output_win::wdm_ks::probe_ks_device_capabilities(
+            self.device(),
+            max_rate_hz,
+        ))
     }
 }
 
@@ -1647,6 +1735,33 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
                 );
                 let _ = state.dispatch(cmd);
                 return ConsumerStepResult::Continue;
+            }
+
+            // Review #9 E2: if the startup DAC rate probe was deferred due to `DeviceBusy`,
+            // re-probe now (before opening the pin) so `< 8fS` DACs discover their true rate and
+            // wire format on the first free open instead of failing every track until restart.
+            if let Some((shared_caps, max_rate_hz)) = state.deferred_dac_probe.clone() {
+                if let Some(Ok(probed)) = sink.probe_capabilities(max_rate_hz) {
+                    if probed.has_any_supported_rate() {
+                        *shared_caps.write().unwrap_or_else(|e| e.into_inner()) = probed;
+                        state.deferred_dac_probe = None;
+                        if let Ok(expected) =
+                            probed.resolve_for_internal_rate(report.internal_rate_hz)
+                        {
+                            if expected.sample_rate_hz != out_rate
+                                || expected.wire_format != report.wire_format
+                            {
+                                eprintln!(
+                                    "  [dac] Deferred probe resolved {} Hz {} — re-rendering current track",
+                                    expected.sample_rate_hz,
+                                    expected.wire_format.label()
+                                );
+                                state.rerender_current_track(path);
+                                return ConsumerStepResult::Continue;
+                            }
+                        }
+                    }
+                }
             }
 
             // Record the track actually started by the consumer (not producer decode-ahead).
@@ -2880,7 +2995,7 @@ fn stream_single_track(
     };
 
     let src_block_frames =
-        source_block_frames_for_rates(spec.sample_rate_hz, session.report().output_rate_hz);
+        source_block_frames_for_rates(spec.sample_rate_hz, session.report().internal_rate_hz);
 
     // Review #3 Finding #3: decode and validate the first non-empty block BEFORE touching
     // `incoming_carryover` or closing `TrackEnd(prev)`. If this track is 0-frame or corrupt on
@@ -3436,7 +3551,7 @@ fn stream_open_audio_source<S: AudioBlockSource>(
     };
 
     let block_frames = block_frames_override.unwrap_or_else(|| {
-        source_block_frames_for_rates(spec.sample_rate_hz, session.report().output_rate_hz)
+        source_block_frames_for_rates(spec.sample_rate_hz, session.report().internal_rate_hz)
     });
 
     let first_src = loop {
@@ -6784,5 +6899,18 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn source_block_frames_targets_internal_8fs_rate_not_downsampled_dac_rate() {
+        // Review #9 E1: a 44.1 kHz track upsampled to 352.8 kHz internal (even on a 48 kHz DAC)
+        // must chunk at ~8,192 source frames (~186 ms -> 1 UPOLS partition at 352.8 kHz),
+        // NOT ~60,211 source frames (~1.37 s)!
+        let internal_44 = source_block_frames_for_rates(44_100, 352_800);
+        let buggy_48 = source_block_frames_for_rates(44_100, 48_000);
+        assert_eq!(internal_44, 8_192);
+        assert!(buggy_48 > 50_000);
+        assert_eq!(source_block_frames_for_rates(48_000, 384_000), 8_192);
+        assert_eq!(source_block_frames_for_rates(96_000, 384_000), 16_384);
     }
 }

@@ -134,6 +134,24 @@ impl DacOutputCapabilities {
         }
     }
 
+    /// Fallback capabilities when the DAC is temporarily busy at startup: assumes standard `Int32`
+    /// rates up to `max_rate_hz` (preserving `--max-rate` / `[player] max_rate` until the live
+    /// hardware probe succeeds).
+    pub fn native_8fs_capped(max_rate_hz: Option<u32>) -> Self {
+        match max_rate_hz {
+            None => Self::native_8fs(),
+            Some(cap) => {
+                let mut all = Vec::with_capacity(
+                    STANDARD_DAC_RATES_44K.len() + STANDARD_DAC_RATES_48K.len(),
+                );
+                for &r in STANDARD_DAC_RATES_44K.iter().chain(STANDARD_DAC_RATES_48K.iter()) {
+                    all.push((r, DacWireFormat::Int32));
+                }
+                Self::from_supported_rates(&all, Some(cap))
+            }
+        }
+    }
+
     /// Resolve the best per-family targets from a list of supported `(sample_rate_hz, wire_format)`
     /// pairs and an optional `max_rate_hz` ceiling.
     ///
@@ -328,5 +346,17 @@ mod tests {
             capped.resolve_for_internal_rate(384_000).unwrap().sample_rate_hz,
             96_000
         );
+
+        // 5. E2: Busy-DAC startup fallback preserves --max-rate cap.
+        let busy_capped = DacOutputCapabilities::native_8fs_capped(Some(192_000));
+        assert_eq!(
+            busy_capped.resolve_for_internal_rate(352_800).unwrap().sample_rate_hz,
+            176_400
+        );
+        assert_eq!(
+            busy_capped.resolve_for_internal_rate(384_000).unwrap().sample_rate_hz,
+            192_000
+        );
+        assert_eq!(busy_capped.max_rate_hz, Some(192_000));
     }
 }

@@ -522,29 +522,39 @@ impl StreamingPipelineSession {
             out_r.extend_from_slice(&ds_out.right);
         }
 
-        // When last-stage downsampling is active, render Track A's decaying REW tail + downsampler
-        // FIR tail through Track A's own downsampler into `output_rate_hz` so Track B receives
-        // a strictly additive `z_A[n]` at `output_rate_hz` with zero cross-track coupling.
+        // When last-stage downsampling is active, render Track A's decaying REW tail through
+        // Track A's own downsampler into `output_rate_hz` so Track B receives a strictly additive
+        // `z_A[n]` at `output_rate_hz` with zero cross-track coupling.
+        //
+        // Review #9 D1: the decimator lags its input by `half` samples, so before feeding
+        // `conv_tail` we record `pending_a_out` — the exact number of output frames belonging to
+        // Track A's own already-pushed samples (`ceil(N_A * L / M)` total). Only the outputs
+        // AFTER `pending_a_out` (driven by `conv_tail`) become the additive tail `z_A[n]`!
         if !self.downsampler.is_bypass() {
-            let mut tail_out_l = Vec::new();
-            let mut tail_out_r = Vec::new();
+            let pending_a_out = self.downsampler.pending_flush_frames();
+            let mut combined_l = Vec::new();
+            let mut combined_r = Vec::new();
             if let Some(ct) = conv_tail.take() {
                 let ds_c = self.downsampler.process_block(StereoF64Buffer {
                     sample_rate_hz: internal_rate,
                     left: ct.left,
                     right: ct.right,
                 })?;
-                tail_out_l.extend_from_slice(&ds_c.left);
-                tail_out_r.extend_from_slice(&ds_c.right);
+                combined_l.extend_from_slice(&ds_c.left);
+                combined_r.extend_from_slice(&ds_c.right);
             }
             let ds_flush = self.downsampler.flush()?;
-            tail_out_l.extend_from_slice(&ds_flush.left);
-            tail_out_r.extend_from_slice(&ds_flush.right);
-            if !tail_out_l.is_empty() {
+            combined_l.extend_from_slice(&ds_flush.left);
+            combined_r.extend_from_slice(&ds_flush.right);
+
+            let split = pending_a_out.min(combined_l.len());
+            out_l.extend_from_slice(&combined_l[..split]);
+            out_r.extend_from_slice(&combined_r[..split]);
+            if split < combined_l.len() {
                 conv_tail = Some(ConvolutionTail {
                     sample_rate_hz: out_rate,
-                    left: tail_out_l,
-                    right: tail_out_r,
+                    left: combined_l[split..].to_vec(),
+                    right: combined_r[split..].to_vec(),
                 });
             }
         }
@@ -888,7 +898,7 @@ pub struct AudioPipeline {
     picker: UpsamplerPicker,
     convolver_factory: Box<dyn StereoConvolverFactory>,
     delayer_factory: Box<dyn ChannelDelayerFactory>,
-    dac_caps: DacOutputCapabilities,
+    dac_caps: std::sync::Arc<std::sync::RwLock<DacOutputCapabilities>>,
 }
 
 impl AudioPipeline {
@@ -899,20 +909,40 @@ impl AudioPipeline {
             picker: UpsamplerPicker::new(upsampler_policy)?,
             convolver_factory: Box::new(NullConvolverFactory),
             delayer_factory: Box::new(NullChannelDelayerFactory),
-            dac_caps: DacOutputCapabilities::native_8fs(),
+            dac_caps: std::sync::Arc::new(std::sync::RwLock::new(
+                DacOutputCapabilities::native_8fs(),
+            )),
         })
     }
 
     /// Attach probed or configured [`DacOutputCapabilities`] for optional last-stage `f64`
     /// downsampling on `< 352.8 / 384 kHz` DACs (no-op bypass on native `8fS` DACs).
-    pub fn with_dac_capabilities(mut self, dac_caps: DacOutputCapabilities) -> Self {
+    pub fn with_dac_capabilities(self, dac_caps: DacOutputCapabilities) -> Self {
+        self.update_dac_capabilities(dac_caps);
+        self
+    }
+
+    /// Attach a shared [`DacOutputCapabilities`] handle so a deferred hardware probe can update
+    /// the active DAC capabilities once a busy DAC becomes free.
+    pub fn with_shared_dac_capabilities(
+        mut self,
+        dac_caps: std::sync::Arc<std::sync::RwLock<DacOutputCapabilities>>,
+    ) -> Self {
         self.dac_caps = dac_caps;
         self
     }
 
+    /// Update the active DAC capabilities in place.
+    pub fn update_dac_capabilities(&self, dac_caps: DacOutputCapabilities) {
+        *self
+            .dac_caps
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = dac_caps;
+    }
+
     /// Active DAC output capabilities attached to this pipeline factory.
     pub fn dac_capabilities(&self) -> DacOutputCapabilities {
-        self.dac_caps
+        *self.dac_caps.read().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Construct a pipeline with configured REW stereo convolution (`ConvolutionConfig`) + null delay.
@@ -960,7 +990,9 @@ impl AudioPipeline {
         }
 
         let internal_rate = dsp_plan.target_rate_hz;
-        let dac_target = self.dac_caps.resolve_for_internal_rate(internal_rate)?;
+        let dac_target = self
+            .dac_capabilities()
+            .resolve_for_internal_rate(internal_rate)?;
         let out_rate = dac_target.sample_rate_hz;
         let wire_format = dac_target.wire_format;
 
@@ -1045,7 +1077,9 @@ impl AudioPipeline {
             picker: UpsamplerPicker::new(upsampler_policy)?,
             convolver_factory,
             delayer_factory,
-            dac_caps: DacOutputCapabilities::native_8fs(),
+            dac_caps: std::sync::Arc::new(std::sync::RwLock::new(
+                DacOutputCapabilities::native_8fs(),
+            )),
         })
     }
 
@@ -1142,7 +1176,9 @@ impl AudioPipeline {
         let is_streaming_source = source_info.is_streaming_source;
         let dsp_plan = self.picker.select(&source_info);
         let internal_rate = dsp_plan.target_rate_hz;
-        let dac_target = self.dac_caps.resolve_for_internal_rate(internal_rate)?;
+        let dac_target = self
+            .dac_capabilities()
+            .resolve_for_internal_rate(internal_rate)?;
         let out_rate = dac_target.sample_rate_hz;
         let wire_format = dac_target.wire_format;
 
@@ -1286,7 +1322,12 @@ impl AudioPipeline {
                     let mut delayer = self.delayer_factory.create_for_rate(internal_rate)?;
                     let mut downsampler = build_downsampler(internal_rate, out_rate)?;
                     if let Some(down_carry) = rejected.downsampler.take() {
-                        let _ = downsampler.set_incoming_carryover(down_carry);
+                        downsampler.set_incoming_carryover(down_carry).map_err(|dc| {
+                            format!(
+                                "downsampler carryover mismatch ({} -> {} Hz into {} -> {} Hz)",
+                                dc.input_rate_hz, dc.output_rate_hz, internal_rate, out_rate
+                            )
+                        })?;
                     }
                     let mut quantizer = StreamingQuantizer::with_rate_options(
                         rejected.effective_shaper,
@@ -1346,7 +1387,12 @@ impl AudioPipeline {
                         frames.extend(quantizer.quantize_block(&ds_immediate).frames);
                     }
                     if let Some(dc) = next_down_carry {
-                        let _ = session.downsampler.set_incoming_carryover(dc);
+                        session.downsampler.set_incoming_carryover(dc).map_err(|dc| {
+                            format!(
+                                "downsampler carryover handoff mismatch ({} -> {} Hz into {} -> {} Hz)",
+                                dc.input_rate_hz, dc.output_rate_hz, internal_rate, out_rate
+                            )
+                        })?;
                     }
                     tail_stats = quantizer.stats();
                     if rejected.effective_shaper == session.report.effective_shaper
@@ -1416,7 +1462,15 @@ impl AudioPipeline {
                         }
                     }
                     if let Some(down_carry) = rejected.downsampler.take() {
-                        let _ = session.downsampler.set_incoming_carryover(down_carry);
+                        session
+                            .downsampler
+                            .set_incoming_carryover(down_carry)
+                            .map_err(|dc| {
+                                format!(
+                                    "downsampler carryover attach mismatch ({} -> {} Hz into {} -> {} Hz)",
+                                    dc.input_rate_hz, dc.output_rate_hz, internal_rate, out_rate
+                                )
+                            })?;
                     }
                     if let Some(q_state) = rejected.quantizer_state.take() {
                         if rejected.effective_shaper == session.report.effective_shaper
@@ -1468,7 +1522,12 @@ impl AudioPipeline {
         let mut delayer = self.delayer_factory.create_for_rate(internal_rate)?;
         let mut downsampler = build_downsampler(internal_rate, out_rate)?;
         if let Some(down_carry) = carryover.downsampler {
-            let _ = downsampler.set_incoming_carryover(down_carry);
+            downsampler.set_incoming_carryover(down_carry).map_err(|dc| {
+                format!(
+                    "downsampler carryover drain mismatch ({} -> {} Hz into {} -> {} Hz)",
+                    dc.input_rate_hz, dc.output_rate_hz, internal_rate, out_rate
+                )
+            })?;
         }
         let mut quantizer = StreamingQuantizer::with_rate_options(
             carryover.effective_shaper,
@@ -1805,5 +1864,112 @@ mod tests {
         assert_eq!(out_48.report.output_rate_hz, 192_000);
         assert_eq!(out_48.report.downsampler_name, "decim-rational-kaiser");
         assert_eq!(out_48.report.effective_shaper, NoiseShaperProfile::NsGentle2);
+    }
+
+    #[test]
+    fn ultimate_gapless_with_downsampler_exact_length_and_no_end_overlap_onto_b() {
+        // Review #9 D1 + D10: Track A ends with a strong burst near its tail, Track B is silence.
+        // In Ultimate gapless mode with downsampling active (both integer ÷8 and rational 352.8->48):
+        // 1) Track A's output length MUST equal ceil(N_A_internal * L / M) (not cut short by half/D).
+        // 2) Track A's ending burst MUST appear inside Track A's own output, and with no REW
+        //    convolver, the additive tail `z_A[n]` MUST be None (zero bleed onto Track B's start!).
+        let policy = UpsamplerPolicy::default();
+        let spec_44k = StreamSpec {
+            sample_rate_hz: 44_100,
+            bits_per_sample: 16,
+            channels: 2,
+        };
+        let src_info = TrackSourceInfo::from_stream_spec(spec_44k);
+        let plan = UpsamplerPicker::new(policy).unwrap().select(&src_info);
+        let placeholder_hr = HeadroomDecision {
+            mode: HeadroomMode::ZeroDb,
+            peak_dbfs: Some(-1.0),
+            peak_kind: Some(ap_core::headroom::PeakKind::TruePeak),
+            convolution_scale_db: 0.0,
+            reason: "test".to_string(),
+        };
+
+        let cases: &[(u32, usize, usize)] = &[
+            (44_100, 1, 8),    // integer ÷8 (352,800 -> 44,100)
+            (176_400, 1, 2),   // integer ÷2 (352,800 -> 176,400)
+            (48_000, 20, 147), // rational (352,800 -> 48,000)
+        ];
+
+        for &(dac_rate, up_l, down_m) in cases {
+            let caps = DacOutputCapabilities::from_supported_rates(
+                &[(dac_rate, DacWireFormat::Int32)],
+                None,
+            );
+            let pipe = AudioPipeline::new(policy)
+                .unwrap()
+                .with_dac_capabilities(caps);
+
+            // Track A: 2048 source samples @ 44.1 kHz (= 16,384 internal 8fS samples),
+            // with a 0.5-amplitude 1 kHz burst in the final 400 source samples (~9 ms).
+            let n_src_a = 2048_usize;
+            let n_internal_a = n_src_a * 8;
+            let mut a_l = vec![0.0_f64; n_src_a];
+            let mut a_r = vec![0.0_f64; n_src_a];
+            for n in (n_src_a - 400)..n_src_a {
+                let v = 0.5 * (2.0 * std::f64::consts::PI * 1000.0 * n as f64 / 44_100.0).sin();
+                a_l[n] = v;
+                a_r[n] = v;
+            }
+            let buf_a = StereoF64Buffer {
+                sample_rate_hz: 44_100,
+                left: a_l,
+                right: a_r,
+            };
+
+            let mut sess_a = pipe
+                .start_track_with_plan_and_headroom(spec_44k, plan.clone(), placeholder_hr.clone())
+                .unwrap();
+            let mut out_a = sess_a.process_block_unity_f64(buf_a).unwrap();
+            let (tail_a, _peak_a, carry_a) = sess_a.flush_for_gapless_unity_f64(0.0).unwrap();
+            out_a.left.extend_from_slice(&tail_a.left);
+            out_a.right.extend_from_slice(&tail_a.right);
+
+            let expected_a = (n_internal_a * up_l).div_ceil(down_m);
+            assert_eq!(
+                out_a.left.len(),
+                expected_a,
+                "D1/D10 dac_rate={dac_rate}: Track A len {} != expected {expected_a}",
+                out_a.left.len()
+            );
+            assert!(
+                carry_a.as_ref().and_then(|c| c.convolver.as_ref()).is_none(),
+                "D1 dac_rate={dac_rate}: without REW convolver, Track A's end must NOT leak into additive tail z_A"
+            );
+            // Verify Track A's final 2 ms actually contain the burst (not cut off!).
+            let tail_window = ((dac_rate as usize) * 2) / 1000;
+            let end_peak = out_a.left[out_a.left.len().saturating_sub(tail_window)..]
+                .iter()
+                .fold(0.0_f64, |m, &x| m.max(x.abs()));
+            assert!(
+                end_peak > 0.25,
+                "D1 dac_rate={dac_rate}: Track A's ending burst was cut short (end_peak={end_peak:.4})"
+            );
+
+            // Track B: 1024 silent source samples -> exact length ceil(8192 * L / M) and all zeros.
+            let n_src_b = 1024_usize;
+            let n_internal_b = n_src_b * 8;
+            let buf_b = StereoF64Buffer {
+                sample_rate_hz: 44_100,
+                left: vec![0.0_f64; n_src_b],
+                right: vec![0.0_f64; n_src_b],
+            };
+            let mut sess_b = pipe
+                .start_track_with_plan_and_headroom(spec_44k, plan.clone(), placeholder_hr.clone())
+                .unwrap();
+            let mut out_b = sess_b.process_block_unity_f64(buf_b).unwrap();
+            let (tail_b, _peak_b, carry_b) = sess_b.flush_for_gapless_unity_f64(0.0).unwrap();
+            out_b.left.extend_from_slice(&tail_b.left);
+            assert_eq!(out_b.left.len(), (n_internal_b * up_l).div_ceil(down_m));
+            assert!(carry_b.as_ref().and_then(|c| c.convolver.as_ref()).is_none());
+            assert_eq!(
+                out_a.left.len() + out_b.left.len(),
+                expected_a + (n_internal_b * up_l).div_ceil(down_m)
+            );
+        }
     }
 }
