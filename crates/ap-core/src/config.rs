@@ -41,16 +41,14 @@ pub const fn is_valid_dac_bits(bits: u8) -> bool {
 }
 
 /// Allowed `[quantizer] shaper` string values (case-insensitive).
-pub const ALLOWED_SHAPER_NAMES: [&str; 10] = [
+pub const ALLOWED_SHAPER_NAMES: [&str; 8] = [
     "auto",
     "bypass",
     "tpdf",
     "ns-gentle-2",
-    "ns5",
-    "ns5-class",
-    "lns15",
-    "lns15-class",
-    "pggb-optimal",
+    "ns-sharp-5",
+    "ns-smooth-15",
+    "ns-wide-9",
     "wide40-9",
 ];
 
@@ -227,8 +225,7 @@ impl QuantizerConfig {
             if !is_valid_shaper_name(shaper) {
                 return Err(format!(
                     "[quantizer] unknown 'shaper' '{shaper}'; expected auto, bypass, tpdf, \
-                     ns-gentle-2, ns5 (alias ns5-class), lns15 (alias lns15-class), \
-                     or pggb-optimal (alias wide40-9)"
+                     ns-gentle-2, ns-sharp-5, ns-smooth-15, or ns-wide-9 (alias wide40-9)"
                 ));
             }
         }
@@ -721,7 +718,7 @@ impl PlayerConfig {
                             } else {
                                 return Err(format!(
                                     "config line {line_no}: unknown 'shaper' '{trimmed}' in [quantizer] \
-                                     (allowed: auto, bypass, tpdf, ns-gentle-2, ns5, lns15, pggb-optimal)"
+                                     (allowed: auto, bypass, tpdf, ns-gentle-2, ns-sharp-5, ns-smooth-15, ns-wide-9)"
                                 ));
                             }
                         }

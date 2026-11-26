@@ -2,7 +2,7 @@
 
 [🏠 Home](../README.md) · [🚀 Quick Start](QUICK_START.md) · [🧭 Getting Started](GETTING_STARTED.md) · [💎 Ultimate Mode](ULTIMATE_MODE.md) · **🎛️ Sound Engine** · [⌨️ CLI](CLI.md)
 
-This page assumes you already know the vocabulary: poly-sinc, apodizing, closed-form, NS5/LNS15, DAC bits. It covers what this player does differently, and why.
+This page assumes you already know the vocabulary: poly-sinc, apodizing, closed-form, noise shaping, DAC bits. It covers what this player does differently, and why.
 
 ---
 
@@ -82,7 +82,7 @@ There is one quantizer, right at the end. It always applies TPDF dither, plus no
 ```mermaid
 xychart-beta
     title "In-band (0-20 kHz) noise vs flat TPDF, dB (384 kHz)"
-    x-axis ["tpdf", "ns-gentle-2", "pggb-optimal", "lns15", "ns5"]
+    x-axis ["tpdf", "ns-gentle-2", "ns-wide-9", "ns-smooth-15", "ns-sharp-5"]
     y-axis "dB" -60 --> 0
     bar [0, -14.6, -40.6, -51.5, -58.7]
 ```
@@ -91,9 +91,9 @@ xychart-beta
 |---|---|---|---|---|---|
 | `tpdf` | flat | 0 dB | none | 🟢 lowest | Outputs at 96 kHz and below |
 | `ns-gentle-2` | 2 | −14.6 dB | +6 dB peak | 🟢 low | **Default** at 8fS and 4fS |
-| `pggb-optimal` (`wide40-9`) | 9 | −40.6 dB, quiet to 40 kHz | +18 dB peak | 🟠 high | Listening option |
-| `lns15` (`lns15-class`) | 15 | −51.5 dB | +15 dB peak | 🟠 high | Listening option |
-| `ns5` (`ns5-class`) | 5 | −58.7 dB | +20 dB peak | 🔴 highest | Listening option |
+| `ns-wide-9` (`wide40-9`) | 9 | −40.6 dB, quiet to 40 kHz | +18 dB peak | 🟠 high | Listening option |
+| `ns-smooth-15` | 15 | −51.5 dB | +15 dB peak | 🟠 high | Listening option |
+| `ns-sharp-5` | 5 | −58.7 dB | +20 dB peak | 🔴 highest | Listening option |
 | `bypass` | — | — | — | — | Automatic for native 32-bit 8fS with `null` (bit-perfect) |
 
 The figures in the table are for 384 kHz. At 4fS each shaper uses its own table, designed for the narrower ultrasonic band, so these exact figures don't apply there.
@@ -140,7 +140,7 @@ flowchart LR
 | DAC's best rate (per family) | What the last stage does | Noise shaping |
 |---|---|---|
 | 352.8 / 384 kHz | Nothing. No downsampler in the path at all | 8fS shapers (`ns-gentle-2` default) |
-| 176.4 / 192 kHz (4fS) | ÷2 | 4fS shapers (`ns-gentle-2` default; `ns5`, `lns15`, `pggb-optimal` available) |
+| 176.4 / 192 kHz (4fS) | ÷2 | 4fS shapers (`ns-gentle-2` default; `ns-sharp-5`, `ns-wide-9`, `ns-smooth-15` available) |
 | 88.2 / 96 kHz (2fS) | ÷4 | Flat TPDF |
 | 44.1 / 48 kHz (1fS) | ÷8 | Flat TPDF |
 | Only one clock family (e.g. a 48 / 96 / 192 kHz-only HDMI or S/PDIF device) | For the other family: exact rational (L/M) polyphase conversion, e.g. 352.8 → 192 kHz | As per the output rate |

@@ -297,7 +297,7 @@ Installation and setup problems (installer exit codes, `doctor` items, DAC busy,
 | "DAC busy … staying paused" | Another app holds the DAC exclusively. Close it, then press Play |
 | "Output error (… unsupported format …)" or exit code `3` | The DAC (or its current driver mode) accepts none of the standard rates. Run `audiophile-player devices`; some DACs have a driver control panel that sets the allowed rates or bit depth |
 | Output is 192 kHz (or lower) although you expected 384 | Your DAC tops out there, or `max_rate` is set. Check `devices` and `config show`. This is supported: the last stage converts down |
-| `[shaper warn] noise shaper '…' requires 4fS/8fS …; falling back to tpdf` | You forced a shaper (`--shaper ns5` etc.) on a DAC running at 96 kHz or lower. Shaped profiles exist for 176.4 / 192 / 352.8 / 384 kHz only; flat TPDF is used below that |
+| `[shaper warn] noise shaper '…' requires 4fS/8fS …; falling back to tpdf` | You forced a shaper (`--shaper ns-sharp-5` etc.) on a DAC running at 96 kHz or lower. Shaped profiles exist for 176.4 / 192 / 352.8 / 384 kHz only; flat TPDF is used below that |
 | Wrong output device | `config set device "<any part of the name>"`, then `restart` |
 | Tidal doesn't show `Line (Audiophile Player)` | Restart Tidal Desktop once after running `install-driver.ps1`; check that `Get-PnpDevice -Class MEDIA` shows `Audiophile Player` as `OK` |
 | `[capture zero-mixer] Blocked … audiodg.exe` | Normal safety message: Windows or an app tried shared mode (mixer) on `Line (Audiophile Player)` and the kernel rejected it. Turn **Use Exclusive Mode ON** in Tidal |

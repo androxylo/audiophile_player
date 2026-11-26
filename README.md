@@ -119,4 +119,4 @@ This program is distributed in the hope that it will be useful, but **WITHOUT AN
 
 The optional kernel driver (`drivers/ap-exclusive-acx`) includes a GPLv3 Section 7 additional permission for linking with Microsoft WDK/KMDF/ACX static libraries; see [`drivers/ap-exclusive-acx/NOTICE`](drivers/ap-exclusive-acx/NOTICE).
 
-The repository contains no copyrighted music and no proprietary filter coefficients. Shapers named after familiar ones (`ns5`, `lns15`, `pggb-optimal`) are clean-room designs that follow the published *intent* of those shapers. They are not copies.
+The repository contains no copyrighted music and no proprietary filter or noise-shaper coefficients. All upsampling filters and error-feedback noise shapers (`ns-gentle-2`, `ns-sharp-5`, `ns-wide-9`, `ns-smooth-15`) are independent clean-room designs.

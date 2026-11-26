@@ -143,7 +143,7 @@ fn dummy_default_selector_ignores_apodizing_flag_while_custom_selector_can_plug_
 fn cli_filter_and_shaper_overrides_are_enforced_across_tracks() {
     let policy = UpsamplerPolicy {
         filter_override: Some(FilterArchetype::SincSteep4M),
-        shaper_override: Some(NoiseShaperProfile::Lns15Smooth),
+        shaper_override: Some(NoiseShaperProfile::NsSmooth15),
         max_taps: MAX_FILTER_TAPS,
         ..UpsamplerPolicy::default()
     };
@@ -156,7 +156,7 @@ fn cli_filter_and_shaper_overrides_are_enforced_across_tracks() {
     ] {
         let plan = picker.select(&track(rate, 24));
         assert_eq!(plan.filter, FilterArchetype::SincSteep4M);
-        assert_eq!(plan.shaper, NoiseShaperProfile::Lns15Smooth);
+        assert_eq!(plan.shaper, NoiseShaperProfile::NsSmooth15);
         assert_eq!(plan.ratio, expected_ratio);
         assert!(plan.filter_overridden);
         assert!(plan.shaper_overridden);
@@ -167,7 +167,7 @@ fn cli_filter_and_shaper_overrides_are_enforced_across_tracks() {
     let plan_384 = picker.select(&track(384_000, 32));
     assert_eq!(plan_384.filter, FilterArchetype::Null);
     assert_eq!(plan_384.ratio, UpsampleRatio::Bypass1x);
-    assert_eq!(plan_384.shaper, NoiseShaperProfile::Lns15Smooth);
+    assert_eq!(plan_384.shaper, NoiseShaperProfile::NsSmooth15);
 }
 
 #[test]
@@ -364,23 +364,15 @@ fn cli_names_and_compatibility_aliases_parse_roundtrip_for_all_filters_and_shape
         NoiseShaperProfile::Bypass,
         NoiseShaperProfile::TpdfDither,
         NoiseShaperProfile::NsGentle2,
-        NoiseShaperProfile::Ns5Multibit,
-        NoiseShaperProfile::Lns15Smooth,
-        NoiseShaperProfile::PggbOptimal,
+        NoiseShaperProfile::NsSharp5,
+        NoiseShaperProfile::NsSmooth15,
+        NoiseShaperProfile::NsWide9,
     ] {
         assert_eq!(NoiseShaperProfile::from_str(s.cli_name()).unwrap(), s);
     }
     assert_eq!(
-        NoiseShaperProfile::from_str("ns5-class").unwrap(),
-        NoiseShaperProfile::Ns5Multibit
-    );
-    assert_eq!(
-        NoiseShaperProfile::from_str("lns15-class").unwrap(),
-        NoiseShaperProfile::Lns15Smooth
-    );
-    assert_eq!(
         NoiseShaperProfile::from_str("wide40-9").unwrap(),
-        NoiseShaperProfile::PggbOptimal
+        NoiseShaperProfile::NsWide9
     );
     assert!(NoiseShaperProfile::from_str("nonexistent").is_err());
 }

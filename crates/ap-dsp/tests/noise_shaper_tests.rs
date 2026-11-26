@@ -14,17 +14,17 @@ use realfft::RealFftPlanner;
 
 const SHAPED_PROFILES: [NoiseShaperProfile; 4] = [
     NoiseShaperProfile::NsGentle2,
-    NoiseShaperProfile::Ns5Multibit,
-    NoiseShaperProfile::Lns15Smooth,
-    NoiseShaperProfile::PggbOptimal,
+    NoiseShaperProfile::NsSharp5,
+    NoiseShaperProfile::NsSmooth15,
+    NoiseShaperProfile::NsWide9,
 ];
 
 const ALL_DITHERED_PROFILES: [NoiseShaperProfile; 5] = [
     NoiseShaperProfile::TpdfDither,
     NoiseShaperProfile::NsGentle2,
-    NoiseShaperProfile::Ns5Multibit,
-    NoiseShaperProfile::Lns15Smooth,
-    NoiseShaperProfile::PggbOptimal,
+    NoiseShaperProfile::NsSharp5,
+    NoiseShaperProfile::NsSmooth15,
+    NoiseShaperProfile::NsWide9,
 ];
 
 /// 4-term Blackman-Harris window (`-92 dB` sidelobes) so `+18.6 dB` ultrasonic shaped noise
@@ -275,7 +275,7 @@ fn gate3_minus_100_dbfs_997hz_tone_at_16bit_is_linear_and_spur_free() {
     for profile in [
         NoiseShaperProfile::TpdfDither,
         NoiseShaperProfile::NsGentle2,
-        NoiseShaperProfile::Ns5Multibit,
+        NoiseShaperProfile::NsSharp5,
     ] {
         let mut q = StreamingQuantizer::with_rate(profile, dac_bits, rate_hz).unwrap();
         let out = q.quantize_block(&audio);
@@ -371,7 +371,7 @@ fn gate4_digital_silence_is_bounded_and_free_of_idle_tones() {
                 let f = (k as f64) * fs / (fft_n as f64);
                 let expected = 0.25 * ntf_mag_sq_at_hz(coeffs, f, fs);
                 // Ignore ultra-deep near-DC bins where -92 dB Blackman-Harris sidelobe floor
-                // sits above a -65 dB theoretical notch (`ns5` below 2 kHz).
+                // sits above a -65 dB theoretical notch (`ns-sharp-5` below 2 kHz).
                 if expected < 1e-6 {
                     continue;
                 }
@@ -475,9 +475,9 @@ fn gate6_determinism_chunk_invariance_state_carryover_and_non_8fs_fallback() {
         NoiseShaperProfile::Bypass,
         NoiseShaperProfile::TpdfDither,
         NoiseShaperProfile::NsGentle2,
-        NoiseShaperProfile::Ns5Multibit,
-        NoiseShaperProfile::Lns15Smooth,
-        NoiseShaperProfile::PggbOptimal,
+        NoiseShaperProfile::NsSharp5,
+        NoiseShaperProfile::NsSmooth15,
+        NoiseShaperProfile::NsWide9,
     ] {
         // Repeatability: two fresh quantizers produce byte-identical output.
         let out_a = quantize_to_int32(&audio, profile, 20).unwrap();

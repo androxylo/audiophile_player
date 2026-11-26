@@ -838,7 +838,7 @@ mod quantizer_policy_tests {
     fn cli_quantizer_flags_override_toml_config_and_auto_clears_toml_shaper() {
         let cfg = QuantizerConfig {
             dac_bits: 16,
-            shaper: Some("ns5".to_string()),
+            shaper: Some("ns-sharp-5".to_string()),
         };
 
         // No CLI flags -> config wins.
@@ -846,7 +846,7 @@ mod quantizer_policy_tests {
             resolve_upsampler_policy(UpsamplerPolicy::default(), QuantizerCliOverride::default(), &cfg)
                 .unwrap();
         assert_eq!(p_cfg.dac_bits, 16);
-        assert_eq!(p_cfg.shaper_override, Some(NoiseShaperProfile::Ns5Multibit));
+        assert_eq!(p_cfg.shaper_override, Some(NoiseShaperProfile::NsSharp5));
 
         // Explicit --dac-bits 20 --shaper auto overrides both TOML fields.
         let p_cli = resolve_upsampler_policy(

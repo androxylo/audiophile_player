@@ -18,10 +18,10 @@
 //! deterministic across platforms) and unit tests audit every frozen table against the
 //! clean-room solver to `< 1e-9`.
 //!
-//! Note on naming (`04-noise-shapers.md` §3): `Ns5Multibit` (`ns5-class`), `Lns15Smooth`
-//! (`lns15-class`), and `PggbOptimal` (`wide40-9`) are independent clean-room designs
-//! matching the order, passband, and ultrasonic envelope class of those shaper families —
-//! they are NOT reverse-engineered or claimed bit-identical to proprietary shapers.
+//! Note on naming: `NsGentle2` (`ns-gentle-2`), `NsSharp5` (`ns-sharp-5`), `NsSmooth15`
+//! (`ns-smooth-15`), and `NsWide9` (`ns-wide-9` / `wide40-9`) are independent clean-room
+//! Levinson–Durbin minimum-phase designs defined purely by their order, passband, and ultrasonic
+//! ceiling.
 
 use std::f64::consts::PI;
 
@@ -67,19 +67,19 @@ pub const fn shaper_design_spec(profile: NoiseShaperProfile) -> Option<ShaperDes
             f_taper_end_hz: None,
             max_ntf_db: 6.0,
         }),
-        NoiseShaperProfile::Ns5Multibit => Some(ShaperDesignSpec {
+        NoiseShaperProfile::NsSharp5 => Some(ShaperDesignSpec {
             order: 5,
             f_band_hz: 20_000.0,
             f_taper_end_hz: None,
             max_ntf_db: 20.0,
         }),
-        NoiseShaperProfile::Lns15Smooth => Some(ShaperDesignSpec {
+        NoiseShaperProfile::NsSmooth15 => Some(ShaperDesignSpec {
             order: 15,
             f_band_hz: 20_000.0,
             f_taper_end_hz: Some(60_000.0),
             max_ntf_db: 15.0,
         }),
-        NoiseShaperProfile::PggbOptimal => Some(ShaperDesignSpec {
+        NoiseShaperProfile::NsWide9 => Some(ShaperDesignSpec {
             order: 9,
             f_band_hz: 40_000.0,
             f_taper_end_hz: None,
@@ -94,8 +94,8 @@ pub const COEFFS_NS_GENTLE_2_352800: [f64; 2] = [-0.9671215842020704, 0.02814074
 /// Frozen `ns-gentle-2` (`N = 2`, 20 kHz, `+6 dB` ceiling) taps at `384,000 Hz`.
 pub const COEFFS_NS_GENTLE_2_384000: [f64; 2] = [-0.9717433371099817, 0.023518987889512587];
 
-/// Frozen `ns5-class` (`N = 5`, 20 kHz, `+20 dB` ceiling) taps at `352,800 Hz`.
-pub const COEFFS_NS5_352800: [f64; 5] = [
+/// Frozen `ns-sharp-5` (`N = 5`, 20 kHz, `+20 dB` ceiling) taps at `352,800 Hz`.
+pub const COEFFS_NS_SHARP_5_352800: [f64; 5] = [
     -3.5141390833724726,
     4.353793051123896,
     -1.8219329497209977,
@@ -103,8 +103,8 @@ pub const COEFFS_NS5_352800: [f64; 5] = [
     0.3369751975735615,
 ];
 
-/// Frozen `ns5-class` (`N = 5`, 20 kHz, `+20 dB` ceiling) taps at `384,000 Hz`.
-pub const COEFFS_NS5_384000: [f64; 5] = [
+/// Frozen `ns-sharp-5` (`N = 5`, 20 kHz, `+20 dB` ceiling) taps at `384,000 Hz`.
+pub const COEFFS_NS_SHARP_5_384000: [f64; 5] = [
     -3.531239327106661,
     4.376059952146921,
     -1.8110181903054046,
@@ -112,8 +112,8 @@ pub const COEFFS_NS5_384000: [f64; 5] = [
     0.3429045538861563,
 ];
 
-/// Frozen `lns15-class` (`N = 15`, 20 kHz + 40 kHz taper -> 60 kHz, `+15 dB` ceiling) taps at `352,800 Hz`.
-pub const COEFFS_LNS15_352800: [f64; 15] = [
+/// Frozen `ns-smooth-15` (`N = 15`, 20 kHz + 40 kHz taper -> 60 kHz, `+15 dB` ceiling) taps at `352,800 Hz`.
+pub const COEFFS_NS_SMOOTH_15_352800: [f64; 15] = [
     -2.8339997946577324,
     2.031579651056906,
     0.8477682736388443,
@@ -131,8 +131,8 @@ pub const COEFFS_LNS15_352800: [f64; 15] = [
     0.039891848469640605,
 ];
 
-/// Frozen `lns15-class` (`N = 15`, 20 kHz + 40 kHz taper -> 60 kHz, `+15 dB` ceiling) taps at `384,000 Hz`.
-pub const COEFFS_LNS15_384000: [f64; 15] = [
+/// Frozen `ns-smooth-15` (`N = 15`, 20 kHz + 40 kHz taper -> 60 kHz, `+15 dB` ceiling) taps at `384,000 Hz`.
+pub const COEFFS_NS_SMOOTH_15_384000: [f64; 15] = [
     -2.891286787102481,
     2.046662036048544,
     0.9412594338320859,
@@ -150,8 +150,8 @@ pub const COEFFS_LNS15_384000: [f64; 15] = [
     -0.018521691962031298,
 ];
 
-/// Frozen `wide40-9` (`pggb-optimal` class: `N = 9`, 40 kHz, `+18 dB` ceiling) taps at `352,800 Hz`.
-pub const COEFFS_WIDE40_9_352800: [f64; 9] = [
+/// Frozen `ns-wide-9` (`N = 9`, 40 kHz, `+18 dB` ceiling) taps at `352,800 Hz`.
+pub const COEFFS_NS_WIDE_9_352800: [f64; 9] = [
     -3.0272202541837214,
     2.801694550878594,
     0.34593817132766264,
@@ -163,8 +163,8 @@ pub const COEFFS_WIDE40_9_352800: [f64; 9] = [
     0.3329848683122273,
 ];
 
-/// Frozen `wide40-9` (`pggb-optimal` class: `N = 9`, 40 kHz, `+18 dB` ceiling) taps at `384,000 Hz`.
-pub const COEFFS_WIDE40_9_384000: [f64; 9] = [
+/// Frozen `ns-wide-9` (`N = 9`, 40 kHz, `+18 dB` ceiling) taps at `384,000 Hz`.
+pub const COEFFS_NS_WIDE_9_384000: [f64; 9] = [
     -3.060128124726337,
     2.791093015410925,
     0.4364652774557149,
@@ -182,8 +182,8 @@ pub const COEFFS_NS_GENTLE_2_176400: [f64; 2] = [-0.8889758800409757, 0.10628644
 /// Frozen `ns-gentle-2` (`N = 2`, 20 kHz, `+6 dB` ceiling) taps at `192,000 Hz` (`4fS`).
 pub const COEFFS_NS_GENTLE_2_192000: [f64; 2] = [-0.9037707216668668, 0.09149160576272607];
 
-/// Frozen `ns5-class` (`N = 5`, 20 kHz, `+20 dB` ceiling) taps at `176,400 Hz` (`4fS`).
-pub const COEFFS_NS5_176400: [f64; 5] = [
+/// Frozen `ns-sharp-5` (`N = 5`, 20 kHz, `+20 dB` ceiling) taps at `176,400 Hz` (`4fS`).
+pub const COEFFS_NS_SHARP_5_176400: [f64; 5] = [
     -3.207492133272697,
     3.971088568456903,
     -2.0056438453480294,
@@ -191,8 +191,8 @@ pub const COEFFS_NS5_176400: [f64; 5] = [
     0.22549835957112183,
 ];
 
-/// Frozen `ns5-class` (`N = 5`, 20 kHz, `+20 dB` ceiling) taps at `192,000 Hz` (`4fS`).
-pub const COEFFS_NS5_192000: [f64; 5] = [
+/// Frozen `ns-sharp-5` (`N = 5`, 20 kHz, `+20 dB` ceiling) taps at `192,000 Hz` (`4fS`).
+pub const COEFFS_NS_SHARP_5_192000: [f64; 5] = [
     -3.268162170731663,
     4.044418745120229,
     -1.9711846692247346,
@@ -200,8 +200,8 @@ pub const COEFFS_NS5_192000: [f64; 5] = [
     0.24845255063053076,
 ];
 
-/// Frozen `lns15-class` (`N = 15`, 20 kHz + 40 kHz taper -> 60 kHz, `+15 dB` ceiling) taps at `176,400 Hz` (`4fS`).
-pub const COEFFS_LNS15_176400: [f64; 15] = [
+/// Frozen `ns-smooth-15` (`N = 15`, 20 kHz + 40 kHz taper -> 60 kHz, `+15 dB` ceiling) taps at `176,400 Hz` (`4fS`).
+pub const COEFFS_NS_SMOOTH_15_176400: [f64; 15] = [
     -2.168716597171538,
     2.113013086541712,
     -0.8982653796298233,
@@ -219,8 +219,8 @@ pub const COEFFS_LNS15_176400: [f64; 15] = [
     -0.013927010634295014,
 ];
 
-/// Frozen `lns15-class` (`N = 15`, 20 kHz + 40 kHz taper -> 60 kHz, `+15 dB` ceiling) taps at `192,000 Hz` (`4fS`).
-pub const COEFFS_LNS15_192000: [f64; 15] = [
+/// Frozen `ns-smooth-15` (`N = 15`, 20 kHz + 40 kHz taper -> 60 kHz, `+15 dB` ceiling) taps at `192,000 Hz` (`4fS`).
+pub const COEFFS_NS_SMOOTH_15_192000: [f64; 15] = [
     -2.315228009576652,
     2.2054467572612726,
     -0.6844938968827368,
@@ -238,8 +238,8 @@ pub const COEFFS_LNS15_192000: [f64; 15] = [
     -0.006974778660709156,
 ];
 
-/// Frozen `wide40-9` (`pggb-optimal` class: `N = 9`, 40 kHz, `+18 dB` ceiling) taps at `176,400 Hz` (`4fS`).
-pub const COEFFS_WIDE40_9_176400: [f64; 9] = [
+/// Frozen `ns-wide-9` (`N = 9`, 40 kHz, `+18 dB` ceiling) taps at `176,400 Hz` (`4fS`).
+pub const COEFFS_NS_WIDE_9_176400: [f64; 9] = [
     -2.3932634749932147,
     2.833546396944659,
     -1.477880796956254,
@@ -251,8 +251,8 @@ pub const COEFFS_WIDE40_9_176400: [f64; 9] = [
     -0.2661641700027518,
 ];
 
-/// Frozen `wide40-9` (`pggb-optimal` class: `N = 9`, 40 kHz, `+18 dB` ceiling) taps at `192,000 Hz` (`4fS`).
-pub const COEFFS_WIDE40_9_192000: [f64; 9] = [
+/// Frozen `ns-wide-9` (`N = 9`, 40 kHz, `+18 dB` ceiling) taps at `192,000 Hz` (`4fS`).
+pub const COEFFS_NS_WIDE_9_192000: [f64; 9] = [
     -2.482501848188318,
     2.806954512353321,
     -1.1401083904464906,
@@ -278,18 +278,18 @@ pub const fn frozen_shaper_coeffs(
         (NoiseShaperProfile::NsGentle2, 192_000) => Some(&COEFFS_NS_GENTLE_2_192000),
         (NoiseShaperProfile::NsGentle2, 352_800) => Some(&COEFFS_NS_GENTLE_2_352800),
         (NoiseShaperProfile::NsGentle2, 384_000) => Some(&COEFFS_NS_GENTLE_2_384000),
-        (NoiseShaperProfile::Ns5Multibit, 176_400) => Some(&COEFFS_NS5_176400),
-        (NoiseShaperProfile::Ns5Multibit, 192_000) => Some(&COEFFS_NS5_192000),
-        (NoiseShaperProfile::Ns5Multibit, 352_800) => Some(&COEFFS_NS5_352800),
-        (NoiseShaperProfile::Ns5Multibit, 384_000) => Some(&COEFFS_NS5_384000),
-        (NoiseShaperProfile::Lns15Smooth, 176_400) => Some(&COEFFS_LNS15_176400),
-        (NoiseShaperProfile::Lns15Smooth, 192_000) => Some(&COEFFS_LNS15_192000),
-        (NoiseShaperProfile::Lns15Smooth, 352_800) => Some(&COEFFS_LNS15_352800),
-        (NoiseShaperProfile::Lns15Smooth, 384_000) => Some(&COEFFS_LNS15_384000),
-        (NoiseShaperProfile::PggbOptimal, 176_400) => Some(&COEFFS_WIDE40_9_176400),
-        (NoiseShaperProfile::PggbOptimal, 192_000) => Some(&COEFFS_WIDE40_9_192000),
-        (NoiseShaperProfile::PggbOptimal, 352_800) => Some(&COEFFS_WIDE40_9_352800),
-        (NoiseShaperProfile::PggbOptimal, 384_000) => Some(&COEFFS_WIDE40_9_384000),
+        (NoiseShaperProfile::NsSharp5, 176_400) => Some(&COEFFS_NS_SHARP_5_176400),
+        (NoiseShaperProfile::NsSharp5, 192_000) => Some(&COEFFS_NS_SHARP_5_192000),
+        (NoiseShaperProfile::NsSharp5, 352_800) => Some(&COEFFS_NS_SHARP_5_352800),
+        (NoiseShaperProfile::NsSharp5, 384_000) => Some(&COEFFS_NS_SHARP_5_384000),
+        (NoiseShaperProfile::NsSmooth15, 176_400) => Some(&COEFFS_NS_SMOOTH_15_176400),
+        (NoiseShaperProfile::NsSmooth15, 192_000) => Some(&COEFFS_NS_SMOOTH_15_192000),
+        (NoiseShaperProfile::NsSmooth15, 352_800) => Some(&COEFFS_NS_SMOOTH_15_352800),
+        (NoiseShaperProfile::NsSmooth15, 384_000) => Some(&COEFFS_NS_SMOOTH_15_384000),
+        (NoiseShaperProfile::NsWide9, 176_400) => Some(&COEFFS_NS_WIDE_9_176400),
+        (NoiseShaperProfile::NsWide9, 192_000) => Some(&COEFFS_NS_WIDE_9_192000),
+        (NoiseShaperProfile::NsWide9, 352_800) => Some(&COEFFS_NS_WIDE_9_352800),
+        (NoiseShaperProfile::NsWide9, 384_000) => Some(&COEFFS_NS_WIDE_9_384000),
         _ => None,
     }
 }
@@ -527,9 +527,9 @@ mod tests {
 
     const SHAPED_PROFILES: [NoiseShaperProfile; 4] = [
         NoiseShaperProfile::NsGentle2,
-        NoiseShaperProfile::Ns5Multibit,
-        NoiseShaperProfile::Lns15Smooth,
-        NoiseShaperProfile::PggbOptimal,
+        NoiseShaperProfile::NsSharp5,
+        NoiseShaperProfile::NsSmooth15,
+        NoiseShaperProfile::NsWide9,
     ];
 
     #[test]
@@ -579,9 +579,9 @@ mod tests {
         // (profile, 0-20k, 20-40k, 40-100k, 100k-nyq, total, sum|c|)
         let expected_384 = [
             (NoiseShaperProfile::NsGentle2, -14.6, -6.5, 0.5, 5.1, 2.9, 1.00),
-            (NoiseShaperProfile::Ns5Multibit, -58.7, -22.3, 6.8, 18.6, 15.6, 10.44),
-            (NoiseShaperProfile::Lns15Smooth, -51.5, -27.3, 11.9, 13.8, 12.15, 9.56),
-            (NoiseShaperProfile::PggbOptimal, -40.6, -39.1, 11.25, 16.0, 13.65, 11.21),
+            (NoiseShaperProfile::NsSharp5, -58.7, -22.3, 6.8, 18.6, 15.6, 10.44),
+            (NoiseShaperProfile::NsSmooth15, -51.5, -27.3, 11.9, 13.8, 12.15, 9.56),
+            (NoiseShaperProfile::NsWide9, -40.6, -39.1, 11.25, 16.0, 13.65, 11.21),
         ];
 
         for (profile, b0, b1, b2, b3, tot, l1) in expected_384 {
@@ -622,9 +622,9 @@ mod tests {
         // Expected 0-20 kHz band gains at 352.8 kHz from §3.1:
         let expected_352 = [
             (NoiseShaperProfile::NsGentle2, -13.9),
-            (NoiseShaperProfile::Ns5Multibit, -55.9),
-            (NoiseShaperProfile::Lns15Smooth, -46.3),
-            (NoiseShaperProfile::PggbOptimal, -37.9),
+            (NoiseShaperProfile::NsSharp5, -55.9),
+            (NoiseShaperProfile::NsSmooth15, -46.3),
+            (NoiseShaperProfile::NsWide9, -37.9),
         ];
         for (profile, b0) in expected_352 {
             let coeffs = frozen_shaper_coeffs(profile, 352_800).unwrap();

@@ -406,26 +406,24 @@ impl FilterSelector for DefaultFilterSelector {
     }
 }
 
-/// Curated `8fS` (`352.8 / 384 kHz`) noise shapers & dithers (`docs/research/04-noise-shapers.md`).
+/// Curated `4fS`/`8fS` (`176.4 / 192 / 352.8 / 384 kHz`) clean-room noise shapers & dithers.
 ///
-/// Note on naming (§3): `Ns5Multibit` (`ns5` / `ns5-class`), `Lns15Smooth` (`lns15` / `lns15-class`),
-/// and `PggbOptimal` (`pggb-optimal` / `wide40-9`) are independent clean-room Levinson–Durbin
-/// minimum-phase designs matching those order/passband/envelope classes — never reverse-engineered
-/// or claimed bit-identical to proprietary shapers.
+/// All shaped profiles (`ns-gentle-2`, `ns-sharp-5`, `ns-wide-9`, `ns-smooth-15`) are independent
+/// clean-room Levinson–Durbin minimum-phase FIR error-feedback designs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoiseShaperProfile {
     /// Pass-through (no re-quantization when source is already untouched 32-bit at 8fS).
     Bypass,
-    /// Flat triangular PDF dither (zero ultrasonic noise shaping; default at 24-bit).
+    /// Flat triangular PDF dither (zero ultrasonic noise shaping).
     TpdfDither,
-    /// Clean-room 2nd-order gentle shaper (`ns-gentle-2`, 20 kHz, `+6 dB` ceiling; auto default at `<= 20` bits).
+    /// Clean-room 2nd-order gentle shaper (`ns-gentle-2`, 20 kHz, `+6 dB` ceiling; auto default at 4fS/8fS).
     NsGentle2,
-    /// Clean-room 5th-order multibit-class shaper (`ns5` / `ns5-class`, 20 kHz, `+20 dB` ceiling).
-    Ns5Multibit,
-    /// Clean-room 15th-order tapered-ultrasonic shaper (`lns15` / `lns15-class`, 20->60 kHz, `+15 dB` ceiling).
-    Lns15Smooth,
-    /// Clean-room 9th-order 40 kHz-wideband shaper (`pggb-optimal` / `wide40-9`, 40 kHz, `+18 dB` ceiling).
-    PggbOptimal,
+    /// Clean-room 5th-order sharp-band shaper (`ns-sharp-5`, 20 kHz, `+20 dB` ceiling).
+    NsSharp5,
+    /// Clean-room 15th-order tapered-ultrasonic shaper (`ns-smooth-15`, 20->60 kHz, `+15 dB` ceiling).
+    NsSmooth15,
+    /// Clean-room 9th-order 40 kHz-wideband shaper (`ns-wide-9`, alias `wide40-9`, 40 kHz, `+18 dB` ceiling).
+    NsWide9,
 }
 
 impl NoiseShaperProfile {
@@ -434,9 +432,9 @@ impl NoiseShaperProfile {
             Self::Bypass => "bypass",
             Self::TpdfDither => "tpdf",
             Self::NsGentle2 => "ns-gentle-2",
-            Self::Ns5Multibit => "ns5",
-            Self::Lns15Smooth => "lns15",
-            Self::PggbOptimal => "pggb-optimal",
+            Self::NsSharp5 => "ns-sharp-5",
+            Self::NsSmooth15 => "ns-smooth-15",
+            Self::NsWide9 => "ns-wide-9",
         }
     }
 
@@ -446,9 +444,9 @@ impl NoiseShaperProfile {
             Self::Bypass
             | Self::TpdfDither
             | Self::NsGentle2
-            | Self::Ns5Multibit
-            | Self::Lns15Smooth
-            | Self::PggbOptimal => true,
+            | Self::NsSharp5
+            | Self::NsSmooth15
+            | Self::NsWide9 => true,
         }
     }
 }
@@ -467,12 +465,12 @@ impl FromStr for NoiseShaperProfile {
             "bypass" => Ok(Self::Bypass),
             "tpdf" => Ok(Self::TpdfDither),
             "ns-gentle-2" => Ok(Self::NsGentle2),
-            "ns5" | "ns5-class" => Ok(Self::Ns5Multibit),
-            "lns15" | "lns15-class" => Ok(Self::Lns15Smooth),
-            "pggb-optimal" | "wide40-9" => Ok(Self::PggbOptimal),
+            "ns-sharp-5" => Ok(Self::NsSharp5),
+            "ns-smooth-15" => Ok(Self::NsSmooth15),
+            "ns-wide-9" | "wide40-9" => Ok(Self::NsWide9),
             other => Err(format!(
-                "unknown shaper '{other}'; expected auto, bypass, tpdf, ns-gentle-2, ns5 \
-                 (alias ns5-class), lns15 (alias lns15-class), or pggb-optimal (alias wide40-9)"
+                "unknown shaper '{other}'; expected auto, bypass, tpdf, ns-gentle-2, ns-sharp-5, \
+                 ns-smooth-15, or ns-wide-9 (alias wide40-9)"
             )),
         }
     }
@@ -788,7 +786,7 @@ impl UpsamplerPicker {
 ///   genres and bit depths: `-14.6 dB` in-band @ 384k, `-6.5 dB` 20–40k, `+6 dB` ultrasonic ceiling,
 ///   minimal `1.21 LSB` R-2R code activity, safe for NOS multibit DACs and wideband amps).
 /// - Non-`8fS` rates (e.g. `--filter null` at 44.1–192 kHz) -> `TpdfDither`.
-/// Higher-order shapers (`ns5`, `lns15`, `pggb-optimal`) and flat `tpdf` remain explicit overrides.
+/// Higher-order shapers (`ns-sharp-5`, `ns-smooth-15`, `ns-wide-9`) and flat `tpdf` remain explicit overrides.
 fn auto_select_shaper(
     source: &TrackSourceInfo,
     filter: FilterArchetype,

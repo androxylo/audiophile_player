@@ -222,9 +222,9 @@ pub const SHAPER_VALUES: &[&str] = &[
     "bypass",
     "tpdf",
     "ns-gentle-2",
-    "ns5",
-    "lns15",
-    "pggb-optimal",
+    "ns-sharp-5",
+    "ns-smooth-15",
+    "ns-wide-9",
 ];
 
 pub const OPT_VALUES: &[&str] = &["normal", "high", "extreme"];
@@ -472,9 +472,9 @@ pub static OPTIONS: &[OptSpec] = &[
         scope: &[Cmd::Play, Cmd::Restart],
         group: Group::Dsp,
         restart: Restart::Always,
-        summary: "Force 8fS noise shaper: auto | bypass | tpdf | ns-gentle-2 | ns5 | lns15 | pggb-optimal",
-        details: "Selects the 8fS noise-shaping / dither profile applied during final f64 -> Int32 quantization. `auto` selects `ns-gentle-2` at 8fS, bit-perfect `bypass` for untouched native 32-bit 8fS, and `tpdf` at non-8fS rates.",
-        examples: &["audiophile-player --shaper lns15"],
+        summary: "Force 4fS/8fS noise shaper: auto | bypass | tpdf | ns-gentle-2 | ns-sharp-5 | ns-smooth-15 | ns-wide-9",
+        details: "Selects the 4fS/8fS noise-shaping / dither profile applied during final f64 -> Int32 quantization. `auto` selects `ns-gentle-2` at 4fS/8fS, bit-perfect `bypass` for untouched native 32-bit 8fS, and `tpdf` at <= 2fS rates.",
+        examples: &["audiophile-player --shaper ns-smooth-15"],
         since: "0.1.0",
     },
     OptSpec {

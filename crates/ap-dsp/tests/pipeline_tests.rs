@@ -372,9 +372,9 @@ fn pipeline_runs_all_inv04_noise_shapers_and_rejects_unsupported_rates() {
     };
     for shaper in [
         NoiseShaperProfile::NsGentle2,
-        NoiseShaperProfile::Ns5Multibit,
-        NoiseShaperProfile::Lns15Smooth,
-        NoiseShaperProfile::PggbOptimal,
+        NoiseShaperProfile::NsSharp5,
+        NoiseShaperProfile::NsSmooth15,
+        NoiseShaperProfile::NsWide9,
     ] {
         let p = AudioPipeline::new(UpsamplerPolicy {
             shaper_override: Some(shaper),
@@ -1312,11 +1312,11 @@ fn inv04_dac_bits_auto_shaper_and_gapless_shaper_continuity_matches_continuous_s
         assert_eq!(r & 0xFFFF, 0, "16-bit left-justified sample must zero lower 16 bits");
     }
 
-    // 2. Gapless FullHandoff with 15th-order Lns15Smooth preserves both upsampler FIR history
+    // 2. Gapless FullHandoff with 15th-order NsSmooth15 preserves both upsampler FIR history
     //    AND quantizer/shaper state, producing bit-for-bit identical PCM to one continuous track!
     let policy_lns15 = UpsamplerPolicy {
         filter_override: Some(FilterArchetype::SimpleTest),
-        shaper_override: Some(NoiseShaperProfile::Lns15Smooth),
+        shaper_override: Some(NoiseShaperProfile::NsSmooth15),
         dac_bits: 18,
         ..UpsamplerPolicy::default()
     };
@@ -1380,6 +1380,6 @@ fn inv04_dac_bits_auto_shaper_and_gapless_shaper_continuity_matches_continuous_s
 
     assert_eq!(
         stitched, continuous.pcm.frames,
-        "equal-rate gapless handoff with Lns15Smooth must match continuous stream bit-for-bit"
+        "equal-rate gapless handoff with NsSmooth15 must match continuous stream bit-for-bit"
     );
 }

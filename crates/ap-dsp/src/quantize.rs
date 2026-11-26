@@ -147,7 +147,7 @@ impl StreamingQuantizer {
 
     /// Construct a quantizer bound to `sample_rate_hz`.
     ///
-    /// Shaped profiles (`ns-gentle-2`, `ns5`, `lns15`, `pggb-optimal`) load their frozen `4fS`/`8fS`
+    /// Shaped profiles (`ns-gentle-2`, `ns-sharp-5`, `ns-smooth-15`, `ns-wide-9`) load their frozen `4fS`/`8fS`
     /// coefficient table for `176,400`, `192,000`, `352,800`, or `384,000 Hz`. At any other sample
     /// rate (`<= 96 kHz`), shaped profiles fall back cleanly to `TpdfDither` (`04-noise-shapers.md` §6.2).
     pub fn with_rate(
@@ -170,9 +170,9 @@ impl StreamingQuantizer {
             NoiseShaperProfile::Bypass => (NoiseShaperProfile::Bypass, &[]),
             NoiseShaperProfile::TpdfDither => (NoiseShaperProfile::TpdfDither, &[]),
             NoiseShaperProfile::NsGentle2
-            | NoiseShaperProfile::Ns5Multibit
-            | NoiseShaperProfile::Lns15Smooth
-            | NoiseShaperProfile::PggbOptimal => {
+            | NoiseShaperProfile::NsSharp5
+            | NoiseShaperProfile::NsSmooth15
+            | NoiseShaperProfile::NsWide9 => {
                 if let Some(table) = frozen_shaper_coeffs(shaper, sample_rate_hz) {
                     (shaper, table)
                 } else {

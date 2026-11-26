@@ -39,7 +39,7 @@
 | Option | Config key | Default | Scope | Restart | Summary |
 |---|---|---|---|---|---|
 | `--filter NAME` | `player.filter` | `auto` | play, scan, restart | restart | Force upsampling filter globally (or 'auto') |
-| `--shaper NAME` | `quantizer.shaper` | `auto` | play, restart | restart | Force 8fS noise shaper: auto \| bypass \| tpdf \| ns-gentle-2 \| ns5 \| lns15 \| pggb-optimal |
+| `--shaper NAME` | `quantizer.shaper` | `auto` | play, restart | restart | Force 4fS/8fS noise shaper: auto \| bypass \| tpdf \| ns-gentle-2 \| ns-sharp-5 \| ns-smooth-15 \| ns-wide-9 |
 | `--max-taps N` | `player.max_taps` | `4000000` | play, restart | restart | Upsampling filter tap ceiling (1..=4000000) |
 | `--conv-dir PATH` | `convolution.dir` | — | play, scan, restart | restart | REW stereo WAV folder (auto-picks newest 352.8 / 384 kHz WAV) |
 | `--conv-file PATH` | `convolution.file` | — | play, scan, restart | restart | Explicit 2-channel REW stereo WAV file |

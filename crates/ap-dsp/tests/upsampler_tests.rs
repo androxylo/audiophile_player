@@ -637,9 +637,9 @@ fn all_inv04_noise_shaper_profiles_are_implemented_and_construct_cleanly() {
         NoiseShaperProfile::Bypass,
         NoiseShaperProfile::TpdfDither,
         NoiseShaperProfile::NsGentle2,
-        NoiseShaperProfile::Ns5Multibit,
-        NoiseShaperProfile::Lns15Smooth,
-        NoiseShaperProfile::PggbOptimal,
+        NoiseShaperProfile::NsSharp5,
+        NoiseShaperProfile::NsSmooth15,
+        NoiseShaperProfile::NsWide9,
     ] {
         assert!(profile.is_implemented(), "{profile} should be implemented");
         let q = StreamingQuantizer::with_rate(profile, 24, 384_000).unwrap();

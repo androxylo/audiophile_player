@@ -51,10 +51,9 @@
 # set dac_bits = 16, 18, or 20.
 # dac_bits = 24
 #
-# Optional 8fS shaper override: 'auto' | 'bypass' | 'tpdf' | 'ns-gentle-2' |
-# 'ns5' (clean-room ns5-class) | 'lns15' (clean-room lns15-class) | 'pggb-optimal' (wide40-9).
-# Note: ns5, lns15, and pggb-optimal are independent clean-room Levinson-Durbin designs
-# matching those order/passband/envelope classes (not proprietary copies).
+# Optional 4fS/8fS shaper override: 'auto' | 'bypass' | 'tpdf' | 'ns-gentle-2' |
+# 'ns-sharp-5' (5th-order 20 kHz) | 'ns-wide-9' (9th-order 40 kHz) | 'ns-smooth-15' (15th-order tapered).
+# All shaped profiles are independent clean-room Levinson-Durbin minimum-phase designs.
 # shaper = 'auto'
 
 [upnp]
