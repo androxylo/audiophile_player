@@ -19,4 +19,5 @@ ap-control.workspace = true
 ap-upnp.workspace = true
 
 [dev-dependencies]
+ap-stream-protocol.workspace = true
 flac-codec = "1.3"

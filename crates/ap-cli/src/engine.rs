@@ -653,6 +653,7 @@ pub fn run_random_music_player(
     quantizer_override: QuantizerCliOverride,
     rew_override: Option<ConvolutionConfig>,
     upnp_override: UpnpCliOverride,
+    capture_disabled: bool,
     ultimate_override: UltimateCliOverride,
     controller: &ShutdownController,
 ) -> Result<(), String> {
@@ -778,31 +779,36 @@ pub fn run_random_music_player(
     // Start opt-in exclusive kernel stream capture watcher (\\.\ApExclusiveAudio).
     // Quietly parks if the virtual ACX driver is not installed; preempts automatically when Tidal
     // Desktop opens in Exclusive Mode (hard zero-mixer gate enforced in kernel & user mode).
-    let shared_for_cap = Arc::clone(&shared);
-    let shared_for_blk = Arc::clone(&shared);
-    let capture_monitor = StreamCaptureMonitor::start(
-        move |ev| {
-            shared_for_cap.submit_command(ControlCommand::PlayStreamCapture(
-                StreamCaptureRequest {
-                    generation: ev.generation,
-                    sample_rate_hz: ev.sample_rate_hz,
-                    channels: ev.channels,
-                    bits_per_sample: ev.bits_per_sample,
-                    valid_bits_per_sample: ev.valid_bits_per_sample,
-                    caller_name: ev.caller_name,
-                    caller_pid: ev.caller_pid,
-                },
-            ));
-        },
-        move |delta, proc_name, pid, stage| {
-            let msg = format!(
-                "Blocked {delta} Windows mixer (shared-mode) attempt(s) from {proc_name} (PID {pid}) at {stage}"
-            );
-            eprintln!("  [capture zero-mixer] {msg}");
-            shared_for_blk.record_action(msg);
-        },
-    );
-    let capture_transport = capture_monitor.transport();
+    let capture_enabled = loaded_cfg.config.capture.enabled && !capture_disabled;
+    let capture_monitor = if capture_enabled {
+        let shared_for_cap = Arc::clone(&shared);
+        let shared_for_blk = Arc::clone(&shared);
+        Some(StreamCaptureMonitor::start(
+            move |ev| {
+                shared_for_cap.submit_command(ControlCommand::PlayStreamCapture(
+                    StreamCaptureRequest {
+                        generation: ev.generation,
+                        sample_rate_hz: ev.sample_rate_hz,
+                        channels: ev.channels,
+                        bits_per_sample: ev.bits_per_sample,
+                        valid_bits_per_sample: ev.valid_bits_per_sample,
+                        caller_name: ev.caller_name,
+                        caller_pid: ev.caller_pid,
+                    },
+                ));
+            },
+            move |delta, proc_name, pid, stage| {
+                let msg = format!(
+                    "Blocked {delta} Windows mixer (shared-mode) attempt(s) from {proc_name} (PID {pid}) at {stage}"
+                );
+                eprintln!("  [capture zero-mixer] {msg}");
+                shared_for_blk.record_action(msg);
+            },
+        ))
+    } else {
+        None
+    };
+    let capture_transport = capture_monitor.as_ref().map(|m| m.transport());
 
     println!(
         "audiophile-player v{} started (WDM-KS WaveRT, streaming blocks, opt={optimization:?}, DAC='{dac_name}', music='{}').",
@@ -824,12 +830,18 @@ pub fn run_random_music_player(
     } else {
         println!("UPnP renderer: disabled");
     }
-    if capture_monitor.is_driver_connected() {
-        println!(
-            "Exclusive capture: READY (\\\\.\\ApExclusiveAudio -> 'Line (Audiophile Player)' in Tidal Exclusive Mode; Windows mixer blocked)"
-        );
-    } else {
-        println!("Exclusive capture: waiting for opt-in ACX driver (\\\\.\\ApExclusiveAudio)");
+    match capture_monitor.as_ref() {
+        Some(mon) if mon.is_driver_connected() => {
+            println!(
+                "Exclusive capture: READY (\\\\.\\ApExclusiveAudio -> 'Line (Audiophile Player)' in Tidal Exclusive Mode; Windows mixer blocked)"
+            );
+        }
+        Some(_) => {
+            println!("Exclusive capture: waiting for opt-in ACX driver (\\\\.\\ApExclusiveAudio)");
+        }
+        None => {
+            println!("Exclusive capture: disabled");
+        }
     }
     if let Some(ref ult) = ultimate_ctx {
         println!(
@@ -864,7 +876,7 @@ pub fn run_random_music_player(
     let ctrl_bg = Arc::clone(&prod_ctrl);
     let shared_bg = Arc::clone(&shared);
     let upnp_bg = upnp_state.clone();
-    let capture_bg = Some(capture_transport);
+    let capture_bg = capture_transport;
     let producer_thread = thread::Builder::new()
         .name("ap-dsp-stream".to_string())
         .spawn(move || {
@@ -905,7 +917,9 @@ pub fn run_random_music_player(
     }
 
     url_guard.disarm();
-    capture_monitor.stop();
+    if let Some(mon) = capture_monitor {
+        mon.stop();
+    }
     teardown_player_resources_with_upnp(
         &stream_buf,
         &prod_ctrl,
@@ -5392,5 +5406,223 @@ mod tests {
         assert!(saw_track_end, "F8: Track A's TrackEnd must be emitted on panic");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stream_capture_end_to_end_upsamples_enforces_headroom_rejects_next_and_releases_dac() {
+        use ap_source::stream_capture::CaptureTransport;
+        use ap_stream_protocol::{
+            AP_STREAM_ABI_VERSION, ApDriverConfig, ApDriverStatus, ApPcmChunkHeader,
+            ApStreamFormat,
+        };
+
+        struct MockCaptureTransport {
+            chunks: std::collections::VecDeque<Vec<u8>>,
+            generation: u32,
+        }
+
+        impl MockCaptureTransport {
+            fn new(generation: u32, frames: usize) -> Self {
+                // 24-in-32 integer PCM @ 44.1 kHz stereo, 1 kHz sine at 0.5 amplitude
+                let mut pcm = Vec::with_capacity(frames * 8);
+                for i in 0..frames {
+                    let s = (2.0 * std::f64::consts::PI * 1000.0 * (i as f64) / 44_100.0).sin()
+                        * 0.5;
+                    let v = (s * 2_147_483_648.0).round() as i32;
+                    pcm.extend_from_slice(&v.to_le_bytes());
+                    pcm.extend_from_slice(&v.to_le_bytes());
+                }
+                let mut chunks = std::collections::VecDeque::new();
+                for slice in pcm.chunks(4096 * 8) {
+                    chunks.push_back(slice.to_vec());
+                }
+                Self { chunks, generation }
+            }
+
+            fn fmt() -> ApStreamFormat {
+                ApStreamFormat {
+                    sample_rate: 44_100,
+                    channels: 2,
+                    bits_per_sample: 32,
+                    valid_bits_per_sample: 24,
+                    block_align: 8,
+                    is_float: 0,
+                    packet_size_bytes: 8192,
+                    packet_count: 2,
+                    reserved: 0,
+                }
+            }
+
+            fn caller(name: &str) -> [u8; 16] {
+                let mut buf = [0u8; 16];
+                let b = name.as_bytes();
+                let n = b.len().min(15);
+                buf[..n].copy_from_slice(&b[..n]);
+                buf
+            }
+        }
+
+        impl CaptureTransport for MockCaptureTransport {
+            fn get_status(&mut self) -> Result<ApDriverStatus, String> {
+                Ok(ApDriverStatus {
+                    abi_version: AP_STREAM_ABI_VERSION,
+                    stream_generation: self.generation,
+                    stream_running: if self.chunks.is_empty() { 0 } else { 1 },
+                    exclusive_verified: 1,
+                    strict_reject_audiodg: 1,
+                    format: Self::fmt(),
+                    alloc_proc: Self::caller("TIDALPlayer.ex"),
+                    run_proc: Self::caller("TIDALPlayer.ex"),
+                    packet_proc: Self::caller("TIDALPlayer.ex"),
+                    create_proc: Self::caller("audiodg.exe"),
+                    ..ApDriverStatus::default()
+                })
+            }
+
+            fn set_config(&mut self, _cfg: ApDriverConfig) -> Result<(), String> {
+                Ok(())
+            }
+
+            fn reset_ring(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+
+            fn read_pcm(&mut self, io_buf: &mut [u8]) -> Result<(ApPcmChunkHeader, usize), String> {
+                let hdr_sz = std::mem::size_of::<ApPcmChunkHeader>();
+                if let Some(chunk) = self.chunks.pop_front() {
+                    let n = chunk.len().min(io_buf.len() - hdr_sz);
+                    io_buf[hdr_sz..hdr_sz + n].copy_from_slice(&chunk[..n]);
+                    let hdr = ApPcmChunkHeader {
+                        abi_version: AP_STREAM_ABI_VERSION,
+                        stream_generation: self.generation,
+                        format: Self::fmt(),
+                        pcm_bytes: n as u32,
+                        stream_running: 1,
+                        exclusive_verified: 1,
+                        ..ApPcmChunkHeader::default()
+                    };
+                    Ok((hdr, n))
+                } else {
+                    let hdr = ApPcmChunkHeader {
+                        abi_version: AP_STREAM_ABI_VERSION,
+                        stream_generation: self.generation,
+                        format: Self::fmt(),
+                        pcm_bytes: 0,
+                        stream_running: 0,
+                        exclusive_verified: 1,
+                        ..ApPcmChunkHeader::default()
+                    };
+                    Ok((hdr, 0))
+                }
+            }
+        }
+
+        let transport =
+            SharedCaptureTransport::new(Some(Box::new(MockCaptureTransport::new(7, 8_192))));
+        let pipeline = AudioPipeline::with_rew_config_full_tail(
+            UpsamplerPolicy::default(),
+            ConvolutionConfig::disabled(),
+            true,
+        )
+        .unwrap();
+        let buf = BoundedBlockStreamBuffer::new(384_000 * 10);
+        let shared = SharedControl::new(PathBuf::from("."), "Mock DAC".to_string());
+        let init_ep = buf.current_epoch();
+        let req = StreamCaptureRequest {
+            generation: 7,
+            sample_rate_hz: 44_100,
+            channels: 2,
+            bits_per_sample: 32,
+            valid_bits_per_sample: 24,
+            caller_name: "TIDALPlayer.ex".to_string(),
+            caller_pid: 4242,
+        };
+        let prod_ctrl = ProducerControl::new(init_ep, ProducerDirective::Paused);
+
+        // Verify EngineState transitions cleanly on PlayStreamCapture and rejects Next during live capture.
+        let mut eng_state = EngineState::new(
+            init_ep,
+            PlayDirective::Random {
+                root: PathBuf::from("."),
+            },
+            &buf,
+            &prod_ctrl,
+            &shared,
+        );
+        assert_eq!(
+            eng_state.dispatch(ControlCommand::PlayStreamCapture(req)),
+            DispatchOutcome::Applied
+        );
+        assert_eq!(
+            eng_state.dispatch(ControlCommand::Next),
+            DispatchOutcome::Rejected,
+            "Next must be rejected during live exclusive stream capture"
+        );
+        let active_ep = eng_state.active_epoch;
+
+        let buf_bg = Arc::clone(&buf);
+        let ctrl_bg = Arc::clone(&prod_ctrl);
+        let shared_bg = Arc::clone(&shared);
+        let handle = thread::spawn(move || {
+            producer_loop_with_sources(
+                pipeline,
+                ctrl_bg,
+                buf_bg,
+                shared_bg,
+                None,
+                Some(transport),
+                None,
+            );
+        });
+
+        let mut saw_start = false;
+        let mut total_out_frames = 0usize;
+        let mut saw_end_of_queue = false;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if let Some(ev) = buf.pop_for_epoch_timeout(active_ep, Duration::from_millis(100)) {
+                match ev {
+                    StreamEvent::TrackStart {
+                        mode_label,
+                        report,
+                        ..
+                    } => {
+                        assert_eq!(mode_label, PlayModeLabel::StreamCapture);
+                        assert_eq!(report.output_rate_hz, 352_800);
+                        assert!(
+                            report.headroom.mode.gain_db() <= -2.99,
+                            "live stream must enforce -3 dB safety headroom, got {} dB",
+                            report.headroom.mode.gain_db()
+                        );
+                        saw_start = true;
+                    }
+                    StreamEvent::PcmBlock(b) => {
+                        assert_eq!(b.sample_rate_hz, 352_800);
+                        total_out_frames += b.frames.len();
+                    }
+                    StreamEvent::EndOfQueue(msg) => {
+                        assert!(msg.contains("DAC released"));
+                        saw_end_of_queue = true;
+                        break;
+                    }
+                    StreamEvent::TrackEnd => {}
+                    other => panic!("unexpected event in stream capture test: {other:?}"),
+                }
+            }
+        }
+
+        buf.close();
+        prod_ctrl.set(active_ep.wrapping_add(1), ProducerDirective::Shutdown);
+        handle.join().unwrap();
+
+        assert!(saw_start, "expected TrackStart for PlayModeLabel::StreamCapture");
+        assert!(
+            total_out_frames >= 8_192 * 8,
+            "expected >= 8x upsampled PCM frames, got {total_out_frames}"
+        );
+        assert!(
+            saw_end_of_queue,
+            "expected EndOfQueue releasing DAC when capture pauses/stops"
+        );
     }
 }

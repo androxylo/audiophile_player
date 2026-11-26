@@ -53,6 +53,7 @@ fn main() -> ExitCode {
             quantizer_override,
             rew_override,
             upnp_override,
+            capture_disabled,
             ultimate_override,
         } => engine::run_random_music_player(
             config_path,
@@ -65,6 +66,7 @@ fn main() -> ExitCode {
             quantizer_override,
             rew_override,
             upnp_override,
+            capture_disabled,
             ultimate_override,
             controller,
         ),

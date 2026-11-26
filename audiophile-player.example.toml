@@ -49,6 +49,12 @@
 # port = 49152
 # bind_ip = '192.168.0.187'
 
+[capture]
+# Opt-in exclusive kernel stream capture (\\.\ApExclusiveAudio -> 'Line (Audiophile Player)'
+# in Tidal Desktop Exclusive Mode, zero Windows mixer). Quietly parks when the optional ACX
+# virtual render driver is not installed. Set `enabled = false` or pass `--no-capture` to disable.
+# enabled = true
+
 [ultimate]
 # Showcase "best possible quality" playback mode (30 s bounded look-ahead, per-track
 # content analysis H/A/L/B, full-tail REW convolution, exact-M fixed whole-track gain,

@@ -142,7 +142,7 @@ flowchart TD
 
 - An `AP_PHASE` tag (`minimum` / `intermediate` / `linear`) switches to the **min-phase** or **intermediate-phase** member of the Gaussian family.
 - The genre rules are on by default. Turn them off with `--no-genre-rules` or `genre_rules = false` in `[ultimate]`.
-- On **streams** (UPnP), the 4M-class filters are replaced by their long Gaussian equivalents. A stream can't be held back for a whole-track render.
+- On **streams** (UPnP and live exclusive Tidal capture), the 4M-class filters are replaced by their long Gaussian equivalents (`gauss-long-lp` / `gauss-hires-lp`). Live real-time capture starts with a short ~0.75 s cushion instead of waiting 30 s, while still keeping Ultimate mode's full-tail REW convolution and pure-`f64` 8fS path.
 
 The filters themselves are described in [Sound Engine → Filters](SOUND_ENGINE.md#upsampling-filters).
 
@@ -165,7 +165,7 @@ stateDiagram-v2
 
 - If you skip mid-track, nothing is saved. A file whose audio MD5 doesn't match its header is never saved either.
 - Running an **offline scan** (`scan --post-chain`) pre-measures your whole library, so even the first play is `cached`. See [Getting Started → Scan](GETTING_STARTED.md#scan-your-library-optional).
-- Streams always keep −3 dB, because their end is unknown.
+- Streams (UPnP and live exclusive Tidal capture) always keep −3 dB, because their peak and end are unknown ahead of time.
 
 ---
 

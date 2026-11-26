@@ -4,7 +4,7 @@
 
 ```mermaid
 flowchart LR
-    A["1️⃣ Build &<br/>install"]:::s --> B["2️⃣ First play"]:::s --> C["3️⃣ Room<br/>correction"]:::o --> D["4️⃣ Ultimate<br/>mode"]:::o --> E["5️⃣ Scan your<br/>library"]:::o
+    A["1️⃣ Install or<br/>build"]:::s --> B["2️⃣ First play"]:::s --> C["3️⃣ Room<br/>correction"]:::o --> D["4️⃣ Ultimate<br/>mode"]:::o --> E["5️⃣ Tidal<br/>exclusive"]:::o --> F["6️⃣ Scan your<br/>library"]:::o
     classDef s fill:#d3f9d8,stroke:#2f9e44,color:#000
     classDef o fill:#e7f5ff,stroke:#1c7ed6,color:#000,stroke-dasharray: 4 3
 ```
@@ -18,14 +18,23 @@ flowchart LR
 |---|---|
 | 💻 **PC** | Windows 10/11, 64-bit. A fast multi-core CPU makes Ultimate mode start sooner |
 | 🔊 **DAC** | USB DAC that accepts **32-bit, 352.8 and 384 kHz**. Reference: Schiit Gungnir 2 |
-| 🎵 **Music** | FLAC files (any rate from 44.1 to 384 kHz), or a UPnP controller app |
-| 🛠️ **To build** | [Rust](https://rustup.rs) (stable) and Git |
+| 🎵 **Music** | FLAC files (any rate from 44.1 to 384 kHz), a UPnP controller app, or Tidal Desktop (opt-in driver) |
+| 🛠️ **To build from source** | [Rust](https://rustup.rs) (stable) and Git *(not needed if using a pre-built release archive)* |
 
 > DACs limited to 192 kHz are not supported. The player has no fallback rate, so the DAC will refuse the stream and playback pauses with a message.
 
 ---
 
-## Build & install
+## Install or build
+
+### From a release archive
+Unpack `audiophile-player-vX.Y.Z-win-x64.zip` into a folder of your choice, then optionally create Desktop and Start Menu shortcuts:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install-shortcuts.ps1
+```
+
+### From source
 
 ```powershell
 git clone https://github.com/androxylo/audiophile_player.git
@@ -36,7 +45,7 @@ cargo build --release --bin audiophile-player
 powershell -ExecutionPolicy Bypass -File scripts\install-shortcuts.ps1
 ```
 
-The icon is smart: if the player is already running, clicking it only re-opens the web page. It doesn't restart playback.
+The icon is smart: if the player is already running, clicking it only re-opens the web page. It doesn't restart playback. To assemble a complete release archive yourself (including the unsigned opt-in driver), run `powershell -ExecutionPolicy Bypass -File scripts\package-release.ps1`.
 
 ---
 
@@ -81,6 +90,51 @@ sequenceDiagram
 - Advertised formats are lossless only (FLAC, WAV, L16/L24 PCM…).
 - Gapless works with controllers that send "next track" ahead of time.
 - Streams always use −3 dB headroom and the long Gaussian filters in place of the 4M class (see [why](ULTIMATE_MODE.md#how-the-filter-is-chosen)).
+
+---
+
+## Tidal Desktop (Exclusive Mode — opt-in)
+
+To feed **vanilla Tidal Desktop** through Audiophile Player's full 8fS `f64` upsampler, REW room convolution, and WDM-KS DAC output — with **zero Windows mixer anywhere in the path** — Audiophile Player includes an optional pure-Rust **ACX 1.1 virtual render driver** (`ap_exclusive_audio.sys`).
+
+```mermaid
+flowchart LR
+    T["🎵 Tidal Desktop<br/>(Exclusive Mode ON)"]:::src --> DRV["🛡️ Line (Audiophile Player)<br/>Rust ACX virtual driver<br/>blocks audiodg.exe mixer"]:::drv --> AP["🎛️ Audiophile Player<br/>f64 8fS Gaussian + REW<br/>+ noise-shaped quantizer"]:::dsp --> DAC["🔊 Your DAC<br/>WDM-KS exclusive<br/>352.8 / 384 kHz"]:::dac
+    classDef src fill:#fff3bf,stroke:#f08c00,color:#000
+    classDef drv fill:#e5dbff,stroke:#7048e8,color:#000
+    classDef dsp fill:#d0ebff,stroke:#1c7ed6,color:#000
+    classDef dac fill:#d3f9d8,stroke:#2f9e44,color:#000
+```
+
+### Honest trade-offs (opt-in only)
+- **Windows Test Mode is required** (and UEFI Secure Boot must be off). Because this is an open-source community project without a paid Microsoft EV/WHQL certificate, the driver is **locally test-signed on your own PC** during install — no third-party private keys or pre-signed certificates are ever distributed.
+- If you only play local FLACs or UPnP, **you do not need this driver**. Audiophile Player quietly parks its capture watcher when the driver is not installed.
+
+### Install the virtual driver (no WDK needed for release archives)
+
+Open an **Administrator PowerShell** in `driver\` (from a release zip) — or build first from source with `drivers\ap-exclusive-acx\scripts\build-and-sign.ps1 -FetchWdk` and then run from `drivers\ap-exclusive-acx\scripts\`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install-driver.ps1
+```
+
+1. If Test Mode is off, the script runs `bcdedit /set testsigning on` and asks you to **reboot once**, then run the same command again.
+2. It creates a per-machine self-signed certificate, signs `ap_exclusive_audio.sys` and `ap_exclusive_audio.cat` locally with SHA-256, registers `ROOT\ApExclusiveAudio`, and binds the driver via `pnputil`.
+3. **Restart Tidal Desktop** (if it was already open) so it sees the new output device.
+4. In Tidal Desktop → **Sound output**, pick **`Line (Audiophile Player)`**, turn **Use Exclusive Mode ON**, and leave **Force volume OFF**.
+5. Start Audiophile Player (the startup log prints `Exclusive capture: READY`) and press Play in Tidal. Audiophile Player automatically preempts local playback, follows every sample-rate change (44.1–384 kHz), blocks any Windows shared-mode mixer attempt (`audiodg.exe`) in the kernel, and releases the DAC cleanly when you pause Tidal.
+
+### Uninstall or disable
+
+```powershell
+# Remove the virtual endpoint, Driver Store package, and local test certificate (Admin PowerShell):
+powershell -ExecutionPolicy Bypass -File .\uninstall-driver.ps1
+
+# Same, and turn off Windows Test Mode too (reboot once afterward):
+powershell -ExecutionPolicy Bypass -File .\uninstall-driver.ps1 -DisableTestSigning
+```
+
+To keep the driver installed while temporarily disabling capture in Audiophile Player, pass `--no-capture` or set `enabled = false` under `[capture]` in `config.toml`. Full driver build details are in [`drivers/ap-exclusive-acx/README.md`](../drivers/ap-exclusive-acx/README.md).
 
 ---
 
@@ -156,6 +210,7 @@ Options on the command line always win over the file. Unknown sections or keys a
 | `[ultimate]` | `enabled` (false), `genre_rules` (true), `learn_on_play` (true) |
 | `[trackdb]` | `dir` (%APPDATA%\audiophile-player\trackdb), `sidecar` (false) |
 | `[upnp]` | `enabled` (true), `friendly_name` ("Audiophile Player"), `port` (auto), `bind_ip` |
+| `[capture]` | `enabled` (true) — opt-in exclusive capture watcher (`\\.\ApExclusiveAudio`) |
 
 ---
 
@@ -177,6 +232,7 @@ Options on the command line always win over the file. Unknown sections or keys a
 | `--no-genre-rules`, `--no-learn-on-play` | Ultimate mode refinements |
 | `--trackdb-dir <path>`, `--trackdb-sidecar` | Track DB location |
 | `--no-upnp`, `--upnp-name <n>`, `--upnp-port <p>`, `--upnp-bind <ip>` | UPnP renderer |
+| `--no-capture` | Disable the opt-in exclusive capture watcher (`\\.\ApExclusiveAudio`) |
 | `--port <p>` | Web page port |
 | `--opt <normal\|high\|extreme>` | Audio thread and process priority (default high) |
 | `--config <file>` | Use this config file |
@@ -199,8 +255,10 @@ Options on the command line always win over the file. Unknown sections or keys a
 | Symptom | Likely cause / fix |
 |---|---|
 | "DAC busy … staying paused" | Another app holds the DAC exclusively. Close it, then press Play |
-| "DAC rejected format" | The DAC (or its driver mode) doesn't accept 32-bit 352.8 / 384 kHz |
+| "Output error (… unsupported format …)" | The DAC (or its driver mode) doesn't accept 32-bit 352.8 / 384 kHz |
 | Wrong output device | Use `--device gungnir` (any part of the name) |
+| Tidal doesn't show `Line (Audiophile Player)` | Restart Tidal Desktop once after running `install-driver.ps1`; verify `Get-PnpDevice -Class MEDIA` shows `Audiophile Player` as `OK` |
+| `[capture zero-mixer] Blocked … audiodg.exe` | Normal safety message: Windows or an app tried Shared Mode (mixer) on `Line (Audiophile Player)` and the kernel rejected it. Turn **Use Exclusive Mode ON** in Tidal |
 | `[clip warn] Quantizer clipped N sample(s)` | Rare. With Ultimate learn-on-play, the next play is corrected automatically |
 | `[ultimate throughput] REFUSED …` | The PC was too slow for the chosen filter in real time. A lighter **exact** filter was used instead |
 | Ultimate mode starts slowly | Expected: the first 30 s are rendered before playback starts. Run a [library scan](#scan-your-library-optional), or use a faster CPU |
@@ -212,16 +270,20 @@ Options on the command line always win over the file. Unknown sections or keys a
 
 ```text
 crates/
-  ap-core/        config, headroom, FLAC metadata, track DB
-  ap-source/      FLAC decoding, HTTP streams
-  ap-dsp/         upsampling, analysis, REW convolution, quantizer
-  ap-output-win/  WDM-KS kernel streaming (Windows)
-  ap-upnp/        UPnP / DLNA renderer
-  ap-control/     local web page
-  ap-cli/         the audiophile-player binary
-docs/research/    design research and open questions
-poc/              prototypes
-tests/            synthetic CC0 test fixtures
+  ap-core/            config, headroom, FLAC metadata, track DB
+  ap-stream-protocol/ shared no_std kernel/user IOCTL ABI for exclusive capture
+  ap-source/          FLAC decoding, HTTP streams, exclusive kernel stream capture
+  ap-dsp/             upsampling, analysis, REW convolution, quantizer
+  ap-output-win/      WDM-KS kernel streaming (Windows)
+  ap-upnp/            UPnP / DLNA renderer
+  ap-control/         local web page
+  ap-cli/             the audiophile-player binary
+drivers/
+  ap-exclusive-acx/   opt-in pure-Rust KMDF 1.31 + ACX 1.1 virtual render driver
+scripts/              Windows shortcut launcher & release packager
+docs/research/        design research and open questions
+poc/                  prototypes
+tests/                synthetic CC0 test fixtures
 ```
 
 Requirements and design background: [REQUIREMENTS.md](../REQUIREMENTS.md) and [docs/research/](research/).

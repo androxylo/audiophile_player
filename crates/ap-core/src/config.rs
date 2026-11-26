@@ -1,8 +1,9 @@
 //! Engine configuration schema & zero-dependency TOML config file loader.
 //!
 //! Configures **REW stereo convolution** (`[convolution]`), **quantizer / noise shaping**
-//! (`[quantizer]`), the built-in **UPnP AV MediaRenderer** (`[upnp]`), **Ultimate Mode**
-//! (`[ultimate]`), and the Schema-1 YAML **Track Database** (`[trackdb]`).
+//! (`[quantizer]`), the built-in **UPnP AV MediaRenderer** (`[upnp]`), opt-in **exclusive stream
+//! capture** (`[capture]`), **Ultimate Mode** (`[ultimate]`), and the Schema-1 YAML **Track
+//! Database** (`[trackdb]`).
 //!
 //! ## Config Discovery Order
 //! 1. Explicit `--config <PATH>` (must exist and parse cleanly).
@@ -256,6 +257,21 @@ impl Default for UltimateConfig {
     }
 }
 
+/// Opt-in exclusive kernel stream capture configuration (`\\.\ApExclusiveAudio`, e.g. Tidal Desktop
+/// Exclusive Mode) loaded from `[capture]` in `config.toml` or overridden via `--no-capture`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CaptureConfig {
+    /// Watch for Audiophile Player's opt-in ACX virtual render driver (`true` by default; quietly
+    /// parks with zero audio impact when the driver is not installed).
+    pub enabled: bool,
+}
+
+impl Default for CaptureConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 /// Persistent Schema-1 YAML Track Database configuration loaded from `[trackdb]` in `config.toml`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TrackDbConfig {
@@ -271,6 +287,7 @@ pub struct PlayerConfig {
     pub convolution: ConvolutionConfig,
     pub quantizer: QuantizerConfig,
     pub upnp: UpnpConfig,
+    pub capture: CaptureConfig,
     pub ultimate: UltimateConfig,
     pub trackdb: TrackDbConfig,
 }
@@ -310,8 +327,8 @@ impl PlayerConfig {
         None
     }
 
-    /// Parse a strict TOML config string (`[convolution]`, `[quantizer]`, `[upnp]`, `[ultimate]`,
-    /// and `[trackdb]` sections).
+    /// Parse a strict TOML config string (`[convolution]`, `[quantizer]`, `[upnp]`, `[capture]`,
+    /// `[ultimate]`, and `[trackdb]` sections).
     pub fn from_toml_str(input: &str) -> Result<Self, String> {
         // Strip optional UTF-8 BOM (Windows editors such as Notepad may emit it).
         let text = input.strip_prefix('\u{feff}').unwrap_or(input);
@@ -322,6 +339,7 @@ impl PlayerConfig {
             Convolution,
             Quantizer,
             Upnp,
+            Capture,
             Ultimate,
             TrackDb,
         }
@@ -330,17 +348,20 @@ impl PlayerConfig {
         let mut seen_convolution_section = false;
         let mut seen_quantizer_section = false;
         let mut seen_upnp_section = false;
+        let mut seen_capture_section = false;
         let mut seen_ultimate_section = false;
         let mut seen_trackdb_section = false;
         let mut seen_conv_keys: HashSet<&str> = HashSet::new();
         let mut seen_quant_keys: HashSet<&str> = HashSet::new();
         let mut seen_upnp_keys: HashSet<&str> = HashSet::new();
+        let mut seen_capture_keys: HashSet<&str> = HashSet::new();
         let mut seen_ultimate_keys: HashSet<&str> = HashSet::new();
         let mut seen_trackdb_keys: HashSet<&str> = HashSet::new();
         let mut explicit_conv_enabled: Option<bool> = None;
         let mut conv = ConvolutionConfig::default();
         let mut quantizer = QuantizerConfig::default();
         let mut upnp = UpnpConfig::default();
+        let mut capture = CaptureConfig::default();
         let mut ultimate = UltimateConfig::default();
         let mut trackdb = TrackDbConfig::default();
 
@@ -386,6 +407,15 @@ impl PlayerConfig {
                         seen_upnp_section = true;
                         active_section = Section::Upnp;
                     }
+                    "capture" => {
+                        if seen_capture_section {
+                            return Err(format!(
+                                "config line {line_no}: duplicate section '[capture]'"
+                            ));
+                        }
+                        seen_capture_section = true;
+                        active_section = Section::Capture;
+                    }
                     "ultimate" => {
                         if seen_ultimate_section {
                             return Err(format!(
@@ -406,7 +436,7 @@ impl PlayerConfig {
                     }
                     other => {
                         return Err(format!(
-                            "config line {line_no}: unknown section '[{other}]' (supported: [convolution], [quantizer], [upnp], [ultimate], [trackdb])"
+                            "config line {line_no}: unknown section '[{other}]' (supported: [convolution], [quantizer], [upnp], [capture], [ultimate], [trackdb])"
                         ));
                     }
                 }
@@ -415,7 +445,7 @@ impl PlayerConfig {
 
             if active_section == Section::None {
                 return Err(format!(
-                    "config line {line_no}: key-value entry outside a section (expected [convolution], [quantizer], [upnp], [ultimate], or [trackdb])"
+                    "config line {line_no}: key-value entry outside a section (expected [convolution], [quantizer], [upnp], [capture], [ultimate], or [trackdb])"
                 ));
             }
 
@@ -556,6 +586,23 @@ impl PlayerConfig {
                         }
                     }
                 }
+                Section::Capture => {
+                    if !seen_capture_keys.insert(key) {
+                        return Err(format!(
+                            "config line {line_no}: duplicate key '{key}' in [capture]"
+                        ));
+                    }
+                    match key {
+                        "enabled" => {
+                            capture.enabled = parse_toml_bool(val, line_no, "enabled")?;
+                        }
+                        other => {
+                            return Err(format!(
+                                "config line {line_no}: unknown key '{other}' in [capture] (allowed: enabled)"
+                            ));
+                        }
+                    }
+                }
                 Section::Ultimate => {
                     if !seen_ultimate_keys.insert(key) {
                         return Err(format!(
@@ -613,6 +660,7 @@ impl PlayerConfig {
             convolution: conv,
             quantizer,
             upnp,
+            capture,
             ultimate,
             trackdb,
         })

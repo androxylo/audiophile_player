@@ -312,3 +312,21 @@ sidecar = true
     assert!(PlayerConfig::from_toml_str("[trackdb]\nsidecar = true\nsidecar = false\n").is_err());
     assert!(PlayerConfig::from_toml_str("[trackdb]\nunknown = 1\n").is_err());
 }
+
+#[test]
+fn parses_and_validates_capture_section() {
+    let default_cfg = PlayerConfig::default();
+    assert!(default_cfg.capture.enabled);
+
+    let cfg = PlayerConfig::from_toml_str("[capture]\nenabled = false\n").unwrap();
+    assert!(!cfg.capture.enabled);
+
+    let cfg_on = PlayerConfig::from_toml_str("[capture]\nenabled = true\n").unwrap();
+    assert!(cfg_on.capture.enabled);
+
+    assert!(PlayerConfig::from_toml_str("[capture]\nenabled = true\n[capture]\n").is_err());
+    assert!(
+        PlayerConfig::from_toml_str("[capture]\nenabled = true\nenabled = false\n").is_err()
+    );
+    assert!(PlayerConfig::from_toml_str("[capture]\nunknown = true\n").is_err());
+}

@@ -7,6 +7,7 @@
 ![Filters](https://img.shields.io/badge/filters-up%20to%204M%20taps-d73a49)
 ![Transport](https://img.shields.io/badge/transport-WDM--KS%20exclusive-2da44e)
 ![UPnP](https://img.shields.io/badge/UPnP-renderer-fb8500)
+![Tidal](https://img.shields.io/badge/Tidal%20Desktop-exclusive%20ACX%20(opt--in)-00b4d8)
 ![License](https://img.shields.io/badge/license-GPL--3.0--or--later-555)
 
 No GUI and no volume knob. There is no EQ beyond your REW filter, and no Windows mixer anywhere in the path. All the effort goes into the signal.
@@ -17,7 +18,7 @@ No GUI and no volume knob. There is no EQ beyond your REW filter, and no Windows
 
 ```mermaid
 flowchart LR
-    SRC["🎵 FLAC file<br/>or UPnP stream<br/>44.1 … 384 kHz"]:::src
+    SRC["🎵 FLAC file, UPnP,<br/>or Tidal Exclusive<br/>44.1 … 384 kHz"]:::src
     UP["⬆️ Upsampling<br/>to 8fS<br/>Gaussian / sinc / apodizing<br/>up to 4M taps"]:::dsp
     DE["De-emphasis<br/>50/15 µs<br/><i>only when flagged</i>"]:::opt
     REW["🏠 REW room<br/>convolution<br/>up to 4M-tap IR"]:::dsp
@@ -72,7 +73,7 @@ flowchart TB
 |---|---|---|
 | 💎 | **[Ultimate Mode](docs/ULTIMATE_MODE.md)** | The 30-second look-ahead, the detectors, how a filter is chosen, exact headroom, learn-on-play, per-track overrides |
 | 🎛️ | **[Sound Engine](docs/SOUND_ENGINE.md)** | Every filter and noise shaper explained for HQPlayer users, DAC bits, headroom policy, REW convolution, gapless |
-| 🚀 | **[Getting Started](docs/GETTING_STARTED.md)** | Install, first play, web page, UPnP with foobar2000 / BubbleUPnP, config file, every command-line option |
+| 🚀 | **[Getting Started](docs/GETTING_STARTED.md)** | Install (release or source), first play, web page, UPnP, Tidal Desktop exclusive driver, config file, command-line options |
 
 ---
 
@@ -84,7 +85,7 @@ mindmap
     Sources
       Local FLAC library
       UPnP / DLNA renderer
-      Tidal: planned
+      Tidal Desktop (opt-in exclusive ACX driver)
     DSP
       f64 throughout
       8fS only
@@ -101,8 +102,8 @@ mindmap
 ```
 
 **Status and honest limits**
-- 🟢 **Works today:** local FLAC (random or sequential, gapless), UPnP renderer (gapless), normal and ultimate modes, REW convolution, offline library scan, local web page.
-- 🟡 **Planned:** Tidal, WASAPI exclusive output, per-channel delay.
+- 🟢 **Works today:** local FLAC (random or sequential, gapless), UPnP renderer (gapless), **Tidal Desktop Exclusive Mode** via our opt-in Rust ACX virtual driver (zero Windows mixer), normal and ultimate modes, REW convolution, offline library scan, local web page.
+- 🟡 **Planned:** WASAPI exclusive output, per-channel delay.
 - 🔴 **Not supported, by design:** Windows shared mode, volume control, DSP effects, macOS / Linux playback, DACs without 352.8 / 384 kHz input.
 - Reference DAC: **Schiit Gungnir 2** (Unison USB, NOS). Any DAC that accepts 32-bit 352.8 / 384 kHz over a kernel-streaming driver should work.
 

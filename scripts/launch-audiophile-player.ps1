@@ -15,7 +15,9 @@
 $ErrorActionPreference = 'SilentlyContinue'
 
 $repoRoot    = Split-Path -Parent $PSScriptRoot
-$exePath     = Join-Path $repoRoot 'target\release\audiophile-player.exe'
+$releaseExe  = Join-Path $repoRoot 'audiophile-player.exe'
+$cargoExe    = Join-Path $repoRoot 'target\release\audiophile-player.exe'
+$exePath     = if (Test-Path -LiteralPath $releaseExe) { $releaseExe } else { $cargoExe }
 $urlFilePath = Join-Path $env:LOCALAPPDATA 'audiophile-player\server.url'
 
 function Show-PlayerWarning([string]$Message) {

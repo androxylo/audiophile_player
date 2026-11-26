@@ -63,6 +63,8 @@ pub enum RunMode {
         rew_override: Option<ConvolutionConfig>,
         /// Explicit CLI overrides for `[upnp]` in `config.toml`.
         upnp_override: UpnpCliOverride,
+        /// Disable opt-in exclusive kernel stream capture watcher (`--no-capture`).
+        capture_disabled: bool,
         /// Explicit CLI overrides for `[ultimate]` and `[trackdb]` in `config.toml`.
         ultimate_override: UltimateCliOverride,
     },
@@ -113,6 +115,7 @@ where
     let mut quantizer_override = QuantizerCliOverride::default();
     let mut rew_override: Option<ConvolutionConfig> = None;
     let mut upnp_override = UpnpCliOverride::default();
+    let mut capture_disabled = false;
     let mut ultimate_override = UltimateCliOverride::default();
     let mut idle = false;
 
@@ -231,6 +234,9 @@ where
             "--no-upnp" => {
                 upnp_override.disabled = true;
             }
+            "--no-capture" => {
+                capture_disabled = true;
+            }
             "--upnp-name" => {
                 let val = iter
                     .next()
@@ -328,6 +334,7 @@ where
         quantizer_override,
         rew_override,
         upnp_override,
+        capture_disabled,
         ultimate_override,
     })
 }
@@ -449,7 +456,7 @@ pub fn help_text() -> String {
                                               YAML trackdb entries; never modifies FLAC files).\n\n\
          CONFIG FILE:\n\
            Auto-loads .\\audiophile-player.toml or %APPDATA%\\audiophile-player\\config.toml\n\
-           (or pass --config <PATH>). Configures [convolution], [quantizer], and [upnp].\n\n\
+           (or pass --config <PATH>). Configures [convolution], [quantizer], [upnp], [capture], [ultimate], and [trackdb].\n\n\
          OPTIONS:\n\
            --config <PATH>      Path to TOML config file (default: auto-discover)\n\
            --music-dir <PATH>   Root folder containing FLAC subfolders (default: ~/Music)\n\
@@ -459,6 +466,7 @@ pub fn help_text() -> String {
            --upnp-port <PORT>   UPnP HTTP/SOAP port (default: auto-pick free port in 49152..49250)\n\
            --upnp-bind <IPV4>   Bind/advertise UPnP renderer on a specific local IPv4 address\n\
            --no-upnp            Disable the built-in UPnP AV MediaRenderer\n\
+           --no-capture         Disable the opt-in exclusive capture watcher (\\\\.\\ApExclusiveAudio)\n\
            --filter <NAME>      Enforce upsampling filter: auto | gauss-long-lp | gauss-hires-lp |\n\
                                 null | simple-test | gauss-apod-4m | sinc-steep-4m | ext-sharp-lp |\n\
                                 minphase-long | intermediate-long | short-lp | short-mp\n\
@@ -507,6 +515,7 @@ mod tests {
                 quantizer_override: QuantizerCliOverride::default(),
                 rew_override: None,
                 upnp_override: UpnpCliOverride::default(),
+                capture_disabled: false,
                 ultimate_override: UltimateCliOverride::default(),
             }
         );
@@ -577,6 +586,7 @@ mod tests {
                     port: Some(49170),
                     bind_ip: Some(Ipv4Addr::new(192, 168, 0, 187)),
                 },
+                capture_disabled: false,
                 ultimate_override: UltimateCliOverride {
                     enabled: Some(true),
                     genre_rules: Some(false),
@@ -594,6 +604,15 @@ mod tests {
                 rew_override: Some(ref c),
                 ..
             } if !c.enabled
+        ));
+
+        let no_cap = parse_args(["audiophile-player", "--no-capture"]).unwrap();
+        assert!(matches!(
+            no_cap,
+            RunMode::PlayRandom {
+                capture_disabled: true,
+                ..
+            }
         ));
 
         assert_eq!(
