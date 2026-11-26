@@ -209,8 +209,19 @@ fn http_server_serves_scrollable_no_volume_ui_and_routes_play_pause_commands() {
     assert!(page_with_peak.contains(">Pause (Release DAC)<"));
 
     server.shutdown();
-    // Port should be cleanly released once shutdown finishes
-    assert!(TcpListener::bind(server.addr()).is_ok());
+    // Our server must have released the port (if a parallel test immediately reused the
+    // shared default port range, it will not serve our server's unique temp music_dir).
+    if TcpListener::bind(server.addr()).is_err() {
+        let probe = http_request(
+            server.addr(),
+            &format!("GET /api/status HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
+        );
+        assert!(
+            !probe.contains("Gungnir 2 Unison 384"),
+            "old server still answering on {} after shutdown: {probe}",
+            server.addr()
+        );
+    }
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -479,7 +490,12 @@ fn rejects_unc_device_reserved_and_out_of_root_paths_on_get_and_post() {
 fn slow_idle_client_does_not_block_concurrent_status_or_shutdown_and_caps_8k_headers() {
     let dir = make_temp_music_dir("concurrency_caps");
     let shared = SharedControl::new(dir.clone(), "Test DAC");
-    let mut server = ControlServer::start(Arc::clone(&shared), None).unwrap();
+    // Use an OS-assigned ephemeral port outside 8085..=8199 so parallel tests scanning the
+    // default port range cannot grab our port during shutdown()'s 200 ms slow-worker drain.
+    let probe = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral port");
+    let dedicated_port = probe.local_addr().unwrap().port();
+    drop(probe);
+    let mut server = ControlServer::start(Arc::clone(&shared), Some(dedicated_port)).unwrap();
     let addr = server.addr();
     let port = addr.port();
 
