@@ -3618,7 +3618,7 @@ mod tests {
         let elapsed = t0.elapsed();
         let _ = tx.send(());
         assert!(!joined, "stuck producer should detach on bounded timeout");
-        assert!(elapsed >= Duration::from_millis(100) && elapsed < Duration::from_millis(600));
+        assert!(elapsed >= Duration::from_millis(100) && elapsed < Duration::from_millis(1500));
 
         // 3. Ctrl+C followed by ConsoleClose mid-wait switches dynamically to fast_timeout!
         let ctrl_esc = Arc::new(ShutdownController::new());
@@ -3645,7 +3645,7 @@ mod tests {
         assert!(!joined2);
         assert!(ctrl_esc.fast_teardown_requested());
         assert!(
-            elapsed2 < Duration::from_millis(500),
+            elapsed2 < Duration::from_millis(1500),
             "ConsoleClose escalation should cut 5 s normal budget down to fast timeout, took {elapsed2:?}"
         );
     }

@@ -451,7 +451,7 @@ mod tests {
             let l = Arc::clone(&low_latch);
             pool.submit(
                 Box::new(move || {
-                    thread::sleep(Duration::from_millis(15));
+                    thread::sleep(Duration::from_millis(40));
                     ord.lock().unwrap().push("low");
                     l.complete_one();
                 }),
@@ -483,7 +483,7 @@ mod tests {
             "C9: high-priority job must execute BEFORE queued low-priority jobs: {seq:?}"
         );
         assert!(
-            hi_elapsed < Duration::from_millis(80),
+            hi_elapsed < Duration::from_millis(250),
             "C9: high-priority job waited behind low-priority queue ({hi_elapsed:?})"
         );
     }

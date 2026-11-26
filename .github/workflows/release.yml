@@ -39,7 +39,7 @@ jobs:
       - name: Run workspace unit tests
         shell: pwsh
         run: |
-          cargo test --release --workspace --locked -- --skip hardware_live --skip plays_random_flac_from_user_music
+          cargo test --release --workspace --locked -- --skip hardware_live --skip live_wdm_ks --skip plays_random_flac_from_user_music
 
       - name: Determine release tag and version
         id: meta

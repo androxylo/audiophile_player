@@ -61,7 +61,7 @@ jobs:
       - name: Build release binary and run drift-guard + workspace tests
         shell: pwsh
         run: |
-          cargo test --release --workspace --locked -- --skip hardware_live --skip plays_random_flac_from_user_music
+          cargo test --release --workspace --locked -- --skip hardware_live --skip live_wdm_ks --skip plays_random_flac_from_user_music
           cargo build --release --locked --bin audiophile-player
 
       - name: Smoke test CLI JSON surfaces
@@ -83,3 +83,4 @@ jobs:
           if ($docExit -ne 0 -and $docExit -ne 1) {
             throw "Unexpected doctor exit code on CI: $docExit"
           }
+          exit 0

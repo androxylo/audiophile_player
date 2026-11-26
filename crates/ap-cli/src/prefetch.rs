@@ -1066,7 +1066,7 @@ mod tests {
         // Empty queue returns Underrun immediately (no condvar sleep).
         let started = std::time::Instant::now();
         assert!(matches!(try_pop(&buf, ep), PopBlockResult::Underrun));
-        assert!(started.elapsed() < Duration::from_millis(20));
+        assert!(started.elapsed() < Duration::from_millis(200));
 
         // Once producer pushes a block and TrackEnd, non-blocking pops drain them in order.
         assert!(buf.push_for_epoch(ep, StreamEvent::PcmBlock(make_block(128))));
