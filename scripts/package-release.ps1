@@ -186,6 +186,11 @@ $gsRaw = $gsRaw.Replace("(../drivers/ap-exclusive-acx/README.md)", "(../driver/R
 $gsRaw = $gsRaw.Replace("``drivers/ap-exclusive-acx/README.md``", "``driver/README.md``")
 Set-Content -LiteralPath $stagedGettingStarted -Value $gsRaw -Encoding UTF8
 
+$stagedSoundEngine = Join-Path $stageDir "docs\SOUND_ENGINE.md"
+$seRaw = Get-Content -LiteralPath $stagedSoundEngine -Raw
+$seRaw = $seRaw.Replace("(FILTER_PREFERENCES.md)", "(https://github.com/androxylo/audiophile_player/blob/main/docs/FILTER_PREFERENCES.md)")
+Set-Content -LiteralPath $stagedSoundEngine -Value $seRaw -Encoding UTF8
+
 Write-Host "`n=== 4. Verifying release hygiene (forbidden extensions, strict manifest allowlist, unsigned binaries) ===" -ForegroundColor Cyan
 $forbiddenExts = @(
     ".cer", ".pfx", ".pvk", ".key", ".pdb",

@@ -56,7 +56,7 @@ flowchart LR
 | `short-lp`, `short-mp` | Short Gaussian, −150 dB | Short filters | Low-power machines |
 | `null` | Pass-through | — | Native 352.8 / 384 kHz sources |
 
-The "closest idea" column is an analogy only. These are original designs, not copies of commercial filters.
+The "closest idea" column is an analogy only. These are original designs, not copies of commercial filters. For a living collection of listener opinions and forum filter guides mapped to these filters, see [Community Filter Preferences](FILTER_PREFERENCES.md).
 
 ### Which filter plays, in normal mode
 
