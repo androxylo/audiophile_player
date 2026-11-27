@@ -225,6 +225,7 @@ impl BlockStreamAudioSink for FileWireSink {
             notifications,
             mmcss_pro_audio: false,
             underrun_halves: underruns,
+            ..PlaybackStats::default()
         })
     }
 }

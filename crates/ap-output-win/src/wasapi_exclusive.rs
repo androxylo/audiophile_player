@@ -18,6 +18,8 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(windows)]
+use std::time::{Duration, Instant};
 
 use ap_core::buffer::InterleavedInt32Buffer;
 use ap_core::format::{DacOutputCapabilities, DacWireFormat};
@@ -25,6 +27,17 @@ use ap_core::format::{DacOutputCapabilities, DacWireFormat};
 use crate::hygiene::{MemoryLockGuard, MmcssGuard, OptimizationLevel};
 use crate::sink::{OutputError, PlaybackStats, ZeroMixerAudioSink};
 use crate::wdm_ks::{StreamBlock, StreamingWaveRtPump, WaveRtFramePump, WaveRtPumpSource};
+
+/// WASAPI Exclusive delivery pacing mode (`WDMKS_TIMING_TESTS_REVIEW.md` §5.2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WasapiDeliveryMode {
+    /// Event-driven ping-pong (`AUDCLNT_STREAMFLAGS_EVENTCALLBACK`, recommended default).
+    #[default]
+    EventDriven,
+    /// Push (polling via `GetCurrentPadding`) fallback for USB/PCI drivers whose event callback
+    /// mode is unreliable. Still strictly `AUDCLNT_SHAREMODE_EXCLUSIVE` (zero mixer).
+    Push,
+}
 
 #[cfg(windows)]
 use core::ffi::c_void;
@@ -90,6 +103,7 @@ pub fn classify_wasapi_hr(
     const HR_EXCLUSIVE_NOT_ALLOWED: i32 = 0x8889_000E_u32 as i32;
     const HR_UNSUPPORTED_FORMAT: i32 = 0x8889_0008_u32 as i32;
     const HR_DEVICE_INVALIDATED: i32 = 0x8889_0004_u32 as i32;
+    const HR_RESOURCES_INVALIDATED: i32 = 0x8889_0026_u32 as i32;
     const HR_INVALIDARG: i32 = 0x8007_0057_u32 as i32;
 
     let code = hr as u32;
@@ -102,7 +116,7 @@ pub fn classify_wasapi_hr(
         HR_EXCLUSIVE_NOT_ALLOWED => OutputError::DeviceBusy {
             device: device_name.to_string(),
             os_error: code,
-            detail: "Exclusive Mode is disabled in Windows Sound settings for this device (AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED)".to_string(),
+            detail: "Exclusive Mode is disabled for this device; enable 'Allow applications to take exclusive control of this device' in Windows Sound settings (AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED)".to_string(),
         },
         HR_UNSUPPORTED_FORMAT | HR_INVALIDARG if sample_rate_hz.is_some() && wire_format.is_some() => {
             OutputError::UnsupportedFormat {
@@ -116,8 +130,8 @@ pub fn classify_wasapi_hr(
                 },
             }
         }
-        HR_DEVICE_INVALIDATED => OutputError::DeviceNotFound(format!(
-            "WASAPI endpoint '{device_name}' was disconnected or invalidated (AUDCLNT_E_DEVICE_INVALIDATED)"
+        HR_DEVICE_INVALIDATED | HR_RESOURCES_INVALIDATED => OutputError::DeviceNotFound(format!(
+            "WASAPI endpoint '{device_name}' was disconnected or invalidated (HRESULT {code:#010x})"
         )),
         _ => OutputError::Win32 {
             operation,
@@ -218,6 +232,7 @@ pub struct WasapiLoopController {
     bpf: usize,
     frames_played: usize,
     underrun_periods: usize,
+    partial_underrun_periods: usize,
     fading_stop: bool,
     eof_drain_periods: usize,
 }
@@ -238,6 +253,7 @@ impl WasapiLoopController {
             bpf,
             frames_played: 0,
             underrun_periods: 0,
+            partial_underrun_periods: 0,
             fading_stop: false,
             eof_drain_periods: 0,
         })
@@ -255,6 +271,10 @@ impl WasapiLoopController {
         self.underrun_periods
     }
 
+    pub fn partial_underrun_periods(&self) -> usize {
+        self.partial_underrun_periods
+    }
+
     /// Fill the initial hardware buffer before `IAudioClient::Start()`.
     /// Returns `(is_silent_buffer)` indicating whether the buffer is pure silence.
     pub fn prefill(
@@ -268,8 +288,12 @@ impl WasapiLoopController {
             return Err(err);
         }
         self.frames_played += written;
-        if written < self.period_frames && !pump.is_eof() {
-            self.underrun_periods += 1;
+        if !pump.is_eof() {
+            if written == 0 {
+                self.underrun_periods += 1;
+            } else if written < self.period_frames {
+                self.partial_underrun_periods += 1;
+            }
         }
         if pump.is_eof() && written == 0 {
             // Empty stream: one silence period already queued.
@@ -339,18 +363,40 @@ impl WasapiLoopController {
             return Ok((written == 0, WasapiStepOutcome::Continue));
         }
 
-        if written < self.period_frames {
+        if written == 0 {
             self.underrun_periods += 1;
+        } else if written < self.period_frames {
+            self.partial_underrun_periods += 1;
         }
         Ok((written == 0, WasapiStepOutcome::Continue))
     }
 }
 
-/// Event-driven WASAPI Exclusive (`AUDCLNT_SHAREMODE_EXCLUSIVE`) output sink handle.
+/// Pure, unit-testable format-negotiation quirk selector (`WDMKS_TIMING_TESTS_REVIEW.md` §5.3 & §5.5).
+///
+/// Tries standard `FL|FR` channel mask first, then falls back to `dwChannelMask = 0` when a
+/// driver rejects the speaker mask with `UnsupportedFormat`. Never silently accepts a closest match.
+pub fn negotiate_channel_mask_with_probe<F>(mut probe_mask: F) -> Result<u32, OutputError>
+where
+    F: FnMut(u32) -> Result<(), OutputError>,
+{
+    const FL_FR_MASK: u32 = 0x3;
+    match probe_mask(FL_FR_MASK) {
+        Ok(()) => Ok(FL_FR_MASK),
+        Err(OutputError::UnsupportedFormat { .. }) => {
+            probe_mask(0)?;
+            Ok(0)
+        }
+        Err(other) => Err(other),
+    }
+}
+
+/// Event-driven (or push-fallback) WASAPI Exclusive (`AUDCLNT_SHAREMODE_EXCLUSIVE`) output sink.
 #[derive(Debug)]
 pub struct WasapiExclusiveSink {
     device: WasapiRenderDevice,
     optimization: OptimizationLevel,
+    delivery_mode: WasapiDeliveryMode,
     stop_flag: Arc<AtomicBool>,
 }
 
@@ -377,8 +423,19 @@ impl WasapiExclusiveSink {
         Ok(Self {
             device: found,
             optimization,
+            delivery_mode: WasapiDeliveryMode::EventDriven,
             stop_flag: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Select Event-Driven (default) or Push (polling) WASAPI Exclusive mode (§5.2).
+    pub fn with_delivery_mode(mut self, mode: WasapiDeliveryMode) -> Self {
+        self.delivery_mode = mode;
+        self
+    }
+
+    pub fn delivery_mode(&self) -> WasapiDeliveryMode {
+        self.delivery_mode
     }
 
     /// Return a thread-safe stop handle that gracefully interrupts active playback with a
@@ -499,12 +556,12 @@ impl WasapiExclusiveSink {
                 device_name: self.device.friendly_name.clone(),
                 sample_rate_hz,
                 wire_format,
-                frames_played: 0,
-                wavert_buffer_bytes: 0,
-                notifications: 0,
-                mmcss_pro_audio: false,
-                underrun_halves: 0,
+                ..PlaybackStats::default()
             });
+        }
+
+        if self.delivery_mode == WasapiDeliveryMode::Push {
+            return self.run_wasapi_push_pump(sample_rate_hz, wire_format, pump);
         }
 
         let mmcss = MmcssGuard::enter_pro_audio(self.optimization);
@@ -553,8 +610,17 @@ impl WasapiExclusiveSink {
         }
 
         let start_guard = win::WasapiStartGuard::start(&audio_client, &self.device.friendly_name)?;
+        let mut last_wake = Instant::now();
         let mut notifications: usize = 0;
         let mut pump_error: Option<OutputError> = None;
+        let mut stats = PlaybackStats {
+            device_name: self.device.friendly_name.clone(),
+            sample_rate_hz,
+            wire_format,
+            wavert_buffer_bytes: (period_bytes.saturating_mul(2)) as u32,
+            mmcss_pro_audio: mmcss.is_active(),
+            ..PlaybackStats::default()
+        };
 
         loop {
             let wait_res = unsafe { WaitForSingleObject(event.raw(), 1500) };
@@ -567,6 +633,13 @@ impl WasapiExclusiveSink {
                         .to_string(),
                 });
             }
+            let now = Instant::now();
+            let delta_ns = now
+                .saturating_duration_since(last_wake)
+                .as_nanos()
+                .min(u64::MAX as u128) as u64;
+            last_wake = now;
+            stats.record_wake_interval_ns(delta_ns);
             notifications += 1;
 
             let stop_requested = self.stop_flag.load(Ordering::SeqCst);
@@ -618,16 +691,201 @@ impl WasapiExclusiveSink {
             return Err(err);
         }
 
-        Ok(PlaybackStats {
+        stats.frames_played = controller.frames_played();
+        stats.notifications = notifications;
+        stats.underrun_halves = controller.underrun_periods().max(pump.underrun_events());
+        stats.partial_underrun_halves = controller.partial_underrun_periods();
+        Ok(stats)
+    }
+
+    /// Push (polling) WASAPI Exclusive fallback (`AUDCLNT_SHAREMODE_EXCLUSIVE`, flags = 0,
+    /// `WDMKS_TIMING_TESTS_REVIEW.md` §5.2 Fallback 1).
+    #[cfg(windows)]
+    fn run_wasapi_push_pump(
+        &mut self,
+        sample_rate_hz: u32,
+        wire_format: DacWireFormat,
+        pump: &mut dyn WaveRtPumpSource,
+    ) -> Result<PlaybackStats, OutputError> {
+        let mmcss = MmcssGuard::enter_pro_audio(self.optimization);
+        let _com = win::ComGuard::init_mta()?;
+
+        let mm_device =
+            win::open_endpoint_by_id(&self.device.endpoint_id, &self.device.friendly_name)?;
+        let (audio_client, buffer_frames) = win::initialize_exclusive_push_client(
+            &mm_device,
+            &self.device.friendly_name,
+            sample_rate_hz,
+            wire_format,
+        )?;
+        let render_client =
+            win::audio_client_get_render_client(&audio_client, &self.device.friendly_name)?;
+
+        let bpf = wire_format.bytes_per_frame();
+        let buf_frames_usize = buffer_frames as usize;
+        let sleep_dur = Duration::from_secs_f64(
+            (buf_frames_usize as f64 / f64::from(sample_rate_hz.max(1))) * 0.25,
+        )
+        .clamp(Duration::from_millis(2), Duration::from_millis(25));
+
+        let mut frames_played: usize = 0;
+        let mut underrun_periods: usize = 0;
+        let mut partial_underrun_periods: usize = 0;
+        let mut notifications: usize = 0;
+        let mut fading_stop = false;
+        let mut eof_draining = false;
+
+        // Pre-fill entire exclusive buffer before `Start()`.
+        {
+            let ptr = win::render_client_get_buffer(
+                &render_client,
+                buffer_frames,
+                &self.device.friendly_name,
+            )?;
+            let slice = unsafe { core::slice::from_raw_parts_mut(ptr, buf_frames_usize * bpf) };
+            let written = pump.fill_slice(slice);
+            let err = pump.take_error();
+            let flags = if written == 0 || err.is_some() {
+                AUDCLNT_BUFFERFLAGS_SILENT as u32
+            } else {
+                0
+            };
+            win::render_client_release_buffer(
+                &render_client,
+                buffer_frames,
+                flags,
+                &self.device.friendly_name,
+            )?;
+            if let Some(e) = err {
+                return Err(e);
+            }
+            frames_played += written;
+            if pump.is_eof() {
+                eof_draining = true;
+            }
+        }
+
+        let start_guard = win::WasapiStartGuard::start(&audio_client, &self.device.friendly_name)?;
+        let mut last_wake = Instant::now();
+        let mut pump_error: Option<OutputError> = None;
+        let mut stats = PlaybackStats {
             device_name: self.device.friendly_name.clone(),
             sample_rate_hz,
             wire_format,
-            frames_played: controller.frames_played(),
-            wavert_buffer_bytes: (period_bytes.saturating_mul(2)) as u32,
-            notifications,
+            wavert_buffer_bytes: (buf_frames_usize * bpf) as u32,
             mmcss_pro_audio: mmcss.is_active(),
-            underrun_halves: controller.underrun_periods().max(pump.underrun_events()),
-        })
+            ..PlaybackStats::default()
+        };
+
+        loop {
+            std::thread::sleep(sleep_dur);
+            let now = Instant::now();
+            let delta_ns = now
+                .saturating_duration_since(last_wake)
+                .as_nanos()
+                .min(u64::MAX as u128) as u64;
+            last_wake = now;
+            stats.record_wake_interval_ns(delta_ns);
+            notifications += 1;
+
+            let padding = match win::audio_client_get_current_padding(
+                &audio_client,
+                &self.device.friendly_name,
+            ) {
+                Ok(p) => p,
+                Err(err) => {
+                    pump_error = Some(err);
+                    break;
+                }
+            };
+            if (eof_draining || fading_stop) && padding == 0 {
+                break;
+            }
+            let avail = buffer_frames.saturating_sub(padding);
+            if avail == 0 {
+                continue;
+            }
+            if eof_draining || fading_stop {
+                // Wait for remaining padded frames to finish clocking out.
+                continue;
+            }
+
+            let stop_requested = self.stop_flag.load(Ordering::SeqCst);
+            let ptr = match win::render_client_get_buffer(
+                &render_client,
+                avail,
+                &self.device.friendly_name,
+            ) {
+                Ok(p) => p,
+                Err(err) => {
+                    pump_error = Some(err);
+                    break;
+                }
+            };
+            let slice = unsafe { core::slice::from_raw_parts_mut(ptr, (avail as usize) * bpf) };
+
+            let (written, flags) = if stop_requested {
+                fading_stop = true;
+                let w = pump.fill_fade_out_slice(slice);
+                (
+                    w,
+                    if w == 0 {
+                        AUDCLNT_BUFFERFLAGS_SILENT as u32
+                    } else {
+                        0
+                    },
+                )
+            } else {
+                let w = pump.fill_slice(slice);
+                if let Some(e) = pump.take_error() {
+                    pump_error = Some(e);
+                    (0, AUDCLNT_BUFFERFLAGS_SILENT as u32)
+                } else {
+                    if pump.is_eof() {
+                        eof_draining = true;
+                    } else if w == 0 {
+                        underrun_periods += 1;
+                    } else if w < avail as usize {
+                        partial_underrun_periods += 1;
+                    }
+                    (
+                        w,
+                        if w == 0 {
+                            AUDCLNT_BUFFERFLAGS_SILENT as u32
+                        } else {
+                            0
+                        },
+                    )
+                }
+            };
+            frames_played += written;
+
+            if let Err(err) = win::render_client_release_buffer(
+                &render_client,
+                avail,
+                flags,
+                &self.device.friendly_name,
+            ) {
+                if pump_error.is_none() {
+                    pump_error = Some(err);
+                }
+                break;
+            }
+            if pump_error.is_some() {
+                break;
+            }
+        }
+
+        drop(start_guard);
+        if let Some(err) = pump_error {
+            return Err(err);
+        }
+
+        stats.frames_played = frames_played;
+        stats.notifications = notifications;
+        stats.underrun_halves = underrun_periods.max(pump.underrun_events());
+        stats.partial_underrun_halves = partial_underrun_periods;
+        Ok(stats)
     }
 }
 
@@ -718,12 +976,14 @@ pub fn probe_wasapi_device_capabilities(
     })
 }
 
-/// Build an exact integer PCM `WAVEFORMATEXTENSIBLE` for WASAPI Exclusive Mode (never float/mix).
+/// Build an exact integer PCM `WAVEFORMATEXTENSIBLE` for WASAPI Exclusive Mode (never float/mix),
+/// with an explicit `dwChannelMask` override (supports the `dwChannelMask = 0` driver quirk, §5.3).
 #[cfg(windows)]
-pub fn build_wasapi_wave_format(
+pub fn build_wasapi_wave_format_with_mask(
     sample_rate_hz: u32,
     channels: u16,
     wire_format: DacWireFormat,
+    channel_mask: u32,
 ) -> WAVEFORMATEXTENSIBLE {
     let (bits_per_sample, valid_bits) = match wire_format {
         DacWireFormat::Int32 => (32_u16, 32_u16),
@@ -733,16 +993,6 @@ pub fn build_wasapi_wave_format(
     };
     let block_align = channels * (bits_per_sample / 8);
     let avg_bytes_per_sec = sample_rate_hz * u32::from(block_align);
-    let channel_mask = if channels == 2 {
-        SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT
-    } else if channels == 0 {
-        0
-    } else {
-        1_u32
-            .checked_shl(u32::from(channels))
-            .map(|v| v - 1)
-            .unwrap_or(u32::MAX)
-    };
 
     WAVEFORMATEXTENSIBLE {
         Format: WAVEFORMATEX {
@@ -760,6 +1010,26 @@ pub fn build_wasapi_wave_format(
         dwChannelMask: channel_mask,
         SubFormat: KSDATAFORMAT_SUBTYPE_PCM,
     }
+}
+
+/// Build an exact integer PCM `WAVEFORMATEXTENSIBLE` for WASAPI Exclusive Mode (never float/mix).
+#[cfg(windows)]
+pub fn build_wasapi_wave_format(
+    sample_rate_hz: u32,
+    channels: u16,
+    wire_format: DacWireFormat,
+) -> WAVEFORMATEXTENSIBLE {
+    let channel_mask = if channels == 2 {
+        SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT
+    } else if channels == 0 {
+        0
+    } else {
+        1_u32
+            .checked_shl(u32::from(channels))
+            .map(|v| v - 1)
+            .unwrap_or(u32::MAX)
+    };
+    build_wasapi_wave_format_with_mask(sample_rate_hz, channels, wire_format, channel_mask)
 }
 
 #[cfg(windows)]
@@ -1342,18 +1612,153 @@ mod win {
         Ok((default_period, min_period))
     }
 
-    /// Initialize an event-driven WASAPI Exclusive `IAudioClient` performing the mandatory
-    /// MSDN `AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED` alignment retry sequence.
+    fn probe_client_mask(
+        client: &ComPtr<IAudioClientRaw>,
+        device_name: &str,
+        sample_rate_hz: u32,
+        wire_format: DacWireFormat,
+        channel_mask: u32,
+    ) -> Result<(), OutputError> {
+        let wfx = build_wasapi_wave_format_with_mask(sample_rate_hz, 2, wire_format, channel_mask);
+        let fmt_ptr = core::ptr::addr_of!(wfx).cast::<WAVEFORMATEX>();
+        let hr = unsafe {
+            let vtbl = (*client.as_ptr()).vtbl;
+            ((*vtbl).is_format_supported)(
+                client.as_ptr().cast::<c_void>(),
+                AUDCLNT_SHAREMODE_EXCLUSIVE,
+                fmt_ptr,
+                core::ptr::null_mut(),
+            )
+        };
+        if hr == S_OK {
+            Ok(())
+        } else if hr == S_FALSE {
+            Err(OutputError::UnsupportedFormat {
+                sample_rate_hz,
+                wire_format,
+                os_error: hr as u32,
+                detail: "WASAPI Exclusive endpoint does not support exact integer PCM format (S_FALSE)"
+                    .to_string(),
+            })
+        } else {
+            Err(classify_wasapi_hr(
+                hr,
+                "IAudioClient::IsFormatSupported",
+                device_name,
+                Some(sample_rate_hz),
+                Some(wire_format),
+            ))
+        }
+    }
+
+    pub(super) fn audio_client_get_current_padding(
+        client: &ComPtr<IAudioClientRaw>,
+        device_name: &str,
+    ) -> Result<u32, OutputError> {
+        let mut padding: u32 = 0;
+        let hr = unsafe {
+            let vtbl = (*client.as_ptr()).vtbl;
+            ((*vtbl).get_current_padding)(client.as_ptr().cast::<c_void>(), &mut padding)
+        };
+        if hr < 0 {
+            return Err(classify_wasapi_hr(
+                hr,
+                "IAudioClient::GetCurrentPadding",
+                device_name,
+                None,
+                None,
+            ));
+        }
+        Ok(padding)
+    }
+
+    /// Initialize a Push (polling) WASAPI Exclusive `IAudioClient` (flags = 0, §5.2 Fallback 1).
+    pub(super) fn initialize_exclusive_push_client(
+        dev: &ComPtr<IMMDeviceRaw>,
+        device_name: &str,
+        sample_rate_hz: u32,
+        wire_format: DacWireFormat,
+    ) -> Result<(ComPtr<IAudioClientRaw>, u32), OutputError> {
+        let client = activate_audio_client(dev, device_name)?;
+        let mask = negotiate_channel_mask_with_probe(|m| {
+            probe_client_mask(&client, device_name, sample_rate_hz, wire_format, m)
+        })
+        .unwrap_or(SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT);
+        let wfx = build_wasapi_wave_format_with_mask(sample_rate_hz, 2, wire_format, mask);
+        let fmt_ptr = core::ptr::addr_of!(wfx).cast::<WAVEFORMATEX>();
+        let (default_period, min_period) = audio_client_get_device_period(&client, device_name)?;
+        let requested_hns = default_period.max(min_period).saturating_mul(4).max(400_000);
+
+        let hr = unsafe {
+            let vtbl = (*client.as_ptr()).vtbl;
+            ((*vtbl).initialize)(
+                client.as_ptr().cast::<c_void>(),
+                AUDCLNT_SHAREMODE_EXCLUSIVE,
+                0,
+                requested_hns,
+                0,
+                fmt_ptr,
+                core::ptr::null(),
+            )
+        };
+        if hr == AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED {
+            let aligned_frames = audio_client_get_buffer_size(&client, device_name)?;
+            let aligned_hns = aligned_buffer_duration_hns(aligned_frames, sample_rate_hz);
+            drop(client);
+            let fresh_client = activate_audio_client(dev, device_name)?;
+            let hr2 = unsafe {
+                let vtbl = (*fresh_client.as_ptr()).vtbl;
+                ((*vtbl).initialize)(
+                    fresh_client.as_ptr().cast::<c_void>(),
+                    AUDCLNT_SHAREMODE_EXCLUSIVE,
+                    0,
+                    aligned_hns,
+                    0,
+                    fmt_ptr,
+                    core::ptr::null(),
+                )
+            };
+            if hr2 < 0 {
+                return Err(classify_wasapi_hr(
+                    hr2,
+                    "IAudioClient::Initialize(push-aligned)",
+                    device_name,
+                    Some(sample_rate_hz),
+                    Some(wire_format),
+                ));
+            }
+            let buf_frames = audio_client_get_buffer_size(&fresh_client, device_name)?;
+            return Ok((fresh_client, buf_frames));
+        }
+        if hr < 0 {
+            return Err(classify_wasapi_hr(
+                hr,
+                "IAudioClient::Initialize(push)",
+                device_name,
+                Some(sample_rate_hz),
+                Some(wire_format),
+            ));
+        }
+        let buf_frames = audio_client_get_buffer_size(&client, device_name)?;
+        Ok((client, buf_frames))
+    }
+
+    /// Initialize an event-driven WASAPI Exclusive `IAudioClient` performing the channel-mask
+    /// quirk check and mandatory MSDN `AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED` alignment retry sequence.
     pub(super) fn initialize_exclusive_event_client(
         dev: &ComPtr<IMMDeviceRaw>,
         device_name: &str,
         sample_rate_hz: u32,
         wire_format: DacWireFormat,
     ) -> Result<(ComPtr<IAudioClientRaw>, u32), OutputError> {
-        let wfx = build_wasapi_wave_format(sample_rate_hz, 2, wire_format);
+        let client = activate_audio_client(dev, device_name)?;
+        let mask = negotiate_channel_mask_with_probe(|m| {
+            probe_client_mask(&client, device_name, sample_rate_hz, wire_format, m)
+        })
+        .unwrap_or(SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT);
+        let wfx = build_wasapi_wave_format_with_mask(sample_rate_hz, 2, wire_format, mask);
         let fmt_ptr = core::ptr::addr_of!(wfx).cast::<WAVEFORMATEX>();
 
-        let client = activate_audio_client(dev, device_name)?;
         let (default_period, min_period) = audio_client_get_device_period(&client, device_name)?;
         // In event-driven Exclusive Mode, buffer duration == periodicity; default_period is
         // driver-chosen (typically 10 ms = 100,000 hns) for glitch-free 352.8/384 kHz streaming.
@@ -1427,38 +1832,10 @@ mod win {
         let _com = ComGuard::init_mta()?;
         let dev = open_endpoint_by_id(&device.endpoint_id, &device.friendly_name)?;
         let client = activate_audio_client(&dev, &device.friendly_name)?;
-        let wfx = build_wasapi_wave_format(sample_rate_hz, 2, wire_format);
-        let fmt_ptr = core::ptr::addr_of!(wfx).cast::<WAVEFORMATEX>();
-
-        // In Exclusive Mode, `ppClosestMatch` MUST be NULL per MSDN.
-        let hr = unsafe {
-            let vtbl = (*client.as_ptr()).vtbl;
-            ((*vtbl).is_format_supported)(
-                client.as_ptr().cast::<c_void>(),
-                AUDCLNT_SHAREMODE_EXCLUSIVE,
-                fmt_ptr,
-                core::ptr::null_mut(),
-            )
-        };
-        if hr == S_OK {
-            Ok(())
-        } else if hr == S_FALSE {
-            Err(OutputError::UnsupportedFormat {
-                sample_rate_hz,
-                wire_format,
-                os_error: hr as u32,
-                detail: "WASAPI Exclusive endpoint does not support exact integer PCM format (S_FALSE)"
-                    .to_string(),
-            })
-        } else {
-            Err(classify_wasapi_hr(
-                hr,
-                "IAudioClient::IsFormatSupported",
-                &device.friendly_name,
-                Some(sample_rate_hz),
-                Some(wire_format),
-            ))
-        }
+        negotiate_channel_mask_with_probe(|mask| {
+            probe_client_mask(&client, &device.friendly_name, sample_rate_hz, wire_format, mask)
+        })
+        .map(|_| ())
     }
 
     pub(super) fn audio_client_set_event_handle(

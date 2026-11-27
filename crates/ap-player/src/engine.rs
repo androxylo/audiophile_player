@@ -37,7 +37,9 @@ use ap_dsp::selector::{
 };
 use ap_output_win::hygiene::OptimizationLevel;
 use ap_output_win::sink::{OutputError, PlaybackStats};
-use ap_output_win::wasapi_exclusive::{WasapiExclusiveSink, probe_wasapi_device_capabilities};
+use ap_output_win::wasapi_exclusive::{
+    WasapiDeliveryMode, WasapiExclusiveSink, probe_wasapi_device_capabilities,
+};
 use ap_output_win::wdm_ks::WdmKsSink;
 use ap_source::flac::{
     AudioBlockSource, FlacBlockReader, UNSUPPORTED_CHANNEL_LAYOUT_PREFIX,
@@ -985,6 +987,7 @@ pub fn run_random_music_player(
     rew_override: Option<ConvolutionConfig>,
     upnp_override: UpnpCliOverride,
     capture_disabled: bool,
+    trace_wavert: bool,
     ultimate_override: UltimateCliOverride,
     startup_argv: Vec<String>,
     controller: &'static ShutdownController,
@@ -1026,7 +1029,7 @@ pub fn run_random_music_player(
         Some(t) => t,
         None => match loaded_cfg.config.player.output.as_deref() {
             Some(raw) => ap_core::config::OutputTransport::parse(raw).map_err(CliError::config)?,
-            None => ap_core::config::OutputTransport::WdmKs,
+            None => ap_core::config::OutputTransport::default(),
         },
     };
     let effective_max_rate = max_rate_override.or(loaded_cfg.config.player.max_rate);
@@ -1126,6 +1129,7 @@ pub fn run_random_music_player(
         effective_output,
         device_filter.as_deref(),
         optimization,
+        trace_wavert,
     )
     .map_err(|e| CliError::device(e.to_string()))?;
     let dac_name = sink.friendly_name().to_string();
@@ -1547,13 +1551,19 @@ impl HardwareAudioSink {
         transport: ap_core::config::OutputTransport,
         device_filter: Option<&str>,
         optimization: OptimizationLevel,
+        trace_wavert: bool,
     ) -> Result<Self, OutputError> {
         match transport {
             ap_core::config::OutputTransport::WdmKs => {
-                WdmKsSink::open_best(device_filter, optimization).map(Self::WdmKs)
+                WdmKsSink::open_best(device_filter, optimization)
+                    .map(|s| Self::WdmKs(if trace_wavert { s.with_trace_wavert(true) } else { s }))
             }
             ap_core::config::OutputTransport::WasapiExclusive => {
                 WasapiExclusiveSink::open_best(device_filter, optimization).map(Self::Wasapi)
+            }
+            ap_core::config::OutputTransport::WasapiPush => {
+                WasapiExclusiveSink::open_best(device_filter, optimization)
+                    .map(|s| Self::Wasapi(s.with_delivery_mode(WasapiDeliveryMode::Push)))
             }
         }
     }
@@ -2029,14 +2039,48 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
                 stream_buf.drain_deferred_drops();
                 match play_res {
                     Ok(stats) => {
-                        if stats.underrun_halves > 0 {
+                        let hist_json: Vec<JsonValue> = stats
+                            .non_zero_histogram_bins()
+                            .into_iter()
+                            .map(|(ms, count)| {
+                                JsonValue::obj(vec![
+                                    ("ms", JsonValue::from(ms)),
+                                    ("count", JsonValue::from(count)),
+                                ])
+                            })
+                            .collect();
+                        shared.set_last_playback_stats(JsonValue::obj(vec![
+                            ("track", JsonValue::from(path.display().to_string())),
+                            ("device", JsonValue::from(stats.device_name.clone())),
+                            ("sample_rate_hz", JsonValue::from(stats.sample_rate_hz)),
+                            ("wire_format", JsonValue::from(stats.wire_format.label())),
+                            ("frames_played", JsonValue::from(stats.frames_played)),
+                            ("notifications", JsonValue::from(stats.notifications)),
+                            ("underrun_halves", JsonValue::from(stats.underrun_halves)),
+                            (
+                                "partial_underrun_halves",
+                                JsonValue::from(stats.partial_underrun_halves),
+                            ),
+                            ("coalesced_wakes", JsonValue::from(stats.coalesced_wakes)),
+                            ("spurious_wakes", JsonValue::from(stats.spurious_wakes)),
+                            ("rescue_writes", JsonValue::from(stats.rescue_writes)),
+                            (
+                                "max_wake_interval_ms",
+                                JsonValue::from(
+                                    ((stats.max_wake_interval_ns as f64) / 10_000.0).round()
+                                        / 100.0,
+                                ),
+                            ),
+                            ("wake_interval_histogram_ms", JsonValue::Array(hist_json)),
+                        ]));
+                        if stats.has_timing_anomalies() {
                             let warn_msg = format!(
-                                "Buffer underrun on '{}' ({} Hz): {} DMA half-buffer(s) padded with silence",
+                                "Output timing anomaly on '{}' ({} Hz): {}",
                                 path.display(),
                                 out_rate,
-                                stats.underrun_halves
+                                stats.timing_summary(),
                             );
-                            eprintln!("  [underrun warn] {warn_msg}");
+                            eprintln!("  [timing warn] {warn_msg}");
                             shared.record_action(warn_msg);
                         }
                         if hit_track_end.load(Ordering::SeqCst)
@@ -4983,6 +5027,7 @@ mod tests {
                     notifications: 1,
                     mmcss_pro_audio: false,
                     underrun_halves: 0,
+                    ..PlaybackStats::default()
                 })
             }
         }
@@ -5366,6 +5411,7 @@ mod tests {
                     notifications: 0,
                     mmcss_pro_audio: false,
                     underrun_halves: 0,
+                    ..PlaybackStats::default()
                 })
             }
         }
@@ -5664,6 +5710,7 @@ mod tests {
                     notifications: 1,
                     mmcss_pro_audio: false,
                     underrun_halves: 0,
+                    ..PlaybackStats::default()
                 })
             }
         }

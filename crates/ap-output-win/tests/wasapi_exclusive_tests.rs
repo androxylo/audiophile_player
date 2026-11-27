@@ -7,7 +7,7 @@ use ap_core::format::DacWireFormat;
 use ap_output_win::sink::OutputError;
 use ap_output_win::wasapi_exclusive::{
     WasapiLoopController, WasapiRenderDevice, WasapiStepOutcome, aligned_buffer_duration_hns,
-    classify_wasapi_hr, select_wasapi_device,
+    classify_wasapi_hr, negotiate_channel_mask_with_probe, select_wasapi_device,
 };
 use ap_output_win::wdm_ks::{StreamBlock, StreamingWaveRtPump, WaveRtFramePump};
 
@@ -160,6 +160,42 @@ fn wasapi_loop_controller_recovers_from_streaming_underrun() {
     assert_eq!(ctrl.frames_played(), 4);
 }
 
+#[test]
+fn format_negotiation_retries_zero_channel_mask_and_never_swallows_busy() {
+    // Quirk 1: driver rejects FL|FR (0x3) with UnsupportedFormat, accepts mask 0.
+    let mut seen = Vec::new();
+    let mask = negotiate_channel_mask_with_probe(|m| {
+        seen.push(m);
+        if m == 0x3 {
+            Err(OutputError::UnsupportedFormat {
+                sample_rate_hz: 384_000,
+                wire_format: DacWireFormat::Int32,
+                os_error: 0x8889_0008,
+                detail: "rejects FL|FR mask".to_string(),
+            })
+        } else {
+            Ok(())
+        }
+    })
+    .unwrap();
+    assert_eq!(mask, 0);
+    assert_eq!(seen, vec![0x3, 0]);
+
+    // Quirk 2: DeviceBusy stops immediately without retrying mask 0.
+    let mut seen2 = Vec::new();
+    let err = negotiate_channel_mask_with_probe(|m| {
+        seen2.push(m);
+        Err(OutputError::DeviceBusy {
+            device: "DAC".to_string(),
+            os_error: 0x8889_000A,
+            detail: "in use".to_string(),
+        })
+    })
+    .unwrap_err();
+    assert!(err.is_device_busy());
+    assert_eq!(seen2, vec![0x3]);
+}
+
 #[cfg(windows)]
 #[test]
 fn build_wasapi_wave_format_builds_exact_integer_pcm_containers() {
@@ -193,7 +229,7 @@ fn build_wasapi_wave_format_builds_exact_integer_pcm_containers() {
 
 #[cfg(windows)]
 #[test]
-fn live_enumerate_and_probe_wasapi_exclusive_devices() {
+fn hardware_live_enumerate_and_probe_wasapi_exclusive_devices() {
     use ap_output_win::wasapi_exclusive::{
         enumerate_wasapi_render_devices, probe_wasapi_device_format,
     };

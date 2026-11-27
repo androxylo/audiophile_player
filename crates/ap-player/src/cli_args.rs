@@ -157,6 +157,8 @@ pub enum RunMode {
         upnp_override: UpnpCliOverride,
         /// Disable opt-in exclusive kernel stream capture watcher (`--no-capture`).
         capture_disabled: bool,
+        /// Emit per-wake WDM-KS WaveRT timing trace to stderr (`--trace-wavert`).
+        trace_wavert: bool,
         /// Explicit CLI overrides for `[ultimate]` and `[trackdb]` in `config.toml`.
         ultimate_override: UltimateCliOverride,
     },
@@ -365,6 +367,7 @@ where
     let mut rew_override: Option<ConvolutionConfig> = None;
     let mut upnp_override = UpnpCliOverride::default();
     let mut capture_disabled = false;
+    let mut trace_wavert = false;
     let mut ultimate_override = UltimateCliOverride::default();
     let mut idle = false;
     let mut show_version = false;
@@ -393,6 +396,7 @@ where
                 let raw = take_opt_str("--output", &mut iter)?;
                 output_transport = Some(OutputTransport::parse(&raw)?);
             }
+            "--trace-wavert" => trace_wavert = true,
             "--max-rate" => {
                 let val_str = take_opt_str("--max-rate", &mut iter)?;
                 let trimmed = val_str.trim();
@@ -528,6 +532,7 @@ where
         rew_override,
         upnp_override,
         capture_disabled,
+        trace_wavert,
         ultimate_override,
     })
 }
@@ -1080,6 +1085,7 @@ mod tests {
                 rew_override: None,
                 upnp_override: UpnpCliOverride::default(),
                 capture_disabled: false,
+                trace_wavert: false,
                 ultimate_override: UltimateCliOverride::default(),
             }
         );
@@ -1175,6 +1181,7 @@ mod tests {
                     bind_ip: Some(Ipv4Addr::new(192, 168, 0, 187)),
                 },
                 capture_disabled: false,
+                trace_wavert: false,
                 ultimate_override: UltimateCliOverride {
                     enabled: Some(true),
                     genre_rules: Some(false),

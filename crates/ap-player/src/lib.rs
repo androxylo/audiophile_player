@@ -125,6 +125,7 @@ pub fn run_cli_main() -> ExitCode {
                     rew_override,
                     upnp_override,
                     capture_disabled,
+                    trace_wavert,
                     ultimate_override,
                 } => engine::run_random_music_player(
                     config_path,
@@ -140,6 +141,7 @@ pub fn run_cli_main() -> ExitCode {
                     rew_override,
                     upnp_override,
                     capture_disabled,
+                    trace_wavert,
                     ultimate_override,
                     raw_argv,
                     controller,

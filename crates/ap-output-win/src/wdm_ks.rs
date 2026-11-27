@@ -1065,8 +1065,49 @@ const WAKE_RING_LEN: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WaveRtWakeDecision {
-    Write { write_half: usize, coalesced: bool },
+    Write {
+        write_half: usize,
+        coalesced: bool,
+        rescue: bool,
+    },
     Spurious,
+}
+
+/// Hardware-independent wait outcome for [`WaveRtDevice::wait_notification`]
+/// (`WDMKS_TIMING_TESTS_REVIEW.md` §4.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaveRtWaitResult {
+    Signaled,
+    Timeout,
+}
+
+/// Hardware position reading returned by [`WaveRtDevice::read_position`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaveRtPositionSample {
+    pub offset_bytes: u64,
+    pub wrap_mode: PositionWrapMode,
+}
+
+/// Narrow hardware abstraction for the WaveRT playback pump (`WDMKS_TIMING_TESTS_REVIEW.md` §4.1).
+///
+/// Implemented in production by `KsWaveRtDevice` (wrapping the real WDM-KS WaveRT session) and
+/// in verification tests by `FakeWaveRtDevice` (a causal virtual-timeline DMA simulator).
+pub trait WaveRtDevice {
+    fn device_name(&self) -> &str;
+    fn layout(&self) -> WaveRtRingLayout;
+    fn actual_buffer_bytes(&self) -> u32;
+    fn is_modular_position(&self) -> bool;
+    fn ring_mut(&mut self) -> &mut [u8];
+    fn wait_notification(&mut self, timeout: Duration) -> WaveRtWaitResult;
+    fn read_position(&mut self) -> Option<WaveRtPositionSample>;
+    fn barrier(&self);
+    fn start_run(&mut self) -> Result<(), OutputError>;
+    fn stop_clean(&mut self);
+}
+
+/// Monotonic clock abstraction for deterministic virtual-timeline WaveRT simulation (§4.1).
+pub trait WaveRtClock {
+    fn now_since_run(&self) -> Duration;
 }
 
 /// Pure, hardware-independent WaveRT cyclic half-buffer state machine.
@@ -1096,6 +1137,9 @@ pub struct WaveRtLoopController {
     lag_history_cursor: usize,
     wrap_mode: PositionWrapMode,
     observed_wrap: bool,
+    /// True once any raw hardware position `>= buf_len` has been seen (prevents a monotonic
+    /// 32-bit counter from misclassifying as modular right after rolling over past `u32::MAX`, S6).
+    observed_above_buf: bool,
     /// True once any hardware position sample has been observed strictly inside a half
     /// (`pos % half != 0`). Remains `false` for boundary-quantized drivers such as
     /// `usbaudio2.sys` that snap `KSAUDIO_POSITION` to exact `0` / `half` multiples.
@@ -1122,7 +1166,9 @@ pub struct WaveRtLoopController {
     completed_audio_frames: usize,
     spurious_wakes: usize,
     coalesced_wakes: usize,
+    rescue_writes: usize,
     underrun_halves: usize,
+    partial_underrun_halves: usize,
     trailing_silent_halves: usize,
     stopping_fade_done: bool,
 }
@@ -1142,6 +1188,7 @@ impl WaveRtLoopController {
             lag_history_cursor: 0,
             wrap_mode: PositionWrapMode::Auto,
             observed_wrap: false,
+            observed_above_buf: false,
             observed_intra_half_pos: false,
             half_duration: None,
             clock_ref_bidx: 0,
@@ -1161,7 +1208,9 @@ impl WaveRtLoopController {
             completed_audio_frames: 0,
             spurious_wakes: 0,
             coalesced_wakes: 0,
+            rescue_writes: 0,
             underrun_halves: 0,
+            partial_underrun_halves: 0,
             trailing_silent_halves: 0,
             stopping_fade_done: false,
         }
@@ -1202,9 +1251,20 @@ impl WaveRtLoopController {
         self.coalesced_wakes
     }
 
+    /// Number of wakes that took the wall-clock lag-rescue branch (S2 observability).
+    pub fn rescue_writes(&self) -> usize {
+        self.rescue_writes
+    }
+
     /// Number of DMA half-buffer refills that received zero frames from a non-EOF producer.
     pub fn underrun_halves(&self) -> usize {
         self.underrun_halves
+    }
+
+    /// Number of DMA half-buffer refills that ran dry mid-half (`0 < written < half_frames`
+    /// before EOF, S5 observability).
+    pub fn partial_underrun_halves(&self) -> usize {
+        self.partial_underrun_halves
     }
 
     /// Current estimated hardware play-cursor lag in bytes (strictly `0` for boundary-quantized
@@ -1729,6 +1789,7 @@ impl WaveRtLoopController {
         WaveRtWakeDecision::Write {
             write_half,
             coalesced,
+            rescue: false,
         }
     }
 
@@ -1750,6 +1811,9 @@ impl WaveRtLoopController {
 
         if pos % half != 0 {
             self.observed_intra_half_pos = true;
+        }
+        if pos >= buf {
+            self.observed_above_buf = true;
         }
 
         let clock_info = match (now_since_run, self.half_duration) {
@@ -1776,6 +1840,13 @@ impl WaveRtLoopController {
                             } else {
                                 pos
                             }
+                        } else if pos >= buf.saturating_mul(4)
+                            && now.as_nanos() < eff_half_ns.saturating_mul(2)
+                        {
+                            // Non-zero monotonic hardware counter origin (e.g. near u32::MAX, S6):
+                            // anchor wake #1 at byte `half` while preserving raw `pos` for exact
+                            // subsequent deltas and 32-bit rollover unwrapping.
+                            half
                         } else {
                             pos
                         };
@@ -1829,8 +1900,10 @@ impl WaveRtLoopController {
                 }
 
                 let is_modular = self.wrap_mode == PositionWrapMode::Modular || self.observed_wrap;
-                let can_be_modular =
-                    prev_raw < buf && pos < buf && self.wrap_mode != PositionWrapMode::Monotonic;
+                let can_be_modular = prev_raw < buf
+                    && pos < buf
+                    && self.wrap_mode != PositionWrapMode::Monotonic
+                    && !self.observed_above_buf;
 
                 if can_be_modular {
                     if pos < prev_raw {
@@ -1878,9 +1951,20 @@ impl WaveRtLoopController {
                 } else if pos >= prev_raw {
                     prev_unwrapped.saturating_add(pos - prev_raw)
                 } else {
-                    // 32-bit counter wrap or non-monotonic quirk: step 1 half cleanly.
-                    self.boundary_byte(self.last_boundary_idx.saturating_add(1))
-                        .saturating_sub(self.lag_bytes)
+                    // Issue #22 S6 fix: compute exact 32-bit counter rollover delta when a
+                    // monotonic 32-bit byte cursor wraps past u32::MAX (~25 min at 352.8 kHz).
+                    let delta32 = if prev_raw > 0x8000_0000 && pos < 0x8000_0000 {
+                        ((1_u64 << 32) - prev_raw).saturating_add(pos)
+                    } else {
+                        u64::MAX
+                    };
+                    if delta32 <= buf.saturating_mul(8) {
+                        prev_unwrapped.saturating_add(delta32)
+                    } else {
+                        // Non-monotonic quirk: step 1 half cleanly.
+                        self.boundary_byte(self.last_boundary_idx.saturating_add(1))
+                            .saturating_sub(self.lag_bytes)
+                    }
                 }
             }
             _ => pos,
@@ -1925,57 +2009,63 @@ impl WaveRtLoopController {
             }
         }
 
-        let (new_bidx, coalesced, record_lag) = if raw_bidx >= next_expected_bidx.saturating_add(1)
-        {
-            // Crossed >= 2 half boundaries: genuine coalescing; resync directly to DMA half.
-            (raw_bidx, true, false)
-        } else if raw_bidx == next_expected_bidx {
-            // Exactly 1 half boundary crossed (including late-but-not-coalesced wakes).
-            (raw_bidx, false, !is_first_wake)
-        } else {
-            // Position is still short of `next_expected_byte`.
-            let shortfall = next_expected_byte.saturating_sub(adj_pos);
-            if shortfall <= guard {
-                // Inside pre-boundary jitter guard band: trust expected half boundary.
-                (next_expected_bidx, false, !is_first_wake)
+        let (new_bidx, coalesced, record_lag, rescue) =
+            if raw_bidx >= next_expected_bidx.saturating_add(1) {
+                // Crossed >= 2 half boundaries: genuine coalescing; resync directly to DMA half.
+                (raw_bidx, true, false, false)
+            } else if raw_bidx == next_expected_bidx {
+                // Exactly 1 half boundary crossed (including late-but-not-coalesced wakes).
+                (raw_bidx, false, !is_first_wake, false)
             } else {
-                // Outside guard band: distinguish a genuine boundary wake whose true cursor lag
-                // was underestimated (e.g. wake #1 arrived late) from a spurious/duplicate wake.
-                // Review #5 #12: When the wall clock proves we are at `next_expected_bidx` (and
-                // not yet at `next_expected_bidx + 1`), accept lags up to a full `half` (use the
-                // stricter `half / 2` cap only when no wall clock is available).
-                let candidate_lag = next_expected_byte.saturating_sub(unwrapped);
-                let (clock_reached_boundary, effective_max_lag) = match clock_info {
-                    Some((now, hd)) => {
-                        let now_ns = now.as_nanos() as i128;
-                        let ideal_next = self.ideal_boundary_ns(next_expected_bidx, hd);
-                        let ideal_after =
-                            self.ideal_boundary_ns(next_expected_bidx.saturating_add(1), hd);
-                        let early_margin = self.effective_half_ns_for(hd) / 8;
-                        let reached = now_ns.saturating_add(early_margin) >= ideal_next
-                            && now_ns.saturating_add(early_margin) < ideal_after;
-                        (reached, half)
-                    }
-                    None => (
-                        self.last_unwrapped_pos
-                            .map(|prev| unwrapped.saturating_sub(prev) >= half / 2)
-                            .unwrap_or(false),
-                        max_plausible_lag,
-                    ),
-                };
-
-                if !is_first_wake
-                    && candidate_lag <= effective_max_lag
-                    && clock_reached_boundary
-                {
-                    (next_expected_bidx, false, true)
+                // Position is still short of `next_expected_byte`.
+                let shortfall = next_expected_byte.saturating_sub(adj_pos);
+                if shortfall <= guard {
+                    // Inside pre-boundary jitter guard band: trust expected half boundary.
+                    (next_expected_bidx, false, !is_first_wake, false)
                 } else {
-                    // Spurious / duplicate wake before the next half boundary: do NOT overwrite
-                    // the pending half and do NOT credit unplayed frames.
-                    return WaveRtWakeDecision::Spurious;
+                    // Outside guard band: distinguish a genuine boundary wake whose true cursor lag
+                    // was underestimated (e.g. wake #1 arrived late) from a spurious/duplicate wake.
+                    // Issue #22 S2 fix: NEVER allow `candidate_lag == half` on boundary-quantized
+                    // drivers (`!self.observed_intra_half_pos`), where a stuck cursor means DMA
+                    // has not crossed into the other half yet. Cap strictly below `half`.
+                    let candidate_lag = next_expected_byte.saturating_sub(unwrapped);
+                    let bpf = self.layout.bytes_per_frame() as u64;
+                    let (clock_reached_boundary, effective_max_lag) = match clock_info {
+                        Some((now, hd)) => {
+                            let now_ns = now.as_nanos() as i128;
+                            let ideal_next = self.ideal_boundary_ns(next_expected_bidx, hd);
+                            let ideal_after =
+                                self.ideal_boundary_ns(next_expected_bidx.saturating_add(1), hd);
+                            let early_margin = self.effective_half_ns_for(hd) / 8;
+                            let reached = now_ns.saturating_add(early_margin) >= ideal_next
+                                && now_ns.saturating_add(early_margin) < ideal_after;
+                            let cap = if self.observed_intra_half_pos {
+                                half.saturating_sub(bpf)
+                            } else {
+                                max_plausible_lag
+                            };
+                            (reached, cap)
+                        }
+                        None => (
+                            self.last_unwrapped_pos
+                                .map(|prev| unwrapped.saturating_sub(prev) >= half / 2)
+                                .unwrap_or(false),
+                            max_plausible_lag,
+                        ),
+                    };
+
+                    if !is_first_wake
+                        && candidate_lag <= effective_max_lag
+                        && clock_reached_boundary
+                    {
+                        (next_expected_bidx, false, true, true)
+                    } else {
+                        // Spurious / duplicate wake before the next half boundary: do NOT overwrite
+                        // the pending half and do NOT credit unplayed frames.
+                        return WaveRtWakeDecision::Spurious;
+                    }
                 }
-            }
-        };
+            };
 
         if record_lag {
             self.record_observed_lag(now_since_run, new_bidx, unwrapped);
@@ -1993,6 +2083,7 @@ impl WaveRtLoopController {
         WaveRtWakeDecision::Write {
             write_half,
             coalesced,
+            rescue,
         }
     }
 
@@ -2019,21 +2110,25 @@ impl WaveRtLoopController {
         play_offset_bytes: Option<u64>,
         now_since_run: Option<Duration>,
     ) -> Result<(usize, WaveRtStepOutcome), OutputError> {
-        let (write_half, coalesced) = match self.select_write_half(play_offset_bytes, now_since_run)
-        {
-            WaveRtWakeDecision::Write {
-                write_half,
-                coalesced,
-            } => (write_half, coalesced),
-            WaveRtWakeDecision::Spurious => {
-                self.spurious_wakes = self.spurious_wakes.saturating_add(1);
-                return Ok((
-                    self.last_written_half.unwrap_or(0),
-                    WaveRtStepOutcome::Spurious,
-                ));
-            }
-        };
+        let (write_half, coalesced, rescue) =
+            match self.select_write_half(play_offset_bytes, now_since_run) {
+                WaveRtWakeDecision::Write {
+                    write_half,
+                    coalesced,
+                    rescue,
+                } => (write_half, coalesced, rescue),
+                WaveRtWakeDecision::Spurious => {
+                    self.spurious_wakes = self.spurious_wakes.saturating_add(1);
+                    return Ok((
+                        self.last_written_half.unwrap_or(0),
+                        WaveRtStepOutcome::Spurious,
+                    ));
+                }
+            };
         self.next_expected_half = write_half ^ 1;
+        if rescue {
+            self.rescue_writes = self.rescue_writes.saturating_add(1);
+        }
 
         if coalesced {
             // Coalesced notification (>= 2 boundaries crossed): both halves completed DMA.
@@ -2067,6 +2162,7 @@ impl WaveRtLoopController {
             return Ok((write_half, outcome));
         }
 
+        let half_capacity_frames = range.len() / self.layout.bytes_per_frame();
         let written = pump.fill_slice(&mut cyclic_slice[range]);
         self.half_audio_frames[write_half] = written;
 
@@ -2087,6 +2183,11 @@ impl WaveRtLoopController {
                 self.trailing_silent_halves = 0;
             }
         } else {
+            // Issue #22 S5 fix: count mid-half producer underruns (`0 < written < half_capacity`
+            // before EOF) so partial silence padding is never silently masked.
+            if written < half_capacity_frames && !pump.is_eof() {
+                self.partial_underrun_halves = self.partial_underrun_halves.saturating_add(1);
+            }
             self.trailing_silent_halves = 0;
         }
 
@@ -2225,6 +2326,7 @@ pub struct WdmKsSink {
     device: KsRenderDevice,
     optimization: OptimizationLevel,
     stop_flag: Arc<AtomicBool>,
+    trace_wavert: bool,
 }
 
 impl WdmKsSink {
@@ -2248,11 +2350,21 @@ impl WdmKsSink {
     ) -> Result<Self, OutputError> {
         let devices = enumerate_wdm_ks_render_devices()?;
         let found = select_wdm_ks_device(&devices, device_filter)?;
+        let env_trace = std::env::var("AP_TRACE_WAVERT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         Ok(Self {
             device: found,
             optimization,
             stop_flag: Arc::new(AtomicBool::new(false)),
+            trace_wavert: env_trace,
         })
+    }
+
+    /// Enable or disable per-wake WaveRT diagnostic tracing (`--trace-wavert`, §4.3).
+    pub fn with_trace_wavert(mut self, enabled: bool) -> Self {
+        self.trace_wavert = enabled;
+        self
     }
 
     /// Return a thread-safe stop handle that can gracefully interrupt active playback
@@ -2390,85 +2502,243 @@ impl WdmKsSink {
                 device_name: self.device.friendly_name.clone(),
                 sample_rate_hz,
                 wire_format,
-                frames_played: 0,
-                wavert_buffer_bytes: 0,
-                notifications: 0,
-                mmcss_pro_audio: false,
-                underrun_halves: 0,
+                ..PlaybackStats::default()
             });
         }
 
         let mmcss = MmcssGuard::enter_pro_audio(self.optimization);
-        let mut session = open_wavert_session(&self.device, sample_rate_hz, wire_format)?;
+        let session = open_wavert_session(&self.device, sample_rate_hz, wire_format)?;
+        let mut dev = KsWaveRtDevice {
+            device_name: self.device.friendly_name.clone(),
+            session,
+        };
+        let clock = MonotonicWaveRtClock::new();
+        run_wavert_pump_with_device(
+            &mut dev,
+            &clock,
+            sample_rate_hz,
+            wire_format,
+            pump,
+            &self.stop_flag,
+            mmcss.is_active(),
+            self.trace_wavert,
+        )
+    }
+}
 
-        let half_frames = session.layout.half_len() / session.layout.bytes_per_frame();
-        let half_duration =
-            Duration::from_secs_f64(half_frames as f64 / f64::from(sample_rate_hz.max(1)));
-        let mut controller = WaveRtLoopController::new(session.layout)
-            .with_half_duration(half_duration)
-            .with_wrap_mode(if session.pos_reader.is_modular() {
-                PositionWrapMode::Modular
-            } else {
-                PositionWrapMode::Auto
+/// Hardware-independent WaveRT playback pump shared by production `KsWaveRtDevice` and causal
+/// `FakeWaveRtDevice` DMA simulations (`WDMKS_TIMING_TESTS_REVIEW.md` §§4.1–4.2).
+#[allow(clippy::too_many_arguments)]
+pub fn run_wavert_pump_with_device<D: WaveRtDevice, C: WaveRtClock>(
+    device: &mut D,
+    clock: &C,
+    sample_rate_hz: u32,
+    wire_format: DacWireFormat,
+    pump: &mut dyn WaveRtPumpSource,
+    stop_flag: &AtomicBool,
+    mmcss_pro_audio: bool,
+    trace_wavert: bool,
+) -> Result<PlaybackStats, OutputError> {
+    if stop_flag.load(Ordering::SeqCst) {
+        return Ok(PlaybackStats {
+            device_name: device.device_name().to_string(),
+            sample_rate_hz,
+            wire_format,
+            ..PlaybackStats::default()
+        });
+    }
+
+    let layout = device.layout();
+    let half_frames = layout.half_len() / layout.bytes_per_frame();
+    let half_duration =
+        Duration::from_secs_f64(half_frames as f64 / f64::from(sample_rate_hz.max(1)));
+    let mut controller = WaveRtLoopController::new(layout)
+        .with_half_duration(half_duration)
+        .with_wrap_mode(if device.is_modular_position() {
+            PositionWrapMode::Modular
+        } else {
+            PositionWrapMode::Auto
+        });
+
+    if trace_wavert {
+        eprintln!(
+            "[trace-wavert] device='{}' rate={}Hz fmt={:?} actual_buf={}B half={}B ({} frames, {:.3}ms)",
+            device.device_name(),
+            sample_rate_hz,
+            wire_format,
+            device.actual_buffer_bytes(),
+            layout.half_len(),
+            half_frames,
+            half_duration.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    controller.prefill(device.ring_mut(), pump)?;
+    device.barrier();
+
+    device.start_run()?;
+    let run_origin = clock.now_since_run();
+    let mut prev_wake_rel = Duration::ZERO;
+    let mut notifications: usize = 0;
+    let mut pump_error: Option<OutputError> = None;
+
+    let mut stats = PlaybackStats {
+        device_name: device.device_name().to_string(),
+        sample_rate_hz,
+        wire_format,
+        wavert_buffer_bytes: device.actual_buffer_bytes(),
+        mmcss_pro_audio,
+        ..PlaybackStats::default()
+    };
+
+    loop {
+        if device.wait_notification(Duration::from_millis(1500)) != WaveRtWaitResult::Signaled {
+            device.stop_clean();
+            return Err(OutputError::Win32 {
+                operation: "WaitForSingleObject(WaveRT)",
+                code: 258,
+                detail: "timed out waiting for WaveRT hardware notification event".to_string(),
             });
-        controller.prefill(session.cyclic_slice_mut(), pump)?;
-        session.maybe_barrier();
+        }
+        notifications += 1;
 
-        let run_start = session.start_run()?;
-        let mut notifications: usize = 0;
-        let mut pump_error: Option<OutputError> = None;
+        let stop_requested = stop_flag.load(Ordering::SeqCst);
+        let pos_sample = device.read_position();
+        let play_offset = pos_sample.map(|p| p.offset_bytes);
+        let now_since_run = clock.now_since_run().saturating_sub(run_origin);
+        let delta_ns = now_since_run
+            .saturating_sub(prev_wake_rel)
+            .as_nanos()
+            .min(u64::MAX as u128) as u64;
+        prev_wake_rel = now_since_run;
+        stats.record_wake_interval_ns(delta_ns);
 
-        loop {
-            let wait_res = unsafe { WaitForSingleObject(session.event.raw(), 1500) };
-            if wait_res != WAIT_OBJECT_0 {
-                return Err(OutputError::Win32 {
-                    operation: "WaitForSingleObject(WaveRT)",
-                    code: wait_res,
-                    detail: "timed out waiting for WaveRT hardware notification event".to_string(),
-                });
-            }
-            notifications += 1;
-
-            let stop_requested = self.stop_flag.load(Ordering::SeqCst);
-            let play_offset = session.pos_reader.read_position_bytes();
-            let now_since_run = run_start.elapsed();
-
-            match controller.on_notification_at(
-                session.cyclic_slice_mut(),
-                pump,
-                stop_requested,
-                play_offset,
-                Some(now_since_run),
-            ) {
-                Ok((_, outcome)) => {
-                    session.maybe_barrier();
-                    if outcome == WaveRtStepOutcome::Finished {
-                        break;
-                    }
+        match controller.on_notification_at(
+            device.ring_mut(),
+            pump,
+            stop_requested,
+            play_offset,
+            Some(now_since_run),
+        ) {
+            Ok((half_written, outcome)) => {
+                device.barrier();
+                if trace_wavert {
+                    eprintln!(
+                        "[trace-wavert] wake={notifications} t={:.3}ms dt={:.3}ms pos={:?} half={half_written} outcome={outcome:?}",
+                        now_since_run.as_secs_f64() * 1_000.0,
+                        (delta_ns as f64) / 1_000_000.0,
+                        play_offset,
+                    );
                 }
-                Err(err) => {
-                    session.maybe_barrier();
-                    pump_error = Some(err);
+                if outcome == WaveRtStepOutcome::Finished {
                     break;
                 }
             }
+            Err(err) => {
+                device.barrier();
+                pump_error = Some(err);
+                break;
+            }
         }
+    }
 
-        session.stop_clean();
-        if let Some(err) = pump_error {
-            return Err(err);
+    device.stop_clean();
+    if let Some(err) = pump_error {
+        return Err(err);
+    }
+
+    stats.frames_played = controller.frames_played();
+    stats.notifications = notifications;
+    stats.underrun_halves = controller.underrun_halves().max(pump.underrun_events());
+    stats.partial_underrun_halves = controller.partial_underrun_halves();
+    stats.coalesced_wakes = controller.coalesced_wakes();
+    stats.spurious_wakes = controller.spurious_wakes();
+    stats.rescue_writes = controller.rescue_writes();
+    Ok(stats)
+}
+
+#[cfg(windows)]
+struct MonotonicWaveRtClock {
+    origin: Instant,
+}
+
+#[cfg(windows)]
+impl MonotonicWaveRtClock {
+    fn new() -> Self {
+        Self {
+            origin: Instant::now(),
         }
+    }
+}
 
-        Ok(PlaybackStats {
-            device_name: self.device.friendly_name.clone(),
-            sample_rate_hz,
-            wire_format,
-            frames_played: controller.frames_played(),
-            wavert_buffer_bytes: session.actual_buffer_size,
-            notifications,
-            mmcss_pro_audio: mmcss.is_active(),
-            underrun_halves: controller.underrun_halves().max(pump.underrun_events()),
+#[cfg(windows)]
+impl WaveRtClock for MonotonicWaveRtClock {
+    fn now_since_run(&self) -> Duration {
+        self.origin.elapsed()
+    }
+}
+
+#[cfg(windows)]
+struct KsWaveRtDevice {
+    device_name: String,
+    session: WaveRtSession,
+}
+
+#[cfg(windows)]
+impl WaveRtDevice for KsWaveRtDevice {
+    fn device_name(&self) -> &str {
+        &self.device_name
+    }
+
+    fn layout(&self) -> WaveRtRingLayout {
+        self.session.layout
+    }
+
+    fn actual_buffer_bytes(&self) -> u32 {
+        self.session.actual_buffer_size
+    }
+
+    fn is_modular_position(&self) -> bool {
+        self.session.pos_reader.is_modular()
+    }
+
+    fn ring_mut(&mut self) -> &mut [u8] {
+        self.session.cyclic_slice_mut()
+    }
+
+    fn wait_notification(&mut self, timeout: Duration) -> WaveRtWaitResult {
+        let ms = timeout.as_millis().min(u32::MAX as u128) as u32;
+        let wait_res = unsafe { WaitForSingleObject(self.session.event.raw(), ms) };
+        if wait_res == WAIT_OBJECT_0 {
+            WaveRtWaitResult::Signaled
+        } else {
+            WaveRtWaitResult::Timeout
+        }
+    }
+
+    fn read_position(&mut self) -> Option<WaveRtPositionSample> {
+        let offset_bytes = self.session.pos_reader.read_position_bytes()?;
+        Some(WaveRtPositionSample {
+            offset_bytes,
+            wrap_mode: if self.session.pos_reader.is_modular() {
+                PositionWrapMode::Modular
+            } else {
+                PositionWrapMode::Auto
+            },
         })
+    }
+
+    fn barrier(&self) {
+        self.session.maybe_barrier();
+    }
+
+    fn start_run(&mut self) -> Result<(), OutputError> {
+        let _ = self.session.start_run()?;
+        Ok(())
+    }
+
+    fn stop_clean(&mut self) {
+        self.session.stop_clean();
     }
 }
 

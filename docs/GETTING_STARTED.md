@@ -23,7 +23,7 @@ Double-click **Audiophile Player** (Desktop or Start Menu), or run `audiophile-p
 
 ```mermaid
 flowchart LR
-    S["Start"] --> D["Finds your DAC<br/>(your config.toml choice,<br/>else the best USB DAC)"] --> R["Probes its rates<br/>native 8fS, or the highest<br/>it accepts"] --> M["Shuffles FLACs<br/>from your music folder"] --> P["Plays via<br/>WDM-KS exclusive"]
+    S["Start"] --> D["Finds your DAC<br/>(your config.toml choice,<br/>else the best USB DAC)"] --> R["Probes its rates<br/>native 8fS, or the highest<br/>it accepts"] --> M["Shuffles FLACs<br/>from your music folder"] --> P["Plays via<br/>WASAPI Exclusive<br/>(or --output wdm-ks)"]
     S --> W["Opens the web page<br/>http://127.0.0.1:8085…8199"]
     S --> U["Announces a UPnP renderer<br/>'Audiophile Player'"]
     style P fill:#d3f9d8,stroke:#2f9e44,color:#000

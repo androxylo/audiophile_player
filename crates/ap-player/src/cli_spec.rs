@@ -228,7 +228,7 @@ pub const SHAPER_VALUES: &[&str] = &[
 ];
 
 pub const OPT_VALUES: &[&str] = &["normal", "high", "extreme"];
-pub const OUTPUT_VALUES: &[&str] = &["wdm-ks", "wasapi"];
+pub const OUTPUT_VALUES: &[&str] = &["wasapi", "wasapi-push", "wdm-ks"];
 pub const MAX_RATE_VALUES: &[&str] = &[
     "auto", "44100", "48000", "88200", "96000", "176400", "192000", "352800", "384000",
 ];
@@ -300,12 +300,12 @@ pub static COMMANDS: &[CmdSpec] = &[
     },
     CmdSpec {
         name: "devices",
-        usage: "audiophile-player devices [--output wdm-ks|wasapi] [--json]",
-        summary: "List Windows WDM-KS or WASAPI Exclusive audio render devices and probe 8fS support",
-        details: "Enumerates present WDM-KS WaveRT (default) or WASAPI Exclusive (`--output wasapi`) audio render devices, probes 32-bit 352.8 kHz and 384 kHz support cleanly (reporting busy if another exclusive player holds the DAC), and marks which DAC auto-selection would choose.",
+        usage: "audiophile-player devices [--output wasapi|wasapi-push|wdm-ks] [--json]",
+        summary: "List Windows WASAPI Exclusive or WDM-KS audio render devices and probe 8fS support",
+        details: "Enumerates present WASAPI Exclusive (default) or WDM-KS WaveRT (`--output wdm-ks`) audio render devices, probes 32-bit 352.8 kHz and 384 kHz support cleanly (reporting busy if another exclusive player holds the DAC), and marks which DAC auto-selection would choose.",
         examples: &[
             "audiophile-player devices",
-            "audiophile-player devices --output wasapi",
+            "audiophile-player devices --output wdm-ks",
             "audiophile-player devices --json",
         ],
         since: "0.2.0",
@@ -392,18 +392,33 @@ pub static OPTIONS: &[OptSpec] = &[
             placeholder: "BACKEND",
             values: OUTPUT_VALUES,
         },
-        default: Some("wdm-ks"),
+        default: Some("wasapi"),
         config_key: Some("player.output"),
         scope: &[Cmd::Play, Cmd::Devices, Cmd::Restart],
         group: Group::Output,
         restart: Restart::Always,
-        summary: "Zero-mixer Windows output backend: wdm-ks | wasapi",
-        details: "Selects the strictly zero-mixer Windows output transport: `wdm-ks` (default, direct Kernel Streaming WaveRT bypassing both audiodg.exe and AudioSes.dll) or `wasapi` (event-driven WASAPI Exclusive Mode with automatic buffer-alignment retry, bypassing the Windows audio mixer). Windows Shared Mode is intentionally absent and impossible to fall back to.",
+        summary: "Zero-mixer Windows output backend: wasapi | wasapi-push | wdm-ks",
+        details: "Selects the strictly zero-mixer Windows output transport: `wasapi` (default, event-driven WASAPI Exclusive Mode sharing the hardware WaveRT buffer directly with zero mixer/APO/SRC and automatic buffer-alignment retry), `wasapi-push` (polling WASAPI Exclusive fallback for DACs with unreliable event callbacks), or `wdm-ks` (alias `ks`, opt-in direct Kernel Streaming WaveRT). Windows Shared Mode is intentionally absent and impossible to fall back to.",
         examples: &[
             "audiophile-player --output wasapi",
+            "audiophile-player --output wasapi-push",
             "audiophile-player --output wdm-ks",
-            "audiophile-player devices --output wasapi",
+            "audiophile-player devices --output wdm-ks",
         ],
+        since: "0.2.0",
+    },
+    OptSpec {
+        name: "--trace-wavert",
+        short: None,
+        value: ValueKind::Flag,
+        default: Some("off"),
+        config_key: None,
+        scope: &[Cmd::Play, Cmd::Restart],
+        group: Group::Output,
+        restart: Restart::Always,
+        summary: "Emit per-wake WDM-KS WaveRT timing trace to stderr (diagnostic)",
+        details: "Logs ActualBufferSize, half duration, and per-wake monotonic timestamp, raw hardware position, write half, and outcome to stderr when running with `--output wdm-ks` (also enabled via `AP_TRACE_WAVERT=1`).",
+        examples: &["audiophile-player --output wdm-ks --trace-wavert"],
         since: "0.2.0",
     },
     OptSpec {

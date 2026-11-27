@@ -103,7 +103,8 @@ flowchart LR
 ## 🚦 Status and honest limits
 
 - 🟢 **Works today:** local FLAC (random or sequential, gapless); UPnP renderer (gapless); **Tidal Desktop Exclusive Mode** through the opt-in ACX virtual driver; normal and ultimate modes; REW convolution; offline library scan and filter database; local web page; DACs from 44.1 to 384 kHz; diagnostics; AI control over stdio MCP.
-- 🟡 **Planned:** WASAPI exclusive output, per-channel delay. An HTTP transport for MCP is deferred until someone asks for it.
+- ✅ **Implemented:** Event-driven **WASAPI Exclusive** (default, bit-perfect zero-mixer) + **WASAPI Push** fallback + opt-in direct **WDM-KS WaveRT** (`--output wasapi|wasapi-push|wdm-ks`); pure-`f64` 8fS upsampling (12 curated filters); 4 clean-room 4fS/8fS noise shapers; REW 4M-tap UPOLS room correction; Ultimate Mode (30 s look-ahead + exact headroom + Schema-2 Filter DB); UPnP AV renderer; localhost web UI; CLI + MCP control; opt-in Tidal Exclusive ACX driver; independent `ap-verify` loopback null & causal WaveRT timing test suites.
+- 🟡 **Planned:** Per-channel delay. An HTTP transport for MCP is deferred until someone asks for it.
 - 🔴 **Not supported, by design:** Windows shared mode, volume control, DSP effects, macOS / Linux playback.
 - 📦 **Prebuilt binaries** come with some release tags only and can lag behind the source. Building from source is the default.
 - 🧪 **Reference DAC:** Schiit Gungnir 2 (Unison USB, NOS, 352.8 / 384 kHz). A native 8fS DAC is still the best match. Lower-rate DACs are supported, but they hear the 8fS chain through one extra (very clean) conversion step.

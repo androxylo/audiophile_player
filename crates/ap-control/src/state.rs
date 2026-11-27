@@ -134,6 +134,7 @@ struct InnerState {
     shutdown_callback: Option<Arc<dyn Fn() + Send + Sync>>,
     api_token: Option<String>,
     effective_options: JsonValue,
+    last_playback_stats: Option<JsonValue>,
     started_unix_s: u64,
     version: String,
 }
@@ -174,6 +175,7 @@ impl SharedControl {
                 shutdown_callback: None,
                 api_token: None,
                 effective_options: JsonValue::Object(Vec::new()),
+                last_playback_stats: None,
                 started_unix_s: ap_core::track_db::now_unix_secs(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
             }),
@@ -332,6 +334,13 @@ impl SharedControl {
         st.effective_options = opts;
     }
 
+    /// Record the most recent completed playback sink timing/observability stats JSON
+    /// exposed in `GET /api/v1/status` (`last_playback_stats`).
+    pub fn set_last_playback_stats(&self, stats: JsonValue) {
+        let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        st.last_playback_stats = Some(stats);
+    }
+
     /// Verify an incoming `Authorization: Bearer <token>` header in constant time.
     pub fn verify_bearer_token(&self, auth_header: Option<&str>) -> bool {
         let expected = {
@@ -377,10 +386,11 @@ impl SharedControl {
     /// Build the structured `/api/v1/status` JSON payload (`schema: "ap.status/1"`).
     pub fn api_v1_status_json(&self) -> JsonValue {
         let snap = self.snapshot();
-        let (effective_options, restart_pending, started_unix_s, version) = {
+        let (effective_options, last_playback_stats, restart_pending, started_unix_s, version) = {
             let st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             (
                 st.effective_options.clone(),
+                st.last_playback_stats.clone(),
                 st.shutdown_after_track,
                 st.started_unix_s,
                 st.version.clone(),
@@ -418,6 +428,10 @@ impl SharedControl {
             ),
             ("restart_pending", JsonValue::from(restart_pending)),
             ("effective_options", effective_options),
+            (
+                "last_playback_stats",
+                last_playback_stats.unwrap_or(JsonValue::Null),
+            ),
             (
                 "recent_actions",
                 JsonValue::Array(

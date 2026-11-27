@@ -62,37 +62,44 @@ pub fn is_valid_shaper_name(name: &str) -> bool {
 /// Shared Mode is intentionally unrepresentable.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum OutputTransport {
-    /// Direct Windows Kernel Streaming (`WDM-KS`, Audirvana-style WaveRT pin).
+    /// Event-driven WASAPI Exclusive (`AUDCLNT_SHAREMODE_EXCLUSIVE`, default per Issue #22 §5.2).
     #[default]
-    WdmKs,
-    /// Event-driven WASAPI Exclusive (`AUDCLNT_SHAREMODE_EXCLUSIVE`).
     WasapiExclusive,
+    /// Push (polling) WASAPI Exclusive fallback (`AUDCLNT_SHAREMODE_EXCLUSIVE`, no event callback).
+    WasapiPush,
+    /// Direct Windows Kernel Streaming (`WDM-KS`, opt-in WaveRT pin).
+    WdmKs,
 }
 
 impl OutputTransport {
-    /// Canonical lowercase CLI / TOML identifier (`"wdm-ks"` or `"wasapi"`).
+    /// Canonical lowercase CLI / TOML identifier (`"wasapi"`, `"wasapi-push"`, or `"wdm-ks"`).
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::WdmKs => "wdm-ks",
             Self::WasapiExclusive => "wasapi",
+            Self::WasapiPush => "wasapi-push",
+            Self::WdmKs => "wdm-ks",
         }
     }
 
     /// Short human-readable backend label for banners and status lines.
     pub const fn display_label(self) -> &'static str {
         match self {
-            Self::WdmKs => "WDM-KS WaveRT",
             Self::WasapiExclusive => "WASAPI Exclusive",
+            Self::WasapiPush => "WASAPI Exclusive (Push)",
+            Self::WdmKs => "WDM-KS WaveRT",
         }
     }
 
     /// Parse a CLI or `config.toml` output backend string (case-insensitive).
     pub fn parse(raw: &str) -> Result<Self, String> {
         match raw.trim().to_ascii_lowercase().as_str() {
+            "wasapi" | "wasapi-exclusive" | "wasapi_exclusive" | "wasapi-event" => {
+                Ok(Self::WasapiExclusive)
+            }
+            "wasapi-push" | "wasapi_push" => Ok(Self::WasapiPush),
             "wdm-ks" | "wdmks" | "ks" => Ok(Self::WdmKs),
-            "wasapi" | "wasapi-exclusive" | "wasapi_exclusive" => Ok(Self::WasapiExclusive),
             other => Err(format!(
-                "invalid output backend '{other}'; expected 'wdm-ks' or 'wasapi' (Windows Shared Mode is strictly unsupported)"
+                "invalid output backend '{other}'; expected 'wasapi', 'wasapi-push', or 'wdm-ks' (Windows Shared Mode is strictly unsupported)"
             )),
         }
     }
@@ -1133,7 +1140,7 @@ impl PlayerConfig {
                 self.player
                     .output
                     .clone()
-                    .unwrap_or_else(|| OutputTransport::WdmKs.as_str().to_string()),
+                    .unwrap_or_else(|| OutputTransport::default().as_str().to_string()),
             ),
             "player.music_dir" => self
                 .player

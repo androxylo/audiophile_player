@@ -251,16 +251,16 @@ pub fn probe_all_wasapi_render_devices() -> Result<Vec<ProbedDeviceInfo>, String
     Ok(out)
 }
 
-/// Build `devices --json` payload (`schema: "ap.devices/1"`) for the default WDM-KS backend.
+/// Build `devices --json` payload (`schema: "ap.devices/1"`) for the default backend (WASAPI Exclusive).
 pub fn devices_report_json() -> Result<JsonValue, CliError> {
-    devices_report_json_for(OutputTransport::WdmKs)
+    devices_report_json_for(OutputTransport::default())
 }
 
 /// Build `devices --json` payload (`schema: "ap.devices/1"`) for a specific zero-mixer backend.
 pub fn devices_report_json_for(transport: OutputTransport) -> Result<JsonValue, CliError> {
     let probed = match transport {
         OutputTransport::WdmKs => probe_all_render_devices().map_err(CliError::device)?,
-        OutputTransport::WasapiExclusive => {
+        OutputTransport::WasapiExclusive | OutputTransport::WasapiPush => {
             probe_all_wasapi_render_devices().map_err(CliError::device)?
         }
     };
@@ -309,7 +309,7 @@ pub fn run_devices_cli(
             .ok()
             .and_then(|c| c.config.player.output)
             .and_then(|s| OutputTransport::parse(&s).ok())
-            .unwrap_or(OutputTransport::WdmKs),
+            .unwrap_or_default(),
     };
     let json = devices_report_json_for(transport)?;
     if as_json {
