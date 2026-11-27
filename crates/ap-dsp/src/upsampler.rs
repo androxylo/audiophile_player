@@ -2260,7 +2260,6 @@ fn build_polyphase_bank(ratio: usize, m: usize) -> Vec<Vec<f64>> {
     for phase in 0..ratio {
         let frac = (phase as f64) / (ratio as f64);
         let mut weights = Vec::with_capacity(m);
-        let mut sum = 0.0_f64;
 
         for k in 0..m {
             let j = (k as isize) - half + 1;
@@ -2278,15 +2277,18 @@ fn build_polyphase_bank(ratio: usize, m: usize) -> Vec<Vec<f64>> {
             } else {
                 0.0
             };
-            let w = sinc * win;
-            sum += w;
-            weights.push(w);
+            weights.push(sinc * win);
         }
 
-        if sum.abs() > 1e-15 {
-            let inv = 1.0 / sum;
+        let exact_sum = dd_sum_f64(&weights).to_f64();
+        if exact_sum.abs() > 1e-15 {
+            let inv = 1.0 / exact_sum;
             for w in &mut weights {
                 *w *= inv;
+            }
+            let residual = 1.0 - dd_sum_f64(&weights).to_f64();
+            if let Some(slot) = weights.get_mut(m / 2) {
+                *slot += residual;
             }
         }
         bank.push(weights);

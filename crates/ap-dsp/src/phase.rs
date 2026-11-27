@@ -51,10 +51,17 @@ pub fn convert_prototype_phase(
     }
 
     // K >= 16 * N power of 2 (UPS §4.3), capped safely at 2^20 for memory hygiene.
+    const MAX_CEPSTRUM_K: usize = 1 << 20;
+    if n > MAX_CEPSTRUM_K / 2 {
+        return Err(format!(
+            "cepstral phase conversion prototype length {n} exceeds safe cap ({})",
+            MAX_CEPSTRUM_K / 2
+        ));
+    }
     let k_len = n
         .saturating_mul(16)
         .next_power_of_two()
-        .clamp(4_096, 1 << 20);
+        .clamp(4_096, MAX_CEPSTRUM_K);
     let half_k = k_len / 2;
     let spec_len = half_k + 1;
 
