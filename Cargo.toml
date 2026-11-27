@@ -36,3 +36,8 @@ ap-upnp = { path = "crates/ap-upnp" }
 # decoding large 32-bit/384 kHz HiRes FLACs stays fast during `cargo test`.
 [profile.dev.package."*"]
 opt-level = 3
+
+# Keep ap-dsp fast in dev/test builds (debug assertions remain enabled) so
+# 384 kHz pipeline and loopback null tests run at >10x real time.
+[profile.dev.package.ap-dsp]
+opt-level = 2

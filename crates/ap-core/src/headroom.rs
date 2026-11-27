@@ -485,13 +485,21 @@ pub fn quantizer_margin_db(dac_bits: u8, shaper_l1_sum: f64) -> f64 {
     -20.0 * max_linear.log10()
 }
 
+/// DAC safety margin (`1.0 dB`, matching ITU-R BS.1770 / EBU R128 `-1.0 dBTP` ceiling) reserved
+/// below digital full scale in Ultimate Mode so cached-peak gain `G = min(0, -(max(M, M30) + m_q +
+/// ULTIMATE_DAC_MARGIN_DB))` never drives multibit or delta-sigma DACs into near-0 dBFS overload
+/// and leaves tracks peaking `<= -1.0 dBFS` completely untouched at `0.0 dB`.
+pub const ULTIMATE_DAC_MARGIN_DB: f64 = 1.0;
+
 /// Choose a **mandatory fixed whole-track gain** for Ultimate Mode (`OQ-33`, `07-ultimate-mode.md` §4.2):
 /// - **Streaming sources (`is_streaming_source == true`):** track peak is never known, so ALWAYS
 ///   enforce `-3 dB` upsampling safety (+ REW excess `S`), tightened further only if `M30` requires.
-/// - **Local file with cached whole-track exact `M`:** `G = min(0, -M - m_q)` (zero overs, zero
-///   wasted headroom; `G < -3 dB` only when REW boost / `M > +3 dBFS` requires it).
-/// - **Local file without cached `M` (first play):** `G = min(G_HR, -M30 - m_q)` (`M30` can only
-///   add attenuation and never relaxes normal HR safety).
+/// - **Local file with cached whole-track exact `M`:**
+///   `G = min(0, -(max(M, M30) + m_q + ULTIMATE_DAC_MARGIN_DB))` (zero overs, DAC margin preserved,
+///   tracks peaking `<= -1 dBFS` untouched at `0 dB`).
+/// - **Local file without cached `M` (first play):**
+///   `G = min(G_HR, -(M30 + m_q + ULTIMATE_DAC_MARGIN_DB))` (`M30` can only add attenuation and
+///   never relaxes normal HR safety).
 #[allow(clippy::too_many_arguments)]
 pub fn select_ultimate_headroom(
     meta: &TrackPeakMetadata,
@@ -507,6 +515,7 @@ pub fn select_ultimate_headroom(
     } else {
         0.0
     };
+    let total_margin = m_q + ULTIMATE_DAC_MARGIN_DB;
 
     // Pack any constant total gain `g_db <= 0.0` into `(HeadroomMode, convolution_scale_db)` so
     // `HeadroomDecision::total_gain_db()` equals `g_db` exactly.
@@ -545,10 +554,10 @@ pub fn select_ultimate_headroom(
             None,
         );
         if let Some(m30) = window_m30_db.filter(|v| v.is_finite()) {
-            let g_m30 = (-(m30 + m_q)).min(0.0);
+            let g_m30 = (-(m30 + total_margin)).min(0.0);
             if g_m30 < hr.total_gain_db() - 1e-9 {
                 let reason = format!(
-                    "{}; W30 exact peak M30={m30:+.2} dBFS -> tightened to {g_m30:.2} dB",
+                    "{}; W30 exact peak M30={m30:+.2} dBFS (dac_margin={ULTIMATE_DAC_MARGIN_DB:.2} dB) -> tightened to {g_m30:.2} dB",
                     hr.reason
                 );
                 hr = pack_gain(g_m30, hr.peak_dbfs, hr.peak_kind, reason);
@@ -557,16 +566,21 @@ pub fn select_ultimate_headroom(
         return hr;
     }
 
-    // Local file with cached whole-track exact post-chain peak M: G = min(0, -M - m_q).
+    // Local file with cached whole-track exact post-chain peak M:
+    // G = min(0, -(max(M, M30) + m_q + ULTIMATE_DAC_MARGIN_DB)).
     if let Some(m_db) = cached_exact_m_db.filter(|v| v.is_finite()) {
-        let g_exact = (-(m_db + m_q)).min(0.0);
+        let m_eff = window_m30_db
+            .filter(|v| v.is_finite())
+            .map_or(m_db, |m30| m_db.max(m30));
+        let g_exact = (-(m_eff + total_margin)).min(0.0);
         let reason = format!(
-            "ultimate cached exact M={m_db:+.2} dBFS (m_q={m_q:.5} dB) -> fixed gain {g_exact:+.2} dB"
+            "ultimate cached exact M={m_db:+.2} dBFS (eff={m_eff:+.2} dBFS, m_q={m_q:.5} dB, dac_margin={ULTIMATE_DAC_MARGIN_DB:.2} dB) -> fixed gain {g_exact:+.2} dB"
         );
-        return pack_gain(g_exact, Some(m_db), Some(PeakKind::TruePeak), reason);
+        return pack_gain(g_exact, Some(m_eff), Some(PeakKind::TruePeak), reason);
     }
 
-    // Local file without cached M: G = min(G_HR, -M30 - m_q) (M30 only adds safety, never relaxes).
+    // Local file without cached M: G = min(G_HR, -(M30 + m_q + ULTIMATE_DAC_MARGIN_DB))
+    // (M30 only adds safety, never relaxes).
     let hr = select_headroom_for_bits(
         meta,
         bits_per_sample,
@@ -576,10 +590,10 @@ pub fn select_ultimate_headroom(
     );
     let g_hr = hr.total_gain_db();
     if let Some(m30) = window_m30_db.filter(|v| v.is_finite()) {
-        let g_m30 = (-(m30 + m_q)).min(0.0);
+        let g_m30 = (-(m30 + total_margin)).min(0.0);
         if g_m30 < g_hr - 1e-9 {
             let reason = format!(
-                "{}; W30 exact peak M30={m30:+.2} dBFS -> fixed gain {g_m30:+.2} dB",
+                "{}; W30 exact peak M30={m30:+.2} dBFS (dac_margin={ULTIMATE_DAC_MARGIN_DB:.2} dB) -> fixed gain {g_m30:+.2} dB",
                 hr.reason
             );
             return pack_gain(g_m30, hr.peak_dbfs, hr.peak_kind, reason);

@@ -729,7 +729,7 @@ impl AlbumAnalysisFile {
                 s.push_str("    post_chain_peaks:\n");
                 for p in &t.post_chain_peaks {
                     s.push_str(&format!(
-                        "      - {{ upsampler: {}, f_eff_hz: {}, out_hz: {}, deemph: {}, hf_noise: {}, rew: {}, peak_dbfs: {:.6} }}\n",
+                        "      - {{ upsampler: {}, f_eff_hz: {}, out_hz: {}, deemph: {}, hf_noise: {}, rew: {}, peak_dbfs: {:.10} }}\n",
                         yaml_quote(&p.key.upsampler),
                         p.key.f_eff_hz,
                         p.key.output_rate_hz,

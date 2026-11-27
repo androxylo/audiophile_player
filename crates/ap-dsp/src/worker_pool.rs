@@ -113,6 +113,15 @@ struct PersistentPool {
 
 impl PersistentPool {
     fn new(name_prefix: &'static str, num_workers: usize) -> Self {
+        Self::new_inner(name_prefix, num_workers, true)
+    }
+
+    #[cfg(test)]
+    fn new_untracked(name_prefix: &'static str, num_workers: usize) -> Self {
+        Self::new_inner(name_prefix, num_workers, false)
+    }
+
+    fn new_inner(name_prefix: &'static str, num_workers: usize, track_global: bool) -> Self {
         let num_workers = num_workers.max(1);
         let queue = Arc::new((
             Mutex::new(PoolQueue {
@@ -123,7 +132,9 @@ impl PersistentPool {
         ));
         for idx in 0..num_workers {
             let q = Arc::clone(&queue);
-            WORKER_SPAWN_COUNT.fetch_add(1, Ordering::Relaxed);
+            if track_global {
+                WORKER_SPAWN_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
             thread::Builder::new()
                 .name(format!("{name_prefix}-{idx}"))
                 .spawn(move || loop {
@@ -429,7 +440,7 @@ mod tests {
 
         // Dedicated 1-worker pool so queue ordering is 100% deterministic:
         // job 0 occupies the worker while jobs 1..=8 (low prio) and job HI (high prio) queue up.
-        let pool = PersistentPool::new("ap-dsp-prio-test", 1);
+        let pool = PersistentPool::new_untracked("ap-dsp-prio-test", 1);
         let gate = Arc::new(Barrier::new(2));
         let release = Arc::new(Barrier::new(2));
         let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));

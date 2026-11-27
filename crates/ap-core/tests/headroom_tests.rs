@@ -609,7 +609,10 @@ fn review6_16bit_rounded_sample_peak_tags_stay_sample_peak_and_keep_isp_reserve(
 
 #[test]
 fn ultimate_quantizer_margin_and_fixed_whole_track_headroom_honor_oq33() {
-    use ap_core::headroom::{quantizer_margin_db, select_ultimate_headroom};
+    use ap_core::headroom::{ULTIMATE_DAC_MARGIN_DB, quantizer_margin_db, select_ultimate_headroom};
+
+    let dm = ULTIMATE_DAC_MARGIN_DB;
+    assert!(dm >= 0.5 && dm <= 1.5, "unexpected ULTIMATE_DAC_MARGIN_DB={dm}");
 
     // 1. Quantizer margin m_q: ns-gentle-2 (L1 = 2.0) -> 4.5 LSB below full scale.
     let m_q_24 = quantizer_margin_db(24, 2.0);
@@ -621,7 +624,7 @@ fn ultimate_quantizer_margin_and_fixed_whole_track_headroom_honor_oq33() {
     let expected_16 = -20.0 * (1.0_f64 - 4.5_f64 / 32768.0_f64).log10();
     assert!((m_q_16 - expected_16).abs() < 1e-12);
 
-    // 2. Local cached exact whole-track M = +1.4 dBFS -> exact fixed G = -1.4 - m_q (zero wasted headroom!).
+    // 2. Local cached exact whole-track M = +1.4 dBFS -> exact fixed G = -(1.4 + m_q + dac_margin).
     let d_cached_hot = select_ultimate_headroom(
         &TrackPeakMetadata::default(),
         24,
@@ -632,9 +635,25 @@ fn ultimate_quantizer_margin_and_fixed_whole_track_headroom_honor_oq33() {
         m_q_24,
     );
     assert!(
-        (d_cached_hot.total_gain_db() - (-1.4 - m_q_24)).abs() < 1e-9,
-        "cached exact M=+1.4 must give G=-1.4-m_q, got {}",
+        (d_cached_hot.total_gain_db() - (-(1.4 + m_q_24 + dm))).abs() < 1e-9,
+        "cached exact M=+1.4 must give G=-(1.4+m_q+dac_margin), got {}",
         d_cached_hot.total_gain_db()
+    );
+
+    // When M30 exceeds a stale cached M, max(M, M30) governs so overs cannot occur.
+    let d_cached_m30_higher = select_ultimate_headroom(
+        &TrackPeakMetadata::default(),
+        24,
+        false,
+        None,
+        Some(0.5),
+        Some(2.1),
+        m_q_24,
+    );
+    assert!(
+        (d_cached_m30_higher.total_gain_db() - (-(2.1 + m_q_24 + dm))).abs() < 1e-9,
+        "cached M=+0.5 with M30=+2.1 must use max(M, M30), got {}",
+        d_cached_m30_higher.total_gain_db()
     );
 
     // Local cached exact M = -2.0 dBFS -> G = 0.0 dB (never boosts, never wastes -3 dB!).
@@ -649,7 +668,7 @@ fn ultimate_quantizer_margin_and_fixed_whole_track_headroom_honor_oq33() {
     );
     assert_eq!(d_cached_quiet.total_gain_db(), 0.0);
 
-    // Local cached exact M = +4.2 dBFS (e.g. heavy REW boost) -> G = -4.2 - m_q (< -3 dB).
+    // Local cached exact M = +4.2 dBFS (e.g. heavy REW boost) -> G = -(4.2 + m_q + dac_margin).
     let d_cached_rew = select_ultimate_headroom(
         &TrackPeakMetadata::default(),
         24,
@@ -659,10 +678,10 @@ fn ultimate_quantizer_margin_and_fixed_whole_track_headroom_honor_oq33() {
         None,
         m_q_24,
     );
-    assert!((d_cached_rew.total_gain_db() - (-4.2 - m_q_24)).abs() < 1e-9);
+    assert!((d_cached_rew.total_gain_db() - (-(4.2 + m_q_24 + dm))).abs() < 1e-9);
     assert_eq!(d_cached_rew.mode, HeadroomMode::Minus3Db);
 
-    // 3. Local uncached first play: G = min(G_HR, -M30 - m_q).
+    // 3. Local uncached first play: G = min(G_HR, -(M30 + m_q + dac_margin)).
     // Quiet W30 (M30 = -8.0 dBFS) NEVER relaxes G_HR (-3.0 dB for untagged track)!
     let d_uncached_quiet_w30 = select_ultimate_headroom(
         &TrackPeakMetadata::default(),
@@ -675,7 +694,7 @@ fn ultimate_quantizer_margin_and_fixed_whole_track_headroom_honor_oq33() {
     );
     assert!((d_uncached_quiet_w30.total_gain_db() - (-3.0)).abs() < 1e-9);
 
-    // Hot W30 (M30 = +4.5 dBFS) DOES tighten below G_HR (-3.0 dB) to -4.5 - m_q.
+    // Hot W30 (M30 = +4.5 dBFS) DOES tighten below G_HR (-3.0 dB) to -(4.5 + m_q + dac_margin).
     let d_uncached_hot_w30 = select_ultimate_headroom(
         &TrackPeakMetadata::default(),
         24,
@@ -685,7 +704,7 @@ fn ultimate_quantizer_margin_and_fixed_whole_track_headroom_honor_oq33() {
         Some(4.5),
         m_q_24,
     );
-    assert!((d_uncached_hot_w30.total_gain_db() - (-4.5 - m_q_24)).abs() < 1e-9);
+    assert!((d_uncached_hot_w30.total_gain_db() - (-(4.5 + m_q_24 + dm))).abs() < 1e-9);
 
     // 4. Streaming (OQ-33): ALWAYS enforces -3 dB safety (+ REW excess), even when cached M
     // or quiet tags are passed!
@@ -706,7 +725,7 @@ fn ultimate_quantizer_margin_and_fixed_whole_track_headroom_honor_oq33() {
     assert_eq!(d_stream.mode, HeadroomMode::Minus3Db);
     assert!((d_stream.total_gain_db() - (-5.0)).abs() < 1e-9);
 
-    // Streaming with hot W30 (+6.0 dBFS > 5.0 dB reserve) tightens further to -6.0 - m_q.
+    // Streaming with hot W30 (+6.0 dBFS > 5.0 dB reserve) tightens further to -(6.0 + m_q + dm).
     let d_stream_hot = select_ultimate_headroom(
         &quiet_meta,
         24,
@@ -716,5 +735,5 @@ fn ultimate_quantizer_margin_and_fixed_whole_track_headroom_honor_oq33() {
         Some(6.0),
         m_q_24,
     );
-    assert!((d_stream_hot.total_gain_db() - (-6.0 - m_q_24)).abs() < 1e-9);
+    assert!((d_stream_hot.total_gain_db() - (-(6.0 + m_q_24 + dm))).abs() < 1e-9);
 }

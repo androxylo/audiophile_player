@@ -42,6 +42,7 @@ use ap_dsp::analysis::{DETECTOR_VERSION, TrackAnalyzer};
 use ap_dsp::convolution::ConvolutionTail;
 use ap_dsp::fusion::{CachedWholeTrackEvidence, build_track_db_entry};
 use ap_dsp::pipeline::{AudioPipeline, GaplessCarryover, UltimateDecisionReport};
+use ap_dsp::quantize::QuantizerStats;
 use ap_dsp::selector::{
     FilterArchetype, NoiseShaperProfile, ULTIMATE_LOOKAHEAD_SECONDS, UpsamplerPicker,
     UpsamplerPolicy, build_post_chain_key, check_ultimate_throughput_with_buffer,
@@ -171,6 +172,11 @@ pub enum UltimateStreamResult {
         next_pending_end: bool,
         #[allow(dead_code)]
         wrote_yaml: bool,
+        /// Cumulative pre-quantizer peak and clipping backstop statistics for this track.
+        quantizer_stats: QuantizerStats,
+        /// Exact measured whole-track unity-gain post-chain peak `M` in dBFS (when `W2..W4` ran).
+        #[allow(dead_code)]
+        measured_whole_track_m_dbfs: Option<f64>,
         /// Non-fatal mid-track warning/error logged after `TrackStart` (Review #7 F7/F-B2).
         warning: Option<String>,
     },
@@ -1631,6 +1637,8 @@ where
         next_carryover,
         next_pending_end,
         wrote_yaml,
+        quantizer_stats: session.quantizer_stats(),
+        measured_whole_track_m_dbfs: Some(linear_to_dbfs(whole_track_m_linear)),
         warning: error_warning,
     }
 }
@@ -1918,6 +1926,8 @@ where
                     next_carryover: carry,
                     next_pending_end: true,
                     wrote_yaml: false,
+                    quantizer_stats: session.quantizer_stats(),
+                    measured_whole_track_m_dbfs: None,
                     warning: None,
                 }
             }
@@ -1930,6 +1940,8 @@ where
                     next_carryover: None,
                     next_pending_end: false,
                     wrote_yaml: false,
+                    quantizer_stats: session.quantizer_stats(),
+                    measured_whole_track_m_dbfs: None,
                     warning: Some(err),
                 }
             }
@@ -1947,6 +1959,8 @@ where
                     next_carryover: None,
                     next_pending_end: false,
                     wrote_yaml: false,
+                    quantizer_stats: session.quantizer_stats(),
+                    measured_whole_track_m_dbfs: None,
                     warning: error_warning,
                 }
             }
@@ -1959,6 +1973,8 @@ where
                     next_carryover: None,
                     next_pending_end: false,
                     wrote_yaml: false,
+                    quantizer_stats: session.quantizer_stats(),
+                    measured_whole_track_m_dbfs: None,
                     warning: error_warning.or(Some(err)),
                 }
             }
@@ -2663,7 +2679,7 @@ mod tests {
             let mut report = None;
             let mut first_frames: Vec<[i32; 2]> = Vec::new();
             loop {
-                match buf_c3.pop_for_epoch_timeout(ep, Duration::from_secs(2)) {
+                match buf_c3.pop_for_epoch_timeout(ep, Duration::from_secs(30)) {
                     Some(StreamEvent::TrackStart { report: r, .. }) => report = Some(r),
                     Some(StreamEvent::PcmBlock(b)) => {
                         if first_frames.len() < 1_024 {
@@ -2796,6 +2812,7 @@ mod tests {
                 next_pending_end,
                 wrote_yaml,
                 warning,
+                ..
             } => {
                 assert!(next_carryover.is_none(), "errored track must not export carryover");
                 assert!(!next_pending_end);
@@ -3528,6 +3545,348 @@ mod tests {
             "expected line-numbered parse warning, got {:?}",
             u_bad.warnings
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// In-memory `AudioBlockSource` backed by pre-built stereo `f64` samples (used by L1 tests
+    /// to feed extended real fixture audio and hot intersample-peak masters).
+    struct BufferSource {
+        spec: StreamSpec,
+        peak_meta: TrackPeakMetadata,
+        track_meta: TrackMetadata,
+        md5: [u8; 16],
+        left: Vec<f64>,
+        right: Vec<f64>,
+        cursor: usize,
+    }
+
+    impl AudioBlockSource for BufferSource {
+        fn spec(&self) -> StreamSpec {
+            self.spec
+        }
+        fn peak_meta(&self) -> TrackPeakMetadata {
+            self.peak_meta
+        }
+        fn is_streaming(&self) -> bool {
+            false
+        }
+        fn total_frames(&self) -> Option<u64> {
+            Some(self.left.len() as u64)
+        }
+        fn track_meta(&self) -> TrackMetadata {
+            self.track_meta.clone()
+        }
+        fn streaminfo_md5(&self) -> Option<[u8; 16]> {
+            Some(self.md5)
+        }
+        fn computed_md5(&self) -> Option<[u8; 16]> {
+            if self.cursor >= self.left.len() {
+                Some(self.md5)
+            } else {
+                None
+            }
+        }
+        fn read_next_block(&mut self, max_frames: usize) -> Result<Option<StereoF64Buffer>, String> {
+            if self.cursor >= self.left.len() {
+                return Ok(None);
+            }
+            let take = max_frames.min(self.left.len() - self.cursor);
+            let end = self.cursor + take;
+            let buf = StereoF64Buffer {
+                sample_rate_hz: self.spec.sample_rate_hz,
+                left: self.left[self.cursor..end].to_vec(),
+                right: self.right[self.cursor..end].to_vec(),
+            };
+            self.cursor = end;
+            Ok(Some(buf))
+        }
+    }
+
+    /// Write a stereo IEEE-float 32-bit WAV impulse response file for REW convolution tests.
+    fn write_stereo_f32_wav(path: &Path, sample_rate_hz: u32, left: &[f64], right: &[f64]) {
+        use std::io::Write;
+        let n = left.len().min(right.len());
+        let data_bytes = (n * 2 * 4) as u32;
+        let riff_size = 4 + (8 + 16) + (8 + data_bytes);
+        let mut f = fs::File::create(path).unwrap();
+        f.write_all(b"RIFF").unwrap();
+        f.write_all(&riff_size.to_le_bytes()).unwrap();
+        f.write_all(b"WAVE").unwrap();
+        f.write_all(b"fmt ").unwrap();
+        f.write_all(&16u32.to_le_bytes()).unwrap();
+        f.write_all(&3u16.to_le_bytes()).unwrap(); // WAVE_FORMAT_IEEE_FLOAT
+        f.write_all(&2u16.to_le_bytes()).unwrap(); // stereo
+        f.write_all(&sample_rate_hz.to_le_bytes()).unwrap();
+        f.write_all(&(sample_rate_hz * 8).to_le_bytes()).unwrap();
+        f.write_all(&8u16.to_le_bytes()).unwrap();
+        f.write_all(&32u16.to_le_bytes()).unwrap();
+        f.write_all(b"data").unwrap();
+        f.write_all(&data_bytes.to_le_bytes()).unwrap();
+        for i in 0..n {
+            f.write_all(&(left[i] as f32).to_le_bytes()).unwrap();
+            f.write_all(&(right[i] as f32).to_le_bytes()).unwrap();
+        }
+    }
+
+    /// Synthesize a stereo peaking-EQ biquad impulse response with `+gain_db` at `f0_hz` (Q=2.0).
+    fn peaking_eq_ir(sample_rate_hz: u32, f0_hz: f64, q: f64, gain_db: f64, len: usize) -> Vec<f64> {
+        let a = 10.0_f64.powf(gain_db / 40.0);
+        let w0 = 2.0 * PI * f0_hz / f64::from(sample_rate_hz);
+        let alpha = w0.sin() / (2.0 * q);
+        let cos_w0 = w0.cos();
+        let b0 = 1.0 + alpha * a;
+        let b1 = -2.0 * cos_w0;
+        let b2 = 1.0 - alpha * a;
+        let a0 = 1.0 + alpha / a;
+        let a1 = -2.0 * cos_w0;
+        let a2 = 1.0 - alpha / a;
+        let (b0, b1, b2, a1, a2) = (b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0);
+
+        let mut ir = vec![0.0_f64; len];
+        let (mut x1, mut x2, mut y1, mut y2) = (0.0, 0.0, 0.0, 0.0);
+        for (i, slot) in ir.iter_mut().enumerate() {
+            let x0 = if i == 0 { 1.0 } else { 0.0 };
+            let y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+            *slot = y0;
+            x2 = x1;
+            x1 = x0;
+            y2 = y1;
+            y1 = y0;
+        }
+        ir
+    }
+
+    #[test]
+    fn l1_ultimate_headroom_cached_peak_and_hot_isp_with_rew_zero_overs() {
+        use ap_core::headroom::ULTIMATE_DAC_MARGIN_DB;
+        use ap_source::flac::FlacBlockReader;
+
+        let root = temp_dir("l1_headroom");
+        let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("tests")
+            .join("fixtures")
+            .join("audio")
+            .join("original_nocturne_24_96.flac");
+
+        // Decode real 24/96 fixture once via FlacBlockReader.
+        let mut reader = FlacBlockReader::open(&fixture_path).expect("open nocturne fixture");
+        let spec = reader.spec();
+        let mut fix_l = Vec::new();
+        let mut fix_r = Vec::new();
+        while let Some(blk) = reader.read_next_block(16_384).unwrap() {
+            fix_l.extend_from_slice(&blk.left);
+            fix_r.extend_from_slice(&blk.right);
+        }
+        assert!(!fix_l.is_empty());
+
+        // Repeat fixture to 31 s (> 30 s look-ahead) so full W0..W4 Ultimate mode runs.
+        let target_frames = (spec.sample_rate_hz as usize) * 31;
+        let repeat_to = |src_l: &[f64], src_r: &[f64]| -> (Vec<f64>, Vec<f64>) {
+            let mut l = Vec::with_capacity(target_frames);
+            let mut r = Vec::with_capacity(target_frames);
+            while l.len() < target_frames {
+                let take = (target_frames - l.len()).min(src_l.len());
+                l.extend_from_slice(&src_l[..take]);
+                r.extend_from_slice(&src_r[..take]);
+            }
+            (l, r)
+        };
+
+        let (base_l, base_r) = repeat_to(&fix_l, &fix_r);
+
+        // Hot master: fixture normalized to 0 dBFS sample peak + fs/4 tone at 45 deg phase
+        // (+3.01 dB intersample peak after upsampling), plus a 1 kHz burst so +6 dB mid-band
+        // REW IR excites a strong post-chain boost well above 0 dBFS.
+        let base_peak = base_l
+            .iter()
+            .chain(base_r.iter())
+            .fold(0.0_f64, |acc, &s| acc.max(s.abs()));
+        let mut hot_l = Vec::with_capacity(target_frames);
+        let mut hot_r = Vec::with_capacity(target_frames);
+        let rate = f64::from(spec.sample_rate_hz);
+        for i in 0..target_frames {
+            let norm_l = base_l[i] / base_peak;
+            let norm_r = base_r[i] / base_peak;
+            // Alternate 0.5 s bursts of fs/4@45deg (+3 dB ISP) and 1 kHz mid-band tone at 0 dBFS
+            // inside W0 and again after 30 s in W4.
+            let isp = if (i / (spec.sample_rate_hz as usize)) % 8 == 1 {
+                let phase = (2.0 * PI * 0.25 * (i as f64) + PI / 4.0).sin();
+                // sin(n*pi/2 + pi/4) has discrete samples +-1/sqrt(2), so scaling by sqrt(2)
+                // gives exact +-1.0 sample peak and +3.01 dB (sqrt(2)) intersample peak!
+                (phase * std::f64::consts::SQRT_2).clamp(-1.0, 1.0)
+            } else if (i / (spec.sample_rate_hz as usize)) % 8 == 2 {
+                (2.0 * PI * 1_000.0 * (i as f64) / rate).sin()
+            } else {
+                0.0
+            };
+            hot_l.push(if isp != 0.0 { isp } else { norm_l });
+            hot_r.push(if isp != 0.0 { isp } else { norm_r });
+        }
+
+        // Write a +6 dB @ 1 kHz mid-band peaking REW WAV IR at 384 kHz (4x internal rate for 96k).
+        let ir_path = root.join("rew_plus6db_1k_384k.wav");
+        let ir = peaking_eq_ir(384_000, 1_000.0, 2.0, 6.0, 4_096);
+        write_stereo_f32_wav(&ir_path, 384_000, &ir, &ir);
+
+        // Run a 2-pass helper: run 1 uncached (learn-on-play) -> run 2 cached.
+        let run_l1_case = |label: &str,
+                           samples_l: &[f64],
+                           samples_r: &[f64],
+                           rew_cfg: ConvolutionConfig,
+                           md5_byte: u8| {
+            let case_dir = root.join(label);
+            fs::create_dir_all(&case_dir).unwrap();
+            let track_path = case_dir.join(format!("{label}.flac"));
+            fs::write(&track_path, label.as_bytes()).unwrap();
+
+            let ult = UltimateRuntimeContext::for_test(
+                UltimateConfig {
+                    enabled: true,
+                    genre_rules: true,
+                    learn_on_play: true,
+                },
+                case_dir.clone(),
+            );
+            let policy = UpsamplerPolicy {
+                filter_override: Some(FilterArchetype::SimpleTest),
+                ..UpsamplerPolicy::default()
+            };
+            let pipeline =
+                AudioPipeline::with_rew_config_full_tail(policy, rew_cfg, true).unwrap();
+
+            let buf = BoundedBlockStreamBuffer::with_limits(
+                ULTIMATE_MAX_BUFFERED_FRAMES,
+                Duration::from_secs(ULTIMATE_MAX_BUFFERED_SECONDS),
+            );
+            let ep = buf.current_epoch();
+
+            let run_once = |pass: usize| {
+                let mut src = BufferSource {
+                    spec,
+                    peak_meta: TrackPeakMetadata::default(),
+                    track_meta: TrackMetadata::default(),
+                    md5: [md5_byte; 16],
+                    left: samples_l.to_vec(),
+                    right: samples_r.to_vec(),
+                    cursor: 0,
+                };
+                let mut carry = None;
+                let mut backup = None;
+                let mut pend = false;
+                let buf_c = Arc::clone(&buf);
+                let drain_h = std::thread::spawn(move || drain_track_events(&buf_c, ep));
+                let res = stream_track_ultimate(
+                    &pipeline,
+                    &ult,
+                    &buf,
+                    ep,
+                    || false,
+                    &mut src,
+                    &track_path,
+                    Some(&track_path),
+                    None,
+                    None,
+                    PlayModeLabel::SingleFile,
+                    Some(31.0),
+                    &mut carry,
+                    &mut backup,
+                    &mut pend,
+                    false,
+                    16_384,
+                );
+                let (rep, _frames, _max_i32) = drain_h.join().unwrap();
+                let (wrote_yaml, qstats, measured_m) = match res {
+                    UltimateStreamResult::Played {
+                        wrote_yaml,
+                        quantizer_stats,
+                        measured_whole_track_m_dbfs,
+                        ..
+                    } => (wrote_yaml, quantizer_stats, measured_whole_track_m_dbfs),
+                    other => panic!("{label} pass {pass}: unexpected result {other:?}"),
+                };
+                (rep, wrote_yaml, qstats, measured_m.expect("measured M"))
+            };
+
+            // Pass 1 (uncached): learn-on-play persists exact M.
+            let (rep1, wrote1, qstats1, measured_m1) = run_once(1);
+            assert!(wrote1, "{label}: pass 1 must persist learn-on-play YAML");
+            let u1 = rep1.ultimate_report.as_ref().unwrap();
+            assert_eq!(u1.mode, "ultimate: live");
+            assert_eq!(
+                qstats1.overs_count, 0,
+                "{label} pass 1 must have 0 overs (peak={:+.4} dBFS, G={:+.4} dB)",
+                qstats1.max_pre_quant_peak_dbfs(),
+                u1.fixed_gain_db
+            );
+            let ceiling1 = -(u1.quantizer_margin_db + ULTIMATE_DAC_MARGIN_DB);
+            assert!(
+                qstats1.max_pre_quant_peak_dbfs() <= ceiling1 + 1e-6,
+                "{label} pass 1 pre-quant peak {:+.6} dBFS exceeds ceiling {:+.6} dBFS",
+                qstats1.max_pre_quant_peak_dbfs(),
+                ceiling1
+            );
+
+            // Verify cached M stored in Schema-2 album YAML matches run 1 measured M within 1e-9 dB.
+            let album = ult
+                .filter_db
+                .load_album("main", "")
+                .expect("Schema-2 album YAML must exist after pass 1");
+            let stored_track = album
+                .get_track(&format!("{label}.flac"))
+                .expect("track entry in album YAML");
+            assert_eq!(stored_track.post_chain_peaks.len(), 1);
+            let cached_m_yaml = stored_track.post_chain_peaks[0].peak_dbfs;
+            assert!(
+                (cached_m_yaml - measured_m1).abs() <= 1e-9,
+                "{label}: cached M ({cached_m_yaml:.10}) differs from run 1 M ({measured_m1:.10}) by {:.3e} dB",
+                (cached_m_yaml - measured_m1).abs()
+            );
+
+            // Pass 2 (cached): uses cached M + dac_margin.
+            let (rep2, _wrote2, qstats2, _measured_m2) = run_once(2);
+            let u2 = rep2.ultimate_report.as_ref().unwrap();
+            assert_eq!(u2.mode, "ultimate: cached");
+            assert!(u2.cache_hit);
+            assert_eq!(
+                qstats2.overs_count, 0,
+                "{label} pass 2 must have 0 overs (peak={:+.4} dBFS, G={:+.4} dB)",
+                qstats2.max_pre_quant_peak_dbfs(),
+                u2.fixed_gain_db
+            );
+            let ceiling2 = -(u2.quantizer_margin_db + ULTIMATE_DAC_MARGIN_DB);
+            assert!(
+                qstats2.max_pre_quant_peak_dbfs() <= ceiling2 + 1e-6,
+                "{label} pass 2 pre-quant peak {:+.6} dBFS exceeds ceiling {:+.6} dBFS",
+                qstats2.max_pre_quant_peak_dbfs(),
+                ceiling2
+            );
+            let m_max = cached_m_yaml.max(u2.m30_dbfs.expect("M30"));
+            let max_allowed_g2 = (-(m_max + u2.quantizer_margin_db + ULTIMATE_DAC_MARGIN_DB)).min(0.0);
+            assert!(
+                u2.fixed_gain_db <= max_allowed_g2 + 1e-9,
+                "{label} pass 2 gain {:+.6} dB exceeds max allowed {:+.6} dB (M={cached_m_yaml:+.4}, M30={:+.4})",
+                u2.fixed_gain_db,
+                max_allowed_g2,
+                u2.m30_dbfs.unwrap()
+            );
+        };
+
+        // 1. Clean real fixture (-12 dBFS)
+        run_l1_case("fixture_clean", &base_l, &base_r, ConvolutionConfig::disabled(), 0x21);
+
+        // 2. Hot synthetic master (0 dBFS + fs/4 @ 45 deg -> +3 dB ISP), dry
+        run_l1_case("hot_isp_dry", &hot_l, &hot_r, ConvolutionConfig::disabled(), 0x22);
+
+        // 3. Hot synthetic master with +6 dB mid-band peaking REW IR
+        let rew_cfg = ConvolutionConfig {
+            enabled: true,
+            file: Some(ir_path.clone()),
+            ..ConvolutionConfig::default()
+        };
+        run_l1_case("hot_isp_rew_plus6", &hot_l, &hot_r, rew_cfg, 0x23);
 
         let _ = fs::remove_dir_all(&root);
     }

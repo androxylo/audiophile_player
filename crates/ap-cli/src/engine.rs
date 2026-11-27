@@ -2696,9 +2696,20 @@ where
         UltimateStreamResult::Played {
             next_carryover,
             next_pending_end,
+            quantizer_stats,
             warning,
             ..
         } => {
+            if quantizer_stats.overs_count > 0 {
+                let warn_msg = format!(
+                    "Quantizer clipped {} sample(s) on '{}' (pre-quant peak {:+.2} dBFS)",
+                    quantizer_stats.overs_count,
+                    display_path.display(),
+                    quantizer_stats.max_pre_quant_peak_dbfs()
+                );
+                eprintln!("  [clip warn] {warn_msg}");
+                ctx.shared.record_action(warn_msg);
+            }
             if let Some(msg) = warning {
                 ctx.shared.record_action(msg);
             }
