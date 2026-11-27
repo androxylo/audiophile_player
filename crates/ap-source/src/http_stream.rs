@@ -28,12 +28,12 @@ use ap_core::buffer::StereoF64Buffer;
 use ap_core::format::StreamSpec;
 use ap_core::headroom::TrackPeakMetadata;
 use ap_core::metadata::TrackMetadata;
-use flac_codec::decode::{FlacSampleReader, Metadata};
+use flac_codec::decode::Metadata;
 use flac_codec::metadata::{Cuesheet, VorbisComment};
 
 use crate::flac::{
-    AudioBlockSource, extract_flac_track_metadata, parse_peak_metadata_fields,
-    validate_flac_stream_params,
+    AudioBlockSource, SafeFlacSampleReader, extract_flac_track_metadata,
+    parse_peak_metadata_fields, validate_flac_stream_params,
 };
 use crate::md5::FlacSampleMd5Hasher;
 
@@ -1405,7 +1405,7 @@ fn decode_lpcm_be(b: &[u8], bps: usize) -> f64 {
 // ---------------------------------------------------------------------------
 
 struct GenericFlacDecoder<R: Read> {
-    reader: FlacSampleReader<BufReader<R>>,
+    reader: SafeFlacSampleReader<BufReader<R>>,
     source_channels: usize,
     spec: StreamSpec,
     peak_meta: TrackPeakMetadata,
@@ -1423,7 +1423,7 @@ struct GenericFlacDecoder<R: Read> {
 
 impl<R: Read> GenericFlacDecoder<R> {
     fn open(inner: R, label: &str) -> Result<Self, String> {
-        let reader = FlacSampleReader::new(BufReader::new(inner))
+        let reader = SafeFlacSampleReader::new(BufReader::new(inner))
             .map_err(|e| format!("failed to parse streaming FLAC ({label}): {e}"))?;
         let source_channels = reader.channel_count();
         let sample_rate_hz = reader.sample_rate();

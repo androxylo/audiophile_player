@@ -231,3 +231,74 @@ fn loopback_null_env_or_fixture_track_smoke() {
         rep.layer_c_mismatches
     );
 }
+
+#[test]
+fn tpdf_16bit_48k_signed_xcorr_is_unbiased_zero_mean_across_seeds() {
+    // Regression check for 16-bit 48 kHz TPDF (N = 960,000, sigma_rho = 1/sqrt(N) = 1.021e-3):
+    // verify that StreamingQuantizer's TPDF error has zero systematic correlation with the signal
+    // across 24 independent seeds (|mean(rho)| < 4 / sqrt(24 * N)) and passes the 5-sigma gate.
+    use ap_core::buffer::StereoF64Buffer;
+    use ap_dsp::quantize::StreamingQuantizer;
+    use ap_verify::metrics::xcorr;
+
+    let n = 48_000 * 5; // 240k samples per seed -> 5.76M total across 24 seeds
+    let mut left = Vec::with_capacity(n);
+    let mut right = Vec::with_capacity(n);
+    for i in 0..n {
+        let t = (i as f64) / 48_000.0;
+        left.push(0.45 * (2.0 * PI * 440.0 * t).sin() + 0.25 * (2.0 * PI * 1_997.0 * t).sin());
+        right.push(0.40 * (2.0 * PI * 660.0 * t).sin() + 0.20 * (2.0 * PI * 3_571.0 * t).sin());
+    }
+    let buf = StereoF64Buffer {
+        sample_rate_hz: 48_000,
+        left: left.clone(),
+        right: right.clone(),
+    };
+
+    let seeds = 24_u64;
+    let levels = (1_u64 << 15) as f64;
+    let mut sum_rho_l = 0.0_f64;
+    let mut sum_rho_r = 0.0_f64;
+    let limit_5sigma = 5.0 / (n as f64).sqrt();
+
+    for s in 1..=seeds {
+        let mut q = StreamingQuantizer::with_rate_options(
+            NoiseShaperProfile::TpdfDither,
+            16,
+            48_000,
+            false,
+        )
+        .unwrap();
+        q.set_seed(0x9E37_79B9_7F4A_7C15u64.wrapping_mul(s));
+        let pcm = q.quantize_block(&buf);
+        let e_l: Vec<f64> = pcm
+            .frames
+            .iter()
+            .zip(left.iter())
+            .map(|(f, &x)| f64::from(f[0] >> 16) - x * levels)
+            .collect();
+        let e_r: Vec<f64> = pcm
+            .frames
+            .iter()
+            .zip(right.iter())
+            .map(|(f, &x)| f64::from(f[1] >> 16) - x * levels)
+            .collect();
+        let rl = xcorr(&e_l, &left);
+        let rr = xcorr(&e_r, &right);
+        assert!(
+            rl.abs() < limit_5sigma && rr.abs() < limit_5sigma,
+            "seed {s}: |rho| exceeded 5-sigma ({limit_5sigma:.3e}): rl={rl:+.3e}, rr={rr:+.3e}"
+        );
+        sum_rho_l += rl;
+        sum_rho_r += rr;
+    }
+
+    let mean_l = sum_rho_l / (seeds as f64);
+    let mean_r = sum_rho_r / (seeds as f64);
+    let mean_se = 1.0 / ((seeds as f64) * (n as f64)).sqrt();
+    assert!(
+        mean_l.abs() < 4.5 * mean_se && mean_r.abs() < 4.5 * mean_se,
+        "TPDF signed mean(rho) biased! mean_l={mean_l:+.3e}, mean_r={mean_r:+.3e}, 4.5*SE={:.3e}",
+        4.5 * mean_se
+    );
+}

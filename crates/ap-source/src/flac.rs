@@ -9,7 +9,7 @@
 //! 32/384 masters) and future Milestone 2 live streams share one bounded-RAM pipeline.
 
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Read};
 use std::path::Path;
 
 use ap_core::buffer::{InterleavedInt32Buffer, StereoF64Buffer};
@@ -19,10 +19,227 @@ use ap_core::headroom::{
     PEAK_TAG_ROUNDING_TOLERANCE, TrackPeakMetadata,
 };
 use ap_core::metadata::{TrackMetadata, parse_track_metadata_fields};
-use flac_codec::decode::{FlacSampleReader, Metadata};
-use flac_codec::metadata::{Cuesheet, VorbisComment};
+use flac_codec::decode::Metadata;
+use flac_codec::metadata::{BlockList, ChannelMask, Cuesheet, VorbisComment};
+use flac_codec::stream::{ChannelAssignment, FrameIterator, SubframeWidth};
 
 use crate::md5::FlacSampleMd5Hasher;
+
+/// Streaming RFC 9639 FLAC sample reader built on [`flac_codec::stream::FrameIterator`].
+///
+/// Works around a bug in `flac-codec 1.3.3`'s `decode::read_residuals` (`rchunks_mut` rejects
+/// valid RFC 9639 §9.2.5.1 frames where `block_size / 2^partition_order == predictor_order`
+/// and partition 0 therefore has 0 residual samples, throwing `InvalidPartitionOrder`).
+/// `flac_codec::stream::Residuals` parses 0-sample first partitions cleanly via `checked_sub`,
+/// while still validating CRC-8, CRC-16, and 1..=32-bit mono/stereo subframes.
+pub(crate) struct SafeFlacSampleReader<R: Read> {
+    frames: FrameIterator<R>,
+    buf: Vec<i32>,
+    buf_pos: usize,
+    ch0: Vec<i64>,
+    ch1: Vec<i64>,
+}
+
+impl<R: Read> SafeFlacSampleReader<R> {
+    pub(crate) fn new(reader: R) -> Result<Self, flac_codec::Error> {
+        let frames = FrameIterator::new(reader)?;
+        Ok(Self {
+            frames,
+            buf: Vec::new(),
+            buf_pos: 0,
+            ch0: Vec::new(),
+            ch1: Vec::new(),
+        })
+    }
+
+    pub(crate) fn metadata(&self) -> &BlockList {
+        self.frames.metadata()
+    }
+
+    fn decode_subframe_i64(sf: &SubframeWidth, out: &mut Vec<i64>) {
+        out.clear();
+        match sf {
+            SubframeWidth::Common(sub) => out.extend(sub.decode().map(i64::from)),
+            SubframeWidth::Wide(sub) => out.extend(sub.decode()),
+        }
+    }
+
+    fn decode_next_frame(&mut self) -> Result<bool, flac_codec::Error> {
+        self.buf.clear();
+        self.buf_pos = 0;
+
+        let frame = match self.frames.next() {
+            None => return Ok(false),
+            Some(Ok((f, _offset))) => f,
+            Some(Err(e)) => return Err(e),
+        };
+
+        let block_size = usize::from(u16::from(frame.header.block_size));
+        match frame.header.channel_assignment {
+            ChannelAssignment::Independent(ch_count) => match ch_count as u8 {
+                1 => {
+                    if frame.subframes.len() != 1 {
+                        return Err(flac_codec::Error::ChannelsMismatch);
+                    }
+                    Self::decode_subframe_i64(&frame.subframes[0], &mut self.ch0);
+                    if self.ch0.len() != block_size {
+                        return Err(flac_codec::Error::InvalidPartitionOrder);
+                    }
+                    self.buf.reserve(block_size);
+                    for &s in &self.ch0 {
+                        self.buf.push(s as i32);
+                    }
+                }
+                2 => {
+                    if frame.subframes.len() != 2 {
+                        return Err(flac_codec::Error::ChannelsMismatch);
+                    }
+                    Self::decode_subframe_i64(&frame.subframes[0], &mut self.ch0);
+                    Self::decode_subframe_i64(&frame.subframes[1], &mut self.ch1);
+                    if self.ch0.len() != block_size || self.ch1.len() != block_size {
+                        return Err(flac_codec::Error::InvalidPartitionOrder);
+                    }
+                    self.buf.reserve(block_size * 2);
+                    for (&l, &r) in self.ch0.iter().zip(self.ch1.iter()) {
+                        self.buf.push(l as i32);
+                        self.buf.push(r as i32);
+                    }
+                }
+                n => {
+                    let n_ch = usize::from(n);
+                    if frame.subframes.len() != n_ch {
+                        return Err(flac_codec::Error::ChannelsMismatch);
+                    }
+                    let mut chans: Vec<Vec<i64>> = Vec::with_capacity(n_ch);
+                    for sf in &frame.subframes {
+                        let mut v = Vec::with_capacity(block_size);
+                        Self::decode_subframe_i64(sf, &mut v);
+                        if v.len() != block_size {
+                            return Err(flac_codec::Error::InvalidPartitionOrder);
+                        }
+                        chans.push(v);
+                    }
+                    self.buf.reserve(block_size * n_ch);
+                    for i in 0..block_size {
+                        for ch in &chans {
+                            self.buf.push(ch[i] as i32);
+                        }
+                    }
+                }
+            },
+            ChannelAssignment::LeftSide => {
+                if frame.subframes.len() != 2 {
+                    return Err(flac_codec::Error::ChannelsMismatch);
+                }
+                Self::decode_subframe_i64(&frame.subframes[0], &mut self.ch0);
+                Self::decode_subframe_i64(&frame.subframes[1], &mut self.ch1);
+                if self.ch0.len() != block_size || self.ch1.len() != block_size {
+                    return Err(flac_codec::Error::InvalidPartitionOrder);
+                }
+                self.buf.reserve(block_size * 2);
+                for (&left, &side) in self.ch0.iter().zip(self.ch1.iter()) {
+                    let right = left - side;
+                    self.buf.push(left as i32);
+                    self.buf.push(right as i32);
+                }
+            }
+            ChannelAssignment::SideRight => {
+                if frame.subframes.len() != 2 {
+                    return Err(flac_codec::Error::ChannelsMismatch);
+                }
+                Self::decode_subframe_i64(&frame.subframes[0], &mut self.ch0);
+                Self::decode_subframe_i64(&frame.subframes[1], &mut self.ch1);
+                if self.ch0.len() != block_size || self.ch1.len() != block_size {
+                    return Err(flac_codec::Error::InvalidPartitionOrder);
+                }
+                self.buf.reserve(block_size * 2);
+                for (&side, &right) in self.ch0.iter().zip(self.ch1.iter()) {
+                    let left = side + right;
+                    self.buf.push(left as i32);
+                    self.buf.push(right as i32);
+                }
+            }
+            ChannelAssignment::MidSide => {
+                if frame.subframes.len() != 2 {
+                    return Err(flac_codec::Error::ChannelsMismatch);
+                }
+                Self::decode_subframe_i64(&frame.subframes[0], &mut self.ch0);
+                Self::decode_subframe_i64(&frame.subframes[1], &mut self.ch1);
+                if self.ch0.len() != block_size || self.ch1.len() != block_size {
+                    return Err(flac_codec::Error::InvalidPartitionOrder);
+                }
+                self.buf.reserve(block_size * 2);
+                for (&mid, &side) in self.ch0.iter().zip(self.ch1.iter()) {
+                    let sum = (mid << 1) + (side & 1);
+                    let left = (sum + side) >> 1;
+                    let right = (sum - side) >> 1;
+                    self.buf.push(left as i32);
+                    self.buf.push(right as i32);
+                }
+            }
+        }
+
+        Ok(true)
+    }
+
+    pub(crate) fn read(&mut self, samples: &mut [i32]) -> Result<usize, flac_codec::Error> {
+        if samples.is_empty() {
+            return Ok(0);
+        }
+        while self.buf_pos >= self.buf.len() {
+            if !self.decode_next_frame()? {
+                return Ok(0);
+            }
+        }
+        let avail = self.buf.len() - self.buf_pos;
+        let n = samples.len().min(avail);
+        samples[..n].copy_from_slice(&self.buf[self.buf_pos..self.buf_pos + n]);
+        self.buf_pos += n;
+        Ok(n)
+    }
+
+    pub(crate) fn read_to_end(&mut self, out: &mut Vec<i32>) -> Result<usize, flac_codec::Error> {
+        let mut total = 0;
+        if self.buf_pos < self.buf.len() {
+            let rem = &self.buf[self.buf_pos..];
+            out.extend_from_slice(rem);
+            total += rem.len();
+            self.buf_pos = self.buf.len();
+        }
+        while self.decode_next_frame()? {
+            out.extend_from_slice(&self.buf);
+            total += self.buf.len();
+            self.buf_pos = self.buf.len();
+        }
+        Ok(total)
+    }
+}
+
+impl<R: Read> Metadata for SafeFlacSampleReader<R> {
+    fn channel_count(&self) -> u8 {
+        self.frames.channel_count()
+    }
+
+    fn channel_mask(&self) -> ChannelMask {
+        self.frames.channel_mask()
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.frames.sample_rate()
+    }
+
+    fn bits_per_sample(&self) -> u32 {
+        self.frames.bits_per_sample()
+    }
+
+    fn total_samples(&self) -> Option<u64> {
+        self.frames.total_samples()
+    }
+
+    fn md5(&self) -> Option<&[u8; 16]> {
+        self.frames.md5()
+    }
+}
 
 /// Unified bounded-block audio source interface (local FLAC files now; live Tidal streams in Milestone 2).
 pub trait AudioBlockSource: Send {
@@ -113,7 +330,7 @@ pub fn capped_prealloc_frames(total_frames: Option<u64>) -> usize {
 }
 
 struct ValidatedFlac {
-    reader: FlacSampleReader<BufReader<File>>,
+    reader: SafeFlacSampleReader<BufReader<File>>,
     source_channels: u8,
     spec: StreamSpec,
     peak_meta: TrackPeakMetadata,
@@ -163,7 +380,7 @@ pub fn validate_flac_stream_params(
 fn open_validated(path: &Path) -> Result<ValidatedFlac, String> {
     let file = File::open(path)
         .map_err(|e| format!("failed to open FLAC '{}': {e}", path.display()))?;
-    let reader = FlacSampleReader::new(BufReader::new(file))
+    let reader = SafeFlacSampleReader::new(BufReader::new(file))
         .map_err(|e| format!("failed to parse FLAC '{}': {e}", path.display()))?;
 
     let source_channels = reader.channel_count();
@@ -199,7 +416,7 @@ fn open_validated(path: &Path) -> Result<ValidatedFlac, String> {
 /// Supports both mono (`1` channel, duplicated identically into stereo L/R) and stereo
 /// (`2` channels) FLAC files at 1..=32 bits per sample.
 pub struct FlacBlockReader {
-    reader: FlacSampleReader<BufReader<File>>,
+    reader: SafeFlacSampleReader<BufReader<File>>,
     source_channels: usize,
     spec: StreamSpec,
     peak_meta: TrackPeakMetadata,

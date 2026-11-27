@@ -29,7 +29,7 @@ fn print_usage() {
          \n\
          Usage:\n\
            ap-null [--file FILE | --library DIR [--seed SEED] [--count N|all]]\n\
-                   [--full] [--conv-file WAV] [--max-rate HZ] [--filter NAME]\n\
+                   [--full] [--conv-file WAV | --conv-dir DIR] [--max-rate HZ] [--filter NAME]\n\
                    [--shaper NAME] [--dac-bits 16..24] [--wire-format int32|int24in32|int24|int16]\n\
                    [--deemphasis] [--analog CAPTURE.WAV] [--out-dir DIR]\n"
     );
@@ -120,6 +120,15 @@ fn run() -> Result<bool, String> {
                 base_cfg.conv_config = ConvolutionConfig {
                     enabled: true,
                     file: Some(p),
+                    ..ConvolutionConfig::default()
+                };
+            }
+            "--conv-dir" => {
+                i += 1;
+                let p = PathBuf::from(args.get(i).ok_or("--conv-dir requires a directory")?);
+                base_cfg.conv_config = ConvolutionConfig {
+                    enabled: true,
+                    dir: Some(p),
                     ..ConvolutionConfig::default()
                 };
             }

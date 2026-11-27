@@ -547,3 +547,93 @@ fn headroom_design_issue7_tag_bounds_track_vs_album_and_streaminfo_md5() {
 
     let _ = fs::remove_file(&path);
 }
+
+#[test]
+fn decodes_zero_residual_first_partition_rfc9639_frame() {
+    // Regression test for flac-codec 1.3.3 decode::read_residuals rchunks_mut bug:
+    // RFC 9639 §9.2.5.1 allows block_size / 2^partition_order == predictor_order, where
+    // partition 0 has 0 residuals (e.g. block_size=16, partition_order=2 -> 4 samples/partition,
+    // Fixed predictor order=4 -> partition 0 has 4 - 4 = 0 residuals, partitions 1..3 have 4).
+    use flac_codec::decode::FlacSampleReader;
+    use flac_codec::stream::{
+        Frame, FrameIterator, ResidualPartition, Residuals, Subframe, SubframeWidth,
+    };
+
+    // 1. Generate a valid 16-frame 16-bit stereo FLAC to obtain a real STREAMINFO header and
+    //    valid FrameHeader matching its exact stream parameters.
+    let seed_path = make_temp_flac_path("zero_part0_seed");
+    let seed_samples: Vec<i32> = (0..16 * 2).map(|i| 100 + (i as i32)).collect();
+    let mut enc = FlacSampleWriter::create(
+        &seed_path,
+        Options::default(),
+        44_100,
+        16,
+        2,
+        Some(seed_samples.len() as u64),
+    )
+    .unwrap();
+    enc.write(&seed_samples).unwrap();
+    enc.finalize().unwrap();
+
+    let mut fi = FrameIterator::open(&seed_path).unwrap();
+    let metadata_bytes = fs::read(&seed_path).unwrap()[..fi.metadata_len() as usize].to_vec();
+    let streaminfo = fi.metadata().streaminfo().clone();
+    let (mut frame, _) = fi.next().unwrap().unwrap();
+    drop(fi);
+    let _ = fs::remove_file(&seed_path);
+
+    // 2. Replace the frame's subframes with Fixed order=4, 4 partitions (partition_order=2,
+    //    block_size=16 => partition_size=4 == predictor_order => partition 0 has 0 residuals).
+    //    For Fixed order=4 with warm_up=[100, 100, 100, 100] and all-zero residuals, every
+    //    decoded sample equals 100 (left) and -200 (right).
+    let make_subframe = |val: i32| -> SubframeWidth {
+        SubframeWidth::Common(Subframe::Fixed {
+            order: 4,
+            warm_up: vec![val; 4],
+            residuals: Residuals::Method0 {
+                partitions: vec![
+                    ResidualPartition::Constant { partition_len: 0 },
+                    ResidualPartition::Constant { partition_len: 4 },
+                    ResidualPartition::Constant { partition_len: 4 },
+                    ResidualPartition::Constant { partition_len: 4 },
+                ],
+            },
+            wasted_bps: 0,
+        })
+    };
+    frame.header.channel_assignment = flac_codec::stream::ChannelAssignment::LeftSide;
+    let out_path = make_temp_flac_path("zero_part0_valid");
+    let mut raw = metadata_bytes;
+    let frame_fixed = Frame {
+        header: frame.header,
+        // LeftSide: left=100, side=300 => right = left - side = -200.
+        subframes: vec![make_subframe(100), make_subframe(300)],
+    };
+    frame_fixed.write(&streaminfo, &mut raw).unwrap();
+    fs::write(&out_path, &raw).unwrap();
+
+    // 3. Confirm upstream flac-codec 1.3.3 FlacSampleReader rejects this valid RFC 9639 frame.
+    let mut upstream = FlacSampleReader::new(std::io::BufReader::new(
+        fs::File::open(&out_path).unwrap(),
+    ))
+    .unwrap();
+    let mut tmp = vec![0i32; 32];
+    let upstream_err = upstream
+        .read(&mut tmp)
+        .expect_err("expected flac-codec 1.3.3 FlacSampleReader to fail with InvalidPartitionOrder");
+    assert!(
+        upstream_err.to_string().contains("invalid residual partition order"),
+        "unexpected upstream error: {upstream_err}"
+    );
+
+    // 4. Confirm our FlacBlockReader decodes all 16 frames cleanly without error!
+    let decoded = decode_flac_full_memory_int32(&out_path)
+        .expect("SafeFlacSampleReader must decode 0-residual first partition cleanly");
+    assert_eq!(decoded.pcm.frames.len(), 16);
+    for pair in &decoded.pcm.frames {
+        assert_eq!(pair[0] >> 16, 100);
+        assert_eq!(pair[1] >> 16, -200);
+    }
+
+    let _ = fs::remove_file(&out_path);
+}
