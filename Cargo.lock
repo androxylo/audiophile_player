@@ -6,14 +6,7 @@ version = 4
 name = "ap-cli"
 version = "0.1.0"
 dependencies = [
- "ap-control",
- "ap-core",
- "ap-dsp",
- "ap-output-win",
- "ap-source",
- "ap-stream-protocol",
- "ap-upnp",
- "flac-codec",
+ "ap-player",
 ]
 
 [[package]]
@@ -43,6 +36,21 @@ dependencies = [
  "ap-core",
  "ap-source",
  "windows-sys",
+]
+
+[[package]]
+name = "ap-player"
+version = "0.1.0"
+dependencies = [
+ "ap-control",
+ "ap-core",
+ "ap-dsp",
+ "ap-output-win",
+ "ap-source",
+ "ap-stream-protocol",
+ "ap-upnp",
+ "ap-verify",
+ "flac-codec",
 ]
 
 [[package]]

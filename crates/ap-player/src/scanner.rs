@@ -1113,6 +1113,7 @@ struct PostChainRunner {
     upsampler: Box<dyn ap_dsp::upsampler::Upsampler>,
     deemphasis: Option<StereoDeemphasis>,
     convolver: Box<dyn ap_dsp::convolution::StereoConvolver>,
+    delayer: Box<dyn ap_dsp::delay::ChannelDelayer>,
     peak_linear: f64,
 }
 
@@ -1123,6 +1124,7 @@ impl PostChainRunner {
             buf = deemph.process_block(buf)?;
         }
         buf = self.convolver.process_block(buf)?;
+        buf = self.delayer.process_block(buf)?;
         self.observe(&buf);
         Ok(())
     }
@@ -1134,10 +1136,16 @@ impl PostChainRunner {
                 tail = deemph.process_block(tail)?;
             }
             let c = self.convolver.process_block(tail)?;
-            self.observe(&c);
+            let d = self.delayer.process_block(c)?;
+            self.observe(&d);
         }
         let c_tail = self.convolver.flush()?;
-        self.observe(&c_tail);
+        if !c_tail.left.is_empty() {
+            let d = self.delayer.process_block(c_tail)?;
+            self.observe(&d);
+        }
+        let d_tail = self.delayer.flush()?;
+        self.observe(&d_tail);
 
         let peak_dbfs = if self.peak_linear > 0.0 {
             20.0 * self.peak_linear.log10()
@@ -1162,6 +1170,8 @@ fn prepare_post_chain_runner(
     plan: &SelectedDspPlan,
     rew_factory: &RewConvolverFactory,
 ) -> Result<PostChainRunner, String> {
+    use ap_dsp::delay::{ChannelDelayerFactory, NullChannelDelayerFactory};
+
     let upsampler = build_upsampler(plan)?;
     let deemphasis = if plan.deemphasis {
         Some(StereoDeemphasis::new_50_15us(plan.target_rate_hz)?)
@@ -1169,6 +1179,7 @@ fn prepare_post_chain_runner(
         None
     };
     let convolver = rew_factory.create_for_rate(plan.target_rate_hz)?;
+    let delayer = NullChannelDelayerFactory.create_for_rate(plan.target_rate_hz)?;
     let key = build_post_chain_key(
         plan,
         spec.sample_rate_hz,
@@ -1181,6 +1192,7 @@ fn prepare_post_chain_runner(
         upsampler,
         deemphasis,
         convolver,
+        delayer,
         peak_linear: 0.0,
     })
 }

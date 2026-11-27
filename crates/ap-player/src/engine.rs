@@ -1401,9 +1401,9 @@ pub fn run_random_music_player(
     Ok(())
 }
 
-/// Narrow streaming-sink abstraction shared by `WdmKsSink` and mock-sink consumer tests
-/// (Review #4 Finding #15).
-trait BlockStreamAudioSink {
+/// Narrow streaming-sink abstraction shared by `WdmKsSink`, `FileWireSink` (`feature = "verify"`),
+/// and mock-sink consumer tests (Review #4 Finding #15).
+pub trait BlockStreamAudioSink {
     fn play_block_stream<F>(
         &mut self,
         sample_rate_hz: u32,
@@ -1479,6 +1479,95 @@ impl BlockStreamAudioSink for WdmKsSink {
             max_rate_hz,
         ))
     }
+}
+
+/// Hardware-free end-to-end engine runner driving the REAL producer (`producer_loop_with_sources`),
+/// prefetch buffer (`BoundedBlockStreamBuffer`), and consumer (`step_consumer_once`) over a folder
+/// in sequential order into any [`BlockStreamAudioSink`] (e.g. [`crate::file_wire_sink::FileWireSink`]).
+///
+/// Exposed strictly under `test` or `feature = "verify"` for L11 integration verification.
+#[cfg(any(test, feature = "verify"))]
+#[allow(clippy::too_many_arguments)]
+pub fn run_sequential_folder_with_sink<S: BlockStreamAudioSink>(
+    music_dir: PathBuf,
+    pipeline: AudioPipeline,
+    ultimate_ctx: Option<UltimateRuntimeContext>,
+    shared: Arc<SharedControl>,
+    controller: &ShutdownController,
+    stop_handle: Arc<AtomicBool>,
+    sink: &mut S,
+    mut on_step: impl FnMut(&SharedControl, bool) -> bool,
+) -> Result<(), String> {
+    let stream_buf = if ultimate_ctx.is_some() {
+        BoundedBlockStreamBuffer::with_limits_and_pinning(
+            ULTIMATE_MAX_BUFFERED_FRAMES,
+            Duration::from_secs(ULTIMATE_MAX_BUFFERED_SECONDS),
+            false,
+        )
+    } else {
+        BoundedBlockStreamBuffer::new(DEFAULT_MAX_BUFFERED_FRAMES)
+    };
+    let initial_epoch = stream_buf.current_epoch();
+    let initial_dir = PlayDirective::Sequential {
+        root: music_dir,
+        seq_gen: 1,
+        start_after: None,
+        folder_only: false,
+        skip_count: 0,
+    };
+    let prod_ctrl =
+        ProducerControl::new(initial_epoch, ProducerDirective::Active(initial_dir.clone()));
+
+    let buf_bg = Arc::clone(&stream_buf);
+    let ctrl_bg = Arc::clone(&prod_ctrl);
+    let shared_bg = Arc::clone(&shared);
+    let producer_thread = thread::Builder::new()
+        .name("ap-verify-dsp-producer".to_string())
+        .spawn(move || {
+            producer_loop_with_sources(
+                pipeline,
+                ctrl_bg,
+                buf_bg,
+                shared_bg,
+                None,
+                None,
+                ultimate_ctx,
+            )
+        })
+        .map_err(|e| format!("failed spawning verify producer thread: {e}"))?;
+
+    let mut state = EngineState::with_sources(
+        initial_epoch,
+        initial_dir,
+        &stream_buf,
+        &prod_ctrl,
+        &shared,
+        None,
+        None,
+    );
+
+    while controller.current_signal().is_none() {
+        let res = step_consumer_once(
+            &mut state,
+            &stream_buf,
+            &shared,
+            controller,
+            &stop_handle,
+            sink,
+            || producer_thread.is_finished(),
+        );
+        if matches!(res, ConsumerStepResult::Exit) {
+            break;
+        }
+        if on_step(&shared, state.paused_at_end_of_queue) {
+            break;
+        }
+    }
+
+    prod_ctrl.set(state.active_epoch, ProducerDirective::Shutdown);
+    stream_buf.close();
+    let _ = producer_thread.join();
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

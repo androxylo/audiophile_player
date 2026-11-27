@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 androxylo
+
+[package]
+name = "ap-player"
+description = "Audiophile Player core engine, Ultimate Mode, offline scanner, prefetch, filters DB, MCP, and CLI library"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+verify = ["ap-dsp/verify", "ap-output-win/verify"]
+
+[dependencies]
+ap-core.workspace = true
+ap-stream-protocol.workspace = true
+ap-source.workspace = true
+ap-dsp.workspace = true
+ap-output-win.workspace = true
+ap-control.workspace = true
+ap-upnp.workspace = true
+
+[dev-dependencies]
+flac-codec = "1.3"
+ap-verify = { path = "../ap-verify" }
