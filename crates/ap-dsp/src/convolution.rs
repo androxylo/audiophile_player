@@ -33,7 +33,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -274,6 +274,34 @@ pub struct StereoImpulseWav {
     pub sample_rate_hz: u32,
     pub left: Vec<f64>,
     pub right: Vec<f64>,
+}
+
+/// Decoded mono impulse response loaded into pure `f64` (e.g. single-channel REW IR WAV export).
+#[derive(Debug, Clone)]
+pub struct MonoImpulseWav {
+    pub label: String,
+    pub sample_rate_hz: u32,
+    pub samples: Vec<f64>,
+}
+
+/// Output floating-point sample encoding for [`write_stereo_wav`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WavOutputFormat {
+    /// 32-bit IEEE 754 float (`WAVE_FORMAT_IEEE_FLOAT`, 8 bytes/stereo frame).
+    Float32,
+    /// 64-bit IEEE 754 float (`WAVE_FORMAT_IEEE_FLOAT`, 16 bytes/stereo frame).
+    Float64,
+}
+
+/// Exact frequency-domain peak gain (`G_c`) and time-domain `L1` diagnostics for a stereo IR,
+/// computed identically to [`PreparedStereoIr::from_stereo_ir`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StereoIrGainMetrics {
+    pub active_taps: usize,
+    pub max_gain_linear: f64,
+    pub max_boost_db: f64,
+    pub l1_norm: f64,
+    pub l1_norm_db: f64,
 }
 
 /// Fast header-only RIFF WAV probe (reads only chunk headers, skipping audio payload).
@@ -547,6 +575,260 @@ pub fn load_stereo_wav(path: &Path) -> Result<StereoImpulseWav, String> {
         sample_rate_hz: info.sample_rate_hz,
         left,
         right,
+    })
+}
+
+/// Load a 1-channel mono RIFF WAV impulse response directly into IEEE 754 `f64`.
+pub fn load_mono_wav(path: &Path) -> Result<MonoImpulseWav, String> {
+    let info = probe_wav_header(path)?;
+    if info.channels != 1 {
+        return Err(format!(
+            "mono WAV loader requires a 1-channel WAV, got {} channels in '{}'",
+            info.channels,
+            path.display()
+        ));
+    }
+    if info.num_frames == 0 {
+        return Err(format!("mono WAV '{}' contains 0 frames", path.display()));
+    }
+    if info.num_frames > MAX_IR_TAPS || info.data_bytes > MAX_IR_DATA_BYTES {
+        return Err(format!(
+            "mono WAV '{}' exceeds maximum supported IR length ({MAX_IR_TAPS} taps)",
+            path.display()
+        ));
+    }
+
+    let mut file = File::open(path)
+        .map_err(|e| format!("failed to open WAV '{}': {e}", path.display()))?;
+    file.seek(SeekFrom::Start(info.data_offset))
+        .map_err(|e| format!("failed to seek to data chunk in '{}': {e}", path.display()))?;
+
+    let bytes_per_sample = (info.bits_per_sample / 8) as usize;
+    let payload_len = info.num_frames * bytes_per_sample;
+    let mut raw = vec![0u8; payload_len];
+    file.read_exact(&mut raw)
+        .map_err(|e| format!("failed to read WAV payload in '{}': {e}", path.display()))?;
+
+    let mut samples = Vec::with_capacity(info.num_frames);
+    match (info.encoding, info.bits_per_sample) {
+        (WavSampleEncoding::IeeeFloat, 32) => {
+            for s in raw.chunks_exact(4) {
+                let v = f32::from_le_bytes([s[0], s[1], s[2], s[3]]) as f64;
+                if !v.is_finite() {
+                    return Err(format!(
+                        "non-finite float sample detected in WAV '{}'",
+                        path.display()
+                    ));
+                }
+                samples.push(v);
+            }
+        }
+        (WavSampleEncoding::IeeeFloat, 64) => {
+            for s in raw.chunks_exact(8) {
+                let v = f64::from_le_bytes(s.try_into().unwrap());
+                if !v.is_finite() {
+                    return Err(format!(
+                        "non-finite f64 sample detected in WAV '{}'",
+                        path.display()
+                    ));
+                }
+                samples.push(v);
+            }
+        }
+        (WavSampleEncoding::PcmInt, 16) => {
+            const SCALE: f64 = 1.0 / 32_768.0;
+            for s in raw.chunks_exact(2) {
+                samples.push(i16::from_le_bytes([s[0], s[1]]) as f64 * SCALE);
+            }
+        }
+        (WavSampleEncoding::PcmInt, 24) => {
+            const SCALE: f64 = 1.0 / 8_388_608.0;
+            for s in raw.chunks_exact(3) {
+                let v = ((i32::from_le_bytes([0, s[0], s[1], s[2]])) >> 8) as f64;
+                samples.push(v * SCALE);
+            }
+        }
+        (WavSampleEncoding::PcmInt, 32) => {
+            const SCALE: f64 = 1.0 / 2_147_483_648.0;
+            for s in raw.chunks_exact(4) {
+                samples.push(i32::from_le_bytes([s[0], s[1], s[2], s[3]]) as f64 * SCALE);
+            }
+        }
+        (enc, bits) => {
+            return Err(format!(
+                "unsupported WAV format ({enc:?}, {bits}-bit) in '{}'",
+                path.display()
+            ));
+        }
+    }
+
+    let label = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+
+    Ok(MonoImpulseWav {
+        label,
+        sample_rate_hz: info.sample_rate_hz,
+        samples,
+    })
+}
+
+/// Write a 2-channel stereo IEEE float RIFF/WAVE impulse response (`32-bit` or `64-bit` float).
+///
+/// The emitted file satisfies every [`probe_wav_header`] and [`load_stereo_wav`] invariant,
+/// including the [`MAX_IR_TAPS`] length ceiling and finiteness validation.
+pub fn write_stereo_wav(
+    path: &Path,
+    sample_rate_hz: u32,
+    left: &[f64],
+    right: &[f64],
+    format: WavOutputFormat,
+) -> Result<(), String> {
+    if left.len() != right.len() {
+        return Err(format!(
+            "stereo WAV write L/R length mismatch ({} vs {})",
+            left.len(),
+            right.len()
+        ));
+    }
+    if left.is_empty() {
+        return Err("stereo WAV write cannot write 0 frames".to_string());
+    }
+    if sample_rate_hz == 0 {
+        return Err("stereo WAV write sample_rate_hz must be > 0".to_string());
+    }
+    if left.len() > MAX_IR_TAPS {
+        return Err(format!(
+            "stereo WAV write length ({} taps) exceeds maximum supported IR length ({MAX_IR_TAPS} taps)",
+            left.len()
+        ));
+    }
+    if left.iter().any(|v| !v.is_finite()) || right.iter().any(|v| !v.is_finite()) {
+        return Err(format!(
+            "stereo WAV write '{}' contains non-finite (NaN/Inf) samples",
+            path.display()
+        ));
+    }
+
+    let (bits_per_sample, bytes_per_sample): (u16, u64) = match format {
+        WavOutputFormat::Float32 => (32, 4),
+        WavOutputFormat::Float64 => (64, 8),
+    };
+    let channels: u16 = 2;
+    let block_align = channels * (bytes_per_sample as u16);
+    let byte_rate = sample_rate_hz
+        .checked_mul(u32::from(block_align))
+        .ok_or_else(|| "stereo WAV byte_rate overflow".to_string())?;
+    let data_bytes = (left.len() as u64)
+        .checked_mul(u64::from(block_align))
+        .ok_or_else(|| "stereo WAV data_bytes overflow".to_string())?;
+    let riff_size_u64 = 4u64 + (8 + 16) + (8 + data_bytes);
+    let data_bytes_u32 = u32::try_from(data_bytes)
+        .map_err(|_| "stereo WAV data chunk exceeds 4 GiB RIFF limit".to_string())?;
+    let riff_size_u32 = u32::try_from(riff_size_u64)
+        .map_err(|_| "stereo WAV RIFF size exceeds 4 GiB limit".to_string())?;
+
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create WAV output dir '{}': {e}", parent.display()))?;
+    }
+
+    let file = File::create(path)
+        .map_err(|e| format!("failed to create WAV '{}': {e}", path.display()))?;
+    let mut w = BufWriter::new(file);
+
+    w.write_all(b"RIFF")
+        .and_then(|_| w.write_all(&riff_size_u32.to_le_bytes()))
+        .and_then(|_| w.write_all(b"WAVE"))
+        .and_then(|_| w.write_all(b"fmt "))
+        .and_then(|_| w.write_all(&16u32.to_le_bytes()))
+        .and_then(|_| w.write_all(&3u16.to_le_bytes())) // WAVE_FORMAT_IEEE_FLOAT
+        .and_then(|_| w.write_all(&channels.to_le_bytes()))
+        .and_then(|_| w.write_all(&sample_rate_hz.to_le_bytes()))
+        .and_then(|_| w.write_all(&byte_rate.to_le_bytes()))
+        .and_then(|_| w.write_all(&block_align.to_le_bytes()))
+        .and_then(|_| w.write_all(&bits_per_sample.to_le_bytes()))
+        .and_then(|_| w.write_all(b"data"))
+        .and_then(|_| w.write_all(&data_bytes_u32.to_le_bytes()))
+        .map_err(|e| format!("failed to write WAV header '{}': {e}", path.display()))?;
+
+    match format {
+        WavOutputFormat::Float32 => {
+            for (&l, &r) in left.iter().zip(right.iter()) {
+                let lf = l as f32;
+                let rf = r as f32;
+                if !lf.is_finite() || !rf.is_finite() {
+                    return Err(format!(
+                        "stereo WAV write '{}' f32 conversion overflowed to non-finite",
+                        path.display()
+                    ));
+                }
+                w.write_all(&lf.to_le_bytes())
+                    .and_then(|_| w.write_all(&rf.to_le_bytes()))
+                    .map_err(|e| format!("failed to write f32 WAV frame '{}': {e}", path.display()))?;
+            }
+        }
+        WavOutputFormat::Float64 => {
+            for (&l, &r) in left.iter().zip(right.iter()) {
+                w.write_all(&l.to_le_bytes())
+                    .and_then(|_| w.write_all(&r.to_le_bytes()))
+                    .map_err(|e| format!("failed to write f64 WAV frame '{}': {e}", path.display()))?;
+            }
+        }
+    }
+
+    w.flush()
+        .map_err(|e| format!("failed to flush WAV '{}': {e}", path.display()))
+}
+
+/// Measure exact peak frequency-domain magnitude (`G_c = max |H(f)|` via `>= 2x` zero-padded RFFT)
+/// and time-domain `L1` norm for a stereo IR, matching [`PreparedStereoIr::from_stereo_ir`] identically.
+pub fn measure_stereo_ir_gains(
+    left: &[f64],
+    right: &[f64],
+) -> Result<StereoIrGainMetrics, String> {
+    if left.len() != right.len() {
+        return Err("stereo IR L/R length mismatch".to_string());
+    }
+    if left.is_empty() {
+        return Err("stereo IR cannot be empty".to_string());
+    }
+    if left.iter().any(|v| !v.is_finite()) || right.iter().any(|v| !v.is_finite()) {
+        return Err("stereo IR contains non-finite (NaN/Inf) samples".to_string());
+    }
+    let Some(last_nz) = left
+        .iter()
+        .zip(right.iter())
+        .rposition(|(&l, &r)| l != 0.0 || r != 0.0)
+    else {
+        return Err("stereo IR is all zeros (silent impulse response rejected)".to_string());
+    };
+    let active_taps = last_nz + 1;
+    let mut planner = RealFftPlanner::<f64>::new();
+    let max_gain_linear =
+        compute_max_freq_gain_linear(&mut planner, &left[..active_taps], &right[..active_taps])?;
+    let l1_left: f64 = left[..active_taps].iter().map(|v| v.abs()).sum();
+    let l1_right: f64 = right[..active_taps].iter().map(|v| v.abs()).sum();
+    let l1_norm = l1_left.max(l1_right);
+    let max_boost_db = if max_gain_linear > 1.0 + 1e-9 {
+        20.0 * max_gain_linear.log10()
+    } else {
+        0.0
+    };
+    let l1_norm_db = if l1_norm > 1.0 {
+        20.0 * l1_norm.log10()
+    } else {
+        0.0
+    };
+    Ok(StereoIrGainMetrics {
+        active_taps,
+        max_gain_linear,
+        max_boost_db,
+        l1_norm,
+        l1_norm_db,
     })
 }
 
