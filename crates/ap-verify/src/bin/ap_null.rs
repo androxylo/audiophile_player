@@ -16,6 +16,7 @@ use ap_core::config::ConvolutionConfig;
 use ap_core::format::DacWireFormat;
 use ap_dsp::selector::{FilterArchetype, NoiseShaperProfile};
 use ap_source::library::discover_flac_files;
+use ap_verify::analog::{analyze_analog_loopback, read_wav_f64};
 use ap_verify::pick::{
     pick_from_library, resolve_seed, track_from_env_or_library_or_fixture,
 };
@@ -30,7 +31,7 @@ fn print_usage() {
            ap-null [--file FILE | --library DIR [--seed SEED] [--count N|all]]\n\
                    [--full] [--conv-file WAV] [--max-rate HZ] [--filter NAME]\n\
                    [--shaper NAME] [--dac-bits 16..24] [--wire-format int32|int24in32|int24|int16]\n\
-                   [--deemphasis] [--out-dir DIR]\n"
+                   [--deemphasis] [--analog CAPTURE.WAV] [--out-dir DIR]\n"
     );
 }
 
@@ -69,6 +70,7 @@ fn run() -> Result<bool, String> {
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     let mut out_dir = default_report_dir();
+    let mut analog_capture: Option<PathBuf> = None;
     let mut base_cfg = NullRunConfig::default();
 
     let mut i = 0_usize;
@@ -152,6 +154,12 @@ fn run() -> Result<bool, String> {
                 let raw = args.get(i).ok_or("--wire-format requires a format")?;
                 base_cfg.wire_format = parse_wire_format(raw)?;
             }
+            "--analog" => {
+                i += 1;
+                analog_capture = Some(PathBuf::from(
+                    args.get(i).ok_or("--analog requires a capture WAV path")?,
+                ));
+            }
             "--out-dir" => {
                 i += 1;
                 out_dir = PathBuf::from(args.get(i).ok_or("--out-dir requires a directory")?);
@@ -165,6 +173,20 @@ fn run() -> Result<bool, String> {
 
     base_cfg.full_track = full;
     let base_seed = resolve_seed(seed_arg);
+
+    // Optional L12 manual analog loopback report mode (`--analog <capture.wav>`):
+    // compares the ADC capture against the reference FLAC (or `--file`) without pass/fail.
+    if let Some(cap_path) = analog_capture {
+        let cap = read_wav_f64(&cap_path)?;
+        let ref_path = match file {
+            Some(f) => f,
+            None => track_from_env_or_library_or_fixture(Some(base_seed))?.path,
+        };
+        let ref_decoded = ap_source::flac::decode_flac_full_memory(&ref_path)?;
+        let rep = analyze_analog_loopback(&ref_decoded.audio.left, &cap.left, cap.sample_rate_hz);
+        print!("{}", rep.to_yaml());
+        return Ok(true);
+    }
 
     let targets: Vec<(PathBuf, u64)> = if let Some(f) = file {
         vec![(f, base_seed)]

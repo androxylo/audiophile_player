@@ -7,6 +7,8 @@
 //! de-emphasis, polyphase decimation, Welch PSD, and coherence checks are implemented from scratch
 //! in pure IEEE 754 `f64` using complex `rustfft`.
 
+pub mod analog;
+pub mod fixtures;
 pub mod metrics;
 pub mod pick;
 pub mod reference;

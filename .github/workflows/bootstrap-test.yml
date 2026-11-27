@@ -14,6 +14,7 @@ on:
       - '.vsconfig'
       - '.github/workflows/bootstrap-test.yml'
       - 'crates/ap-cli/src/cli_spec.rs'
+      - 'crates/ap-player/src/cli_spec.rs'
       - 'docs/CLI.md'
       - 'docs/GETTING_STARTED.md'
   pull_request:
@@ -24,6 +25,7 @@ on:
       - '.vsconfig'
       - '.github/workflows/bootstrap-test.yml'
       - 'crates/ap-cli/src/cli_spec.rs'
+      - 'crates/ap-player/src/cli_spec.rs'
       - 'docs/CLI.md'
       - 'docs/GETTING_STARTED.md'
 

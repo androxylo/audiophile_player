@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 androxylo
+
+name: CI Workspace & Verify Suite
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'tests/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    paths:
+      - 'crates/**'
+      - 'tests/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/ci.yml'
+
+jobs:
+  windows-verify:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run full workspace test suite with verify feature
+        shell: pwsh
+        run: |
+          cargo test --workspace --locked --features verify -- --skip hardware_live --skip live_wdm_ks --skip plays_random_flac_from_user_music
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Check default (non-verify) workspace build
+        shell: pwsh
+        run: |
+          cargo check --workspace --locked --exclude ap-verify
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload null-test YAML reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-null-test-reports
+          path: target/null-test/*.yaml
+          if-no-files-found: ignore

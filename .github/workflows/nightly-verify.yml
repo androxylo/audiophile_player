@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 androxylo
+
+name: Nightly Loopback Null & L10 Matrix
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 4 * * *'
+
+jobs:
+  nightly-verify:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run ap-null full loopback check on all bundled fixtures
+        shell: pwsh
+        run: |
+          cargo run --release --locked -p ap-verify --bin ap-null -- --library tests/fixtures --count all --full --seed 2026
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run exhaustive L10 rate/format/shaper/bits matrix
+        shell: pwsh
+        run: |
+          cargo test --release --locked -p ap-verify --test matrix_l10 -- --ignored --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload nightly null-test YAML reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-null-test-reports
+          path: target/null-test/*.yaml
+          if-no-files-found: ignore
