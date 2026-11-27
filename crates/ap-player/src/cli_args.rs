@@ -13,7 +13,7 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use ap_core::config::{ConvolutionConfig, is_valid_dac_bits};
+use ap_core::config::{ConvolutionConfig, OutputTransport, is_valid_dac_bits};
 use ap_core::user_filters::FilterMode;
 use ap_dsp::MAX_FILTER_TAPS;
 use ap_dsp::selector::{FilterArchetype, NoiseShaperProfile, UpsamplerPolicy};
@@ -143,6 +143,7 @@ pub enum RunMode {
         config_path: Option<PathBuf>,
         music_dir: Option<PathBuf>,
         device_filter: Option<String>,
+        output_transport: Option<OutputTransport>,
         max_rate_hz: Option<u32>,
         optimization: OptimizationLevel,
         optimization_explicit: bool,
@@ -180,8 +181,11 @@ pub enum RunMode {
         config_path: Option<PathBuf>,
         as_json: bool,
     },
-    /// Enumerate WDM-KS render devices and probe 8fS support (`audiophile-player devices [--json]`).
-    Devices { as_json: bool },
+    /// Enumerate WDM-KS or WASAPI Exclusive render devices and probe 8fS support (`audiophile-player devices [--output wdm-ks|wasapi] [--json]`).
+    Devices {
+        output_transport: Option<OutputTransport>,
+        as_json: bool,
+    },
     /// Inspect or safely edit `config.toml` (`audiophile-player config <show|set|unset>`).
     Config(ConfigCommand),
     /// Query the running player instance (`audiophile-player status [--json]`).
@@ -351,6 +355,7 @@ where
     let mut common = CommonPaths::default();
     let mut music_dir: Option<PathBuf> = None;
     let mut device_filter: Option<String> = None;
+    let mut output_transport: Option<OutputTransport> = None;
     let mut max_rate_hz: Option<u32> = None;
     let mut optimization = OptimizationLevel::High;
     let mut optimization_explicit = false;
@@ -384,6 +389,10 @@ where
             "--idle" => idle = true,
             "--music-dir" => music_dir = Some(take_opt_path("--music-dir", &mut iter)?),
             "--device" => device_filter = Some(take_opt_str("--device", &mut iter)?),
+            "--output" => {
+                let raw = take_opt_str("--output", &mut iter)?;
+                output_transport = Some(OutputTransport::parse(&raw)?);
+            }
             "--max-rate" => {
                 let val_str = take_opt_str("--max-rate", &mut iter)?;
                 let trimmed = val_str.trim();
@@ -509,6 +518,7 @@ where
         config_path: common.config_path,
         music_dir,
         device_filter,
+        output_transport,
         max_rate_hz,
         optimization,
         optimization_explicit,
@@ -778,16 +788,24 @@ fn parse_devices_args<I>(mut iter: I) -> Result<RunMode, String>
 where
     I: Iterator<Item = OsString>,
 {
+    let mut output_transport: Option<OutputTransport> = None;
     let mut as_json = false;
     while let Some(raw) = iter.next() {
         let arg = require_utf8_arg("devices", raw)?;
         match arg.as_str() {
             "-h" | "--help" => return Ok(RunMode::Help(HelpMode::Detail("devices".to_string()))),
             "--json" => as_json = true,
+            "--output" => {
+                let val = take_opt_str("--output", &mut iter)?;
+                output_transport = Some(OutputTransport::parse(&val)?);
+            }
             other => return Err(format!("unknown devices option '{other}'")),
         }
     }
-    Ok(RunMode::Devices { as_json })
+    Ok(RunMode::Devices {
+        output_transport,
+        as_json,
+    })
 }
 
 fn parse_config_args<I>(mut iter: I) -> Result<RunMode, String>
@@ -1052,6 +1070,7 @@ mod tests {
                 config_path: None,
                 music_dir: None,
                 device_filter: None,
+                output_transport: None,
                 max_rate_hz: None,
                 optimization: OptimizationLevel::High,
                 optimization_explicit: false,
@@ -1067,6 +1086,23 @@ mod tests {
     }
 
     #[test]
+    fn output_backend_flag_accepts_wdm_ks_and_wasapi_and_rejects_shared_mode() {
+        let dev_wasapi =
+            parse_args(["audiophile-player", "devices", "--output", "wasapi", "--json"]).unwrap();
+        assert_eq!(
+            dev_wasapi,
+            RunMode::Devices {
+                output_transport: Some(OutputTransport::WasapiExclusive),
+                as_json: true,
+            }
+        );
+
+        let err = parse_args(["audiophile-player", "--output", "shared"])
+            .expect_err("Windows Shared Mode must be rejected");
+        assert!(err.contains("Shared Mode"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn explicit_flags_including_upsampler_overrides_parse_cleanly() {
         let mode = parse_args([
             "audiophile-player",
@@ -1076,6 +1112,8 @@ mod tests {
             r"D:\Audio",
             "--device",
             "Gungnir 2",
+            "--output",
+            "wasapi",
             "--max-rate",
             "192000",
             "--port",
@@ -1110,6 +1148,7 @@ mod tests {
                 config_path: Some(PathBuf::from(r"C:\Cfg\player.toml")),
                 music_dir: Some(PathBuf::from(r"D:\Audio")),
                 device_filter: Some("Gungnir 2".to_string()),
+                output_transport: Some(OutputTransport::WasapiExclusive),
                 max_rate_hz: Some(192_000),
                 optimization: OptimizationLevel::Extreme,
                 optimization_explicit: true,

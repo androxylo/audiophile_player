@@ -60,12 +60,42 @@ pub fn is_valid_shaper_name(name: &str) -> bool {
 
 /// Strictly mixer-free Windows output transport selection.
 /// Shared Mode is intentionally unrepresentable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum OutputTransport {
     /// Direct Windows Kernel Streaming (`WDM-KS`, Audirvana-style WaveRT pin).
+    #[default]
     WdmKs,
     /// Event-driven WASAPI Exclusive (`AUDCLNT_SHAREMODE_EXCLUSIVE`).
     WasapiExclusive,
+}
+
+impl OutputTransport {
+    /// Canonical lowercase CLI / TOML identifier (`"wdm-ks"` or `"wasapi"`).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::WdmKs => "wdm-ks",
+            Self::WasapiExclusive => "wasapi",
+        }
+    }
+
+    /// Short human-readable backend label for banners and status lines.
+    pub const fn display_label(self) -> &'static str {
+        match self {
+            Self::WdmKs => "WDM-KS WaveRT",
+            Self::WasapiExclusive => "WASAPI Exclusive",
+        }
+    }
+
+    /// Parse a CLI or `config.toml` output backend string (case-insensitive).
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "wdm-ks" | "wdmks" | "ks" => Ok(Self::WdmKs),
+            "wasapi" | "wasapi-exclusive" | "wasapi_exclusive" => Ok(Self::WasapiExclusive),
+            other => Err(format!(
+                "invalid output backend '{other}'; expected 'wdm-ks' or 'wasapi' (Windows Shared Mode is strictly unsupported)"
+            )),
+        }
+    }
 }
 
 /// REW stereo convolution configuration loaded from `[convolution]` in `config.toml`
@@ -305,8 +335,10 @@ pub const ALLOWED_OPT_LEVELS: [&str; 3] = ["normal", "high", "extreme"];
 /// (`device`, `music_dir`, `filter`, `max_taps`, `port`, `opt`). CLI flags always override these.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlayerSectionConfig {
-    /// Preferred WDM-KS DAC name substring (e.g. `"Gungnir 2"`).
+    /// Preferred DAC name substring (e.g. `"Gungnir 2"`).
     pub device: Option<String>,
+    /// Output backend transport (`"wdm-ks"` or `"wasapi"`; `None` = `"wdm-ks"`).
+    pub output: Option<String>,
     /// Default local music library folder (`None` -> `~/Music`).
     pub music_dir: Option<PathBuf>,
     /// Optional forced upsampling filter (`None` = `"auto"`).
@@ -324,6 +356,9 @@ pub struct PlayerSectionConfig {
 
 impl PlayerSectionConfig {
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(ref out) = self.output {
+            OutputTransport::parse(out).map_err(|e| format!("[player] {e}"))?;
+        }
         if let Some(ref f) = self.filter {
             if !f.eq_ignore_ascii_case("auto") && !is_known_filter_name(f) {
                 return Err(format!(
@@ -377,6 +412,7 @@ pub struct PlayerConfig {
 /// Canonical dotted TOML keys supported by `PlayerConfig` (verified against `cli_spec.rs` in tests).
 pub const ALL_KNOWN_CONFIG_KEYS: &[&str] = &[
     "player.device",
+    "player.output",
     "player.music_dir",
     "player.filter",
     "player.max_taps",
@@ -415,6 +451,7 @@ pub fn canonicalize_config_key(raw: &str) -> Option<&'static str> {
     }
     match lower.as_str() {
         "device" => Some("player.device"),
+        "output" | "backend" | "transport" => Some("player.output"),
         "music_dir" | "music-dir" => Some("player.music_dir"),
         "filter" => Some("player.filter"),
         "max_taps" | "max-taps" => Some("player.max_taps"),
@@ -568,6 +605,17 @@ impl PlayerConfig {
                             let s = parse_toml_string(val, line_no, "device")?;
                             let trimmed = s.trim();
                             player.device = (!trimmed.is_empty()).then(|| trimmed.to_string());
+                        }
+                        "output" => {
+                            let s = parse_toml_string(val, line_no, "output")?;
+                            let trimmed = s.trim();
+                            if trimmed.is_empty() {
+                                player.output = None;
+                            } else {
+                                let parsed = OutputTransport::parse(trimmed)
+                                    .map_err(|e| format!("config line {line_no}: [player] {e}"))?;
+                                player.output = Some(parsed.as_str().to_string());
+                            }
                         }
                         "music_dir" => {
                             let s = parse_toml_string(val, line_no, "music_dir")?;
@@ -1081,6 +1129,12 @@ impl PlayerConfig {
     pub fn get_value_str(&self, canonical_key: &str) -> Option<String> {
         match canonical_key {
             "player.device" => self.player.device.clone(),
+            "player.output" => Some(
+                self.player
+                    .output
+                    .clone()
+                    .unwrap_or_else(|| OutputTransport::WdmKs.as_str().to_string()),
+            ),
             "player.music_dir" => self
                 .player
                 .music_dir
@@ -1212,6 +1266,10 @@ pub fn format_toml_value_for_key(canonical_key: &str, raw_value: &str) -> Result
             Ok(port.to_string())
         }
         // Validated enum strings
+        "player.output" => {
+            let parsed = OutputTransport::parse(val)?;
+            Ok(toml_quote_string(parsed.as_str()))
+        }
         "player.filter" => {
             if !val.eq_ignore_ascii_case("auto") && !is_known_filter_name(val) {
                 return Err(format!(

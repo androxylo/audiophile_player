@@ -37,6 +37,7 @@ use ap_dsp::selector::{
 };
 use ap_output_win::hygiene::OptimizationLevel;
 use ap_output_win::sink::{OutputError, PlaybackStats};
+use ap_output_win::wasapi_exclusive::{WasapiExclusiveSink, probe_wasapi_device_capabilities};
 use ap_output_win::wdm_ks::WdmKsSink;
 use ap_source::flac::{
     AudioBlockSource, FlacBlockReader, UNSUPPORTED_CHANNEL_LAYOUT_PREFIX,
@@ -884,6 +885,7 @@ mod quantizer_policy_tests {
 #[allow(clippy::too_many_arguments)]
 fn build_effective_options_json(
     dac_name: &str,
+    output_transport: ap_core::config::OutputTransport,
     music_dir: &Path,
     optimization: OptimizationLevel,
     effective_max_rate: Option<u32>,
@@ -896,6 +898,7 @@ fn build_effective_options_json(
 ) -> JsonValue {
     JsonValue::obj(vec![
         ("dac", JsonValue::from(dac_name)),
+        ("output", JsonValue::from(output_transport.as_str())),
         (
             "music_dir",
             JsonValue::from(music_dir.to_string_lossy().into_owned()),
@@ -972,6 +975,7 @@ pub fn run_random_music_player(
     config_path: Option<PathBuf>,
     music_dir_override: Option<PathBuf>,
     device_filter: Option<String>,
+    output_transport_override: Option<ap_core::config::OutputTransport>,
     max_rate_override: Option<u32>,
     optimization: OptimizationLevel,
     optimization_explicit: bool,
@@ -1018,6 +1022,13 @@ pub fn run_random_music_player(
     .map_err(CliError::config)?;
 
     let device_filter = device_filter.or_else(|| loaded_cfg.config.player.device.clone());
+    let effective_output = match output_transport_override {
+        Some(t) => t,
+        None => match loaded_cfg.config.player.output.as_deref() {
+            Some(raw) => ap_core::config::OutputTransport::parse(raw).map_err(CliError::config)?,
+            None => ap_core::config::OutputTransport::WdmKs,
+        },
+    };
     let effective_max_rate = max_rate_override.or(loaded_cfg.config.player.max_rate);
     let http_port = http_port.or(loaded_cfg.config.player.port);
     let (optimization, optimization_explicit) = if !optimization_explicit {
@@ -1111,22 +1122,24 @@ pub fn run_random_music_player(
         enable_ssdp: true,
     };
 
-    let mut sink = WdmKsSink::open_best(device_filter.as_deref(), optimization)
-        .map_err(|e| CliError::device(e.to_string()))?;
-    let dac_name = sink.device().friendly_name.clone();
+    let mut sink = HardwareAudioSink::open_best(
+        effective_output,
+        device_filter.as_deref(),
+        optimization,
+    )
+    .map_err(|e| CliError::device(e.to_string()))?;
+    let dac_name = sink.friendly_name().to_string();
     let stop_handle = sink.stop_handle();
+    let backend_label = effective_output.display_label();
 
     // Probe DAC output capabilities (native 352.8/384 kHz tried first -> 2 probes, zero downsampling
     // on 8fS DACs; < 8fS DACs automatically get last-stage pure-f64 anti-aliasing downsampling).
     let mut deferred_probe_needed = false;
-    let dac_caps = match ap_output_win::wdm_ks::probe_ks_device_capabilities(
-        sink.device(),
-        effective_max_rate,
-    ) {
+    let dac_caps = match sink.probe_capabilities(effective_max_rate).unwrap() {
         Ok(caps) => {
             if !caps.has_any_supported_rate() {
                 return Err(CliError::device(format!(
-                    "DAC '{dac_name}' did not accept any standard WDM-KS PCM format (44.1..=384 kHz)"
+                    "DAC '{dac_name}' did not accept any standard {backend_label} PCM format (44.1..=384 kHz)"
                 )));
             }
             caps
@@ -1158,6 +1171,7 @@ pub fn run_random_music_player(
     let capture_enabled = loaded_cfg.config.capture.enabled && !capture_disabled;
     let effective_options_json = build_effective_options_json(
         &dac_name,
+        effective_output,
         &music_dir,
         optimization,
         effective_max_rate,
@@ -1245,7 +1259,7 @@ pub fn run_random_music_player(
     let capture_transport = capture_monitor.as_ref().map(|m| m.transport());
 
     println!(
-        "audiophile-player v{} started (WDM-KS WaveRT, streaming blocks, opt={optimization:?}, DAC='{dac_name}', music='{}').",
+        "audiophile-player v{} started ({backend_label}, streaming blocks, opt={optimization:?}, DAC='{dac_name}', music='{}').",
         env!("CARGO_PKG_VERSION"),
         music_dir.display()
     );
@@ -1478,6 +1492,138 @@ impl BlockStreamAudioSink for WdmKsSink {
             self.device(),
             max_rate_hz,
         ))
+    }
+}
+
+impl BlockStreamAudioSink for WasapiExclusiveSink {
+    fn play_block_stream<F>(
+        &mut self,
+        sample_rate_hz: u32,
+        wire_format: DacWireFormat,
+        next_block: F,
+    ) -> Result<PlaybackStats, OutputError>
+    where
+        F: FnMut() -> ap_output_win::wdm_ks::StreamBlock,
+    {
+        WasapiExclusiveSink::play_block_stream(self, sample_rate_hz, wire_format, next_block)
+    }
+
+    fn play_block_stream_with_recycler<F, R>(
+        &mut self,
+        sample_rate_hz: u32,
+        wire_format: DacWireFormat,
+        next_block: F,
+        recycle_block: R,
+    ) -> Result<PlaybackStats, OutputError>
+    where
+        F: FnMut() -> ap_output_win::wdm_ks::StreamBlock,
+        R: FnMut(ap_core::buffer::InterleavedInt32Buffer) + 'static,
+    {
+        WasapiExclusiveSink::play_block_stream_with_recycler(
+            self,
+            sample_rate_hz,
+            wire_format,
+            next_block,
+            recycle_block,
+        )
+    }
+
+    fn probe_capabilities(
+        &self,
+        max_rate_hz: Option<u32>,
+    ) -> Option<Result<ap_core::format::DacOutputCapabilities, OutputError>> {
+        Some(probe_wasapi_device_capabilities(self.device(), max_rate_hz))
+    }
+}
+
+/// Unified zero-mixer Windows hardware audio sink (`WDM-KS WaveRT` or `WASAPI Exclusive`).
+enum HardwareAudioSink {
+    WdmKs(WdmKsSink),
+    Wasapi(WasapiExclusiveSink),
+}
+
+impl HardwareAudioSink {
+    fn open_best(
+        transport: ap_core::config::OutputTransport,
+        device_filter: Option<&str>,
+        optimization: OptimizationLevel,
+    ) -> Result<Self, OutputError> {
+        match transport {
+            ap_core::config::OutputTransport::WdmKs => {
+                WdmKsSink::open_best(device_filter, optimization).map(Self::WdmKs)
+            }
+            ap_core::config::OutputTransport::WasapiExclusive => {
+                WasapiExclusiveSink::open_best(device_filter, optimization).map(Self::Wasapi)
+            }
+        }
+    }
+
+    fn friendly_name(&self) -> &str {
+        match self {
+            Self::WdmKs(s) => &s.device().friendly_name,
+            Self::Wasapi(s) => &s.device().friendly_name,
+        }
+    }
+
+    fn stop_handle(&self) -> Arc<AtomicBool> {
+        match self {
+            Self::WdmKs(s) => s.stop_handle(),
+            Self::Wasapi(s) => s.stop_handle(),
+        }
+    }
+}
+
+impl BlockStreamAudioSink for HardwareAudioSink {
+    fn play_block_stream<F>(
+        &mut self,
+        sample_rate_hz: u32,
+        wire_format: DacWireFormat,
+        next_block: F,
+    ) -> Result<PlaybackStats, OutputError>
+    where
+        F: FnMut() -> ap_output_win::wdm_ks::StreamBlock,
+    {
+        match self {
+            Self::WdmKs(s) => s.play_block_stream(sample_rate_hz, wire_format, next_block),
+            Self::Wasapi(s) => s.play_block_stream(sample_rate_hz, wire_format, next_block),
+        }
+    }
+
+    fn play_block_stream_with_recycler<F, R>(
+        &mut self,
+        sample_rate_hz: u32,
+        wire_format: DacWireFormat,
+        next_block: F,
+        recycle_block: R,
+    ) -> Result<PlaybackStats, OutputError>
+    where
+        F: FnMut() -> ap_output_win::wdm_ks::StreamBlock,
+        R: FnMut(ap_core::buffer::InterleavedInt32Buffer) + 'static,
+    {
+        match self {
+            Self::WdmKs(s) => s.play_block_stream_with_recycler(
+                sample_rate_hz,
+                wire_format,
+                next_block,
+                recycle_block,
+            ),
+            Self::Wasapi(s) => s.play_block_stream_with_recycler(
+                sample_rate_hz,
+                wire_format,
+                next_block,
+                recycle_block,
+            ),
+        }
+    }
+
+    fn probe_capabilities(
+        &self,
+        max_rate_hz: Option<u32>,
+    ) -> Option<Result<ap_core::format::DacOutputCapabilities, OutputError>> {
+        match self {
+            Self::WdmKs(s) => s.probe_capabilities(max_rate_hz),
+            Self::Wasapi(s) => s.probe_capabilities(max_rate_hz),
+        }
     }
 }
 

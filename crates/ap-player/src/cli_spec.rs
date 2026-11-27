@@ -228,6 +228,7 @@ pub const SHAPER_VALUES: &[&str] = &[
 ];
 
 pub const OPT_VALUES: &[&str] = &["normal", "high", "extreme"];
+pub const OUTPUT_VALUES: &[&str] = &["wdm-ks", "wasapi"];
 pub const MAX_RATE_VALUES: &[&str] = &[
     "auto", "44100", "48000", "88200", "96000", "176400", "192000", "352800", "384000",
 ];
@@ -299,11 +300,12 @@ pub static COMMANDS: &[CmdSpec] = &[
     },
     CmdSpec {
         name: "devices",
-        usage: "audiophile-player devices [--json]",
-        summary: "List Windows WDM-KS audio render devices and probe 352.8 / 384 kHz 8fS support",
-        details: "Enumerates present WDM-KS WaveRT audio render devices, probes 32-bit 352.8 kHz and 384 kHz support cleanly (reporting busy if another exclusive player holds the DAC), and marks which DAC auto-selection would choose.",
+        usage: "audiophile-player devices [--output wdm-ks|wasapi] [--json]",
+        summary: "List Windows WDM-KS or WASAPI Exclusive audio render devices and probe 8fS support",
+        details: "Enumerates present WDM-KS WaveRT (default) or WASAPI Exclusive (`--output wasapi`) audio render devices, probes 32-bit 352.8 kHz and 384 kHz support cleanly (reporting busy if another exclusive player holds the DAC), and marks which DAC auto-selection would choose.",
         examples: &[
             "audiophile-player devices",
+            "audiophile-player devices --output wasapi",
             "audiophile-player devices --json",
         ],
         since: "0.2.0",
@@ -378,10 +380,31 @@ pub static OPTIONS: &[OptSpec] = &[
         scope: &[Cmd::Play, Cmd::Restart],
         group: Group::Output,
         restart: Restart::Always,
-        summary: "WDM-KS DAC name substring (default: auto-select best USB DAC)",
-        details: "Case-insensitive substring matched against present WDM-KS WaveRT audio render devices. When omitted, prefers Schiit / Unison / USB Audio Class 2.0 DACs automatically.",
+        summary: "DAC name substring (default: auto-select best USB DAC)",
+        details: "Case-insensitive substring matched against present WDM-KS WaveRT or WASAPI Exclusive audio render devices. When omitted, prefers Schiit / Unison / USB Audio Class 2.0 DACs automatically.",
         examples: &["audiophile-player --device \"Gungnir 2\""],
         since: "0.1.0",
+    },
+    OptSpec {
+        name: "--output",
+        short: None,
+        value: ValueKind::Enum {
+            placeholder: "BACKEND",
+            values: OUTPUT_VALUES,
+        },
+        default: Some("wdm-ks"),
+        config_key: Some("player.output"),
+        scope: &[Cmd::Play, Cmd::Devices, Cmd::Restart],
+        group: Group::Output,
+        restart: Restart::Always,
+        summary: "Zero-mixer Windows output backend: wdm-ks | wasapi",
+        details: "Selects the strictly zero-mixer Windows output transport: `wdm-ks` (default, direct Kernel Streaming WaveRT bypassing both audiodg.exe and AudioSes.dll) or `wasapi` (event-driven WASAPI Exclusive Mode with automatic buffer-alignment retry, bypassing the Windows audio mixer). Windows Shared Mode is intentionally absent and impossible to fall back to.",
+        examples: &[
+            "audiophile-player --output wasapi",
+            "audiophile-player --output wdm-ks",
+            "audiophile-player devices --output wasapi",
+        ],
+        since: "0.2.0",
     },
     OptSpec {
         name: "--dac-bits",

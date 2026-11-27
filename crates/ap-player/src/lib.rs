@@ -79,7 +79,10 @@ pub fn run_cli_main() -> ExitCode {
             config_path,
             as_json,
         } => finish_cli(diag::run_doctor_cli(config_path.as_deref(), as_json)),
-        RunMode::Devices { as_json } => finish_cli(diag::run_devices_cli(as_json)),
+        RunMode::Devices {
+            output_transport,
+            as_json,
+        } => finish_cli(diag::run_devices_cli(output_transport, as_json)),
         RunMode::Config(cmd) => finish_cli(diag::run_config_cli(cmd)),
         RunMode::Status { as_json } => finish_cli(lifecycle::run_status_cli(as_json)),
         RunMode::Stop {
@@ -112,6 +115,7 @@ pub fn run_cli_main() -> ExitCode {
                     config_path,
                     music_dir,
                     device_filter,
+                    output_transport,
                     max_rate_hz,
                     optimization,
                     optimization_explicit,
@@ -126,6 +130,7 @@ pub fn run_cli_main() -> ExitCode {
                     config_path,
                     music_dir,
                     device_filter,
+                    output_transport,
                     max_rate_hz,
                     optimization,
                     optimization_explicit,

@@ -15,13 +15,17 @@ use std::process::Command;
 
 use ap_control::server::{DEFAULT_PORT_END, DEFAULT_PORT_START};
 use ap_core::config::{
-    ALL_KNOWN_CONFIG_KEYS, LOCAL_CONFIG_FILENAME, PlayerConfig, canonicalize_config_key,
-    format_toml_value_for_key, unset_toml_key_preserving_comments,
+    ALL_KNOWN_CONFIG_KEYS, LOCAL_CONFIG_FILENAME, OutputTransport, PlayerConfig,
+    canonicalize_config_key, format_toml_value_for_key, unset_toml_key_preserving_comments,
     upsert_toml_key_preserving_comments, write_config_with_backup,
 };
 use ap_core::format::DacWireFormat;
 use ap_core::json::JsonValue;
 use ap_output_win::sink::OutputError;
+use ap_output_win::wasapi_exclusive::{
+    WasapiRenderDevice, enumerate_wasapi_render_devices, probe_wasapi_device_capabilities,
+    probe_wasapi_device_format, select_wasapi_device,
+};
 use ap_output_win::wdm_ks::{
     KsRenderDevice, enumerate_wdm_ks_render_devices, probe_ks_device_capabilities,
     probe_ks_device_format, select_wdm_ks_device,
@@ -45,6 +49,7 @@ pub fn version_json() -> JsonValue {
             "features",
             JsonValue::Array(vec![
                 JsonValue::from("wdm-ks-wavert"),
+                JsonValue::from("wasapi-exclusive"),
                 JsonValue::from("8fs-f64-dsp"),
                 JsonValue::from("rew-upols-convolution"),
                 JsonValue::from("upnp-av-renderer"),
@@ -180,9 +185,85 @@ pub fn probe_all_render_devices() -> Result<Vec<ProbedDeviceInfo>, String> {
     Ok(out)
 }
 
-/// Build `devices --json` payload (`schema: "ap.devices/1"`).
+fn probe_wasapi_rate_status(dev: &WasapiRenderDevice, rate_hz: u32) -> String {
+    match probe_wasapi_device_format(dev, rate_hz, DacWireFormat::Int32) {
+        Ok(()) => "supported".to_string(),
+        Err(OutputError::DeviceBusy { .. }) => "busy".to_string(),
+        Err(OutputError::UnsupportedFormat { .. }) => "unsupported".to_string(),
+        Err(err) => format!("error: {err}"),
+    }
+}
+
+pub fn probe_all_wasapi_render_devices() -> Result<Vec<ProbedDeviceInfo>, String> {
+    let devices = enumerate_wasapi_render_devices().map_err(|e| e.to_string())?;
+    let auto_pick_id = select_wasapi_device(&devices, None)
+        .ok()
+        .map(|d| d.endpoint_id.clone());
+
+    let mut out = Vec::with_capacity(devices.len());
+    for dev in devices {
+        let r352 = probe_wasapi_rate_status(&dev, 352_800);
+        let r384 = probe_wasapi_rate_status(&dev, 384_000);
+        let busy_8fs = r352 == "busy" && r384 == "busy";
+        let supports_8fs = (r352 == "supported" && r384 == "supported") || busy_8fs;
+
+        let (max_rate_44k, wire_format_44k, max_rate_48k, wire_format_48k) = if supports_8fs {
+            (
+                Some(352_800),
+                Some(DacWireFormat::Int32.label()),
+                Some(384_000),
+                Some(DacWireFormat::Int32.label()),
+            )
+        } else {
+            match probe_wasapi_device_capabilities(&dev, None) {
+                Ok(caps) => (
+                    caps.target_for_352800.map(|t| t.sample_rate_hz),
+                    caps.target_for_352800.map(|t| t.wire_format.label()),
+                    caps.target_for_384000.map(|t| t.sample_rate_hz),
+                    caps.target_for_384000.map(|t| t.wire_format.label()),
+                ),
+                Err(_) => (None, None, None, None),
+            }
+        };
+
+        let supports_any_rate = supports_8fs || max_rate_44k.is_some() || max_rate_48k.is_some();
+        let downsampling_needed = supports_any_rate && !supports_8fs;
+        let auto_selected = auto_pick_id
+            .as_deref()
+            .is_some_and(|p| p == dev.endpoint_id);
+        out.push(ProbedDeviceInfo {
+            friendly_name: dev.friendly_name,
+            device_path: dev.endpoint_id,
+            render_pin_id: 0,
+            supports_looped_wavert: true,
+            rate_352800: r352,
+            rate_384000: r384,
+            supports_8fs,
+            max_rate_44k,
+            wire_format_44k,
+            max_rate_48k,
+            wire_format_48k,
+            supports_any_rate,
+            downsampling_needed,
+            auto_selected,
+        });
+    }
+    Ok(out)
+}
+
+/// Build `devices --json` payload (`schema: "ap.devices/1"`) for the default WDM-KS backend.
 pub fn devices_report_json() -> Result<JsonValue, CliError> {
-    let probed = probe_all_render_devices().map_err(CliError::device)?;
+    devices_report_json_for(OutputTransport::WdmKs)
+}
+
+/// Build `devices --json` payload (`schema: "ap.devices/1"`) for a specific zero-mixer backend.
+pub fn devices_report_json_for(transport: OutputTransport) -> Result<JsonValue, CliError> {
+    let probed = match transport {
+        OutputTransport::WdmKs => probe_all_render_devices().map_err(CliError::device)?,
+        OutputTransport::WasapiExclusive => {
+            probe_all_wasapi_render_devices().map_err(CliError::device)?
+        }
+    };
     let arr: Vec<JsonValue> = probed
         .iter()
         .map(|d| {
@@ -212,13 +293,25 @@ pub fn devices_report_json() -> Result<JsonValue, CliError> {
         .collect();
     Ok(JsonValue::obj(vec![
         ("schema", JsonValue::from("ap.devices/1")),
+        ("backend", JsonValue::from(transport.as_str())),
         ("count", JsonValue::from(probed.len())),
         ("devices", JsonValue::Array(arr)),
     ]))
 }
 
-pub fn run_devices_cli(as_json: bool) -> Result<(), CliError> {
-    let json = devices_report_json()?;
+pub fn run_devices_cli(
+    output_transport: Option<OutputTransport>,
+    as_json: bool,
+) -> Result<(), CliError> {
+    let transport = match output_transport {
+        Some(t) => t,
+        None => PlayerConfig::discover_and_load(None)
+            .ok()
+            .and_then(|c| c.config.player.output)
+            .and_then(|s| OutputTransport::parse(&s).ok())
+            .unwrap_or(OutputTransport::WdmKs),
+    };
+    let json = devices_report_json_for(transport)?;
     if as_json {
         println!("{}", json.to_pretty_string());
         return Ok(());
@@ -226,11 +319,12 @@ pub fn run_devices_cli(as_json: bool) -> Result<(), CliError> {
     let Some(devs) = json.get("devices").and_then(JsonValue::as_array) else {
         return Ok(());
     };
+    let label = transport.display_label();
     if devs.is_empty() {
-        println!("No WDM-KS WaveRT audio render devices found.");
+        println!("No {label} audio render devices found.");
         return Ok(());
     }
-    println!("WDM-KS WaveRT Audio Render Devices ({}):", devs.len());
+    println!("{label} Audio Render Devices ({}):", devs.len());
     for d in devs {
         let name = d
             .get("friendly_name")

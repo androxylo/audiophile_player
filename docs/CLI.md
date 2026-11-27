@@ -16,7 +16,7 @@
 | `filters` | `audiophile-player filters <show\|diff\|set\|check\|relink\|migrate> [ARGS]` | Inspect, edit, validate, relink, or migrate Schema-2 filter choices |
 | `help` | `audiophile-player help [<OPTION\|COMMAND>] [--json \| --markdown]` | Show grouped summary help, option/command detail, JSON spec, or Markdown docs |
 | `doctor` | `audiophile-player doctor [--config <PATH>] [--json]` | Check OS, toolchain, DAC 8fS support, config, music folder, ports, and driver status |
-| `devices` | `audiophile-player devices [--json]` | List Windows WDM-KS audio render devices and probe 352.8 / 384 kHz 8fS support |
+| `devices` | `audiophile-player devices [--output wdm-ks\|wasapi] [--json]` | List Windows WDM-KS or WASAPI Exclusive audio render devices and probe 8fS support |
 | `config` | `audiophile-player config <show\|set\|unset> [ARGS]` | Inspect effective configuration or edit config.toml safely with .bak backup |
 | `status` | `audiophile-player status [--json]` | Query the running player instance via run.json and /api/v1/status |
 | `stop` | `audiophile-player stop [--when now\|after-track] [--json]` | Gracefully stop the running player instance and release the DAC |
@@ -29,7 +29,8 @@
 
 | Option | Config key | Default | Scope | Restart | Summary |
 |---|---|---|---|---|---|
-| `--device NAME` | `player.device` | `auto (best USB DAC)` | play, restart | restart | WDM-KS DAC name substring (default: auto-select best USB DAC) |
+| `--device NAME` | `player.device` | `auto (best USB DAC)` | play, restart | restart | DAC name substring (default: auto-select best USB DAC) |
+| `--output BACKEND` | `player.output` | `wdm-ks` | play, devices, restart | restart | Zero-mixer Windows output backend: wdm-ks \| wasapi |
 | `--dac-bits N` | `quantizer.dac_bits` | `24` | play, restart | restart | Quantizer DAC bit depth: 16 \| 18 \| 20 \| 24 |
 | `--max-rate HZ` | `player.max_rate` | `auto (highest DAC rate)` | play, restart | restart | Cap DAC output sample rate (Hz); main DSP stays locked at 8fS (352.8/384 kHz) |
 | `--opt LEVEL` | `player.opt` | `high (extreme in --ultimate)` | play, restart | restart | Windows kernel-streaming priority tier: normal \| high \| extreme |
