@@ -687,6 +687,21 @@ impl Upsampler for FftUpolsUpsampler {
         self.kernel.metrics.num_taps
     }
 
+    fn latency_samples(&self) -> usize {
+        self.kernel.pad_tail * self.kernel.ratio
+    }
+
+    #[cfg(any(test, feature = "verify"))]
+    fn verify_export(&self) -> Option<crate::upsampler::UpsamplerExport> {
+        Some(crate::upsampler::UpsamplerExport {
+            ratio: self.kernel.ratio,
+            taps_per_phase: self.kernel.taps_per_phase,
+            pad_lead: self.kernel.pad_lead,
+            pad_tail: self.kernel.pad_tail,
+            bank: Arc::clone(&self.kernel.bank),
+        })
+    }
+
     fn design_metrics(&self) -> Option<FilterDesignMetrics> {
         Some(self.kernel.metrics)
     }

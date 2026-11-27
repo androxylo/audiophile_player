@@ -193,12 +193,55 @@ impl UpsamplerCarryover {
     }
 }
 
+/// Read-only verification snapshot of an active upsampler's polyphase bank and alignment
+/// (`PIPELINE_TESTS_REVIEW.md` §2.3, exposed only under `test` or `feature = "verify"`).
+#[cfg(any(test, feature = "verify"))]
+#[derive(Debug, Clone)]
+pub struct UpsamplerExport {
+    pub ratio: usize,
+    pub taps_per_phase: usize,
+    pub pad_lead: usize,
+    pub pad_tail: usize,
+    pub bank: Arc<Vec<Vec<f64>>>,
+}
+
+#[cfg(any(test, feature = "verify"))]
+impl UpsamplerExport {
+    /// Causal prototype FIR taps `h[0..taps_per_phase * ratio]` corresponding to zero-stuffed
+    /// linear convolution `h[j * ratio + p] = bank[p][taps_per_phase - 1 - j]`.
+    pub fn prototype_taps(&self) -> Vec<f64> {
+        let mut h = vec![0.0_f64; self.taps_per_phase * self.ratio];
+        for (p, coeffs) in self.bank.iter().enumerate() {
+            for j in 0..self.taps_per_phase {
+                h[j * self.ratio + p] = coeffs[self.taps_per_phase - 1 - j];
+            }
+        }
+        h
+    }
+
+    /// Exact leading discard / latency in output-rate samples (`pad_tail * ratio`).
+    pub fn latency_samples(&self) -> usize {
+        self.pad_tail * self.ratio
+    }
+}
+
 /// Pluggable stateful floating-point upsampler (`StereoF64Buffer -> StereoF64Buffer`).
 pub trait Upsampler: Send {
     fn name(&self) -> &'static str;
 
     /// Prototype FIR kernel tap count (`0` for [`NullUpsampler`]).
     fn total_taps(&self) -> usize;
+
+    /// Exact alignment latency in output-rate samples (`pad_tail * ratio`; `0` for `NullUpsampler`).
+    fn latency_samples(&self) -> usize {
+        0
+    }
+
+    /// Read-only polyphase bank & alignment export for independent loopback null verification.
+    #[cfg(any(test, feature = "verify"))]
+    fn verify_export(&self) -> Option<UpsamplerExport> {
+        None
+    }
 
     /// Measured/analytical filter metadata (`None` for [`NullUpsampler`]).
     fn design_metrics(&self) -> Option<FilterDesignMetrics> {
@@ -808,6 +851,14 @@ pub struct DesignedGaussianFilter {
     pub identity: FilterIdentity,
 }
 
+#[cfg(any(test, feature = "verify"))]
+impl DesignedGaussianFilter {
+    /// Read-only slice of the designed prototype FIR taps (`sum(taps) == ratio`).
+    pub fn taps(&self) -> &[f64] {
+        &self.prototype
+    }
+}
+
 /// Evaluate the exact zero-phase DTFT magnitude `|H(f)|` of a symmetric odd-length prototype
 /// `h[0..N]` (normalized to `sum(h) == ratio`) at frequency `freq_hz` (`0..=fs_out/2`).
 pub fn evaluate_symmetric_prototype_mag(
@@ -842,6 +893,14 @@ pub struct DesignedFilter {
     pub pad_tail: usize,
     pub metrics: FilterDesignMetrics,
     pub identity: FilterIdentity,
+}
+
+#[cfg(any(test, feature = "verify"))]
+impl DesignedFilter {
+    /// Read-only slice of the designed prototype FIR taps (`sum(taps) == ratio`).
+    pub fn taps(&self) -> &[f64] {
+        &self.prototype
+    }
 }
 
 /// Evaluate the exact DTFT magnitude `|H(f)|` of an arbitrary causal prototype `h[0..N]`
@@ -1917,6 +1976,25 @@ impl Upsampler for PolyphaseFirUpsampler {
         self.total_taps
     }
 
+    fn latency_samples(&self) -> usize {
+        self.pad_tail * self.ratio
+    }
+
+    #[cfg(any(test, feature = "verify"))]
+    fn verify_export(&self) -> Option<UpsamplerExport> {
+        let pad_lead = self
+            .taps_per_phase
+            .saturating_sub(1)
+            .saturating_sub(self.pad_tail);
+        Some(UpsamplerExport {
+            ratio: self.ratio,
+            taps_per_phase: self.taps_per_phase,
+            pad_lead,
+            pad_tail: self.pad_tail,
+            bank: Arc::clone(&self.bank),
+        })
+    }
+
     fn design_metrics(&self) -> Option<FilterDesignMetrics> {
         self.metrics
     }
@@ -2101,6 +2179,13 @@ impl Upsampler for SimpleWindowedSincUpsampler {
     }
     fn total_taps(&self) -> usize {
         self.0.total_taps()
+    }
+    fn latency_samples(&self) -> usize {
+        self.0.latency_samples()
+    }
+    #[cfg(any(test, feature = "verify"))]
+    fn verify_export(&self) -> Option<UpsamplerExport> {
+        self.0.verify_export()
     }
     fn design_metrics(&self) -> Option<FilterDesignMetrics> {
         self.0.design_metrics()

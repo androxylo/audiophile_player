@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 androxylo
+
+[package]
+name = "ap-verify"
+description = "Independent f64 loopback null verification suite, harshness/NTF metrics, and ap-null CLI for Audiophile Player"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "ap-null"
+path = "src/bin/ap_null.rs"
+
+[dependencies]
+ap-core.workspace = true
+ap-source.workspace = true
+ap-dsp = { path = "../ap-dsp", features = ["verify"] }
+ap-output-win = { path = "../ap-output-win", features = ["verify"] }
+rustfft = "6.4"

@@ -14,6 +14,7 @@ members = [
     "crates/ap-control",
     "crates/ap-upnp",
     "crates/ap-cli",
+    "crates/ap-verify",
 ]
 
 [workspace.package]
@@ -40,4 +41,7 @@ opt-level = 3
 # Keep ap-dsp fast in dev/test builds (debug assertions remain enabled) so
 # 384 kHz pipeline and loopback null tests run at >10x real time.
 [profile.dev.package.ap-dsp]
+opt-level = 2
+
+[profile.dev.package.ap-verify]
 opt-level = 2

@@ -259,6 +259,12 @@ impl StreamingQuantizer {
         self.shaper_r.reset();
     }
 
+    /// Override the deterministic SplitMix64 TPDF PRNG seed for verification tests.
+    #[cfg(any(test, feature = "verify"))]
+    pub fn set_seed(&mut self, seed: u64) {
+        self.rng_state = seed;
+    }
+
     #[inline]
     fn next_uniform(&mut self) -> f64 {
         self.rng_state = self.rng_state.wrapping_add(0x9E37_79B9_7F4A_7C15);

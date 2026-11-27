@@ -132,9 +132,26 @@ impl ConvolutionTail {
     }
 }
 
+/// Read-only verification snapshot of an active REW stereo impulse response
+/// (`PIPELINE_TESTS_REVIEW.md` §2.3, exposed only under `test` or `feature = "verify"`).
+#[cfg(any(test, feature = "verify"))]
+#[derive(Debug, Clone, Copy)]
+pub struct ConvolverIrExport<'a> {
+    pub sample_rate_hz: u32,
+    pub left: &'a [f64],
+    pub right: &'a [f64],
+    pub flush_tail_samples: usize,
+}
+
 /// Pluggable stateful stereo convolution stage operating strictly in IEEE 754 `f64`.
 pub trait StereoConvolver: Send {
     fn name(&self) -> &'static str;
+
+    /// Read-only access to the active stereo impulse response for independent null verification.
+    #[cfg(any(test, feature = "verify"))]
+    fn ir(&self) -> Option<ConvolverIrExport<'_>> {
+        None
+    }
 
     /// Human-readable description (e.g., active REW WAV filename & tap count) for logs/UI.
     fn description(&self) -> String {
@@ -700,6 +717,10 @@ pub struct PreparedStereoIr {
     nonzero_right: Vec<bool>,
     nonzero_count_left: usize,
     nonzero_count_right: usize,
+    #[cfg(any(test, feature = "verify"))]
+    raw_ir_left: Vec<f64>,
+    #[cfg(any(test, feature = "verify"))]
+    raw_ir_right: Vec<f64>,
 }
 
 impl std::fmt::Debug for PreparedStereoIr {
@@ -892,6 +913,10 @@ impl PreparedStereoIr {
             nonzero_right,
             nonzero_count_left,
             nonzero_count_right,
+            #[cfg(any(test, feature = "verify"))]
+            raw_ir_left: left.to_vec(),
+            #[cfg(any(test, feature = "verify"))]
+            raw_ir_right: right.to_vec(),
         })
     }
 
@@ -1361,6 +1386,16 @@ impl StereoConvolver for PartitionedStereoConvolver {
 
     fn content_hash(&self) -> Option<&str> {
         Some(&self.ir.content_hash)
+    }
+
+    #[cfg(any(test, feature = "verify"))]
+    fn ir(&self) -> Option<ConvolverIrExport<'_>> {
+        Some(ConvolverIrExport {
+            sample_rate_hz: self.ir.sample_rate_hz,
+            left: &self.ir.raw_ir_left,
+            right: &self.ir.raw_ir_right,
+            flush_tail_samples: self.ir.flush_tail_samples,
+        })
     }
 
     fn set_output_scale(&mut self, scale_linear: f64) {

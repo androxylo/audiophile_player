@@ -10,6 +10,10 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+verify = []
+
 [dependencies]
 ap-core.workspace = true
 realfft = "3.4"

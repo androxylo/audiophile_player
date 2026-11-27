@@ -438,6 +438,41 @@ fn pack_wire_frame(
     }
 }
 
+/// Decode little-endian wire bytes emitted by [`WaveRtFramePump::fill_slice`] back into
+/// MSB-aligned stereo `[i32; 2]` frames (exact inverse of `encode_frames_into`, exposed under
+/// `test` or `feature = "verify"` for Layer C loopback null verification).
+#[cfg(any(test, feature = "verify"))]
+pub fn decode_wire_frames(bytes: &[u8], wire_format: DacWireFormat) -> Result<Vec<[i32; 2]>, String> {
+    let bpf = wire_format.bytes_per_frame();
+    if bpf == 0 || bytes.len() % bpf != 0 {
+        return Err(format!(
+            "wire buffer length {} is not a multiple of {} bytes/frame ({wire_format:?})",
+            bytes.len(),
+            bpf
+        ));
+    }
+    let count = bytes.len() / bpf;
+    let mut frames = Vec::with_capacity(count);
+    for chunk in bytes.chunks_exact(bpf) {
+        let frame = match wire_format {
+            DacWireFormat::Int32 | DacWireFormat::Int24In32 => [
+                i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
+                i32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]),
+            ],
+            DacWireFormat::Int24Packed => [
+                i32::from_le_bytes([0, chunk[0], chunk[1], chunk[2]]),
+                i32::from_le_bytes([0, chunk[3], chunk[4], chunk[5]]),
+            ],
+            DacWireFormat::Int16 => [
+                i32::from(i16::from_le_bytes([chunk[0], chunk[1]])) << 16,
+                i32::from(i16::from_le_bytes([chunk[2], chunk[3]])) << 16,
+            ],
+        };
+        frames.push(frame);
+    }
+    Ok(frames)
+}
+
 /// Shared frame encoder used by both `WaveRtFramePump` and `StreamingWaveRtPump`.
 #[inline]
 fn encode_frames_into(

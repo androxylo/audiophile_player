@@ -202,6 +202,8 @@ pub struct PipelineReport {
     pub headroom: HeadroomDecision,
     pub dsp_plan: SelectedDspPlan,
     pub filter_metrics: Option<FilterDesignMetrics>,
+    /// Exact upsampler alignment latency in internal-rate samples (`pad_tail * ratio`).
+    pub upsampler_latency_samples: usize,
     pub deemphasis_name: &'static str,
     pub convolver_name: &'static str,
     pub convolver_description: String,
@@ -332,6 +334,37 @@ impl StreamingPipelineSession {
     /// L1 sum `sum(|c_k|)` of the active noise-shaper feedback coefficients (for `quantizer_margin_db`).
     pub fn shaper_l1_sum(&self) -> f64 {
         self.quantizer.coeffs().iter().map(|c| c.abs()).sum()
+    }
+
+    /// Read-only verification accessors (`PIPELINE_TESTS_REVIEW.md` §2.3).
+    #[cfg(any(test, feature = "verify"))]
+    pub fn upsampler_export(&self) -> Option<crate::upsampler::UpsamplerExport> {
+        self.upsampler.verify_export()
+    }
+
+    #[cfg(any(test, feature = "verify"))]
+    pub fn downsampler_kernel(&self) -> Option<crate::downsampler::DownsamplerExport> {
+        self.downsampler.kernel()
+    }
+
+    #[cfg(any(test, feature = "verify"))]
+    pub fn convolver_ir(&self) -> Option<crate::convolution::ConvolverIrExport<'_>> {
+        self.convolver.ir()
+    }
+
+    #[cfg(any(test, feature = "verify"))]
+    pub fn deemphasis_enabled(&self) -> bool {
+        self.deemphasis.is_enabled()
+    }
+
+    #[cfg(any(test, feature = "verify"))]
+    pub fn shaper_coeffs(&self) -> &'static [f64] {
+        self.quantizer.coeffs()
+    }
+
+    #[cfg(any(test, feature = "verify"))]
+    pub fn set_quantizer_seed(&mut self, seed: u64) {
+        self.quantizer.set_seed(seed);
     }
 
     /// Active convolver's peak frequency-domain boost `G_c` in dB (`0.0` for `NullConvolver`).
@@ -1050,6 +1083,7 @@ impl AudioPipeline {
             headroom,
             dsp_plan,
             filter_metrics: upsampler.design_metrics(),
+            upsampler_latency_samples: upsampler.latency_samples(),
             deemphasis_name: deemphasis.name(),
             convolver_name: convolver.name(),
             convolver_description: conv_desc,

@@ -43,6 +43,21 @@ pub struct DownsamplerCarryover {
     pub pad_tail: usize,
 }
 
+/// Read-only verification snapshot of an active downsampler's polyphase bank and alignment
+/// (`PIPELINE_TESTS_REVIEW.md` §2.3, exposed only under `test` or `feature = "verify"`).
+#[cfg(any(test, feature = "verify"))]
+#[derive(Debug, Clone)]
+pub struct DownsamplerExport {
+    pub input_rate_hz: u32,
+    pub output_rate_hz: u32,
+    pub up_l: usize,
+    pub down_m: usize,
+    pub taps_per_phase: usize,
+    pub pad_lead: usize,
+    pub pad_tail: usize,
+    pub bank: Arc<Vec<Vec<f64>>>,
+}
+
 /// Pluggable stateful pure-`f64` last-stage output downsampler (`8fS -> DAC rate`).
 pub trait Downsampler: Send {
     fn name(&self) -> &'static str;
@@ -50,6 +65,10 @@ pub trait Downsampler: Send {
     fn output_rate_hz(&self) -> u32;
     fn is_bypass(&self) -> bool {
         self.input_rate_hz() == self.output_rate_hz()
+    }
+    #[cfg(any(test, feature = "verify"))]
+    fn kernel(&self) -> Option<DownsamplerExport> {
+        None
     }
     fn process_block(&mut self, input: StereoF64Buffer) -> Result<StereoF64Buffer, String>;
     /// Exact number of output frames that `flush()` would emit for inputs already pushed so far
@@ -341,6 +360,21 @@ impl Downsampler for PolyphaseDecimator {
 
     fn output_rate_hz(&self) -> u32 {
         self.output_rate_hz
+    }
+
+    #[cfg(any(test, feature = "verify"))]
+    fn kernel(&self) -> Option<DownsamplerExport> {
+        let half_tpp = (self.taps_per_phase - 1) / 2;
+        Some(DownsamplerExport {
+            input_rate_hz: self.input_rate_hz,
+            output_rate_hz: self.output_rate_hz,
+            up_l: self.up_l,
+            down_m: self.down_m,
+            taps_per_phase: self.taps_per_phase,
+            pad_lead: half_tpp,
+            pad_tail: self.pad_tail,
+            bank: Arc::clone(&self.bank),
+        })
     }
 
     fn process_block(&mut self, input: StereoF64Buffer) -> Result<StereoF64Buffer, String> {
