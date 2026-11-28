@@ -1088,26 +1088,30 @@ where
         .and_then(file_size_and_mtime)
         .unwrap_or((0, 0));
 
-    let cached_s2_track: Option<(AlbumTrackAnalysis, bool)> = if is_streaming {
+    let cached_s2_track: Option<(AlbumTrackAnalysis, bool, bool)> = if is_streaming {
         None
     } else if let Some((ref root, ref rel_folder, ref file_name)) = track_loc {
         ult.load_album_cached(root, rel_folder).and_then(|album| {
             let track = album.get_track(file_name)?.clone();
-            let current = track.detector_version == DETECTOR_VERSION
-                && track.matches_identity(
-                    header_md5_hex.as_deref(),
-                    Some(file_size),
-                    Some(file_mtime),
-                );
-            Some((track, current))
+            // Issue #23 P1 (K5): split audio-identity validity (`peak_current`) from
+            // `DETECTOR_VERSION` validity (`results_current`). Source true peak and exact
+            // post-chain `M` depend only on audio identity + chain, never on detector versions.
+            let peak_current = track.matches_identity(
+                header_md5_hex.as_deref(),
+                Some(file_size),
+                Some(file_mtime),
+            );
+            let results_current = peak_current && track.detector_version == DETECTOR_VERSION;
+            Some((track, results_current, peak_current))
         })
     } else {
         None
     };
 
-    let cached_current = cached_s2_track.as_ref().is_some_and(|(_, cur)| *cur);
-    let base_cached_wt = if let Some((ref t, cur)) = cached_s2_track {
-        CachedWholeTrackEvidence::from_album_track(t, cur)
+    let cached_current = cached_s2_track.as_ref().is_some_and(|(_, cur, _)| *cur);
+    let cached_peak_current = cached_s2_track.as_ref().is_some_and(|(_, _, pcur)| *pcur);
+    let base_cached_wt = if let Some((ref t, cur, pcur)) = cached_s2_track {
+        CachedWholeTrackEvidence::from_album_track_with_peak(t, cur, pcur)
     } else {
         CachedWholeTrackEvidence::default()
     };
@@ -1207,13 +1211,14 @@ where
     );
 
     // Look up cached exact whole-track M (local files only; NEVER used for streams per OQ-33!).
-    let cached_exact_m_db = if is_streaming || !cached_current {
+    // Issue #23 P1 (K5): gated on `cached_peak_current` (audio identity only), NOT DETECTOR_VERSION.
+    let cached_exact_m_db = if is_streaming || !cached_peak_current {
         None
     } else {
         cached_s2_track
             .as_ref()
-            .filter(|(_, cur)| *cur)
-            .and_then(|(t, _)| t.find_post_chain_peak(&post_key))
+            .filter(|(_, _, pcur)| *pcur)
+            .and_then(|(t, _, _)| t.find_post_chain_peak(&post_key))
     };
 
     let m30_dbfs = linear_to_dbfs(m30_linear);
@@ -2297,7 +2302,10 @@ mod tests {
             false,
             16_384,
         );
-        assert!(matches!(r1, UltimateStreamResult::Played { wrote_yaml: true, .. }));
+        assert!(
+            matches!(r1, UltimateStreamResult::Played { wrote_yaml: true, .. }),
+            "expected Play 1 to succeed and write YAML, got {r1:?}"
+        );
         let (rep1, frames1, _) = drain_h.join().unwrap();
         assert_eq!(frames1, 44_100 * 31);
         assert!(
@@ -3889,5 +3897,165 @@ mod tests {
         run_l1_case("hot_isp_rew_plus6", &hot_l, &hot_r, rew_cfg, 0x23);
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Issue #23 T4 (P1 / K5): a cached Schema-2 track entry with an older `DETECTOR_VERSION`
+    /// but matching audio identity (MD5) MUST still reuse its cached exact post-chain `M` and
+    /// whole-track `true_peak_dbtp`, while recomputing detector results fresh from W30.
+    #[test]
+    fn t4_stale_detector_version_reuses_exact_m_and_true_peak_while_recomputing_detectors() {
+        let db_root = temp_dir("t4_stale_dv");
+        let track_path = db_root.join("t4_track.flac");
+        fs::write(&track_path, b"t4-audio-fixture").unwrap();
+
+        let fast_pipeline = AudioPipeline::with_rew_config_full_tail(
+            UpsamplerPolicy {
+                filter_override: None,
+                max_taps: 16_384,
+                dac_bits: 24,
+                ..UpsamplerPolicy::default()
+            },
+            ConvolutionConfig::disabled(),
+            true,
+        )
+        .unwrap();
+
+        let ult = UltimateRuntimeContext::for_test(
+            UltimateConfig {
+                enabled: true,
+                learn_on_play: true,
+                genre_rules: true,
+            },
+            db_root.clone(),
+        );
+
+        let buf = BoundedBlockStreamBuffer::with_limits(
+            ULTIMATE_MAX_BUFFERED_FRAMES,
+            Duration::from_secs(ULTIMATE_MAX_BUFFERED_SECONDS),
+        );
+        let ep = buf.current_epoch();
+        let mut carry = None;
+        let mut backup = None;
+        let mut pend = false;
+
+        // Play 1 (uncached): populates Schema-2 YAML with exact M and true_peak_dbtp.
+        let mut src1 = SyntheticSource::sine(44_100, 31.0, 0.25, false);
+        src1.streaminfo_md5 = Some([0x44; 16]);
+        src1.computed_md5_at_eof = Some([0x44; 16]);
+        let buf_c1 = Arc::clone(&buf);
+        let h1 = std::thread::spawn(move || drain_track_events(&buf_c1, ep));
+        let r1 = stream_track_ultimate(
+            &fast_pipeline,
+            &ult,
+            &buf,
+            ep,
+            || false,
+            &mut src1,
+            &track_path,
+            Some(&track_path),
+            None,
+            None,
+            PlayModeLabel::SingleFile,
+            Some(31.0),
+            &mut carry,
+            &mut backup,
+            &mut pend,
+            false,
+            16_384,
+        );
+        assert!(
+            matches!(r1, UltimateStreamResult::Played { wrote_yaml: true, .. }),
+            "expected Play 1 to succeed and write YAML, got {r1:?}"
+        );
+        let _ = h1.join().unwrap();
+
+        // Simulate a DETECTOR_VERSION upgrade by downgrading stored detector_version on disk
+        // and mutating stored detector findings (apodizing_needed = "positive") while keeping
+        // the exact same MD5, true_peak_dbtp, and post_chain_peaks!
+        let mut album = ult
+            .filter_db
+            .load_album("main", "")
+            .expect("Schema-2 album must exist after Play 1");
+        let stale_dv = DETECTOR_VERSION.saturating_sub(1);
+        album.detector_version = stale_dv;
+        {
+            let entry = album
+                .tracks
+                .get_mut("t4_track.flac")
+                .expect("track entry must exist");
+            assert!(!entry.post_chain_peaks.is_empty());
+            entry.detector_version = stale_dv;
+            entry.apodizing_needed = "positive".to_string();
+            entry.apod_events = 99;
+        }
+        let lock = ult
+            .filter_db
+            .try_lock_album("main", "")
+            .unwrap()
+            .expect("album lock");
+        ult.filter_db.save_album_under_lock(&album, &lock).unwrap();
+        drop(lock);
+
+        // Fresh runtime context so in-memory album cache reloads the stale-detector_version YAML.
+        let ult2 = UltimateRuntimeContext::for_test(
+            UltimateConfig {
+                enabled: true,
+                learn_on_play: false,
+                genre_rules: true,
+            },
+            db_root.clone(),
+        );
+
+        let mut src2 = SyntheticSource::sine(44_100, 31.0, 0.25, false);
+        src2.streaminfo_md5 = Some([0x44; 16]);
+        src2.computed_md5_at_eof = Some([0x44; 16]);
+        let buf_c2 = Arc::clone(&buf);
+        let h2 = std::thread::spawn(move || drain_track_events(&buf_c2, ep));
+        let r2 = stream_track_ultimate(
+            &fast_pipeline,
+            &ult2,
+            &buf,
+            ep,
+            || false,
+            &mut src2,
+            &track_path,
+            Some(&track_path),
+            None,
+            None,
+            PlayModeLabel::SingleFile,
+            Some(31.0),
+            &mut carry,
+            &mut backup,
+            &mut pend,
+            false,
+            16_384,
+        );
+        assert!(matches!(r2, UltimateStreamResult::Played { .. }));
+        let (rep2, _, _) = h2.join().unwrap();
+        let u2 = rep2.ultimate_report.as_ref().expect("ultimate report");
+
+        // 1. Detector results MUST have been recomputed (clean sine -> NOT apodizing, despite
+        //    stale YAML claiming apodizing_needed="positive")!
+        assert_ne!(
+            u2.winning_rule, "rule_A_apodizing",
+            "stale DETECTOR_VERSION must recompute detector rules instead of trusting stale apodizing finding"
+        );
+        // 2. Exact post-chain M MUST STILL be reused across the DETECTOR_VERSION bump!
+        assert!(
+            u2.cached_m_dbfs.is_some(),
+            "T4: exact post-chain M must still be reused when DETECTOR_VERSION is older but MD5 matches"
+        );
+        assert!(
+            rep2.headroom.reason.contains("ultimate cached exact M"),
+            "T4: headroom must use cached exact M, got reason='{}'",
+            rep2.headroom.reason
+        );
+        assert!(
+            rep2.headroom.total_gain_db().abs() < 1e-6,
+            "T4: quiet -12 dBFS sine with reused exact M must play at 0.0 dB, got {}",
+            rep2.headroom.total_gain_db()
+        );
+
+        let _ = fs::remove_dir_all(&db_root);
     }
 }

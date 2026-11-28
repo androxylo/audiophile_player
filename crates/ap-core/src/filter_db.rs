@@ -38,6 +38,13 @@ use crate::yaml_lite::{
 /// Schema version for per-album analysis files, `library.yaml`, and `relink-report.yaml`.
 pub const FILTER_DB_SCHEMA_VERSION: u32 = 2;
 
+/// True-peak meter id for the 4× oversampling 12-tap/phase meter (`ap_dsp::analysis::TruePeakMeter4x`).
+/// Also assumed for legacy Schema-2 entries that stored `true_peak_dbtp` without an explicit `meter` field.
+pub const TRUE_PEAK_METER_4X_12: &str = "tp4x-12";
+
+/// True-peak meter id for the high-accuracy 8× oversampling 32-tap/phase Kaiser meter (`ap_dsp::peak_scan`).
+pub const TRUE_PEAK_METER_8X_32: &str = "tp8x-32";
+
 /// Hard maximum size for a Schema-2 album analysis YAML file (256 KiB — comfortably covers
 /// 100+ track box sets while bounding untrusted-file memory).
 pub const MAX_ALBUM_YAML_BYTES: usize = 256 * 1024;
@@ -468,6 +475,10 @@ pub struct AlbumTrackAnalysis {
     pub lufs: Option<f64>,
     pub sample_peak: f64,
     pub true_peak_dbtp: Option<f64>,
+    /// True-peak meter identifier (`"tp4x-12"` or `"tp8x-32"`). Optional for backward
+    /// compatibility with older Schema-2 files (which default to `"tp4x-12"` via
+    /// [`Self::effective_true_peak_meter`]).
+    pub true_peak_meter: Option<String>,
     pub clipped_runs: u32,
     pub post_chain_peaks: Vec<PostChainPeakEntry>,
 }
@@ -499,6 +510,7 @@ impl Default for AlbumTrackAnalysis {
             lufs: None,
             sample_peak: 0.0,
             true_peak_dbtp: None,
+            true_peak_meter: None,
             clipped_runs: 0,
             post_chain_peaks: Vec::new(),
         }
@@ -535,9 +547,26 @@ impl AlbumTrackAnalysis {
             lufs: entry.results.integrated_lufs,
             sample_peak: entry.results.sample_peak,
             true_peak_dbtp: entry.results.true_peak_dbtp,
+            true_peak_meter: entry
+                .results
+                .true_peak_dbtp
+                .filter(|v| v.is_finite())
+                .map(|_| TRUE_PEAK_METER_4X_12.to_string()),
             clipped_runs: entry.results.clipped_runs,
             post_chain_peaks: entry.results.post_chain_peaks.clone(),
         }
+    }
+
+    /// Effective true-peak meter identifier for this entry. Older Schema-2 entries that stored
+    /// `true_peak_dbtp` without an explicit `meter` field default to [`TRUE_PEAK_METER_4X_12`].
+    pub fn effective_true_peak_meter(&self) -> Option<&str> {
+        self.true_peak_dbtp.filter(|v| v.is_finite())?;
+        Some(
+            self.true_peak_meter
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(TRUE_PEAK_METER_4X_12),
+        )
     }
 
     /// True if this track's identity matches current `(md5, size, mtime)`.
@@ -718,8 +747,12 @@ impl AlbumAnalysisFile {
                 .filter(|v| v.is_finite())
                 .map(|v| format!("{v:.4}"))
                 .unwrap_or_else(|| "null".to_string());
+            let meter_part = match t.effective_true_peak_meter() {
+                Some(m) => format!(", meter: {}", yaml_quote(m)),
+                None => String::new(),
+            };
             s.push_str(&format!(
-                "    loudness: {{ lufs: {lufs_s}, sample_peak: {:.6}, true_peak_dbtp: {tp_s}, clipped_runs: {} }}\n",
+                "    loudness: {{ lufs: {lufs_s}, sample_peak: {:.6}, true_peak_dbtp: {tp_s}{meter_part}, clipped_runs: {} }}\n",
                 t.sample_peak, t.clipped_runs
             ));
 
@@ -934,6 +967,9 @@ impl AlbumAnalysisFile {
                                 "sample_peak" => cur_track.sample_peak = parse_f64(&fv, line_no)?,
                                 "true_peak_dbtp" => {
                                     cur_track.true_peak_dbtp = parse_opt_f64(&fv, line_no)?
+                                }
+                                "meter" | "true_peak_meter" => {
+                                    cur_track.true_peak_meter = parse_opt_str(&fv)?
                                 }
                                 "clipped_runs" => {
                                     cur_track.clipped_runs = parse_u32(&fv, line_no)?
@@ -1526,6 +1562,17 @@ impl FilterDbStore {
                         track.post_chain_peaks.push(old_peak.clone());
                     }
                 }
+                // Issue #23 P1: never downgrade a higher-accuracy tp8x-32 cached true peak
+                // back to tp4x-12 when learn-on-play or a 4x scan updates the same audio.
+                let prev_is_8x = prev.effective_true_peak_meter() == Some(TRUE_PEAK_METER_8X_32);
+                let new_is_8x = track.effective_true_peak_meter() == Some(TRUE_PEAK_METER_8X_32);
+                if prev_is_8x && !new_is_8x {
+                    track.true_peak_dbtp = prev.true_peak_dbtp;
+                    track.true_peak_meter = Some(TRUE_PEAK_METER_8X_32.to_string());
+                    if prev.sample_peak.is_finite() && prev.sample_peak > track.sample_peak {
+                        track.sample_peak = prev.sample_peak;
+                    }
+                }
             }
         }
         album.tracks.insert(target_key, track.clone());
@@ -1725,6 +1772,7 @@ mod tests {
             lufs: Some(-19.8),
             sample_peak: 0.912,
             true_peak_dbtp: Some(-0.6),
+            true_peak_meter: Some(TRUE_PEAK_METER_8X_32.to_string()),
             clipped_runs: 0,
             post_chain_peaks: Vec::new(),
         };
@@ -1753,6 +1801,19 @@ mod tests {
         assert_eq!(p1.apod_events, 14);
         assert_eq!(p1.post_chain_peaks.len(), 1);
         assert!((p1.post_chain_peaks[0].peak_dbfs - (-1.12)).abs() < 1e-6);
+        assert_eq!(p1.effective_true_peak_meter(), Some(TRUE_PEAK_METER_8X_32));
+
+        // Backward-compatibility: legacy Schema-2 YAML without `meter:` defaults to tp4x-12.
+        let legacy_yaml = yaml.replace(&format!(", meter: \"{}\"", TRUE_PEAK_METER_8X_32), "");
+        assert!(!legacy_yaml.contains("meter:"));
+        let parsed_legacy =
+            AlbumAnalysisFile::from_yaml_str(&legacy_yaml).expect("legacy Schema-2 without meter");
+        let p1_legacy = parsed_legacy
+            .tracks
+            .get("01 So What: Live.flac")
+            .expect("legacy track 1");
+        assert_eq!(p1_legacy.true_peak_meter, None);
+        assert_eq!(p1_legacy.effective_true_peak_meter(), Some(TRUE_PEAK_METER_4X_12));
 
         // Reject unsafe YAML constructs and oversized files.
         assert!(AlbumAnalysisFile::from_yaml_str("schema: 2\nroot: !evil foo\n").is_err());
@@ -1821,6 +1882,12 @@ mod tests {
         let mut track = AlbumTrackAnalysis::default();
         track.suggested = "sinc-steep-4m".to_string();
         track.rule = "rule_G_classical".to_string();
+        track.md5 = Some("11223344556677889900aabbccddeeff".to_string());
+        track.size = 12345;
+        track.mtime_unix_s = 1_700_000_000;
+        track.sample_peak = 0.5;
+        track.true_peak_dbtp = Some(-5.92);
+        track.true_peak_meter = Some(TRUE_PEAK_METER_8X_32.to_string());
         let wrote2 = store
             .upsert_track_nonblocking("main", "Jazz/Album", "01.flac", 7, track)
             .unwrap();
@@ -1828,6 +1895,28 @@ mod tests {
         let loaded = store.load_album("main", "Jazz/Album").unwrap();
         assert_eq!(loaded.tracks["01.flac"].suggested, "sinc-steep-4m");
         assert_eq!(loaded.tracks["01.flac"].detector_version, 7);
+        assert_eq!(
+            loaded.tracks["01.flac"].effective_true_peak_meter(),
+            Some(TRUE_PEAK_METER_8X_32)
+        );
+
+        // Upserting a 4x measurement for the same audio MUST NOT downgrade tp8x-32!
+        let mut track_4x = AlbumTrackAnalysis::default();
+        track_4x.suggested = "sinc-steep-4m".to_string();
+        track_4x.rule = "rule_G_classical".to_string();
+        track_4x.md5 = Some("11223344556677889900aabbccddeeff".to_string());
+        track_4x.size = 12345;
+        track_4x.mtime_unix_s = 1_700_000_000;
+        track_4x.sample_peak = 0.49;
+        track_4x.true_peak_dbtp = Some(-6.30);
+        track_4x.true_peak_meter = Some(TRUE_PEAK_METER_4X_12.to_string());
+        let merged = store
+            .upsert_track_nonblocking("main", "Jazz/Album", "01.flac", 8, track_4x)
+            .unwrap()
+            .expect("merged track");
+        assert_eq!(merged.effective_true_peak_meter(), Some(TRUE_PEAK_METER_8X_32));
+        assert!((merged.true_peak_dbtp.unwrap() - (-5.92)).abs() < 1e-6);
+        assert!((merged.sample_peak - 0.5).abs() < 1e-6);
 
         // U8: Corrupt existing album YAML must NEVER be overwritten with a single track!
         let album_path = store.album_yaml_path("main", "Jazz/Album");

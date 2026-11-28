@@ -9,7 +9,7 @@
 //! Order of trust (`docs/research/07-ultimate-mode.md` §5.3):
 //!   `User > Cache (WT) > Header (facts) > Window (W30) > Tag (priors) > Default`
 
-use ap_core::filter_db::AlbumTrackAnalysis;
+use ap_core::filter_db::{AlbumTrackAnalysis, TRUE_PEAK_METER_4X_12};
 use ap_core::headroom::{PEAK_TAG_ROUNDING_TOLERANCE, PeakKind, TrackPeakMetadata};
 use ap_core::metadata::{GenreClass, PhaseTagOverride, TrackMetadata};
 use ap_core::track_db::{
@@ -69,9 +69,13 @@ impl<T> Evidence<T> {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CachedWholeTrackEvidence {
     /// True only when the cached detector results match the current `DETECTOR_VERSION` and file
-    /// identity (Review #7 F1). When `false`, only `user_*` overrides are consulted and fresh
-    /// `W30`/whole-track analysis drives all detector rules (`A`, `H`, `L`, `HF`, `B`, peak).
+    /// identity (Review #7 F1). When `false`, detector rules (`A`, `H`, `L`, `HF`, `B`) are
+    /// recomputed from fresh `W30`/whole-track analysis while `user_*` overrides still apply.
     pub results_current: bool,
+    /// True when the cached entry's audio identity (MD5 / size+mtime) matches the current file,
+    /// independent of `DETECTOR_VERSION` (Issue #23 P1 / K5). Source true peak, sample peak, and
+    /// exact post-chain `M` depend only on the audio and DSP chain — never on detector versions.
+    pub peak_current: bool,
     pub user_filter: Option<String>,
     /// Provenance of `user_filter` when resolved from Schema 2 `my-filters.yaml` (`Track`/`Folder`/`Tag`/`Default`).
     pub user_filter_provenance: Option<UserFilterProvenance>,
@@ -94,7 +98,10 @@ pub struct CachedWholeTrackEvidence {
     pub integrated_lufs: Option<f64>,
     pub clipped_runs: u32,
     pub loud_and_clipped: DetectorVerdict,
+    pub sample_peak: Option<f64>,
     pub true_peak_dbtp: Option<f64>,
+    /// True-peak meter identifier (`"tp4x-12"` / `"tp8x-32"`), populated when `peak_current` is true.
+    pub true_peak_meter: Option<String>,
     pub effective_bits: Option<u16>,
     pub ultrasonic_noise_detected: DetectorVerdict,
 }
@@ -104,14 +111,34 @@ impl CachedWholeTrackEvidence {
     /// When `results_current == false`, only `user:` overrides are preserved while stale
     /// detector results are left `Inconclusive` / `None`.
     pub fn from_track_db_entry(entry: &TrackDbEntry, results_current: bool) -> Self {
+        Self::from_track_db_entry_with_peak(entry, results_current, results_current)
+    }
+
+    /// Convert a Schema-1 [`TrackDbEntry`] with independent `results_current` (identity +
+    /// `DETECTOR_VERSION`) and `peak_current` (audio identity only, Issue #23 P1).
+    pub fn from_track_db_entry_with_peak(
+        entry: &TrackDbEntry,
+        results_current: bool,
+        peak_current: bool,
+    ) -> Self {
         let mut out = Self {
             results_current,
+            peak_current: peak_current || results_current,
             user_filter: entry.user.filter.clone(),
             user_filter_provenance: entry.user.filter.as_ref().map(|_| UserFilterProvenance::Track),
             user_deemphasis: entry.user.deemphasis,
             user_apodizing: entry.user.apodizing,
             ..Self::default()
         };
+        if out.peak_current {
+            out.sample_peak = (entry.results.sample_peak.is_finite()
+                && entry.results.sample_peak > 0.0)
+                .then_some(entry.results.sample_peak);
+            out.true_peak_dbtp = entry.results.true_peak_dbtp.filter(|v| v.is_finite());
+            out.true_peak_meter = out
+                .true_peak_dbtp
+                .map(|_| TRUE_PEAK_METER_4X_12.to_string());
+        }
         if results_current {
             out.effective_nyquist_hz = entry.results.effective_nyquist_hz;
             out.upsampled_from_1x = DetectorVerdict::from_str_lossy(&entry.results.upsampled_from_1x);
@@ -120,7 +147,6 @@ impl CachedWholeTrackEvidence {
             out.integrated_lufs = entry.results.integrated_lufs;
             out.clipped_runs = entry.results.clipped_runs;
             out.loud_and_clipped = DetectorVerdict::from_str_lossy(&entry.results.loud_and_clipped);
-            out.true_peak_dbtp = entry.results.true_peak_dbtp;
             out.effective_bits = (entry.results.effective_bits > 0).then_some(entry.results.effective_bits);
             out.ultrasonic_noise_detected =
                 DetectorVerdict::from_str_lossy(&entry.results.ultrasonic_noise_detected);
@@ -133,10 +159,27 @@ impl CachedWholeTrackEvidence {
     /// Note: Schema 2 separates machine-owned analysis from user choices (`my-filters.yaml`), so
     /// chain `.with_user_overrides(...)` (in `Mine` mode) or `.suggested_only()` (in `Suggested` mode).
     pub fn from_album_track(track: &AlbumTrackAnalysis, results_current: bool) -> Self {
+        Self::from_album_track_with_peak(track, results_current, results_current)
+    }
+
+    /// Convert a Schema-2 [`AlbumTrackAnalysis`] with independent `results_current` (identity +
+    /// `DETECTOR_VERSION`) and `peak_current` (audio identity only, Issue #23 P1).
+    pub fn from_album_track_with_peak(
+        track: &AlbumTrackAnalysis,
+        results_current: bool,
+        peak_current: bool,
+    ) -> Self {
         let mut out = Self {
             results_current,
+            peak_current: peak_current || results_current,
             ..Self::default()
         };
+        if out.peak_current {
+            out.sample_peak =
+                (track.sample_peak.is_finite() && track.sample_peak > 0.0).then_some(track.sample_peak);
+            out.true_peak_dbtp = track.true_peak_dbtp.filter(|v| v.is_finite());
+            out.true_peak_meter = track.effective_true_peak_meter().map(str::to_string);
+        }
         if results_current {
             out.effective_nyquist_hz = track.effective_nyquist_hz;
             out.upsampled_from_1x = DetectorVerdict::from_str_lossy(&track.fake_hires);
@@ -145,7 +188,6 @@ impl CachedWholeTrackEvidence {
             out.integrated_lufs = track.lufs;
             out.clipped_runs = track.clipped_runs;
             out.loud_and_clipped = DetectorVerdict::from_str_lossy(&track.loud_and_clipped);
-            out.true_peak_dbtp = track.true_peak_dbtp;
             out.effective_bits = (track.effective_bits > 0).then_some(track.effective_bits);
             out.ultrasonic_noise_detected =
                 DetectorVerdict::from_str_lossy(&track.hf_noise);
@@ -199,8 +241,13 @@ impl CachedWholeTrackEvidence {
         analysis: &AnalysisResult,
         user: Option<&ap_core::track_db::TrackDbUserOverrides>,
     ) -> Self {
+        let tp = analysis
+            .true_peak_dbtp
+            .is_finite()
+            .then_some(analysis.true_peak_dbtp);
         Self {
             results_current: true,
+            peak_current: true,
             user_filter: user.and_then(|u| u.filter.clone()),
             user_filter_provenance: user
                 .and_then(|u| u.filter.as_ref())
@@ -214,10 +261,11 @@ impl CachedWholeTrackEvidence {
             integrated_lufs: analysis.integrated_lufs,
             clipped_runs: analysis.clipped_runs,
             loud_and_clipped: analysis.loud_and_clipped,
-            true_peak_dbtp: analysis
-                .true_peak_dbtp
-                .is_finite()
-                .then_some(analysis.true_peak_dbtp),
+            sample_peak: (analysis.sample_peak_linear.is_finite()
+                && analysis.sample_peak_linear > 0.0)
+                .then_some(analysis.sample_peak_linear),
+            true_peak_dbtp: tp,
+            true_peak_meter: tp.map(|_| TRUE_PEAK_METER_4X_12.to_string()),
             effective_bits: (analysis.effective_bits > 0).then_some(analysis.effective_bits),
             ultrasonic_noise_detected: analysis.ultrasonic_noise_detected,
             ..Self::default()
@@ -317,16 +365,18 @@ pub fn fuse_track_evidence(
             notices.extend(c.user_warnings.iter().cloned());
         }
     }
-    // Gate all detector-result lookups on `results_current` so stale entries never mask fresh
-    // W30 / whole-track analysis, while `cached_wt` still provides `user:` overrides (Review #7 F1).
+    // Gate detector-result lookups on `results_current` so stale entries never mask fresh
+    // W30 / whole-track analysis, while `peak_current` independently gates audio-identity-only
+    // peak measurements (Issue #23 P1 / K5) and `cached_wt` still provides `user:` overrides.
     let wt_results = cached_wt.filter(|c| c.results_current);
+    let wt_peak = cached_wt.filter(|c| c.peak_current || c.results_current);
 
     // --- Row 3: Source peak P + Stale Peak Tag Disproof Check (safety-critical!) ---
     let mut peak_meta = *raw_peak_meta;
     let mut stale_peak_tag_disproved = false;
     let mut stale_peak_tag_detail = None;
 
-    if let Some(wt) = wt_results {
+    if let Some(wt) = wt_peak {
         if let Some(wt_tp_db) = wt.true_peak_dbtp {
             peak_meta = peak_meta.with_full_scan_true_peak_dbtp(wt_tp_db);
         }

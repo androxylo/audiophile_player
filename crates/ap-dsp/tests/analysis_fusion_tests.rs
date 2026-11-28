@@ -446,6 +446,7 @@ fn stale_cache_does_not_mask_w30_rules_a_h_l_while_preserving_user_overrides() {
     // 3. Current cache (`results_current = true`) STILL wins over W30!
     let current_wt = CachedWholeTrackEvidence::from_track_db_entry(&stale_entry, true);
     assert!(current_wt.results_current);
+    assert!(current_wt.peak_current);
     let fused_cur = fuse_track_evidence(
         96_000,
         24,
@@ -460,6 +461,41 @@ fn stale_cache_does_not_mask_w30_rules_a_h_l_while_preserving_user_overrides() {
     assert_eq!(fused_cur.effective_nyquist_hz.source, EvidenceSource::Cache);
     assert!(!fused_cur.loud_and_clipped.value);
     assert_eq!(fused_cur.loud_and_clipped.source, EvidenceSource::Cache);
+
+    // 4. Issue #23 P1 (K5 / T4): stale `DETECTOR_VERSION` (`results_current = false`) with
+    //    matching audio identity (`peak_current = true`) STILL applies cached `true_peak_dbtp`
+    //    while recomputing detector rules from W30!
+    let mut track_with_tp = ap_core::filter_db::AlbumTrackAnalysis::from_schema1(&stale_entry, None);
+    track_with_tp.detector_version = 1;
+    track_with_tp.true_peak_dbtp = Some(-6.0);
+    track_with_tp.true_peak_meter = Some(ap_core::filter_db::TRUE_PEAK_METER_8X_32.to_string());
+    let split_wt = CachedWholeTrackEvidence::from_album_track_with_peak(&track_with_tp, false, true);
+    assert!(!split_wt.results_current);
+    assert!(split_wt.peak_current);
+    assert_eq!(split_wt.true_peak_dbtp, Some(-6.0));
+    assert_eq!(
+        split_wt.true_peak_meter.as_deref(),
+        Some(ap_core::filter_db::TRUE_PEAK_METER_8X_32)
+    );
+    let fused_split = fuse_track_evidence(
+        96_000,
+        24,
+        &TrackPeakMetadata::default(),
+        &TrackMetadata::default(),
+        Some(&w30),
+        Some(&split_wt),
+    );
+    // Detector rules MUST be recomputed from W30!
+    assert!(fused_split.apodizing.value);
+    assert_eq!(fused_split.apodizing.source, EvidenceSource::Window);
+    assert_eq!(fused_split.effective_nyquist_hz.value, Some(22_050));
+    assert_eq!(fused_split.effective_nyquist_hz.source, EvidenceSource::Window);
+    // Cached true peak MUST STILL be preserved!
+    let cp = fused_split
+        .peak_meta
+        .classified_peak_for_bits(24)
+        .expect("peak_current must carry cached true_peak_dbtp across DETECTOR_VERSION bumps");
+    assert!((cp.dbfs - (-6.0)).abs() < 1e-4, "expected -6.0 dBTP, got {}", cp.dbfs);
 }
 
 #[test]
