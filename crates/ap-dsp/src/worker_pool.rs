@@ -325,13 +325,32 @@ where
     T: Send,
     F: Fn(usize, usize, &mut [T]) + Sync,
 {
+    for_each_pool_slice(buf, max_slices, 512, f);
+}
+
+/// Split a batch of coarse work items (such as Pass-B candidate audio blocks in `peak_scan`)
+/// across the persistent worker pool with no 512-item floor, honoring `HIGH_PRIORITY_DSP` so
+/// background scans automatically yield to real-time playback jobs.
+pub fn for_each_batch<T, F>(items: &mut [T], max_slices: usize, f: F)
+where
+    T: Send,
+    F: Fn(usize, usize, &mut [T]) + Sync,
+{
+    for_each_pool_slice(items, max_slices, 2, f);
+}
+
+fn for_each_pool_slice<T, F>(buf: &mut [T], max_slices: usize, min_len: usize, f: F)
+where
+    T: Send,
+    F: Fn(usize, usize, &mut [T]) + Sync,
+{
     if FORCE_SEQUENTIAL.with(Cell::get) || IN_MAC_POOL.with(Cell::get) {
         f(0, 0, buf);
         return;
     }
 
     let slices = max_slices.min(mac_pool().num_workers + 1).max(1);
-    if slices <= 1 || buf.len() < 512 {
+    if slices <= 1 || buf.len() < min_len {
         f(0, 0, buf);
         return;
     }

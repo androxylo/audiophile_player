@@ -15,6 +15,7 @@ pub mod deemphasis;
 pub mod delay;
 pub mod downsampler;
 pub mod fusion;
+pub mod peak_scan;
 pub mod phase;
 pub mod pipeline;
 pub mod quantize;
