@@ -105,6 +105,7 @@ pub struct ControlSnapshot {
     pub is_playing: bool,
     pub mode: PlayModeLabel,
     pub dac_name: String,
+    pub output_backend: String,
     pub active_folder: PathBuf,
     pub current_track: Option<String>,
     pub current_format: Option<String>,
@@ -123,6 +124,7 @@ struct InnerState {
     is_playing: bool,
     mode: PlayModeLabel,
     dac_name: String,
+    output_backend: String,
     allowed_root: PathBuf,
     active_folder: PathBuf,
     current_track: Option<String>,
@@ -165,6 +167,7 @@ impl SharedControl {
                 is_playing: false,
                 mode: PlayModeLabel::Paused,
                 dac_name: dac_name.into(),
+                output_backend: "WASAPI Exclusive".to_string(),
                 allowed_root: allowed_root.clone(),
                 active_folder: allowed_root,
                 current_track: None,
@@ -528,6 +531,21 @@ impl SharedControl {
         st.log.push(msg.as_ref());
     }
 
+    /// Record the active zero-mixer output backend label (`WASAPI Exclusive`, `WASAPI Exclusive (Push)`,
+    /// or `WDM-KS WaveRT`) for the web UI header and status messages.
+    pub fn set_output_backend(&self, label: impl Into<String>) {
+        let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        st.output_backend = label.into();
+    }
+
+    pub fn output_backend(&self) -> String {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .output_backend
+            .clone()
+    }
+
     pub fn snapshot(&self) -> ControlSnapshot {
         let st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let live_peak_dbfs = if st.is_playing {
@@ -550,6 +568,7 @@ impl SharedControl {
             is_playing: st.is_playing,
             mode: st.mode,
             dac_name: st.dac_name.clone(),
+            output_backend: st.output_backend.clone(),
             active_folder: st.active_folder.clone(),
             current_track: st.current_track.clone(),
             current_format: st.current_format.clone(),

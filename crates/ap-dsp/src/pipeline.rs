@@ -244,6 +244,14 @@ pub struct PipelineReport {
 
 impl PipelineReport {
     pub fn format_summary(&self, total_duration_s: Option<f64>) -> String {
+        self.format_summary_with_backend(total_duration_s, "WASAPI Exclusive")
+    }
+
+    pub fn format_summary_with_backend(
+        &self,
+        total_duration_s: Option<f64>,
+        backend_label: &str,
+    ) -> String {
         let dur_part = match total_duration_s {
             Some(s) => format!("{s:.1} s"),
             None => "stream".to_string(),
@@ -254,7 +262,7 @@ impl PipelineReport {
         };
         if self.output_rate_hz == self.internal_rate_hz {
             format!(
-                "{mode_prefix}{}/{} Hz -> {} Hz f64 ({}, {}, {}, {}, {}) | WDM-KS {}",
+                "{mode_prefix}{}/{} Hz -> {} Hz f64 ({}, {}, {}, {}, {}) | {backend_label} {}",
                 self.source_spec.bits_per_sample,
                 self.source_spec.sample_rate_hz,
                 self.output_rate_hz,
@@ -267,7 +275,7 @@ impl PipelineReport {
             )
         } else {
             format!(
-                "{mode_prefix}{}/{} Hz -> {} Hz f64 -> {} Hz ({}, {}, {}, {}, {}, {}) | WDM-KS {}",
+                "{mode_prefix}{}/{} Hz -> {} Hz f64 -> {} Hz ({}, {}, {}, {}, {}, {}) | {backend_label} {}",
                 self.source_spec.bits_per_sample,
                 self.source_spec.sample_rate_hz,
                 self.internal_rate_hz,

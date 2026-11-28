@@ -97,9 +97,9 @@ impl OutputTransport {
                 Ok(Self::WasapiExclusive)
             }
             "wasapi-push" | "wasapi_push" => Ok(Self::WasapiPush),
-            "wdm-ks" | "wdmks" | "ks" => Ok(Self::WdmKs),
+            "wdm-ks" | "wdmks" | "ks" | "kernel" | "kernel-streaming" => Ok(Self::WdmKs),
             other => Err(format!(
-                "invalid output backend '{other}'; expected 'wasapi', 'wasapi-push', or 'wdm-ks' (Windows Shared Mode is strictly unsupported)"
+                "invalid output backend '{other}'; expected 'wasapi', 'wasapi-push', or 'wdm-ks' / 'kernel' (Windows Shared Mode is strictly unsupported)"
             )),
         }
     }
@@ -344,7 +344,7 @@ pub const ALLOWED_OPT_LEVELS: [&str; 3] = ["normal", "high", "extreme"];
 pub struct PlayerSectionConfig {
     /// Preferred DAC name substring (e.g. `"Gungnir 2"`).
     pub device: Option<String>,
-    /// Output backend transport (`"wdm-ks"` or `"wasapi"`; `None` = `"wdm-ks"`).
+    /// Output backend transport (`"wasapi"`, `"wasapi-push"`, or `"wdm-ks"` / `"kernel"`; `None` = `"wasapi"`).
     pub output: Option<String>,
     /// Default local music library folder (`None` -> `~/Music`).
     pub music_dir: Option<PathBuf>,

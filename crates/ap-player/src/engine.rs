@@ -728,12 +728,13 @@ impl<'a> EngineState<'a> {
                     }
                 }
                 self.notify_upnp_preempted();
-                self.pause_with_message(
-                    "Paused — WDM-KS kernel pin closed (DAC available to Audirvana)",
-                );
+                let backend = self.shared.output_backend();
+                self.pause_with_message(format!(
+                    "Paused — {backend} stream closed (DAC available to Audirvana)"
+                ));
                 self.resume_track = saved_resume_track;
                 self.paused_at_end_of_queue = false;
-                println!("  [paused] WDM-KS kernel pin closed (DAC released).");
+                println!("  [paused] {backend} stream closed (DAC released).");
                 let _ = io::stdout().flush();
                 DispatchOutcome::Applied
             }
@@ -1191,6 +1192,7 @@ pub fn run_random_music_player(
     );
 
     let shared = SharedControl::new(music_dir.clone(), dac_name.clone());
+    shared.set_output_backend(backend_label);
     shared.set_api_token(api_token.clone());
     shared.set_effective_options(effective_options_json.clone());
     shared.attach_shutdown_callback(Arc::new(move || {
@@ -1955,7 +1957,8 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
             state.record_anchor(path.clone());
             state.just_skipped_track = false;
 
-            let fmt_str = report.format_summary(total_duration_s);
+            let backend_label = state.shared.output_backend();
+            let fmt_str = report.format_summary_with_backend(total_duration_s, &backend_label);
             let track_str = path.display().to_string();
             let decision_str = report.ultimate_report.as_ref().map(|u| u.summary());
             let peak_source = report

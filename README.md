@@ -2,13 +2,13 @@
 
 **🏠 Home** · [🚀 Quick Start](docs/QUICK_START.md) · [🧭 Getting Started](docs/GETTING_STARTED.md) · [💎 Ultimate Mode](docs/ULTIMATE_MODE.md) · [🎛️ Sound Engine](docs/SOUND_ENGINE.md) · [⌨️ CLI](docs/CLI.md)
 
-**A free, headless upsampling player for Windows. Every track is processed in 64-bit float at 8fS (352.8 / 384 kHz) with long filters, your REW room correction and a single noise-shaped quantizer, then sent to your DAC in WDM-KS exclusive mode.**
+**A free, headless upsampling player for Windows. Every track is processed in 64-bit float at 8fS (352.8 / 384 kHz) with long filters, your REW room correction and a single noise-shaped quantizer, then sent to your DAC in WASAPI Exclusive mode (or opt-in WDM-KS Kernel Streaming via `--kernel`).**
 
 ![Output](https://img.shields.io/badge/DSP%20rate-352.8%20%2F%20384%20kHz-6f42c1)
 ![DACs](https://img.shields.io/badge/DACs-44.1%E2%80%93384%20kHz-845ef7)
 ![Math](https://img.shields.io/badge/DSP-64--bit%20float-1f6feb)
 ![Filters](https://img.shields.io/badge/filters-up%20to%204M%20taps-d73a49)
-![Transport](https://img.shields.io/badge/transport-WDM--KS%20exclusive-2da44e)
+![Transport](https://img.shields.io/badge/transport-WASAPI%20Exclusive%20%7C%20WDM--KS-2da44e)
 ![UPnP](https://img.shields.io/badge/UPnP-renderer-fb8500)
 ![Tidal](https://img.shields.io/badge/Tidal%20Desktop-exclusive%20ACX%20(opt--in)-00b4d8)
 ![AI](https://img.shields.io/badge/AI%20control-MCP%20(stdio)-7048e8)
@@ -56,7 +56,7 @@ flowchart LR
     REW["🏠 REW room<br/>convolution<br/>up to 4M-tap IR"]:::dsp
     DS["⬇️ Downsampling<br/>to your DAC's rate<br/><i>only for DACs below 8fS</i>"]:::opt
     Q["🎚️ One quantizer<br/>TPDF + noise shaping<br/>16 / 18 / 20 / 24 bit"]:::q
-    DAC["🔊 Your DAC<br/>WDM-KS exclusive<br/>44.1 … 384 kHz"]:::dac
+    DAC["🔊 Your DAC<br/>WASAPI Exclusive (default)<br/>or --kernel WDM-KS · 44.1 … 384 kHz"]:::dac
 
     SRC --> UP --> DE --> REW --> DS --> Q --> DAC
 

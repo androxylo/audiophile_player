@@ -48,8 +48,8 @@ pub fn version_json() -> JsonValue {
         (
             "features",
             JsonValue::Array(vec![
-                JsonValue::from("wdm-ks-wavert"),
                 JsonValue::from("wasapi-exclusive"),
+                JsonValue::from("wdm-ks-wavert"),
                 JsonValue::from("8fs-f64-dsp"),
                 JsonValue::from("rew-upols-convolution"),
                 JsonValue::from("upnp-av-renderer"),
@@ -547,15 +547,28 @@ pub fn doctor_report_json(config_path: Option<&Path>) -> (JsonValue, bool) {
         }
     }
 
-    // 5. DAC enumeration & capability check (native 8fS preferred; < 8fS supported via last-stage f64 downsampling)
-    match probe_all_render_devices() {
+    // 5. DAC enumeration & capability check using the active output backend (WASAPI Exclusive
+    //    default, or WDM-KS when configured in `[player] output = "wdm-ks"`).
+    let doctor_transport = active_cfg
+        .as_ref()
+        .and_then(|c| c.player.output.as_deref())
+        .and_then(|s| OutputTransport::parse(s).ok())
+        .unwrap_or_default();
+    let backend_label = doctor_transport.display_label();
+    let probed_res = match doctor_transport {
+        OutputTransport::WdmKs => probe_all_render_devices(),
+        OutputTransport::WasapiExclusive | OutputTransport::WasapiPush => {
+            probe_all_wasapi_render_devices()
+        }
+    };
+    match probed_res {
         Ok(devs) if devs.is_empty() => {
             checks.push(DoctorCheck::fail(
                 "dac",
                 "error",
-                "0 WDM-KS render devices found",
-                "No USB/WDM-KS audio DAC detected",
-                "Connect a WDM-KS USB DAC (352.8/384 kHz native preferred; 44.1..192 kHz supported via last-stage f64 downsampling) and run `audiophile-player devices`",
+                format!("0 {backend_label} render devices found"),
+                format!("No {backend_label} audio DAC detected"),
+                "Connect a USB DAC (352.8/384 kHz native preferred; 44.1..192 kHz supported via last-stage f64 downsampling) and run `audiophile-player devices`",
             ));
         }
         Ok(devs) => {
@@ -574,7 +587,7 @@ pub fn doctor_report_json(config_path: Option<&Path>) -> (JsonValue, bool) {
                     };
                     checks.push(DoctorCheck::pass(
                         "dac",
-                        format!("'{}'{note}", chosen.friendly_name),
+                        format!("'{}' [{backend_label}]{note}", chosen.friendly_name),
                     ));
                 } else if chosen.supports_any_rate {
                     let r44 = chosen
@@ -592,7 +605,7 @@ pub fn doctor_report_json(config_path: Option<&Path>) -> (JsonValue, bool) {
                     checks.push(DoctorCheck::pass(
                         "dac",
                         format!(
-                            "'{}' (max 44.1k={r44}, 48k={r48}, {wf}; last-stage f64 downsampling from locked 8fS)",
+                            "'{}' [{backend_label}] (max 44.1k={r44}, 48k={r48}, {wf}; last-stage f64 downsampling from locked 8fS)",
                             chosen.friendly_name
                         ),
                     ));
@@ -601,10 +614,10 @@ pub fn doctor_report_json(config_path: Option<&Path>) -> (JsonValue, bool) {
                         "dac",
                         "error",
                         format!(
-                            "'{}' (352.8k={}, 384k={}, no usable WDM-KS PCM rate found)",
+                            "'{}' (352.8k={}, 384k={}, no usable {backend_label} PCM rate found)",
                             chosen.friendly_name, chosen.rate_352800, chosen.rate_384000
                         ),
-                        "Auto-selected DAC did not accept any standard WDM-KS PCM rate (44.1..=384 kHz)",
+                        format!("Auto-selected DAC did not accept any standard {backend_label} PCM rate (44.1..=384 kHz)"),
                         "Run `audiophile-player devices` and select a working DAC with `audiophile-player config set device \"<NAME>\"`",
                     ));
                 }
@@ -613,7 +626,7 @@ pub fn doctor_report_json(config_path: Option<&Path>) -> (JsonValue, bool) {
                     "dac",
                     "error",
                     format!("{} device(s), none usable", devs.len()),
-                    "No WDM-KS DAC accepting standard PCM rates was found",
+                    format!("No {backend_label} DAC accepting standard PCM rates was found"),
                     "Run `audiophile-player devices` to inspect device capabilities",
                 ));
             }
@@ -622,7 +635,7 @@ pub fn doctor_report_json(config_path: Option<&Path>) -> (JsonValue, bool) {
             checks.push(DoctorCheck::fail(
                 "dac",
                 "error",
-                "WDM-KS enumeration error",
+                format!("{backend_label} enumeration error"),
                 err,
                 "Check Windows audio drivers and run `audiophile-player devices`",
             ));

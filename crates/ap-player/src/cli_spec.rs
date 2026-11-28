@@ -239,12 +239,12 @@ pub static COMMANDS: &[CmdSpec] = &[
     CmdSpec {
         name: "play",
         usage: "audiophile-player [OPTIONS]",
-        summary: "Start headless WDM-KS 8fS playback + localhost HTTP UI + UPnP renderer (default)",
-        details: "Default mode when invoked with no subcommand. Immediately opens the best 352.8/384 kHz USB DAC via direct Windows Kernel Streaming (WDM-KS WaveRT, zero Windows mixer), plays random FLAC files from the configured music folder, starts the localhost web control UI (auto port 8085..8199), and announces the built-in UPnP AV MediaRenderer.",
+        summary: "Start headless WASAPI Exclusive 8fS playback + localhost HTTP UI + UPnP renderer (default)",
+        details: "Default mode when invoked with no subcommand. Immediately opens the best 352.8/384 kHz USB DAC via event-driven WASAPI Exclusive Mode (zero Windows mixer; pass `--kernel` or `--output wdm-ks` for direct Windows Kernel Streaming), plays random FLAC files from the configured music folder, starts the localhost web control UI (auto port 8085..8199), and announces the built-in UPnP AV MediaRenderer.",
         examples: &[
             "audiophile-player",
             "audiophile-player --ultimate --filters mine",
-            "audiophile-player --device \"Gungnir 2\" --music-dir D:\\Music",
+            "audiophile-player --kernel --device \"Gungnir 2\" --music-dir D:\\Music",
         ],
         since: "0.1.0",
     },
@@ -300,11 +300,12 @@ pub static COMMANDS: &[CmdSpec] = &[
     },
     CmdSpec {
         name: "devices",
-        usage: "audiophile-player devices [--output wasapi|wasapi-push|wdm-ks] [--json]",
-        summary: "List Windows WASAPI Exclusive or WDM-KS audio render devices and probe 8fS support",
-        details: "Enumerates present WASAPI Exclusive (default) or WDM-KS WaveRT (`--output wdm-ks`) audio render devices, probes 32-bit 352.8 kHz and 384 kHz support cleanly (reporting busy if another exclusive player holds the DAC), and marks which DAC auto-selection would choose.",
+        usage: "audiophile-player devices [--output wasapi|wasapi-push|wdm-ks | --kernel] [--json]",
+        summary: "List Windows WASAPI Exclusive (default) or WDM-KS audio render devices and probe 8fS support",
+        details: "Enumerates present WASAPI Exclusive (default) or direct Kernel Streaming WDM-KS WaveRT (`--kernel` / `--output wdm-ks`) audio render devices, probes 32-bit 352.8 kHz and 384 kHz support cleanly (reporting busy if another exclusive player holds the DAC), and marks which DAC auto-selection would choose.",
         examples: &[
             "audiophile-player devices",
+            "audiophile-player devices --kernel",
             "audiophile-player devices --output wdm-ks",
             "audiophile-player devices --json",
         ],
@@ -339,7 +340,7 @@ pub static COMMANDS: &[CmdSpec] = &[
         name: "stop",
         usage: "audiophile-player stop [--when now|after-track] [--json]",
         summary: "Gracefully stop the running player instance and release the DAC",
-        details: "Sends an authenticated shutdown request to /api/v1/shutdown (with named-event fallback) so the engine drains cleanly, sends UPnP byebye, releases the WDM-KS DAC pin, and exits. Use `--when after-track` to wait for the current song to finish first. Exits with code 5 if not running.",
+        details: "Sends an authenticated shutdown request to /api/v1/shutdown (with named-event fallback) so the engine drains cleanly, sends UPnP byebye, releases the exclusive DAC handle, and exits. Use `--when after-track` to wait for the current song to finish first. Exits with code 5 if not running.",
         examples: &[
             "audiophile-player stop",
             "audiophile-player stop --when after-track",
@@ -398,12 +399,29 @@ pub static OPTIONS: &[OptSpec] = &[
         group: Group::Output,
         restart: Restart::Always,
         summary: "Zero-mixer Windows output backend: wasapi | wasapi-push | wdm-ks",
-        details: "Selects the strictly zero-mixer Windows output transport: `wasapi` (default, event-driven WASAPI Exclusive Mode sharing the hardware WaveRT buffer directly with zero mixer/APO/SRC and automatic buffer-alignment retry), `wasapi-push` (polling WASAPI Exclusive fallback for DACs with unreliable event callbacks), or `wdm-ks` (alias `ks`, opt-in direct Kernel Streaming WaveRT). Windows Shared Mode is intentionally absent and impossible to fall back to.",
+        details: "Selects the strictly zero-mixer Windows output transport: `wasapi` (default, event-driven WASAPI Exclusive Mode sharing the hardware WaveRT buffer directly with zero mixer/APO/SRC and automatic buffer-alignment retry), `wasapi-push` (polling WASAPI Exclusive fallback for DACs with unreliable event callbacks), or `wdm-ks` (aliases `kernel`, `ks`, or `--kernel`, opt-in direct Kernel Streaming WaveRT). Windows Shared Mode is intentionally absent and impossible to fall back to.",
         examples: &[
             "audiophile-player --output wasapi",
             "audiophile-player --output wasapi-push",
             "audiophile-player --output wdm-ks",
             "audiophile-player devices --output wdm-ks",
+        ],
+        since: "0.2.0",
+    },
+    OptSpec {
+        name: "--kernel",
+        short: None,
+        value: ValueKind::Flag,
+        default: Some("off (uses wasapi)"),
+        config_key: None,
+        scope: &[Cmd::Play, Cmd::Devices, Cmd::Restart],
+        group: Group::Output,
+        restart: Restart::Always,
+        summary: "Use direct Windows Kernel Streaming (WDM-KS WaveRT) instead of WASAPI Exclusive",
+        details: "Convenience shorthand for `--output wdm-ks`. Opens the DAC directly via Windows Kernel Streaming (WDM-KS WaveRT) instead of the default event-driven WASAPI Exclusive Mode.",
+        examples: &[
+            "audiophile-player --kernel",
+            "audiophile-player devices --kernel",
         ],
         since: "0.2.0",
     },
@@ -1084,6 +1102,8 @@ pub fn negated_options(flag: &str) -> &'static [&'static str] {
         "--conv-dir" | "--conv-file" => &["--no-conv"],
         "--no-upnp" => &["--upnp-name", "--upnp-port", "--upnp-bind"],
         "--upnp-name" | "--upnp-port" | "--upnp-bind" => &["--no-upnp"],
+        "--kernel" => &["--output"],
+        "--output" => &["--kernel"],
         _ => &[],
     }
 }
@@ -1176,9 +1196,9 @@ fn format_opt_flag(opt: &OptSpec) -> String {
 pub fn render_summary_help() -> String {
     let mut out = String::with_capacity(3072);
     out.push_str(&format!(
-        "Audiophile Player v{} — headless 8fS WDM-KS upsampling player (GPL-3.0-or-later)\n\
+        "Audiophile Player v{} — headless 8fS WASAPI Exclusive upsampling player (GPL-3.0-or-later)\n\
          Manual: {MANUAL_URL}\n\n\
-         USAGE  audiophile-player [OPTIONS]            play (default: ~/Music, WDM-KS + HTTP UI + UPnP)\n\
+         USAGE  audiophile-player [OPTIONS]            play (default: ~/Music, WASAPI Exclusive + HTTP UI + UPnP; --kernel for WDM-KS)\n\
                 audiophile-player <COMMAND> [ARGS]     ",
         env!("CARGO_PKG_VERSION")
     ));

@@ -14,7 +14,7 @@ This page assumes you already know the vocabulary: poly-sinc, apodizing, closed-
 | **f64 from decoder to quantizer** | Rounding happens once, at the end, with dither |
 | **≤ 4M taps** | No credible evidence of audible benefit beyond that, and it bounds memory |
 | **No volume, no EQ, no effects** | Gain is used only to prevent clipping. Room correction is your REW filter, nothing else |
-| **WDM-KS exclusive** | The Windows mixer is never in the path (and our opt-in Tidal virtual ACX driver blocks `audiodg.exe` in the kernel too). Pause **releases** the DAC |
+| **WASAPI Exclusive (default) / `--kernel` WDM-KS** | Event-driven WASAPI Exclusive shares the hardware WaveRT buffer directly with zero Windows mixer/APO/SRC; pass `--kernel` (or `--output wdm-ks`) for direct WDM-KS Kernel Streaming (and our opt-in Tidal virtual ACX driver blocks `audiodg.exe` in the kernel too). Pause **releases** the DAC |
 
 ---
 

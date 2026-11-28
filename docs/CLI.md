@@ -11,12 +11,12 @@
 
 | Command | Usage | Summary |
 |---|---|---|
-| `play` | `audiophile-player [OPTIONS]` | Start headless WDM-KS 8fS playback + localhost HTTP UI + UPnP renderer (default) |
+| `play` | `audiophile-player [OPTIONS]` | Start headless WASAPI Exclusive 8fS playback + localhost HTTP UI + UPnP renderer (default) |
 | `scan` | `audiophile-player scan [FOLDER\|ROOT] [OPTIONS]` | Offline parallel, incremental FLAC library scanner (Schema-2 filterdb) |
 | `filters` | `audiophile-player filters <show\|diff\|set\|check\|relink\|migrate> [ARGS]` | Inspect, edit, validate, relink, or migrate Schema-2 filter choices |
 | `help` | `audiophile-player help [<OPTION\|COMMAND>] [--json \| --markdown]` | Show grouped summary help, option/command detail, JSON spec, or Markdown docs |
 | `doctor` | `audiophile-player doctor [--config <PATH>] [--json]` | Check OS, toolchain, DAC 8fS support, config, music folder, ports, and driver status |
-| `devices` | `audiophile-player devices [--output wasapi\|wasapi-push\|wdm-ks] [--json]` | List Windows WASAPI Exclusive or WDM-KS audio render devices and probe 8fS support |
+| `devices` | `audiophile-player devices [--output wasapi\|wasapi-push\|wdm-ks \| --kernel] [--json]` | List Windows WASAPI Exclusive (default) or WDM-KS audio render devices and probe 8fS support |
 | `config` | `audiophile-player config <show\|set\|unset> [ARGS]` | Inspect effective configuration or edit config.toml safely with .bak backup |
 | `status` | `audiophile-player status [--json]` | Query the running player instance via run.json and /api/v1/status |
 | `stop` | `audiophile-player stop [--when now\|after-track] [--json]` | Gracefully stop the running player instance and release the DAC |
@@ -31,6 +31,7 @@
 |---|---|---|---|---|---|
 | `--device NAME` | `player.device` | `auto (best USB DAC)` | play, restart | restart | DAC name substring (default: auto-select best USB DAC) |
 | `--output BACKEND` | `player.output` | `wasapi` | play, devices, restart | restart | Zero-mixer Windows output backend: wasapi \| wasapi-push \| wdm-ks |
+| `--kernel` | — | `off (uses wasapi)` | play, devices, restart | restart | Use direct Windows Kernel Streaming (WDM-KS WaveRT) instead of WASAPI Exclusive |
 | `--trace-wavert` | — | `off` | play, restart | restart | Emit per-wake WDM-KS WaveRT timing trace to stderr (diagnostic) |
 | `--dac-bits N` | `quantizer.dac_bits` | `24` | play, restart | restart | Quantizer DAC bit depth: 16 \| 18 \| 20 \| 24 |
 | `--max-rate HZ` | `player.max_rate` | `auto (highest DAC rate)` | play, restart | restart | Cap DAC output sample rate (Hz); main DSP stays locked at 8fS (352.8/384 kHz) |

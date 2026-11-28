@@ -33,6 +33,7 @@ pub fn render_control_page(snapshot: &ControlSnapshot, listing: &FolderListing) 
     let dir_token_html = html_escape(&dir_token);
     let dir_display_html = html_escape(&listing.current_dir.to_string_lossy());
     let dac_html = html_escape(&snapshot.dac_name);
+    let backend_html = html_escape(&snapshot.output_backend);
     let status_badge = if snapshot.is_playing {
         format!(
             "<span class=\"badge playing\">{}</span>",
@@ -45,7 +46,7 @@ pub fn render_control_page(snapshot: &ControlSnapshot, listing: &FolderListing) 
     let now_playing = match (&snapshot.current_track, &snapshot.current_format) {
         (Some(t), Some(f)) => format!("{} &mdash; {}", html_escape(t), html_escape(f)),
         (Some(t), None) => html_escape(t),
-        _ => "Idle &mdash; DAC pin closed (available to Audirvana / other players)".to_string(),
+        _ => "Idle &mdash; DAC released (available to Audirvana / other players)".to_string(),
     };
     let decision_html = match &snapshot.current_decision {
         Some(d) => html_escape(d),
@@ -151,7 +152,7 @@ pre#action-log{{margin:0;max-height:170px;overflow-y:auto;background:#0f1115;bor
 </head>\n\
 <body>\n\
 <header>\n\
-  <h1>Audiophile Player <small style=\"color:var(--muted);font-weight:400\">(WDM-KS WaveRT &middot; Zero Mixer)</small></h1>\n\
+  <h1>Audiophile Player <small style=\"color:var(--muted);font-weight:400\">({backend_html} &middot; Zero Mixer)</small></h1>\n\
   <a href=\"{GITHUB_MANUAL_URL}\" target=\"_blank\" rel=\"noopener\">Manual (GitHub)</a>\n\
 </header>\n\
 <section class=\"card\">\n\
@@ -199,7 +200,7 @@ async function poll(){{try{{const r=await fetch('/api/status');if(!r.ok)return;c
 const b=document.getElementById('status-badge');b.innerHTML=d.playing?'<span class=\"badge playing\">'+d.mode+'</span>':'<span class=\"badge paused\">Paused (DAC released)</span>';\n\
 const pf=document.getElementById('pause-resume-form');const pb=document.getElementById('pause-resume-btn');\n\
 if(pf&&pb){{if(d.playing){{pf.action='/action/pause';pb.className='pause';pb.textContent='Pause (Release DAC)';}}else{{pf.action='/action/resume';pb.className='resume';pb.textContent='Resume';}}}}\n\
-const n=document.getElementById('now-playing');n.textContent=d.track?(d.format?d.track+' — '+d.format:d.track):'Idle — DAC pin closed (available to Audirvana / other players)';\n\
+const n=document.getElementById('now-playing');n.textContent=d.track?(d.format?d.track+' — '+d.format:d.track):'Idle — DAC released (available to Audirvana / other players)';\n\
 const pk=document.getElementById('track-peak');if(pk)pk.textContent=d.peak?(d.peak_source?'Max Peak: '+d.peak+' ['+d.peak_source+']':'Max Peak: '+d.peak):(d.peak_source?'Peak Source: '+d.peak_source:'');\n\
 const dr=document.getElementById('decision-report');if(dr)dr.textContent=d.decision||'';\n\
 const l=document.getElementById('action-log');const atBottom=(l.scrollHeight-l.scrollTop-l.clientHeight)<24;l.textContent=d.log.join('\\n');if(atBottom)l.scrollTop=l.scrollHeight;}}catch(_){{}}}}\n\

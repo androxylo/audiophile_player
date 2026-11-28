@@ -396,6 +396,9 @@ where
                 let raw = take_opt_str("--output", &mut iter)?;
                 output_transport = Some(OutputTransport::parse(&raw)?);
             }
+            "--kernel" => {
+                output_transport = Some(OutputTransport::WdmKs);
+            }
             "--trace-wavert" => trace_wavert = true,
             "--max-rate" => {
                 let val_str = take_opt_str("--max-rate", &mut iter)?;
@@ -804,6 +807,9 @@ where
                 let val = take_opt_str("--output", &mut iter)?;
                 output_transport = Some(OutputTransport::parse(&val)?);
             }
+            "--kernel" => {
+                output_transport = Some(OutputTransport::WdmKs);
+            }
             other => return Err(format!("unknown devices option '{other}'")),
         }
     }
@@ -1102,6 +1108,35 @@ mod tests {
                 as_json: true,
             }
         );
+
+        let dev_kernel =
+            parse_args(["audiophile-player", "devices", "--kernel", "--json"]).unwrap();
+        assert_eq!(
+            dev_kernel,
+            RunMode::Devices {
+                output_transport: Some(OutputTransport::WdmKs),
+                as_json: true,
+            }
+        );
+
+        let play_kernel = parse_args(["audiophile-player", "--kernel"]).unwrap();
+        assert!(matches!(
+            play_kernel,
+            RunMode::PlayRandom {
+                output_transport: Some(OutputTransport::WdmKs),
+                ..
+            }
+        ));
+
+        let play_kernel_alias =
+            parse_args(["audiophile-player", "--output", "kernel"]).unwrap();
+        assert!(matches!(
+            play_kernel_alias,
+            RunMode::PlayRandom {
+                output_transport: Some(OutputTransport::WdmKs),
+                ..
+            }
+        ));
 
         let err = parse_args(["audiophile-player", "--output", "shared"])
             .expect_err("Windows Shared Mode must be rejected");
