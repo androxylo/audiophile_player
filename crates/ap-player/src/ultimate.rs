@@ -5,10 +5,16 @@
 //! (`docs/research/07-ultimate-mode.md` §§2–5, Mandates M1–M4, `OQ-33..OQ-41`).
 //!
 //! Hard invariants enforced here:
-//! - **M1 (30 s cap):** `W0` reads strictly `<= 30 s` of source audio before `W1..W3`; the
-//!   downstream buffer is capped at `ULTIMATE_MAX_BUFFERED_SECONDS = 30`.
-//! - **M3 (`< 30 s` bypass):** If header duration `< 30 s` OR EOF occurs inside `W0`, bypass
-//!   ultimate rules cleanly and play via normal-mode defaults labelled `"normal (<30 s)"`.
+//! - **M1 (Streams vs. Local Files — Scanning is not Buffering, Issue #23 §3.1):**
+//!   - **Streams:** buffer and look-ahead are strictly capped at `ULTIMATE_MAX_BUFFERED_SECONDS = 30`
+//!     (hard cap). Streams never run the E3 whole-file scan and always keep `-3 dB` safety (`OQ-33`).
+//!   - **Local files:** `W0` reads `<= 30 s` for detector analysis while a separate E3 scan reader may
+//!     read the full file quickly to compute an exact `tp8x-32` source true peak (2 s post-W2
+//!     deadline, finishing in the background if missed). Playback buffers only what the active
+//!     filter requires (which can exceed 30 s for 4M-tap filters), not the full decoded file.
+//! - **M3 (`< 30 s` short tracks):** If header duration `< 30 s` OR EOF occurs inside `W0`, play
+//!   via normal-mode filter defaults labelled `"normal (<30 s)"` while still using whole-track peak
+//!   evidence (`exact-M` or synchronous E3 `scan-tp`) for local files (`Issue #23 §3.5`).
 //! - **M4 (Streaming vs. Local):** Streaming sources NEVER buffer beyond 30 s, NEVER use mega-tap
 //!   `gauss-apod-4m`, and ALWAYS apply `-3 dB` upsampling safety (`OQ-33`).
 //! - **Strict Per-Track Independence (`OQ-40`):** Track B's detectors, filter choice, `M30`, `M`,
@@ -1663,6 +1669,10 @@ where
         cached_m_dbfs: cached_exact_m_db,
         fixed_gain_db,
         quantizer_margin_db: m_q_db,
+        peak_source: Some(peak_evidence.source_label().to_string()),
+        peak_scan_ms: e3_scan_result.map(|(_, ms)| ms),
+        a_tp_db: Some(peak_evidence.a_tp_db()),
+        a_up_db: Some(a_up_db),
         throughput_x_rt: Some(final_speed_x_rt),
         warnings: selection.warnings.clone(),
     };
@@ -2223,10 +2233,14 @@ where
     //   exact whole-track unity render can measure exact `M`!
     // - If W0 already hit EOF (`!read_remaining_from_source`): the entire track is already in
     //   `pre_read_blocks`; render at unity ONCE to obtain exact `M` (E1) + exact `tp8x-32`!
-    let mut sync_e3_scan: Option<PeakScanResult> = None;
+    let mut sync_e3_scan: Option<(PeakScanResult, u64)> = None;
     if !is_streaming && read_remaining_from_source {
         if let Some(lp) = local_path {
-            sync_e3_scan = scan_short_local_file_sync(lp);
+            let t0 = Instant::now();
+            if let Some(scan) = scan_short_local_file_sync(lp) {
+                let ms = t0.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                sync_e3_scan = Some((scan, ms));
+            }
         }
         if sync_e3_scan.is_none() {
             let max_short_frames =
@@ -2312,7 +2326,7 @@ where
             m_db,
             source_tp_db: scan_tp_db,
         }
-    } else if let Some(scan) = sync_e3_scan {
+    } else if let Some((scan, _)) = sync_e3_scan {
         if let Some(notice) =
             check_e3_tag_disagreement(&peak_meta, spec.bits_per_sample, scan.true_peak_dbtp)
         {
@@ -2389,6 +2403,10 @@ where
         cached_m_dbfs: exact_m_dbfs,
         fixed_gain_db: fixed_g,
         quantizer_margin_db: m_q,
+        peak_source: Some(peak_evidence.source_label().to_string()),
+        peak_scan_ms: sync_e3_scan.map(|(_, ms)| ms),
+        a_tp_db: Some(peak_evidence.a_tp_db()),
+        a_up_db: Some(a_up_db),
         throughput_x_rt: None,
         warnings,
     });
@@ -4928,6 +4946,12 @@ mod tests {
             "T1: untagged uncached local FLAC must use E3 scan-tp, got reason='{}'",
             rep.headroom.reason
         );
+        let u1 = rep.ultimate_report.as_ref().expect("T1 ultimate report");
+        assert_eq!(u1.peak_source.as_deref(), Some("scan-tp"));
+        assert!(u1.peak_scan_ms.is_some());
+        assert_eq!(u1.a_tp_db, Some(TP_METER_ERR_8X_32_DB));
+        assert_eq!(u1.a_up_db, Some(0.0));
+        assert!(u1.summary().contains("peak_source=scan-tp"));
         assert_eq!(rep.headroom.mode, HeadroomMode::ZeroDb);
         assert!(
             rep.headroom.total_gain_db().abs() < 1e-9,

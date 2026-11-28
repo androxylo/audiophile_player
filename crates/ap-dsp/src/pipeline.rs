@@ -151,6 +151,15 @@ pub struct UltimateDecisionReport {
     pub fixed_gain_db: f64,
     /// Quantizer margin `m_q` in dB (`(1.5 * sum(|c_k|) + 1.5)` LSB below FS).
     pub quantizer_margin_db: f64,
+    /// Provenance of the peak evidence governing headroom (`"exact-M"`, `"scan-tp"`, `"cached-tp"`,
+    /// `"tag-tp"`, `"tag-sp"`, or `"unknown"`, Issue #23 P6).
+    pub peak_source: Option<String>,
+    /// Elapsed wall-clock time of the E3 whole-file peak scan in milliseconds (when E3 ran).
+    pub peak_scan_ms: Option<u64>,
+    /// True-peak meter error / ISP allowance `A_tp` in dB used in the headroom formula.
+    pub a_tp_db: Option<f64>,
+    /// Upsampler overshoot bound `A_up(plan)` in dB used in the headroom formula.
+    pub a_up_db: Option<f64>,
     /// Measured first-window throughput in multiples of real time (`× RT`).
     pub throughput_x_rt: Option<f64>,
     /// Non-fatal diagnostic notices / warnings (stale peak tags disproved, M4 stream guard, MQA, OQ-41).
@@ -170,6 +179,21 @@ impl UltimateDecisionReport {
             (None, Some(m30)) => format!("M30={m30:+.2}dBFS"),
             (None, None) => "M=n/a".to_string(),
         };
+        let peak_src_str = self
+            .peak_source
+            .as_deref()
+            .map(|s| format!(" peak_source={s}"))
+            .unwrap_or_default();
+        let scan_ms_str = self
+            .peak_scan_ms
+            .map(|ms| format!(" peak_scan_ms={ms}"))
+            .unwrap_or_default();
+        let margin_str = match (self.a_tp_db, self.a_up_db) {
+            (Some(atp), Some(aup)) => format!(" A_tp={atp:.2}dB A_up={aup:.2}dB"),
+            (Some(atp), None) => format!(" A_tp={atp:.2}dB"),
+            (None, Some(aup)) => format!(" A_up={aup:.2}dB"),
+            (None, None) => String::new(),
+        };
         let speed_str = self
             .throughput_x_rt
             .map(|s| format!(" speed={s:.1}xRT"))
@@ -182,7 +206,7 @@ impl UltimateDecisionReport {
             _ => String::new(),
         };
         format!(
-            "{choice_str}mode=[{}] rule={} fired=[{}] {peak_str} G={:+.3}dB m_q={:.5}dB{speed_str}",
+            "{choice_str}mode=[{}] rule={} fired=[{}] {peak_str}{peak_src_str}{scan_ms_str}{margin_str} G={:+.3}dB m_q={:.5}dB{speed_str}",
             self.mode, self.winning_rule, rules, self.fixed_gain_db, self.quantizer_margin_db
         )
     }

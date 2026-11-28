@@ -113,6 +113,9 @@ pub struct ControlSnapshot {
     /// Current track maximum peak summary when known (metadata/cached whole-track peak and/or
     /// dynamically updated live DAC output max peak). `None` when paused or silent/unknown.
     pub current_peak: Option<String>,
+    /// Provenance of the peak evidence governing Ultimate Mode headroom (`exact-M`, `scan-tp`,
+    /// `cached-tp`, `tag-tp`, `tag-sp`, `unknown`). `None` outside Ultimate Mode or when paused.
+    pub peak_source: Option<String>,
     pub recent_actions: Vec<String>,
 }
 
@@ -126,6 +129,7 @@ struct InnerState {
     current_format: Option<String>,
     current_decision: Option<String>,
     known_peak: Option<String>,
+    peak_source: Option<String>,
     pending_commands: VecDeque<ControlCommand>,
     log: ActionLog,
     sink_stop_flag: Option<Arc<AtomicBool>>,
@@ -167,6 +171,7 @@ impl SharedControl {
                 current_format: None,
                 current_decision: None,
                 known_peak: None,
+                peak_source: None,
                 pending_commands: VecDeque::new(),
                 log,
                 sink_stop_flag: None,
@@ -426,6 +431,10 @@ impl SharedControl {
                 "current_peak",
                 JsonValue::opt_str(snap.current_peak.as_deref()),
             ),
+            (
+                "peak_source",
+                JsonValue::opt_str(snap.peak_source.as_deref()),
+            ),
             ("restart_pending", JsonValue::from(restart_pending)),
             ("effective_options", effective_options),
             (
@@ -466,6 +475,20 @@ impl SharedControl {
         decision: Option<String>,
         known_peak: Option<String>,
     ) {
+        self.set_playing_with_decision_peak_and_source(
+            mode, track, format, decision, known_peak, None,
+        );
+    }
+
+    pub fn set_playing_with_decision_peak_and_source(
+        &self,
+        mode: PlayModeLabel,
+        track: String,
+        format: String,
+        decision: Option<String>,
+        known_peak: Option<String>,
+        peak_source: Option<String>,
+    ) {
         let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         self.live_output_peak_u32.store(0, Ordering::Relaxed);
         st.is_playing = true;
@@ -475,6 +498,7 @@ impl SharedControl {
         st.current_format = Some(format);
         st.current_decision = decision;
         st.known_peak = known_peak;
+        st.peak_source = peak_source;
     }
 
     /// Lock-free, wait-free update of the current audible track's running maximum output sample
@@ -495,6 +519,7 @@ impl SharedControl {
         st.current_format = None;
         st.current_decision = None;
         st.known_peak = None;
+        st.peak_source = None;
         st.log.push(reason.as_ref());
     }
 
@@ -530,6 +555,7 @@ impl SharedControl {
             current_format: st.current_format.clone(),
             current_decision: st.current_decision.clone(),
             current_peak,
+            peak_source: st.peak_source.clone(),
             recent_actions: st.log.snapshot(),
         }
     }

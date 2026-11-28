@@ -51,9 +51,11 @@ pub fn render_control_page(snapshot: &ControlSnapshot, listing: &FolderListing) 
         Some(d) => html_escape(d),
         None => String::new(),
     };
-    let peak_html = match &snapshot.current_peak {
-        Some(p) => format!("Max Peak: {}", html_escape(p)),
-        None => String::new(),
+    let peak_html = match (&snapshot.current_peak, &snapshot.peak_source) {
+        (Some(p), Some(src)) => format!("Max Peak: {} [{}]", html_escape(p), html_escape(src)),
+        (Some(p), None) => format!("Max Peak: {}", html_escape(p)),
+        (None, Some(src)) => format!("Peak Source: {}", html_escape(src)),
+        (None, None) => String::new(),
     };
 
     let mut items_html = String::new();
@@ -198,7 +200,7 @@ const b=document.getElementById('status-badge');b.innerHTML=d.playing?'<span cla
 const pf=document.getElementById('pause-resume-form');const pb=document.getElementById('pause-resume-btn');\n\
 if(pf&&pb){{if(d.playing){{pf.action='/action/pause';pb.className='pause';pb.textContent='Pause (Release DAC)';}}else{{pf.action='/action/resume';pb.className='resume';pb.textContent='Resume';}}}}\n\
 const n=document.getElementById('now-playing');n.textContent=d.track?(d.format?d.track+' — '+d.format:d.track):'Idle — DAC pin closed (available to Audirvana / other players)';\n\
-const pk=document.getElementById('track-peak');if(pk)pk.textContent=d.peak?'Max Peak: '+d.peak:'';\n\
+const pk=document.getElementById('track-peak');if(pk)pk.textContent=d.peak?(d.peak_source?'Max Peak: '+d.peak+' ['+d.peak_source+']':'Max Peak: '+d.peak):(d.peak_source?'Peak Source: '+d.peak_source:'');\n\
 const dr=document.getElementById('decision-report');if(dr)dr.textContent=d.decision||'';\n\
 const l=document.getElementById('action-log');const atBottom=(l.scrollHeight-l.scrollTop-l.clientHeight)<24;l.textContent=d.log.join('\\n');if(atBottom)l.scrollTop=l.scrollHeight;}}catch(_){{}}}}\n\
 setInterval(poll,1000);\n\
@@ -228,6 +230,10 @@ pub fn render_status_json(snapshot: &ControlSnapshot) -> String {
             JsonValue::opt_str(snapshot.current_decision.as_deref()),
         ),
         ("peak", JsonValue::opt_str(snapshot.current_peak.as_deref())),
+        (
+            "peak_source",
+            JsonValue::opt_str(snapshot.peak_source.as_deref()),
+        ),
         (
             "log",
             JsonValue::Array(

@@ -52,11 +52,13 @@ sequenceDiagram
     R->>B: Whole-track exact peak → saved for next play
 ```
 
-The 30-second cap is deliberate. Streams and gapless playlists can't wait longer than that, and if a look-ahead runs past the end of the track, the analysis is wasted on the next one. Within 30 seconds of a track boundary, the music is assumed to be one consistent recording.
+**Scanning is not buffering (streams vs. local files):**
+- **Streams (UPnP and live exclusive capture):** buffer and look-ahead are strictly capped at **30 seconds** — a hard ceiling. Streams never run a whole-file peak scan and always keep the −3 dB fail-safe.
+- **Local files:** detector look-ahead still runs on the first 30 seconds, while a separate parallel scan reader reads the full file quickly to compute an exact 8× true peak (`tp8x-32`, with a 2-second deadline after W2 finishes; if a slow NAS misses the deadline, playback falls back cleanly and the scan finishes in the background for the next play). Playback buffers only what the active filter needs (which can exceed 30 s for 4M-tap filters), never the full decoded file.
 
 > ⏱️ **Start-up delay:** the first 30 seconds are fully rendered before the first sample plays. With the 4M-class filters on a modest PC, this takes noticeably longer than in normal mode. That cost buys the quality.
 
-**Tracks shorter than 30 s** (interludes, hidden tracks) are played with normal-mode defaults and labelled `normal (<30 s)` in the report.
+**Tracks shorter than 30 s** (interludes, hidden tracks) play with normal-mode filter defaults labelled `normal (<30 s)`, while local short tracks still use whole-track peak evidence (exact unity render `exact-M` or synchronous 8× `scan-tp`) so quiet short tracks never receive a blind −3 dB.
 
 ---
 
@@ -153,22 +155,38 @@ The filters themselves are described in [Sound Engine → Filters](SOUND_ENGINE.
 
 ## Exact headroom: one gain, whole track
 
-Normal mode reserves −3 dB whenever the peak is unknown, to be safe. Ultimate mode **measures** the peak after the complete chain (filter, REW, quantizer margin) and sets one fixed gain for the whole track. That gain is ≤ 0 dB, never a boost, and it never changes mid-track.
+For local files in Ultimate mode, the maximum peak is **always known** (except if decoding fails or a slow network share misses the 2 s scan deadline). Peak evidence is resolved in strict priority order:
 
-```mermaid
-stateDiagram-v2
-    direction LR
-    [*] --> First: first play
-    First: 🟡 First play ("live")<br/>gain from the 30 s window,<br/>conservative
-    Cached: 🟢 Every later play ("cached")<br/>gain from the exact<br/>whole-track peak, zero waste
-    First --> Cached: played to the end<br/>(MD5 verified, saved)
-    Cached --> Cached: replay
-    Cached --> First: file changed, REW filter<br/>changed, or detector upgrade
+| Tier | `peak_source` | Evidence | Meter / ISP allowance `A_tp` |
+|---|---|---|---|
+| **E1** | `exact-M` | Cached exact unity-gain post-chain peak `M` for this audio MD5 and DSP chain (`PostChainKey`). Survives `DETECTOR_VERSION` upgrades | `0.00 dB` (exact) |
+| **E3** | `scan-tp` | Parallel whole-file 8× / 32-tap Kaiser true-peak scan (`tp8x-32`, ≤ 0.1 dB error across 0–0.45·fs, 2 s post-W2 deadline) | `0.10 dB` |
+| **E4** | `cached-tp` | Cached whole-track true peak (`true_peak_dbtp`) for this audio MD5 when the DSP chain changed (`PostChainKey` miss) | `0.10 dB` (`tp8x-32`) / `0.70 dB` (`tp4x-12`) |
+| **E5** | `tag-tp` / `tag-sp` | Validated FLAC true-peak or ReplayGain sample-peak tag | `0.70 dB` (`tag-tp`) / `3.00 dB` (`tag-sp`) |
+| — | `unknown` | Fail-safe (streams, decode error, or missed 2 s deadline without fallback) | `3.00 dB` |
+
+The gain step `G_up` is strictly binary (**0 dB** or **−3 dB**), and `S ≤ 0` handles only excess over the `-(m_q + 1.0 dB)` DAC ceiling:
+
+```text
+G_up  =  0 dB   if source TP <= -3.00 dBFS
+      = -3 dB   otherwise  (including cached exact-M tracks with hot source peaks)
+
+# Cached exact-M (E1):
+S     = min( 0, -(max(M, M30) + G_up + m_q + 1.0 dB) )
+
+# Known source peak without cached M (E3 / E4 / E5):
+M_hat = max( M30, TP + A_tp + A_up(plan) + max(G_c, 0) )
+S     = min( 0, -(M_hat + G_up + m_q + 1.0 dB) )
+
+G     = G_up + S   (locked for the whole track; never boosts, never pumps)
 ```
 
-- If you skip mid-track, nothing is saved. A file whose audio MD5 doesn't match its header is never saved either.
-- Running an **offline scan** (`scan --post-chain`) pre-measures your whole library, so even the first play is `cached`. See [Getting Started → Scan](GETTING_STARTED.md#scan-your-library-optional).
-- Streams (UPnP and live exclusive Tidal capture) always keep −3 dB, because their peak and end are unknown ahead of time.
+- Quiet masters (`TP ≤ −3.00 dBFS`, no REW boost) play at **0.0 dB** on the very first play (and stay bit-perfect `Bypass` when the plan allows it).
+- `A_up(plan)` bounds upsampler peak overshoot relative to ideal reconstruction (`0.00 dB` for `null`, `0.10 dB` for Gaussian LP, `0.40–0.45 dB` for 4M steep/apodizing LP, `1.75–1.80 dB` for intermediate/minimum phase).
+- Peak validity (`true_peak_dbtp`, `sample_peak`, `post_chain_peaks`) is keyed strictly on audio identity (MD5), separate from `DETECTOR_VERSION`, so upgrades recompute detector rules without discarding cached peaks.
+- If a ReplayGain tag disagrees with E3/E4 by more than `0.5 dB`, E3/E4 wins and a `stale ReplayGain tag` notice is logged.
+- Running an **offline scan** (`scan --post-chain`) pre-measures exact `M` for your whole library so even the first play hits `exact-M`. See [Getting Started → Scan](GETTING_STARTED.md#scan-your-library-optional).
+- Streams (UPnP and live exclusive Tidal capture) always keep −3 dB (`unknown`), because their peak and end are unknown ahead of time.
 
 ---
 
@@ -239,8 +257,9 @@ Upgrading from an older version? `audiophile-player filters migrate` imports you
 Every track prints one line to the console and to the web page. The example below is illustrative:
 
 ```text
-ultimate=[mode=[ultimate: cached] rule=rule_A_apodizing fired=[A(apod:cache(WT)),G(Classical)]
-          M=-0.85dBFS(cached) G=-0.912dB m_q=0.00027dB speed=3.4xRT]
+ultimate=[mode=[ultimate: live] rule=rule_A_apodizing fired=[A(apod:window(W30)),G(Classical)]
+          M30=-5.12dBFS peak_source=scan-tp peak_scan_ms=142 A_tp=0.10dB A_up=0.45dB
+          G=+0.000dB m_q=0.00027dB speed=3.4xRT]
 ```
 
 | Field | Meaning |
@@ -249,6 +268,9 @@ ultimate=[mode=[ultimate: cached] rule=rule_A_apodizing fired=[A(apod:cache(WT))
 | `rule` | Which rule picked the filter: `user_filter`, `user_phase_min` / `user_phase_ip`, `rule_A_apodizing`, `rule_L_loud_clipped`, `rule_G_classical` (etc.), `rule_H_fake_hires`, `rule_R_1x_clean`, `rule_R_hires_clean`, `throughput_fallback(…)`, `cli_override`, `short_track_bypass` |
 | `fired` | Every rule that said "yes", and where its evidence came from (`user`, `cache(WT)`, `header`, `window(W30)`, `tag`) |
 | `M` / `M30` | Whole-track / 30-second peak after the full chain |
+| `peak_source` | Peak evidence tier used for headroom (`exact-M`, `scan-tp`, `cached-tp`, `tag-tp`, `tag-sp`, `unknown`) — also exposed in `status --json` and on the web UI |
+| `peak_scan_ms` | Wall-clock duration of the parallel E3 whole-file peak scan in milliseconds (when E3 ran) |
+| `A_tp` / `A_up` | Meter/ISP error allowance (`0.10–3.00 dB`) and upsampler overshoot bound (`0.00–1.80 dB`) |
 | `G` | The fixed gain applied to the whole track |
 | `speed` | Render speed in multiples of real time. Below the required speed, a lighter **exact** filter is used |
 

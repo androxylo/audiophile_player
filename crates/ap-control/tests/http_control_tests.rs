@@ -180,13 +180,14 @@ fn http_server_serves_scrollable_no_volume_ui_and_routes_play_pause_commands() {
     assert_eq!(shared.take_pending_command(), Some(ControlCommand::Resume));
     assert!(!stop_flag.load(Ordering::SeqCst));
 
-    // 5. GET /api/status returns valid JSON including recent bounded action log, decision & peak
-    shared.set_playing_with_decision_and_peak(
+    // 5. GET /api/status returns valid JSON including recent bounded action log, decision, peak & peak_source
+    shared.set_playing_with_decision_peak_and_source(
         ap_control::state::PlayModeLabel::Random,
         "test.flac".to_string(),
         "[ultimate: cached] 16/44100 Hz -> 352800 Hz f64".to_string(),
-        Some("mode=[ultimate: cached] rule=rule_R_1x_clean G=+0.000dB".to_string()),
-        Some("-0.85 dBFS (whole-track)".to_string()),
+        Some("mode=[ultimate: cached] rule=rule_R_1x_clean peak_source=exact-M G=+0.000dB".to_string()),
+        Some("-0.85 dBFS (exact-M)".to_string()),
+        Some("exact-M".to_string()),
     );
     shared.observe_output_peak_u32(1 << 30);
     let status = http_request(
@@ -197,13 +198,19 @@ fn http_server_serves_scrollable_no_volume_ui_and_routes_play_pause_commands() {
     assert!(status.contains("application/json"));
     assert!(status.contains("Command: Pause"));
     assert!(status.contains("\"decision\":\"mode=[ultimate: cached]"));
-    assert!(status.contains("\"peak\":\"-0.85 dBFS (whole-track) · Live DAC: -6.02 dBFS\""));
+    assert!(status.contains("\"peak\":\"-0.85 dBFS (exact-M) · Live DAC: -6.02 dBFS\""));
+    assert!(status.contains("\"peak_source\":\"exact-M\""));
+    let v1_json = shared.api_v1_status_json();
+    assert_eq!(
+        v1_json.get("peak_source").and_then(ap_core::json::JsonValue::as_str),
+        Some("exact-M")
+    );
 
     let page_with_peak = http_request(
         server.addr(),
         &format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
     );
-    assert!(page_with_peak.contains("Max Peak: -0.85 dBFS (whole-track) · Live DAC: -6.02 dBFS"));
+    assert!(page_with_peak.contains("Max Peak: -0.85 dBFS (exact-M) · Live DAC: -6.02 dBFS [exact-M]"));
     // When actively playing, the button becomes Pause (Release DAC) -> /action/pause!
     assert!(page_with_peak.contains("action=\"/action/pause\""));
     assert!(page_with_peak.contains(">Pause (Release DAC)<"));

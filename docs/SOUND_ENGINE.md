@@ -180,7 +180,7 @@ flowchart TD
 - Peak tags are checked for realism before they're trusted. Implausible values count as unknown.
 - REW filters are **not** normalized at load, so their boosts can fill the room's dips. Only the excess that would clip is removed.
 - If something still clips, the quantizer saturates cleanly and reports how many samples were affected (`[clip warn]`).
-- Ultimate mode replaces this with an **exact measured gain**. See [Exact headroom](ULTIMATE_MODE.md#exact-headroom-one-gain-whole-track).
+- Ultimate mode replaces blind −3 dB fallbacks on local files with a **known-peak headroom formula** (`select_ultimate_headroom_v2`): a strictly binary `G_up` step (`0 dB` when source true peak `≤ −3.00 dBFS`, else `−3 dB`), plus excess-only attenuation `S = min(0, -(M_hat + G_up + m_q + 1.0 dB))` using `M_hat = max(M30, TP + A_tp + A_up(plan) + max(G_c, 0))` (or exact cached `M`). See [Exact headroom](ULTIMATE_MODE.md#exact-headroom-one-gain-whole-track).
 
 ---
 

@@ -1955,13 +1955,25 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
             let fmt_str = report.format_summary(total_duration_s);
             let track_str = path.display().to_string();
             let decision_str = report.ultimate_report.as_ref().map(|u| u.summary());
+            let peak_source = report
+                .ultimate_report
+                .as_ref()
+                .and_then(|u| u.peak_source.clone());
             let known_peak = report
                 .ultimate_report
                 .as_ref()
                 .and_then(|u| {
-                    u.cached_m_dbfs
-                        .map(|m| format!("{m:+.2} dBFS (whole-track)"))
-                        .or_else(|| u.m30_dbfs.map(|m| format!("{m:+.2} dBFS (30 s window)")))
+                    if let Some(m) = u.cached_m_dbfs {
+                        Some(format!("{m:+.2} dBFS (exact-M)"))
+                    } else if let (Some(src), Some(p)) = (u.peak_source.as_deref(), report.headroom.peak_dbfs) {
+                        let unit = match report.headroom.peak_kind {
+                            Some(ap_core::headroom::PeakKind::TruePeak) => "dBTP",
+                            _ => "dBFS",
+                        };
+                        Some(format!("{p:+.2} {unit} ({src})"))
+                    } else {
+                        u.m30_dbfs.map(|m| format!("{m:+.2} dBFS (30 s window)"))
+                    }
                 })
                 .or_else(|| {
                     report
@@ -1987,12 +1999,13 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
             }
             let _ = io::stdout().flush();
             shared.record_action(report.log_line());
-            shared.set_playing_with_decision_and_peak(
+            shared.set_playing_with_decision_peak_and_source(
                 mode_label,
                 track_str,
                 fmt_str,
                 decision_str,
                 known_peak,
+                peak_source,
             );
             if mode_label == PlayModeLabel::UpnpRenderer {
                 if let Some(ref upnp) = state.upnp_state {

@@ -592,6 +592,9 @@ pub fn run_status_cli(as_json: bool) -> Result<(), CliError> {
                 if let Some(dec) = val.get("current_decision").and_then(JsonValue::as_str) {
                     println!("  Decision: {dec}");
                 }
+                if let Some(src) = val.get("peak_source").and_then(JsonValue::as_str) {
+                    println!("  Peak Src: {src}");
+                }
             }
             Ok(())
         }
