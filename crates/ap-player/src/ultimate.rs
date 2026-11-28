@@ -21,8 +21,8 @@
 
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use ap_control::state::PlayModeLabel;
 use ap_core::buffer::StereoF64Buffer;
@@ -43,6 +43,7 @@ use ap_core::user_filters::{
 use ap_dsp::analysis::{DETECTOR_VERSION, TrackAnalyzer};
 use ap_dsp::convolution::ConvolutionTail;
 use ap_dsp::fusion::{CachedWholeTrackEvidence, build_track_db_entry};
+use ap_dsp::peak_scan::{GatedPeakScanner, PEAK_SCAN_METER_ID, PeakScanResult};
 use ap_dsp::pipeline::{AudioPipeline, GaplessCarryover, UltimateDecisionReport};
 use ap_dsp::quantize::QuantizerStats;
 use ap_dsp::selector::{
@@ -50,14 +51,23 @@ use ap_dsp::selector::{
     UpsamplerPolicy, build_post_chain_key, check_ultimate_throughput_with_buffer,
     resolve_active_selection, resolve_machine_suggestion,
 };
-use ap_source::flac::AudioBlockSource;
+use ap_source::flac::{AudioBlockSource, FlacBlockReader};
 use ap_source::md5::md5_to_hex;
 
 use crate::prefetch::{BoundedBlockStreamBuffer, StreamEvent};
 
+/// Default deadline (counted from the moment W2 finishes) to wait for the parallel E3 whole-file
+/// peak scan before falling back to E4/E5/Unknown and letting E3 finish in the background
+/// (`Issue #23 §3.1`, Owner Decision #4).
+pub const E3_PEAK_SCAN_DEADLINE: Duration = Duration::from_secs(2);
+
+#[cfg(test)]
+type E3TestOpener =
+    Arc<dyn Fn(&Path) -> Result<Box<dyn AudioBlockSource + Send>, String> + Send + Sync>;
+
 /// Runtime configuration & Schema-2 Filter Database handle active when `[ultimate] enabled = true`
 /// or `--ultimate`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct UltimateRuntimeContext {
     pub config: UltimateConfig,
     /// Schema-2 album-folder mirror store (`%APPDATA%\audiophile-player\filterdb`).
@@ -71,6 +81,23 @@ pub struct UltimateRuntimeContext {
     /// Single-album hot cache `(root_name, rel_folder, AlbumAnalysisFile)` to avoid re-parsing
     /// the same album YAML across consecutive tracks.
     pub album_cache: Arc<Mutex<Option<(String, String, AlbumAnalysisFile)>>>,
+    /// Maximum time to wait after W2 finishes for the parallel E3 whole-file peak scan
+    /// (defaults to [`E3_PEAK_SCAN_DEADLINE`] = 2 s).
+    pub e3_scan_deadline: Duration,
+    /// Optional test-only factory replacing `FlacBlockReader::open` in the E3 worker (used by T8).
+    #[cfg(test)]
+    pub e3_scan_opener: Option<E3TestOpener>,
+}
+
+impl std::fmt::Debug for UltimateRuntimeContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UltimateRuntimeContext")
+            .field("config", &self.config)
+            .field("filter_db", &self.filter_db)
+            .field("filter_mode", &self.filter_mode)
+            .field("e3_scan_deadline", &self.e3_scan_deadline)
+            .finish()
+    }
 }
 
 impl UltimateRuntimeContext {
@@ -89,6 +116,9 @@ impl UltimateRuntimeContext {
             user_filters: Arc::new(UserFiltersCache::new(choices_path)),
             filter_mode,
             album_cache: Arc::new(Mutex::new(None)),
+            e3_scan_deadline: E3_PEAK_SCAN_DEADLINE,
+            #[cfg(test)]
+            e3_scan_opener: None,
         }
     }
 
@@ -823,6 +853,229 @@ fn quantize_and_push_eof_ending(
     }
 }
 
+/// Outcome published by the parallel E3 whole-file peak scan worker (`Issue #23 §3.1`, P2b).
+#[derive(Debug, Clone)]
+enum E3ScanOutcome {
+    Completed {
+        scan: PeakScanResult,
+        elapsed_ms: u64,
+    },
+    Unavailable,
+}
+
+enum E3JoinResult {
+    Completed {
+        scan: PeakScanResult,
+        elapsed_ms: u64,
+    },
+    TimedOut {
+        elapsed_s: f64,
+    },
+    Unavailable,
+    Aborted,
+}
+
+/// Handle to the parallel E3 whole-file peak scan worker started at W0 for local files.
+///
+/// If the deadline expires, dropping this handle leaves the worker running in the background so
+/// it finishes the scan and writes the `tp8x-32` peak-only Schema-2 cache entry for the next play.
+struct E3ScanHandle {
+    state: Arc<(Mutex<Option<E3ScanOutcome>>, Condvar)>,
+    started: Instant,
+}
+
+impl E3ScanHandle {
+    /// Wait up to `deadline` (counted from now — i.e., from the moment W2 finishes) for the
+    /// parallel E3 scan to complete, polling `is_aborted()` every 25 ms so skips abort promptly.
+    fn wait_after_w2<F: Fn() -> bool>(&self, deadline: Duration, is_aborted: &F) -> E3JoinResult {
+        let wait_start = Instant::now();
+        let (lock, cvar) = &*self.state;
+        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(ref outcome) = *guard {
+                return match outcome {
+                    E3ScanOutcome::Completed { scan, elapsed_ms } => E3JoinResult::Completed {
+                        scan: *scan,
+                        elapsed_ms: *elapsed_ms,
+                    },
+                    E3ScanOutcome::Unavailable => E3JoinResult::Unavailable,
+                };
+            }
+            if is_aborted() {
+                return E3JoinResult::Aborted;
+            }
+            let waited = wait_start.elapsed();
+            if waited >= deadline {
+                return E3JoinResult::TimedOut {
+                    elapsed_s: self.started.elapsed().as_secs_f64(),
+                };
+            }
+            let step = (deadline - waited).min(Duration::from_millis(25));
+            let (next_guard, _) = cvar
+                .wait_timeout(guard, step)
+                .unwrap_or_else(|e| e.into_inner());
+            guard = next_guard;
+        }
+    }
+}
+
+/// Spawn a parallel E3 whole-file source scan worker on a second decoder handle for a local file
+/// (`Issue #23 §3.1`, P2b). Never called for streaming sources (`M1` / `OQ-33`).
+#[allow(clippy::too_many_arguments)]
+fn spawn_e3_peak_scan(
+    ult: &UltimateRuntimeContext,
+    local_path: &Path,
+    track_loc: Option<(String, String, String)>,
+    file_size: u64,
+    file_mtime: u64,
+    header_md5: Option<[u8; 16]>,
+    spec: ap_core::format::StreamSpec,
+) -> E3ScanHandle {
+    let state: Arc<(Mutex<Option<E3ScanOutcome>>, Condvar)> =
+        Arc::new((Mutex::new(None), Condvar::new()));
+    let state_w = Arc::clone(&state);
+    let started = Instant::now();
+    let path_buf = local_path.to_path_buf();
+    let filter_db = ult.filter_db.clone();
+    let album_cache = Arc::clone(&ult.album_cache);
+    #[cfg(test)]
+    let test_opener = ult.e3_scan_opener.clone();
+
+    let publish = move |outcome: E3ScanOutcome| {
+        let (lock, cvar) = &*state_w;
+        let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+        *g = Some(outcome);
+        cvar.notify_all();
+    };
+
+    let spawn_res = std::thread::Builder::new()
+        .name("ap-e3-peak-scan".to_string())
+        .spawn(move || {
+            let mut reader: Box<dyn AudioBlockSource + Send> = {
+                #[cfg(test)]
+                {
+                    if let Some(ref opener) = test_opener {
+                        match opener(&path_buf) {
+                            Ok(r) => r,
+                            Err(_) => {
+                                publish(E3ScanOutcome::Unavailable);
+                                return;
+                            }
+                        }
+                    } else {
+                        match FlacBlockReader::open(&path_buf) {
+                            Ok(r) => Box::new(r),
+                            Err(_) => {
+                                publish(E3ScanOutcome::Unavailable);
+                                return;
+                            }
+                        }
+                    }
+                }
+                #[cfg(not(test))]
+                {
+                    match FlacBlockReader::open(&path_buf) {
+                        Ok(r) => Box::new(r),
+                        Err(_) => {
+                            publish(E3ScanOutcome::Unavailable);
+                            return;
+                        }
+                    }
+                }
+            };
+
+            let mut scanner = GatedPeakScanner::new();
+            loop {
+                match reader.read_next_block(16_384) {
+                    Ok(Some(block)) => scanner.push_stereo_buffer(&block),
+                    Ok(None) => break,
+                    Err(_) => {
+                        publish(E3ScanOutcome::Unavailable);
+                        return;
+                    }
+                }
+            }
+
+            // Verify MD5 (Issue #23 §3.1 + K9: when STREAMINFO MD5 is zero/absent, use the
+            // computed audio MD5 from full decode; refuse to trust or persist on MD5 mismatch).
+            let expected_md5 = header_md5.or_else(|| reader.streaminfo_md5());
+            let computed_md5 = reader.computed_md5();
+            if let (Some(exp), Some(act)) = (expected_md5, computed_md5) {
+                if exp != act {
+                    publish(E3ScanOutcome::Unavailable);
+                    return;
+                }
+            }
+            let final_md5_hex = expected_md5.or(computed_md5).as_ref().map(md5_to_hex);
+
+            let Some(scan) = scanner.finish(None) else {
+                publish(E3ScanOutcome::Unavailable);
+                return;
+            };
+            if scan.frames_scanned == 0 || !scan.true_peak_dbtp.is_finite() {
+                publish(E3ScanOutcome::Unavailable);
+                return;
+            }
+
+            let elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            let reader_spec = reader.spec();
+            let eff_rate = if reader_spec.sample_rate_hz > 0 {
+                reader_spec.sample_rate_hz
+            } else {
+                spec.sample_rate_hz
+            };
+            let eff_bits = if reader_spec.bits_per_sample > 0 {
+                reader_spec.bits_per_sample
+            } else {
+                spec.bits_per_sample
+            };
+            let seconds = scan.frames_scanned as f64 / f64::from(eff_rate.max(1));
+
+            // Persist peak-only Schema-2 upsert immediately (even if playback misses the 2 s
+            // deadline or is skipped mid-track), updating the in-memory album cache as well.
+            if let Some((ref root, ref rel_folder, ref file_name)) = track_loc {
+                let head_hash = file_head_4k_hash(&path_buf);
+                if let Ok(Some(merged)) = filter_db.upsert_track_peak_only_nonblocking(
+                    root,
+                    rel_folder,
+                    file_name,
+                    final_md5_hex,
+                    file_size,
+                    file_mtime,
+                    seconds,
+                    head_hash,
+                    eff_rate,
+                    eff_bits,
+                    scan.sample_peak_linear,
+                    scan.true_peak_dbtp,
+                    PEAK_SCAN_METER_ID,
+                ) {
+                    let mut guard = album_cache.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some((r, f, album)) = guard.as_mut() {
+                        if r.eq_ignore_ascii_case(root) && f.eq_ignore_ascii_case(rel_folder) {
+                            let key = album
+                                .find_track_key(file_name)
+                                .unwrap_or_else(|| file_name.to_string());
+                            album.tracks.insert(key, merged);
+                            album.recompute_header_detector_version(0);
+                        }
+                    }
+                }
+            }
+
+            publish(E3ScanOutcome::Completed { scan, elapsed_ms });
+        });
+
+    if spawn_res.is_err() {
+        let (lock, cvar) = &*state;
+        let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+        *g = Some(E3ScanOutcome::Unavailable);
+        cvar.notify_all();
+    }
+
+    E3ScanHandle { state, started }
+}
+
 /// Phase U5b Learn-on-Play: persist verified whole-track analysis + post-chain peak once at clean EOF.
 #[allow(clippy::too_many_arguments)]
 fn persist_learn_on_play<S: AudioBlockSource>(
@@ -1027,6 +1280,52 @@ where
         );
     }
 
+    // --- Early Schema-2 Cache Peek + E3 Parallel Whole-File Scan Spawn (Issue #23 §3.1, P2b) ---
+    let (file_size, file_mtime) = local_path
+        .and_then(file_size_and_mtime)
+        .unwrap_or((0, 0));
+
+    let cached_s2_track: Option<(AlbumTrackAnalysis, bool, bool)> = if is_streaming {
+        None
+    } else if let Some((ref root, ref rel_folder, ref file_name)) = track_loc {
+        ult.load_album_cached(root, rel_folder).and_then(|album| {
+            let track = album.get_track(file_name)?.clone();
+            // Issue #23 P1 (K5): split audio-identity validity (`peak_current`) from
+            // `DETECTOR_VERSION` validity (`results_current`). Source true peak and exact
+            // post-chain `M` depend only on audio identity + chain, never on detector versions.
+            let peak_current = track.matches_identity(
+                header_md5_hex.as_deref(),
+                Some(file_size),
+                Some(file_mtime),
+            );
+            let results_current = peak_current && track.detector_version == DETECTOR_VERSION;
+            Some((track, results_current, peak_current))
+        })
+    } else {
+        None
+    };
+
+    let has_cached_8x_peak = cached_s2_track.as_ref().is_some_and(|(t, _, pcur)| {
+        *pcur && t.effective_true_peak_meter() == Some(TRUE_PEAK_METER_8X_32)
+    });
+    // Spawn E3 whole-file scan in parallel with W0..W2 for local files that don't yet have a
+    // current high-accuracy `tp8x-32` cached peak. Streams NEVER spawn E3 (M1 / OQ-33).
+    let e3_handle = if !is_streaming && !has_cached_8x_peak {
+        local_path.map(|lp| {
+            spawn_e3_peak_scan(
+                ult,
+                lp,
+                track_loc.clone(),
+                file_size,
+                file_mtime,
+                header_md5,
+                spec,
+            )
+        })
+    } else {
+        None
+    };
+
     // --- W0: Bounded <= 30 s Window Acquisition (Mandates M1, M2, M4) ---
     let W0Window {
         blocks: w0_blocks,
@@ -1085,31 +1384,7 @@ where
         );
     }
 
-    // --- W1: Strict Per-Track Schema-2 Cache Lookup + Fusion + Selection (Review #9 U7, U10, U12) ---
-    let (file_size, file_mtime) = local_path
-        .and_then(file_size_and_mtime)
-        .unwrap_or((0, 0));
-
-    let cached_s2_track: Option<(AlbumTrackAnalysis, bool, bool)> = if is_streaming {
-        None
-    } else if let Some((ref root, ref rel_folder, ref file_name)) = track_loc {
-        ult.load_album_cached(root, rel_folder).and_then(|album| {
-            let track = album.get_track(file_name)?.clone();
-            // Issue #23 P1 (K5): split audio-identity validity (`peak_current`) from
-            // `DETECTOR_VERSION` validity (`results_current`). Source true peak and exact
-            // post-chain `M` depend only on audio identity + chain, never on detector versions.
-            let peak_current = track.matches_identity(
-                header_md5_hex.as_deref(),
-                Some(file_size),
-                Some(file_mtime),
-            );
-            let results_current = peak_current && track.detector_version == DETECTOR_VERSION;
-            Some((track, results_current, peak_current))
-        })
-    } else {
-        None
-    };
-
+    // --- W1: Strict Per-Track Schema-2 Fusion + Selection (Review #9 U7, U10, U12) ---
     let cached_current = cached_s2_track.as_ref().is_some_and(|(_, cur, _)| *cur);
     let cached_peak_current = cached_s2_track.as_ref().is_some_and(|(_, _, pcur)| *pcur);
     let base_cached_wt = if let Some((ref t, cur, pcur)) = cached_s2_track {
@@ -1223,8 +1498,26 @@ where
             .and_then(|(t, _, _)| t.find_post_chain_peak(&post_key))
     };
 
-    // Resolve typed PeakEvidence in priority order E1 -> E4 -> E5 -> Unknown (Issue #23 §2, P3).
-    // (E3 whole-file scan slots cleanly between E1 and E4 in P2b.)
+    // Join the parallel E3 whole-file peak scan with the 2 s deadline (counted from W2 finish,
+    // Owner Decision #4). On timeout, log warning, fall back to E4/E5/Unknown, and let the E3
+    // worker finish in the background to populate Schema-2 for the next play.
+    let mut e3_scan_result: Option<(PeakScanResult, u64)> = None;
+    if let Some(handle) = e3_handle {
+        match handle.wait_after_w2(ult.e3_scan_deadline, &is_aborted) {
+            E3JoinResult::Completed { scan, elapsed_ms } => {
+                e3_scan_result = Some((scan, elapsed_ms));
+            }
+            E3JoinResult::TimedOut { elapsed_s } => {
+                selection.warnings.push(format!(
+                    "peak scan deadline missed ({elapsed_s:.2} s); falling back and continuing in background"
+                ));
+            }
+            E3JoinResult::Unavailable => {}
+            E3JoinResult::Aborted => return UltimateStreamResult::Aborted,
+        }
+    }
+
+    // Resolve typed PeakEvidence in priority order E1 -> E3 -> E4 -> E5 -> Unknown (Issue #23 §2).
     let cached_source_tp: Option<(f64, f64)> = if is_streaming || !cached_peak_current {
         None
     } else {
@@ -1240,14 +1533,23 @@ where
     let peak_evidence = if is_streaming {
         PeakEvidence::Unknown
     } else if let Some(m_db) = cached_exact_m_db {
-        let source_tp_db = cached_source_tp.map(|(tp, _)| tp).or_else(|| {
-            selection
-                .peak_meta
-                .classified_peak_for_bits(spec.bits_per_sample)
-                .filter(|cp| cp.kind == PeakKind::TruePeak)
-                .map(|cp| cp.dbfs)
-        });
+        let source_tp_db = e3_scan_result
+            .map(|(s, _)| s.true_peak_dbtp)
+            .or_else(|| cached_source_tp.map(|(tp, _)| tp))
+            .or_else(|| {
+                selection
+                    .peak_meta
+                    .classified_peak_for_bits(spec.bits_per_sample)
+                    .filter(|cp| cp.kind == PeakKind::TruePeak)
+                    .map(|cp| cp.dbfs)
+            });
         PeakEvidence::ExactPostChain { m_db, source_tp_db }
+    } else if let Some((scan, _)) = e3_scan_result {
+        PeakEvidence::SourceTruePeak {
+            tp_db: scan.true_peak_dbtp,
+            meter_err_db: TP_METER_ERR_8X_32_DB,
+            source: "scan-tp",
+        }
     } else if let Some((tp_db, meter_err_db)) = cached_source_tp {
         PeakEvidence::SourceTruePeak {
             tp_db,
@@ -4289,5 +4591,487 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    fn write_test_sine_flac_16(path: &Path, rate: u32, seconds: usize, amp: f64) -> Vec<[i32; 2]> {
+        use flac_codec::encode::{FlacSampleWriter, Options};
+        let frames = (rate as usize) * seconds;
+        let mut interleaved = Vec::with_capacity(frames * 2);
+        let mut expected_i32 = Vec::with_capacity(frames);
+        let scale = 32767.0 * amp;
+        for n in 0..frames {
+            let v = ((2.0 * PI * 1_000.0 * (n as f64) / f64::from(rate)).sin() * scale).round()
+                as i32;
+            interleaved.push(v);
+            interleaved.push(v);
+            expected_i32.push([v << 16, v << 16]);
+        }
+        let mut writer = FlacSampleWriter::create(
+            path,
+            Options::default(),
+            rate,
+            16,
+            2,
+            Some(interleaved.len() as u64),
+        )
+        .expect("create test FLAC");
+        writer.write(&interleaved).expect("write test FLAC samples");
+        writer.finalize().expect("finalize test FLAC");
+        expected_i32
+    }
+
+    /// Issue #23 T1 (P2b / K1): Untagged, uncached local FLAC >= 31 s peaking at -8 dBFS with
+    /// Null filter at native rate MUST resolve via E3 (`scan-tp`) to `G = 0.0 dB`, keep shaper
+    /// `Bypass`, produce **bit-identical** PCM to the source FLAC, and persist `tp8x-32` peak!
+    #[test]
+    fn t1_untagged_uncached_quiet_local_flac_uses_e3_scan_tp_zero_db_and_stays_bit_identical() {
+        let db_root = temp_dir("t1_e3_quiet");
+        let track_path = db_root.join("quiet_minus8.flac");
+        let amp = 10.0_f64.powf(-8.0 / 20.0); // -8.0 dBFS
+        let expected_pcm = write_test_sine_flac_16(&track_path, 44_100, 31, amp);
+
+        let ult = UltimateRuntimeContext::for_test(
+            UltimateConfig {
+                enabled: true,
+                genre_rules: true,
+                learn_on_play: false, // Even without learn-on-play, E3 persists peak-only entry!
+            },
+            db_root.clone(),
+        );
+        let null_pipeline = AudioPipeline::with_rew_config_full_tail(
+            UpsamplerPolicy {
+                filter_override: Some(FilterArchetype::Null),
+                ..UpsamplerPolicy::default()
+            },
+            ConvolutionConfig::disabled(),
+            true,
+        )
+        .unwrap();
+
+        let buf = BoundedBlockStreamBuffer::with_limits(
+            ULTIMATE_MAX_BUFFERED_FRAMES,
+            Duration::from_secs(ULTIMATE_MAX_BUFFERED_SECONDS),
+        );
+        let ep = buf.current_epoch();
+        let mut src = FlacBlockReader::open(&track_path).expect("open T1 FLAC");
+
+        let mut carry = None;
+        let mut backup = None;
+        let mut pend = false;
+        let buf_c = Arc::clone(&buf);
+        let h = std::thread::spawn(move || {
+            let mut report = None;
+            let mut out_frames: Vec<[i32; 2]> = Vec::new();
+            loop {
+                match buf_c.pop_for_epoch_timeout(ep, Duration::from_secs(60)) {
+                    Some(StreamEvent::TrackStart { report: r, .. }) => report = Some(r),
+                    Some(StreamEvent::PcmBlock(b)) => out_frames.extend_from_slice(&b.frames),
+                    Some(StreamEvent::TrackEnd) => break,
+                    other => panic!("unexpected T1 event: {other:?}"),
+                }
+            }
+            (report.expect("missing TrackStart"), out_frames)
+        });
+
+        let res = stream_track_ultimate(
+            &null_pipeline,
+            &ult,
+            &buf,
+            ep,
+            || false,
+            &mut src,
+            &track_path,
+            Some(&track_path),
+            None,
+            None,
+            PlayModeLabel::SingleFile,
+            Some(31.0),
+            &mut carry,
+            &mut backup,
+            &mut pend,
+            false,
+            16_384,
+        );
+        assert!(matches!(res, UltimateStreamResult::Played { .. }), "got {res:?}");
+        let (rep, out_pcm) = h.join().unwrap();
+
+        assert!(
+            rep.headroom.reason.contains("scan-tp"),
+            "T1: untagged uncached local FLAC must use E3 scan-tp, got reason='{}'",
+            rep.headroom.reason
+        );
+        assert_eq!(rep.headroom.mode, HeadroomMode::ZeroDb);
+        assert!(
+            rep.headroom.total_gain_db().abs() < 1e-9,
+            "T1: -8 dBFS local FLAC must play at 0.0 dB, got {}",
+            rep.headroom.total_gain_db()
+        );
+        assert_eq!(
+            rep.effective_shaper,
+            NoiseShaperProfile::Bypass,
+            "T1: 0 dB Null pass-through must keep shaper Bypass"
+        );
+        assert_eq!(rep.output_bits, 16);
+        assert_eq!(out_pcm.len(), expected_pcm.len());
+        assert_eq!(
+            out_pcm, expected_pcm,
+            "T1: output PCM must be bit-identical to source 16-bit FLAC!"
+        );
+
+        // E3 MUST have written the peak-only tp8x-32 entry to Schema-2 YAML even with learn_on_play=false.
+        let album = ult
+            .filter_db
+            .load_album("main", "")
+            .expect("E3 must persist peak-only Schema-2 album YAML");
+        let stored = album
+            .get_track("quiet_minus8.flac")
+            .expect("T1 track entry in Schema-2 YAML");
+        assert_eq!(stored.detector_version, 0, "peak-only upsert must not claim detectors current");
+        assert_eq!(stored.effective_true_peak_meter(), Some(TRUE_PEAK_METER_8X_32));
+        assert!(
+            (stored.true_peak_dbtp.unwrap() - (-8.0)).abs() < 0.1,
+            "stored TP should be ~-8.0 dBTP, got {:?}",
+            stored.true_peak_dbtp
+        );
+
+        let _ = fs::remove_dir_all(&db_root);
+    }
+
+    /// Wrapper around `FlacBlockReader` that injects a sample-peak Vorbis tag (for T3).
+    struct TaggedPeakAdapter {
+        inner: FlacBlockReader,
+        extra_peak_meta: TrackPeakMetadata,
+    }
+
+    impl AudioBlockSource for TaggedPeakAdapter {
+        fn spec(&self) -> ap_core::format::StreamSpec {
+            self.inner.spec()
+        }
+        fn is_streaming(&self) -> bool {
+            false
+        }
+        fn total_frames(&self) -> Option<u64> {
+            self.inner.total_frames()
+        }
+        fn peak_meta(&self) -> TrackPeakMetadata {
+            self.extra_peak_meta
+        }
+        fn track_meta(&self) -> ap_core::metadata::TrackMetadata {
+            self.inner.track_meta()
+        }
+        fn streaminfo_md5(&self) -> Option<[u8; 16]> {
+            self.inner.streaminfo_md5()
+        }
+        fn computed_md5(&self) -> Option<[u8; 16]> {
+            self.inner.computed_md5()
+        }
+        fn read_next_block(&mut self, max_frames: usize) -> Result<Option<StereoF64Buffer>, String> {
+            self.inner.read_next_block(max_frames)
+        }
+    }
+
+    /// Issue #23 T3 (P2b / K2): Sample-peak tag `-4 dBFS` + REW `+6 dB` IR on a real local FLAC.
+    /// E3 (`scan-tp`, `A_tp = 0.1 dB`) replaces blanket `A_isp = 3.0 dB`, saving ~2.9 dB of
+    /// unneeded attenuation while preserving zero overs and full DAC margin.
+    #[test]
+    fn t3_e3_replaces_sample_peak_blanket_isp_allowance_with_rew_boost_zero_overs() {
+        use ap_core::headroom::ULTIMATE_DAC_MARGIN_DB;
+
+        let db_root = temp_dir("t3_e3_rew");
+        let track_path = db_root.join("minus4_rew.flac");
+        let amp = 10.0_f64.powf(-4.0 / 20.0); // -4.0 dBFS
+        let _ = write_test_sine_flac_16(&track_path, 44_100, 31, amp);
+
+        let ir_path = db_root.join("rew_plus6db_1k_352k8.wav");
+        let ir = peaking_eq_ir(352_800, 1_000.0, 2.0, 6.0, 4_096);
+        write_stereo_f32_wav(&ir_path, 352_800, &ir, &ir);
+
+        let pipeline = AudioPipeline::with_rew_config_full_tail(
+            UpsamplerPolicy {
+                filter_override: Some(FilterArchetype::SimpleTest),
+                ..UpsamplerPolicy::default()
+            },
+            ConvolutionConfig {
+                enabled: true,
+                file: Some(ir_path),
+                ..ConvolutionConfig::default()
+            },
+            true,
+        )
+        .unwrap();
+
+        let ult = UltimateRuntimeContext::for_test(
+            UltimateConfig {
+                enabled: true,
+                genre_rules: true,
+                learn_on_play: false,
+            },
+            db_root.clone(),
+        );
+
+        let buf = BoundedBlockStreamBuffer::with_limits(
+            ULTIMATE_MAX_BUFFERED_FRAMES,
+            Duration::from_secs(ULTIMATE_MAX_BUFFERED_SECONDS),
+        );
+        let ep = buf.current_epoch();
+        let mut src = TaggedPeakAdapter {
+            inner: FlacBlockReader::open(&track_path).expect("open T3 FLAC"),
+            extra_peak_meta: TrackPeakMetadata {
+                replaygain_track_peak: Some(amp),
+                ..TrackPeakMetadata::default()
+            },
+        };
+
+        let mut carry = None;
+        let mut backup = None;
+        let mut pend = false;
+        let buf_c = Arc::clone(&buf);
+        let h = std::thread::spawn(move || drain_track_events(&buf_c, ep));
+        let res = stream_track_ultimate(
+            &pipeline,
+            &ult,
+            &buf,
+            ep,
+            || false,
+            &mut src,
+            &track_path,
+            Some(&track_path),
+            None,
+            None,
+            PlayModeLabel::SingleFile,
+            Some(31.0),
+            &mut carry,
+            &mut backup,
+            &mut pend,
+            false,
+            16_384,
+        );
+        let (rep, _, _) = h.join().unwrap();
+        let qstats = match res {
+            UltimateStreamResult::Played { quantizer_stats, .. } => quantizer_stats,
+            other => panic!("T3 expected Played, got {other:?}"),
+        };
+        let u = rep.ultimate_report.as_ref().expect("ultimate report");
+
+        assert!(
+            rep.headroom.reason.contains("scan-tp"),
+            "T3: E3 must override sample-peak tag with scan-tp, got reason='{}'",
+            rep.headroom.reason
+        );
+        assert_eq!(rep.headroom.mode, HeadroomMode::ZeroDb);
+        // With A_tp=0.1, A_up=0.15, G_c=+6.0, DAC_MARGIN=1.0: G ~= -(-4 + 0.1 + 0.15 + 6 + 1) = -3.25 dB
+        // (vs -6.15 dB with blanket A_isp=3.0!).
+        assert!(
+            u.fixed_gain_db > -4.0 && u.fixed_gain_db < -2.5,
+            "T3: expected G near -3.25 dB (replacing A_isp=3 with A_tp=0.1), got {:.3} dB",
+            u.fixed_gain_db
+        );
+        assert_eq!(qstats.overs_count, 0, "T3: must have 0 overs");
+        let ceiling = -(u.quantizer_margin_db + ULTIMATE_DAC_MARGIN_DB);
+        assert!(
+            qstats.max_pre_quant_peak_dbfs() <= ceiling + 0.05,
+            "T3: pre-quant peak {:+.4} dBFS exceeds ceiling {:+.4} dBFS",
+            qstats.max_pre_quant_peak_dbfs(),
+            ceiling
+        );
+
+        let _ = fs::remove_dir_all(&db_root);
+    }
+
+    /// Mock throttled source sleeping per block to deterministically trigger E3 deadline (T8).
+    struct ThrottledPeakSource {
+        inner: SyntheticSource,
+        delay_per_block: Duration,
+    }
+
+    impl AudioBlockSource for ThrottledPeakSource {
+        fn spec(&self) -> ap_core::format::StreamSpec {
+            self.inner.spec()
+        }
+        fn is_streaming(&self) -> bool {
+            false
+        }
+        fn total_frames(&self) -> Option<u64> {
+            self.inner.total_frames()
+        }
+        fn peak_meta(&self) -> TrackPeakMetadata {
+            self.inner.peak_meta()
+        }
+        fn track_meta(&self) -> ap_core::metadata::TrackMetadata {
+            self.inner.track_meta()
+        }
+        fn streaminfo_md5(&self) -> Option<[u8; 16]> {
+            self.inner.streaminfo_md5()
+        }
+        fn computed_md5(&self) -> Option<[u8; 16]> {
+            self.inner.computed_md5()
+        }
+        fn read_next_block(&mut self, max_frames: usize) -> Result<Option<StereoF64Buffer>, String> {
+            std::thread::sleep(self.delay_per_block);
+            self.inner.read_next_block(max_frames)
+        }
+    }
+
+    /// Issue #23 T8 (P2b / Owner Decision #4): When the E3 scan misses its deadline (throttled
+    /// NAS/mock reader), playback falls back cleanly, logs `"peak scan deadline missed"`, lets E3
+    /// finish in the background to write `tp8x-32` to Schema-2 YAML, and the next play hits E4
+    /// (`cached-tp`) at `0.0 dB` without re-spawning E3!
+    #[test]
+    fn t8_e3_deadline_miss_falls_back_finishes_in_background_and_next_play_hits_cached_tp() {
+        let db_root = temp_dir("t8_deadline");
+        let track_path = db_root.join("slow_nas_quiet.flac");
+        fs::write(&track_path, b"slow-nas-placeholder").unwrap();
+
+        let amp = 10.0_f64.powf(-8.0 / 20.0); // -8.0 dBFS
+        let md5 = [0x88_u8; 16];
+
+        let mut ult = UltimateRuntimeContext::for_test(
+            UltimateConfig {
+                enabled: true,
+                genre_rules: true,
+                learn_on_play: false,
+            },
+            db_root.clone(),
+        );
+        // Short test deadline (50 ms) while throttled E3 sleeps 20 ms/block across ~84 blocks (~1.7 s?
+        // Use a shorter 4-block throttled reader at 80 ms/block = 320 ms > 50 ms deadline!).
+        ult.e3_scan_deadline = Duration::from_millis(50);
+        ult.e3_scan_opener = Some(Arc::new(move |_p: &Path| {
+            let mut inner = SyntheticSource::sine(44_100, 1.5, amp, false);
+            inner.streaminfo_md5 = Some(md5);
+            inner.computed_md5_at_eof = Some(md5);
+            Ok(Box::new(ThrottledPeakSource {
+                inner,
+                delay_per_block: Duration::from_millis(80),
+            }) as Box<dyn AudioBlockSource + Send>)
+        }));
+
+        let null_pipeline = AudioPipeline::with_rew_config_full_tail(
+            UpsamplerPolicy {
+                filter_override: Some(FilterArchetype::Null),
+                ..UpsamplerPolicy::default()
+            },
+            ConvolutionConfig::disabled(),
+            true,
+        )
+        .unwrap();
+
+        let buf = BoundedBlockStreamBuffer::with_limits(
+            ULTIMATE_MAX_BUFFERED_FRAMES,
+            Duration::from_secs(ULTIMATE_MAX_BUFFERED_SECONDS),
+        );
+        let ep = buf.current_epoch();
+
+        // Play 1: misses 50 ms deadline -> warning logged + fail-safe -3 dB.
+        let mut src1 = SyntheticSource::sine(44_100, 31.0, amp, false);
+        src1.streaminfo_md5 = Some(md5);
+        src1.computed_md5_at_eof = Some(md5);
+        let mut carry = None;
+        let mut backup = None;
+        let mut pend = false;
+        let buf_c1 = Arc::clone(&buf);
+        let h1 = std::thread::spawn(move || drain_track_events(&buf_c1, ep));
+        let r1 = stream_track_ultimate(
+            &null_pipeline,
+            &ult,
+            &buf,
+            ep,
+            || false,
+            &mut src1,
+            &track_path,
+            Some(&track_path),
+            None,
+            None,
+            PlayModeLabel::SingleFile,
+            Some(31.0),
+            &mut carry,
+            &mut backup,
+            &mut pend,
+            false,
+            16_384,
+        );
+        assert!(matches!(r1, UltimateStreamResult::Played { .. }));
+        let (rep1, _, _) = h1.join().unwrap();
+        let u1 = rep1.ultimate_report.as_ref().expect("ultimate report 1");
+        assert!(
+            u1.warnings.iter().any(|w| w.contains("peak scan deadline missed")),
+            "T8: Play 1 must log 'peak scan deadline missed', got warnings={:?}",
+            u1.warnings
+        );
+        assert_eq!(rep1.headroom.mode, HeadroomMode::Minus3Db);
+
+        // Wait up to 3 s for the background E3 scan to finish and persist tp8x-32 to Schema-2 YAML.
+        let wait_start = Instant::now();
+        let mut cached_ok = false;
+        while wait_start.elapsed() < Duration::from_secs(3) {
+            if let Some(album) = ult.filter_db.load_album("main", "") {
+                if let Some(t) = album.get_track("slow_nas_quiet.flac") {
+                    if t.effective_true_peak_meter() == Some(TRUE_PEAK_METER_8X_32) {
+                        assert_eq!(t.detector_version, 0);
+                        cached_ok = true;
+                        break;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            cached_ok,
+            "T8: background E3 worker must finish and persist tp8x-32 to Schema-2 YAML"
+        );
+
+        // Play 2: fresh context with panicking opener proves E3 is NOT re-spawned and E4 cached-tp
+        // plays the -8 dBFS track at 0.0 dB!
+        let mut ult2 = UltimateRuntimeContext::for_test(
+            UltimateConfig {
+                enabled: true,
+                genre_rules: true,
+                learn_on_play: false,
+            },
+            db_root.clone(),
+        );
+        ult2.e3_scan_opener = Some(Arc::new(|_p: &Path| {
+            panic!("T8 Play 2 must reuse cached tp8x-32 and NOT re-spawn E3");
+        }));
+
+        let mut src2 = SyntheticSource::sine(44_100, 31.0, amp, false);
+        src2.streaminfo_md5 = Some(md5);
+        src2.computed_md5_at_eof = Some(md5);
+        let buf_c2 = Arc::clone(&buf);
+        let h2 = std::thread::spawn(move || drain_track_events(&buf_c2, ep));
+        let r2 = stream_track_ultimate(
+            &null_pipeline,
+            &ult2,
+            &buf,
+            ep,
+            || false,
+            &mut src2,
+            &track_path,
+            Some(&track_path),
+            None,
+            None,
+            PlayModeLabel::SingleFile,
+            Some(31.0),
+            &mut carry,
+            &mut backup,
+            &mut pend,
+            false,
+            16_384,
+        );
+        assert!(matches!(r2, UltimateStreamResult::Played { .. }));
+        let (rep2, _, _) = h2.join().unwrap();
+        assert!(
+            rep2.headroom.reason.contains("cached-tp"),
+            "T8 Play 2 must use cached-tp from background E3 scan, got reason='{}'",
+            rep2.headroom.reason
+        );
+        assert_eq!(rep2.headroom.mode, HeadroomMode::ZeroDb);
+        assert!(
+            rep2.headroom.total_gain_db().abs() < 1e-9,
+            "T8 Play 2 must play -8 dBFS track at 0.0 dB, got {}",
+            rep2.headroom.total_gain_db()
+        );
+
+        let _ = fs::remove_dir_all(&db_root);
     }
 }

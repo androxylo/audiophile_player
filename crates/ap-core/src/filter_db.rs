@@ -1581,6 +1581,132 @@ impl FilterDbStore {
         Ok(Some(track))
     }
 
+    /// Atomically upsert ONLY whole-file peak scan results (`sample_peak`, `true_peak_dbtp`,
+    /// `true_peak_meter`, and verified audio identity) into the Schema-2 album YAML file without
+    /// claiming that detector results are current (`Issue #23 §3.1`, P2b).
+    ///
+    /// - When a matching entry for the same audio already exists, preserves its `detector_version`,
+    ///   detector findings, `suggested`/`why`/`rule`, and `post_chain_peaks`, upgrading only the
+    ///   source peak fields (never downgrading `tp8x-32` back to `tp4x-12`).
+    /// - When no matching entry exists, inserts a partial peak-only entry with
+    ///   `detector_version = 0` so future plays reuse `peak_current = true` while still computing
+    ///   fresh detector results (`results_current = false`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_track_peak_only_nonblocking(
+        &self,
+        root_name: &str,
+        rel_folder: &str,
+        file_name: &str,
+        md5_hex: Option<String>,
+        size: u64,
+        mtime_unix_s: u64,
+        seconds: f64,
+        head_hash: Option<String>,
+        sample_rate: u32,
+        bits: u16,
+        sample_peak: f64,
+        true_peak_dbtp: f64,
+        true_peak_meter: &str,
+    ) -> Result<Option<AlbumTrackAnalysis>, String> {
+        if !true_peak_dbtp.is_finite() || (md5_hex.is_none() && size == 0) {
+            return Ok(None);
+        }
+        let Some(lock) = self.try_lock_album(root_name, rel_folder)? else {
+            return Ok(None);
+        };
+        let mut album = self
+            .try_load_album(root_name, rel_folder)?
+            .unwrap_or_else(|| AlbumAnalysisFile::new(root_name, rel_folder, 0));
+        album.root = root_name.to_string();
+        album.folder = normalize_rel_path(rel_folder);
+        album.scanned_unix_s = now_unix_secs();
+
+        let target_key = album
+            .find_track_key(file_name)
+            .unwrap_or_else(|| file_name.to_string());
+
+        let updated = if let Some(prev) = album.tracks.get(&target_key) {
+            let same_audio = prev.matches_identity(md5_hex.as_deref(), Some(size), Some(mtime_unix_s));
+            if same_audio {
+                let mut merged = prev.clone();
+                if merged.md5.is_none() && md5_hex.is_some() {
+                    merged.md5 = md5_hex;
+                }
+                if merged.head_hash.is_none() && head_hash.is_some() {
+                    merged.head_hash = head_hash;
+                }
+                if merged.seconds <= 0.0 && seconds.is_finite() && seconds > 0.0 {
+                    merged.seconds = seconds;
+                }
+                if merged.sample_rate == 0 {
+                    merged.sample_rate = sample_rate;
+                }
+                if merged.bits == 0 {
+                    merged.bits = bits;
+                }
+                let prev_is_8x = merged.effective_true_peak_meter() == Some(TRUE_PEAK_METER_8X_32);
+                let new_is_8x = true_peak_meter == TRUE_PEAK_METER_8X_32;
+                if !prev_is_8x || new_is_8x {
+                    if sample_peak.is_finite() && sample_peak >= 0.0 {
+                        merged.sample_peak = sample_peak;
+                    }
+                    merged.true_peak_dbtp = Some(true_peak_dbtp);
+                    merged.true_peak_meter = Some(true_peak_meter.to_string());
+                }
+                merged
+            } else {
+                AlbumTrackAnalysis {
+                    suggested: String::new(),
+                    why: "peak-only E3 scan".to_string(),
+                    rule: "peak_only".to_string(),
+                    detector_version: 0,
+                    md5: md5_hex,
+                    size,
+                    mtime_unix_s,
+                    seconds: if seconds.is_finite() && seconds >= 0.0 { seconds } else { 0.0 },
+                    head_hash,
+                    sample_rate,
+                    bits,
+                    sample_peak: if sample_peak.is_finite() && sample_peak >= 0.0 {
+                        sample_peak
+                    } else {
+                        0.0
+                    },
+                    true_peak_dbtp: Some(true_peak_dbtp),
+                    true_peak_meter: Some(true_peak_meter.to_string()),
+                    ..AlbumTrackAnalysis::default()
+                }
+            }
+        } else {
+            AlbumTrackAnalysis {
+                suggested: String::new(),
+                why: "peak-only E3 scan".to_string(),
+                rule: "peak_only".to_string(),
+                detector_version: 0,
+                md5: md5_hex,
+                size,
+                mtime_unix_s,
+                seconds: if seconds.is_finite() && seconds >= 0.0 { seconds } else { 0.0 },
+                head_hash,
+                sample_rate,
+                bits,
+                sample_peak: if sample_peak.is_finite() && sample_peak >= 0.0 {
+                    sample_peak
+                } else {
+                    0.0
+                },
+                true_peak_dbtp: Some(true_peak_dbtp),
+                true_peak_meter: Some(true_peak_meter.to_string()),
+                ..AlbumTrackAnalysis::default()
+            }
+        };
+
+        album.tracks.insert(target_key, updated.clone());
+        album.recompute_header_detector_version(0);
+        self.save_album_under_lock(&album, &lock)?;
+        Ok(Some(updated))
+    }
+
     /// Recursively load all valid Schema-2 album YAML files under `analysis/` (used by `scan`
     /// move-indexing and `filters diff`).
     pub fn load_all_albums(&self) -> Vec<(PathBuf, AlbumAnalysisFile)> {
@@ -1917,6 +2043,38 @@ mod tests {
         assert_eq!(merged.effective_true_peak_meter(), Some(TRUE_PEAK_METER_8X_32));
         assert!((merged.true_peak_dbtp.unwrap() - (-5.92)).abs() < 1e-6);
         assert!((merged.sample_peak - 0.5).abs() < 1e-6);
+
+        // Peak-only upsert on a brand-new track MUST write detector_version = 0 + tp8x-32
+        // without claiming detector results are current, and must preserve existing findings
+        // when upgrading a matched entry!
+        let peak_only = store
+            .upsert_track_peak_only_nonblocking(
+                "main",
+                "Jazz/Album",
+                "03_peak_only.flac",
+                Some("aabbccddeeff00112233445566778899".to_string()),
+                99_999,
+                1_700_000_100,
+                210.5,
+                None,
+                44_100,
+                16,
+                0.398,
+                -8.001,
+                TRUE_PEAK_METER_8X_32,
+            )
+            .unwrap()
+            .expect("peak-only write");
+        assert_eq!(peak_only.detector_version, 0);
+        assert_eq!(peak_only.effective_true_peak_meter(), Some(TRUE_PEAK_METER_8X_32));
+        assert!((peak_only.true_peak_dbtp.unwrap() - (-8.001)).abs() < 1e-6);
+        let reloaded = store.load_album("main", "Jazz/Album").unwrap();
+        assert_eq!(reloaded.tracks["01.flac"].detector_version, 8);
+        assert_eq!(reloaded.tracks["03_peak_only.flac"].detector_version, 0);
+        assert_eq!(
+            reloaded.tracks["03_peak_only.flac"].effective_true_peak_meter(),
+            Some(TRUE_PEAK_METER_8X_32)
+        );
 
         // U8: Corrupt existing album YAML must NEVER be overwritten with a single track!
         let album_path = store.album_yaml_path("main", "Jazz/Album");
