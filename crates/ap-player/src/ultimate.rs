@@ -42,7 +42,9 @@ use ap_core::user_filters::{
 };
 use ap_dsp::analysis::{DETECTOR_VERSION, TrackAnalyzer};
 use ap_dsp::convolution::ConvolutionTail;
-use ap_dsp::fusion::{CachedWholeTrackEvidence, build_track_db_entry};
+use ap_dsp::fusion::{
+    CachedWholeTrackEvidence, TAG_DISAGREEMENT_NOTICE_DB, build_track_db_entry,
+};
 use ap_dsp::peak_scan::{GatedPeakScanner, PEAK_SCAN_METER_ID, PeakScanResult};
 use ap_dsp::pipeline::{AudioPipeline, GaplessCarryover, UltimateDecisionReport};
 use ap_dsp::quantize::QuantizerStats;
@@ -1265,6 +1267,7 @@ where
             Vec::new(),
             true,
             display_path,
+            local_path,
             upnp_uri,
             upnp_next_gen,
             mode_label,
@@ -1369,6 +1372,7 @@ where
             w0_blocks,
             false,
             display_path,
+            local_path,
             upnp_uri,
             upnp_next_gen,
             mode_label,
@@ -1505,6 +1509,17 @@ where
     if let Some(handle) = e3_handle {
         match handle.wait_after_w2(ult.e3_scan_deadline, &is_aborted) {
             E3JoinResult::Completed { scan, elapsed_ms } => {
+                // Issue #23 §3.3 (K3/K4/T9): E3 unconditionally overrides every tag. Strip any
+                // obsolete W1 unknown-fallback notice and emit a "stale ReplayGain tag" notice
+                // if a Vorbis peak tag disagrees with E3 by > 0.5 dB.
+                selection
+                    .warnings
+                    .retain(|w| !w.contains("falling back to -3 dB unknown"));
+                if let Some(tag_notice) =
+                    check_e3_tag_disagreement(&raw_peak_meta, spec.bits_per_sample, scan.true_peak_dbtp)
+                {
+                    selection.warnings.push(tag_notice);
+                }
                 e3_scan_result = Some((scan, elapsed_ms));
             }
             E3JoinResult::TimedOut { elapsed_s } => {
@@ -2001,8 +2016,63 @@ where
     }
 }
 
-/// Mandate M3: play tracks `< 30 s` through normal-mode defaults and label as `"normal (<30 s)"`,
-/// while still honoring explicit user choices from `my-filters.yaml` / `AP_*` tags in `mine` mode.
+/// Check whether any Vorbis ReplayGain / true-peak tag disagrees with a measured E3 whole-file
+/// true peak by more than [`TAG_DISAGREEMENT_NOTICE_DB`] (`0.5 dB`, Issue #23 §3.3).
+fn check_e3_tag_disagreement(
+    raw_peak_meta: &ap_core::headroom::TrackPeakMetadata,
+    bits_per_sample: u16,
+    e3_tp_db: f64,
+) -> Option<String> {
+    if !e3_tp_db.is_finite() {
+        return None;
+    }
+    if let Some(cp) = raw_peak_meta.classified_peak_for_bits(bits_per_sample) {
+        let diff = (e3_tp_db - cp.dbfs).abs();
+        if diff > TAG_DISAGREEMENT_NOTICE_DB {
+            return Some(format!(
+                "stale ReplayGain tag ({}={:+.2} dBFS differs from E3 scan {:+.2} dBTP by {:.2} dB)",
+                cp.source_tag, cp.dbfs, e3_tp_db, diff
+            ));
+        }
+    } else if raw_peak_meta.true_peak_invalid
+        || raw_peak_meta.replaygain_track_peak.is_some()
+        || raw_peak_meta.replaygain_album_peak.is_some()
+        || raw_peak_meta.true_peak_linear.is_some()
+    {
+        return Some(format!(
+            "stale ReplayGain tag (contradictory/implausible metadata overridden by E3 scan {:+.2} dBTP)",
+            e3_tp_db
+        ));
+    }
+    None
+}
+
+/// Synchronously scan a short (`< 30 s`) local FLAC file via `GatedPeakScanner` (`Issue #23 §3.5`).
+fn scan_short_local_file_sync(local_path: &Path) -> Option<PeakScanResult> {
+    let mut reader = FlacBlockReader::open(local_path).ok()?;
+    let mut scanner = GatedPeakScanner::new();
+    loop {
+        match reader.read_next_block(16_384) {
+            Ok(Some(block)) => scanner.push_stereo_buffer(&block),
+            Ok(None) => break,
+            Err(_) => return None,
+        }
+    }
+    let expected_md5 = reader.streaminfo_md5();
+    let computed_md5 = reader.computed_md5();
+    if let (Some(exp), Some(act)) = (expected_md5, computed_md5) {
+        if exp != act {
+            return None;
+        }
+    }
+    let scan = scanner.finish(None)?;
+    (scan.frames_scanned > 0 && scan.true_peak_dbtp.is_finite()).then_some(scan)
+}
+
+/// Mandate M3 + Issue #23 §3.5 (K7): play tracks `< 30 s` using normal-mode filter defaults
+/// labelled `"normal (<30 s)"`, while honoring user choices in `mine` mode and using whole-track
+/// peak evidence (`exact-M` for in-memory W0-EOF tracks, synchronous E3 `scan-tp` for local
+/// header-short FLACs, `select_ultimate_headroom_v2` for all headroom decisions).
 #[allow(clippy::too_many_arguments)]
 fn stream_short_track_normal<S, F>(
     pipeline: &AudioPipeline,
@@ -2010,9 +2080,10 @@ fn stream_short_track_normal<S, F>(
     epoch: u64,
     is_aborted: &F,
     source: &mut S,
-    pre_read_blocks: Vec<StereoF64Buffer>,
-    read_remaining_from_source: bool,
+    mut pre_read_blocks: Vec<StereoF64Buffer>,
+    mut read_remaining_from_source: bool,
     display_path: &Path,
+    local_path: Option<&Path>,
     upnp_uri: Option<String>,
     upnp_next_gen: Option<u64>,
     mode_label: PlayModeLabel,
@@ -2108,66 +2179,201 @@ where
         }
     }
 
-    let mut session = if let Some(user_arch) = user_filter_override {
-        let mut eff_policy = base_policy;
+    // Resolve the DSP plan cleanly through `UpsamplerPicker` so ALL short tracks use
+    // `select_ultimate_headroom_v2` (replacing `select_headroom_for_bits` / `start_track_with_source_info`).
+    let mut eff_policy = base_policy;
+    if let Some(user_arch) = user_filter_override {
         eff_policy.filter_override = Some(user_arch);
-        let picker = match UpsamplerPicker::new(eff_policy) {
-            Ok(p) => p,
-            Err(err) => {
-                return UltimateStreamResult::Failed(format!(
-                    "DSP picker error on short track '{}': {err}",
-                    display_path.display()
-                ));
-            }
-        };
-        let mut plan = picker.select(&src_info);
+    }
+    let picker = match UpsamplerPicker::new(eff_policy) {
+        Ok(p) => p,
+        Err(err) => {
+            return UltimateStreamResult::Failed(format!(
+                "DSP picker error on short track '{}': {err}",
+                display_path.display()
+            ));
+        }
+    };
+    let mut plan = picker.select(&src_info);
+    if let Some(user_arch) = user_filter_override {
         plan.reason = format!("short track (<30 s) user override -> {user_arch}");
-        let placeholder_hr = HeadroomDecision {
-            mode: HeadroomMode::ZeroDb,
-            peak_dbfs: None,
-            peak_kind: None,
-            convolution_scale_db: 0.0,
-            reason: "short-track user override headroom pending".to_string(),
-        };
-        let mut s = match pipeline.start_track_with_plan_and_headroom(spec, plan, placeholder_hr) {
-            Ok(s) => s,
-            Err(err) => {
-                return UltimateStreamResult::Failed(format!(
-                    "DSP pipeline error on short track '{}': {err}",
-                    display_path.display()
-                ));
+    }
+    let a_up_db = plan.filter.upsampler_overshoot_db();
+    let placeholder_hr = HeadroomDecision {
+        mode: HeadroomMode::ZeroDb,
+        peak_dbfs: None,
+        peak_kind: None,
+        convolution_scale_db: 0.0,
+        reason: "short-track headroom pending".to_string(),
+    };
+    let mut session = match pipeline.start_track_with_plan_and_headroom(spec, plan, placeholder_hr) {
+        Ok(s) => s,
+        Err(err) => {
+            return UltimateStreamResult::Failed(format!(
+                "DSP pipeline error on short track '{}': {err}",
+                display_path.display()
+            ));
+        }
+    };
+
+    // Issue #23 §3.5 (K7): obtain whole-track peak evidence for local short tracks.
+    // - If `header_short` (`read_remaining_from_source == true`): run synchronous E3 on
+    //   `local_path` (at most 30 s of decode). If `local_path` cannot be opened (e.g., an
+    //   in-memory synthetic source), read up to 30 s from `source` into `pre_read_blocks` so
+    //   exact whole-track unity render can measure exact `M`!
+    // - If W0 already hit EOF (`!read_remaining_from_source`): the entire track is already in
+    //   `pre_read_blocks`; render at unity ONCE to obtain exact `M` (E1) + exact `tp8x-32`!
+    let mut sync_e3_scan: Option<PeakScanResult> = None;
+    if !is_streaming && read_remaining_from_source {
+        if let Some(lp) = local_path {
+            sync_e3_scan = scan_short_local_file_sync(lp);
+        }
+        if sync_e3_scan.is_none() {
+            let max_short_frames =
+                u64::from(spec.sample_rate_hz) * u64::from(ULTIMATE_LOOKAHEAD_SECONDS);
+            let mut buffered_frames: u64 = pre_read_blocks.iter().map(|b| b.len() as u64).sum();
+            loop {
+                if is_aborted() || buf.current_epoch() != epoch {
+                    return UltimateStreamResult::Aborted;
+                }
+                match source.read_next_block(src_block_frames) {
+                    Ok(Some(blk)) if blk.is_empty() => continue,
+                    Ok(Some(blk)) => {
+                        buffered_frames += blk.len() as u64;
+                        pre_read_blocks.push(blk);
+                        if buffered_frames >= max_short_frames {
+                            break;
+                        }
+                    }
+                    Ok(None) => {
+                        read_remaining_from_source = false;
+                        break;
+                    }
+                    Err(err) => {
+                        return UltimateStreamResult::Failed(format!(
+                            "Decode error on short track '{}': {err}",
+                            display_path.display()
+                        ));
+                    }
+                }
             }
-        };
-        let conv_boost_db = s.convolver_max_boost_db();
-        let hr = ap_core::headroom::select_headroom_for_bits(
-            &peak_meta,
-            spec.bits_per_sample,
-            is_streaming,
-            Some(conv_boost_db),
-            None,
-        );
-        if let Err(err) = s.reconfigure_quantizer_for_headroom(&hr) {
+        }
+    }
+
+    let mut rendered_unity_blocks: Option<Vec<StereoF64Buffer>> = None;
+    let mut exact_m_dbfs: Option<f64> = None;
+
+    let peak_evidence = if is_streaming {
+        PeakEvidence::Unknown
+    } else if !read_remaining_from_source && !pre_read_blocks.is_empty() {
+        // Entire short track is already in `pre_read_blocks`: measure exact source TP + render
+        // at unity ONCE for exact post-chain `M` (Issue #23 §3.5).
+        let mut scanner = GatedPeakScanner::new();
+        for blk in &pre_read_blocks {
+            scanner.push_stereo_buffer(blk);
+        }
+        let scan_tp_db = scanner
+            .finish(None)
+            .filter(|s| s.frames_scanned > 0 && s.true_peak_dbtp.is_finite())
+            .map(|s| s.true_peak_dbtp);
+        if let Some(tp_db) = scan_tp_db {
+            if let Some(notice) = check_e3_tag_disagreement(&peak_meta, spec.bits_per_sample, tp_db) {
+                warnings.push(notice);
+            }
+        }
+
+        let mut u_blocks = Vec::with_capacity(pre_read_blocks.len());
+        let mut max_abs = 0.0_f64;
+        for blk in std::mem::take(&mut pre_read_blocks) {
+            if is_aborted() || buf.current_epoch() != epoch {
+                return UltimateStreamResult::Aborted;
+            }
+            match session.process_block_unity_f64(blk) {
+                Ok(u) => {
+                    for &s in u.left.iter().chain(u.right.iter()) {
+                        if s.is_finite() {
+                            max_abs = max_abs.max(s.abs());
+                        }
+                    }
+                    u_blocks.push(u);
+                }
+                Err(err) => {
+                    return UltimateStreamResult::Failed(format!(
+                        "DSP render error on short track '{}': {err}",
+                        display_path.display()
+                    ));
+                }
+            }
+        }
+        let m_db = linear_to_dbfs(max_abs);
+        exact_m_dbfs = Some(m_db);
+        rendered_unity_blocks = Some(u_blocks);
+        PeakEvidence::ExactPostChain {
+            m_db,
+            source_tp_db: scan_tp_db,
+        }
+    } else if let Some(scan) = sync_e3_scan {
+        if let Some(notice) =
+            check_e3_tag_disagreement(&peak_meta, spec.bits_per_sample, scan.true_peak_dbtp)
+        {
+            warnings.push(notice);
+        }
+        PeakEvidence::SourceTruePeak {
+            tp_db: scan.true_peak_dbtp,
+            meter_err_db: TP_METER_ERR_8X_32_DB,
+            source: "scan-tp",
+        }
+    } else if let Some(cp) = peak_meta.classified_peak_for_bits(spec.bits_per_sample) {
+        match cp.kind {
+            PeakKind::TruePeak => PeakEvidence::SourceTruePeak {
+                tp_db: cp.dbfs,
+                meter_err_db: TP_METER_ERR_4X_12_DB,
+                source: "tag-tp",
+            },
+            PeakKind::SamplePeak => PeakEvidence::SourceSamplePeak {
+                sp_db: cp.dbfs,
+                source: "tag-sp",
+            },
+        }
+    } else {
+        PeakEvidence::Unknown
+    };
+
+    let conv_boost_db = session.convolver_max_boost_db();
+    let mut m_q = if session.report().effective_shaper == NoiseShaperProfile::Bypass {
+        0.0
+    } else {
+        quantizer_margin_db(session.report().output_bits, session.shaper_l1_sum())
+    };
+    let mut hr = select_ultimate_headroom_v2(
+        &peak_evidence,
+        is_streaming,
+        Some(conv_boost_db),
+        exact_m_dbfs,
+        a_up_db,
+        m_q,
+    );
+    if hr.total_gain_db() < -1e-9 && session.report().effective_shaper == NoiseShaperProfile::Bypass
+    {
+        if let Err(err) = session.reconfigure_quantizer_for_headroom(&hr) {
             return UltimateStreamResult::Failed(format!(
                 "DSP quantizer error on short track '{}': {err}",
                 display_path.display()
             ));
         }
-        s.set_fixed_headroom(hr);
-        s
-    } else {
-        match pipeline.start_track_with_source_info(spec, src_info, &peak_meta) {
-            Ok(s) => s,
-            Err(err) => {
-                return UltimateStreamResult::Failed(format!(
-                    "DSP pipeline error on short track '{}': {err}",
-                    display_path.display()
-                ));
-            }
-        }
-    };
+        m_q = quantizer_margin_db(session.report().output_bits, session.shaper_l1_sum());
+        hr = select_ultimate_headroom_v2(
+            &peak_evidence,
+            is_streaming,
+            Some(conv_boost_db),
+            exact_m_dbfs,
+            a_up_db,
+            m_q,
+        );
+    }
+    session.set_fixed_headroom(hr);
 
     let fixed_g = session.report().headroom.total_gain_db();
-    let m_q = quantizer_margin_db(session.report().output_bits, session.shaper_l1_sum());
     let active_filter_name = session.report().dsp_plan.filter.to_string();
     let suggested_filter_name = session.report().dsp_plan.target_audiophile_filter.to_string();
     session.set_ultimate_report(UltimateDecisionReport {
@@ -2179,8 +2385,8 @@ where
         suggested_rule: Some("short_track_bypass".to_string()),
         fired_rules: vec!["M3(<30 s)".to_string()],
         cache_hit: false,
-        m30_dbfs: None,
-        cached_m_dbfs: None,
+        m30_dbfs: exact_m_dbfs,
+        cached_m_dbfs: exact_m_dbfs,
         fixed_gain_db: fixed_g,
         quantizer_margin_db: m_q,
         throughput_x_rt: None,
@@ -2222,53 +2428,75 @@ where
     let mut had_error = false;
     let mut error_warning: Option<String> = None;
 
-    let mut push_blk = |blk: StereoF64Buffer| -> Result<bool, String> {
-        let pcm = session.process_block(blk)?;
-        if !pcm.is_empty() && !buf.push_for_epoch(epoch, StreamEvent::PcmBlock(pcm)) {
-            return Ok(false);
-        }
-        Ok(true)
-    };
-
-    for blk in pre_read_blocks {
-        if is_aborted() || buf.current_epoch() != epoch {
-            return UltimateStreamResult::Aborted;
-        }
-        match push_blk(blk) {
-            Ok(true) => {}
-            Ok(false) => return UltimateStreamResult::Aborted,
-            Err(err) => {
-                eprintln!("  [short track err] {err}");
-                had_error = true;
-                error_warning = Some(err);
-                break;
-            }
-        }
-    }
-
-    if read_remaining_from_source && !had_error {
-        loop {
+    if let Some(u_blocks) = rendered_unity_blocks {
+        let mut no_tail: Option<(ConvolutionTail, usize)> = None;
+        for u_blk in u_blocks {
             if is_aborted() || buf.current_epoch() != epoch {
                 return UltimateStreamResult::Aborted;
             }
-            match source.read_next_block(src_block_frames) {
-                Ok(Some(blk)) if blk.is_empty() => continue,
-                Ok(Some(blk)) => match push_blk(blk) {
-                    Ok(true) => {}
-                    Ok(false) => return UltimateStreamResult::Aborted,
+            match session.quantize_scaled_block(&u_blk, fixed_g, &mut no_tail) {
+                Ok(pcm) => {
+                    if !pcm.is_empty() && !buf.push_for_epoch(epoch, StreamEvent::PcmBlock(pcm)) {
+                        return UltimateStreamResult::Aborted;
+                    }
+                }
+                Err(err) => {
+                    eprintln!("  [short track err] {err}");
+                    had_error = true;
+                    error_warning = Some(err);
+                    break;
+                }
+            }
+        }
+    } else {
+        let mut push_blk = |blk: StereoF64Buffer| -> Result<bool, String> {
+            let pcm = session.process_block(blk)?;
+            if !pcm.is_empty() && !buf.push_for_epoch(epoch, StreamEvent::PcmBlock(pcm)) {
+                return Ok(false);
+            }
+            Ok(true)
+        };
+
+        for blk in pre_read_blocks {
+            if is_aborted() || buf.current_epoch() != epoch {
+                return UltimateStreamResult::Aborted;
+            }
+            match push_blk(blk) {
+                Ok(true) => {}
+                Ok(false) => return UltimateStreamResult::Aborted,
+                Err(err) => {
+                    eprintln!("  [short track err] {err}");
+                    had_error = true;
+                    error_warning = Some(err);
+                    break;
+                }
+            }
+        }
+
+        if read_remaining_from_source && !had_error {
+            loop {
+                if is_aborted() || buf.current_epoch() != epoch {
+                    return UltimateStreamResult::Aborted;
+                }
+                match source.read_next_block(src_block_frames) {
+                    Ok(Some(blk)) if blk.is_empty() => continue,
+                    Ok(Some(blk)) => match push_blk(blk) {
+                        Ok(true) => {}
+                        Ok(false) => return UltimateStreamResult::Aborted,
+                        Err(err) => {
+                            eprintln!("  [short track err] {err}");
+                            had_error = true;
+                            error_warning = Some(err);
+                            break;
+                        }
+                    },
+                    Ok(None) => break,
                     Err(err) => {
                         eprintln!("  [short track err] {err}");
                         had_error = true;
                         error_warning = Some(err);
                         break;
                     }
-                },
-                Ok(None) => break,
-                Err(err) => {
-                    eprintln!("  [short track err] {err}");
-                    had_error = true;
-                    error_warning = Some(err);
-                    break;
                 }
             }
         }
@@ -5071,6 +5299,221 @@ mod tests {
             "T8 Play 2 must play -8 dBFS track at 0.0 dB, got {}",
             rep2.headroom.total_gain_db()
         );
+
+        let _ = fs::remove_dir_all(&db_root);
+    }
+
+    /// Issue #23 T5 (P4 / K7): Short untagged local track (20 s, -10 dBFS) MUST get `G = 0.0 dB`
+    /// with `scan-tp` (header-short real FLAC) or `exact-M` (W0-EOF path) — zero blind -3 dB!
+    #[test]
+    fn t5_short_untagged_quiet_local_track_uses_whole_track_evidence_and_zero_db() {
+        let db_root = temp_dir("t5_short_track");
+        let flac_path = db_root.join("short_20s_minus10.flac");
+        let amp = 10.0_f64.powf(-10.0 / 20.0); // -10.0 dBFS
+        let _ = write_test_sine_flac_16(&flac_path, 44_100, 20, amp);
+
+        let ult = UltimateRuntimeContext::for_test(
+            UltimateConfig {
+                enabled: true,
+                genre_rules: true,
+                learn_on_play: false,
+            },
+            db_root.clone(),
+        );
+        let null_pipeline = AudioPipeline::with_rew_config_full_tail(
+            UpsamplerPolicy {
+                filter_override: Some(FilterArchetype::Null),
+                ..UpsamplerPolicy::default()
+            },
+            ConvolutionConfig::disabled(),
+            true,
+        )
+        .unwrap();
+
+        let buf = BoundedBlockStreamBuffer::with_limits(
+            ULTIMATE_MAX_BUFFERED_FRAMES,
+            Duration::from_secs(ULTIMATE_MAX_BUFFERED_SECONDS),
+        );
+        let ep = buf.current_epoch();
+
+        // Case A: header-short real 20 s FLAC -> synchronous E3 `scan-tp`, G = 0.0 dB, Bypass!
+        let mut src_a = FlacBlockReader::open(&flac_path).expect("open T5 FLAC");
+        let mut carry = None;
+        let mut backup = None;
+        let mut pend = false;
+        let buf_ca = Arc::clone(&buf);
+        let ha = std::thread::spawn(move || drain_track_events(&buf_ca, ep));
+        let ra = stream_track_ultimate(
+            &null_pipeline,
+            &ult,
+            &buf,
+            ep,
+            || false,
+            &mut src_a,
+            &flac_path,
+            Some(&flac_path),
+            None,
+            None,
+            PlayModeLabel::SingleFile,
+            Some(20.0),
+            &mut carry,
+            &mut backup,
+            &mut pend,
+            false,
+            16_384,
+        );
+        assert!(matches!(ra, UltimateStreamResult::Played { .. }));
+        let (rep_a, frames_a, _) = ha.join().unwrap();
+        assert_eq!(frames_a, 44_100 * 20);
+        assert_eq!(rep_a.headroom.mode, HeadroomMode::ZeroDb);
+        assert!(
+            rep_a.headroom.total_gain_db().abs() < 1e-9,
+            "T5 Case A (header-short 20 s -10 dBFS) must play at 0.0 dB, got {}",
+            rep_a.headroom.total_gain_db()
+        );
+        assert!(
+            rep_a.headroom.reason.contains("scan-tp"),
+            "T5 Case A expected scan-tp, got reason='{}'",
+            rep_a.headroom.reason
+        );
+        assert_eq!(rep_a.effective_shaper, NoiseShaperProfile::Bypass);
+
+        // Case B: total_samples unknown -> W0 hits EOF at 20 s -> whole track already in memory ->
+        // exact post-chain M (`ultimate cached exact M`), G = 0.0 dB, Bypass!
+        let dummy_path = db_root.join("short_w0_eof.flac");
+        let mut src_b = SyntheticSource::sine(44_100, 20.0, amp, false);
+        src_b.claimed_total_frames = None;
+        let buf_cb = Arc::clone(&buf);
+        let hb = std::thread::spawn(move || drain_track_events(&buf_cb, ep));
+        let rb = stream_track_ultimate(
+            &null_pipeline,
+            &ult,
+            &buf,
+            ep,
+            || false,
+            &mut src_b,
+            &dummy_path,
+            Some(&dummy_path),
+            None,
+            None,
+            PlayModeLabel::SingleFile,
+            None,
+            &mut carry,
+            &mut backup,
+            &mut pend,
+            false,
+            16_384,
+        );
+        assert!(matches!(rb, UltimateStreamResult::Played { .. }));
+        let (rep_b, frames_b, _) = hb.join().unwrap();
+        assert_eq!(frames_b, 44_100 * 20);
+        assert_eq!(rep_b.headroom.mode, HeadroomMode::ZeroDb);
+        assert!(
+            rep_b.headroom.total_gain_db().abs() < 1e-9,
+            "T5 Case B (W0-EOF 20 s -10 dBFS) must play at 0.0 dB, got {}",
+            rep_b.headroom.total_gain_db()
+        );
+        assert!(
+            rep_b.headroom.reason.contains("exact M"),
+            "T5 Case B expected exact M, got reason='{}'",
+            rep_b.headroom.reason
+        );
+        assert_eq!(rep_b.effective_shaper, NoiseShaperProfile::Bypass);
+
+        let _ = fs::remove_dir_all(&db_root);
+    }
+
+    /// Issue #23 T9 (P4 / §3.3): Stale ReplayGain tag (`0.25` = -12 dBFS) on a real hot FLAC
+    /// (`0.90` = -0.92 dBFS) with E3 MUST resolve to `scan-tp` (no unknown fallback), emit a
+    /// `"stale ReplayGain tag"` notice, and apply `-3.0 dB` for the hot audio!
+    #[test]
+    fn t9_stale_replaygain_tag_with_e3_uses_scan_tp_and_emits_stale_tag_notice() {
+        let db_root = temp_dir("t9_stale_tag_e3");
+        let track_path = db_root.join("hot_stale_tag.flac");
+        let _ = write_test_sine_flac_16(&track_path, 44_100, 31, 0.90);
+
+        let ult = UltimateRuntimeContext::for_test(
+            UltimateConfig {
+                enabled: true,
+                genre_rules: true,
+                learn_on_play: false,
+            },
+            db_root.clone(),
+        );
+        let null_pipeline = AudioPipeline::with_rew_config_full_tail(
+            UpsamplerPolicy {
+                filter_override: Some(FilterArchetype::Null),
+                ..UpsamplerPolicy::default()
+            },
+            ConvolutionConfig::disabled(),
+            true,
+        )
+        .unwrap();
+
+        let buf = BoundedBlockStreamBuffer::with_limits(
+            ULTIMATE_MAX_BUFFERED_FRAMES,
+            Duration::from_secs(ULTIMATE_MAX_BUFFERED_SECONDS),
+        );
+        let ep = buf.current_epoch();
+        let mut src = TaggedPeakAdapter {
+            inner: FlacBlockReader::open(&track_path).expect("open T9 FLAC"),
+            extra_peak_meta: TrackPeakMetadata {
+                replaygain_track_peak: Some(0.25), // stale tag (-12 dBFS) vs real 0.90 (-0.92 dBFS)
+                ..TrackPeakMetadata::default()
+            },
+        };
+
+        let mut carry = None;
+        let mut backup = None;
+        let mut pend = false;
+        let buf_c = Arc::clone(&buf);
+        let h = std::thread::spawn(move || drain_track_events(&buf_c, ep));
+        let res = stream_track_ultimate(
+            &null_pipeline,
+            &ult,
+            &buf,
+            ep,
+            || false,
+            &mut src,
+            &track_path,
+            Some(&track_path),
+            None,
+            None,
+            PlayModeLabel::SingleFile,
+            Some(31.0),
+            &mut carry,
+            &mut backup,
+            &mut pend,
+            false,
+            16_384,
+        );
+        assert!(matches!(res, UltimateStreamResult::Played { .. }));
+        let (rep, _, _) = h.join().unwrap();
+        let u = rep.ultimate_report.as_ref().expect("ultimate report");
+
+        assert!(
+            rep.headroom.reason.contains("scan-tp"),
+            "T9: E3 must override stale tag with scan-tp (no unknown fallback), got reason='{}'",
+            rep.headroom.reason
+        );
+        assert!(
+            !rep.headroom.reason.contains("unknown"),
+            "T9: must NOT fall back to unknown when E3 succeeds, got reason='{}'",
+            rep.headroom.reason
+        );
+        assert!(
+            u.warnings.iter().any(|w| w.contains("stale ReplayGain tag")),
+            "T9: must emit 'stale ReplayGain tag' notice, got warnings={:?}",
+            u.warnings
+        );
+        assert!(
+            !u.warnings
+                .iter()
+                .any(|w| w.contains("falling back to -3 dB unknown")),
+            "T9: obsolete unknown-fallback warning must be cleared once E3 succeeds, got {:?}",
+            u.warnings
+        );
+        assert_eq!(rep.headroom.mode, HeadroomMode::Minus3Db);
 
         let _ = fs::remove_dir_all(&db_root);
     }

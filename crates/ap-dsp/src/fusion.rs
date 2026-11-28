@@ -23,6 +23,10 @@ use crate::analysis::{AnalysisResult, DETECTOR_VERSION, DetectorVerdict};
 /// Tolerance in dB for disproving a stale true-peak Vorbis tag against `W30` (`07-ultimate-mode.md` §5.3 row 3).
 pub const STALE_TRUE_PEAK_TOLERANCE_DB: f64 = 0.1;
 
+/// Threshold in dB above which a Vorbis ReplayGain / true-peak tag disagreeing with a measured
+/// whole-file peak (E3 or E4) triggers an informational `"stale ReplayGain tag"` notice (`Issue #23 §3.3`).
+pub const TAG_DISAGREEMENT_NOTICE_DB: f64 = 0.5;
+
 /// Authoritative provenance of a fused decision input (`07-ultimate-mode.md` §5.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EvidenceSource {
@@ -332,6 +336,9 @@ pub struct FusedTrackEvidence {
     pub peak_meta: TrackPeakMetadata,
     pub stale_peak_tag_disproved: bool,
     pub stale_peak_tag_detail: Option<String>,
+    /// Lower-bound true peak (`max(tag, W30 true peak)`) preserved for reporting when a stale tag
+    /// is disproved by W30 without E3/E4 whole-track evidence (`Issue #23 §3.3`).
+    pub w30_peak_lower_bound_dbtp: Option<f64>,
 
     pub apodizing: Evidence<bool>,
     pub effective_nyquist_hz: Evidence<Option<u32>>,
@@ -375,26 +382,46 @@ pub fn fuse_track_evidence(
     let mut peak_meta = *raw_peak_meta;
     let mut stale_peak_tag_disproved = false;
     let mut stale_peak_tag_detail = None;
+    let mut w30_peak_lower_bound_dbtp = None;
 
     if let Some(wt) = wt_peak {
         if let Some(wt_tp_db) = wt.true_peak_dbtp {
             peak_meta = peak_meta.with_full_scan_true_peak_dbtp(wt_tp_db);
+            // Issue #23 §3.3: E4 cached whole-track peak unconditionally wins; never reset to
+            // unknown, and emit a stale ReplayGain tag notice if a tag disagrees by > 0.5 dB.
+            if let Some(cp) = raw_peak_meta.classified_peak_for_bits(container_bits) {
+                let diff = (wt_tp_db - cp.dbfs).abs();
+                if diff > TAG_DISAGREEMENT_NOTICE_DB {
+                    let msg = format!(
+                        "stale ReplayGain tag ({}={:+.2} dBFS differs from cached true peak {:+.2} dBTP by {:.2} dB)",
+                        cp.source_tag, cp.dbfs, wt_tp_db, diff
+                    );
+                    notices.push(msg);
+                }
+            }
         }
     }
 
     // Disprove stale Vorbis peak tags if the 30 s window provably exceeds them.
-    // Review #8 C1: When current whole-track (`wt_results`) is available, WT is authoritative
-    // so scan and cached playback never disagree on stale-peak disproof.
+    // Issue #23 §3.3 (K3): when E4 (`full_scan_true_peak_linear`) exists, never reset to unknown;
+    // when neither E3 nor E4 exists, keep unknown fail-safe semantics for whole-track safety while
+    // preserving and reporting `max(tag, W30 true peak)` as a lower bound.
     if wt_results.is_none() && peak_meta.full_scan_true_peak_linear.is_none() {
         if let Some(w) = window {
             if let Some(cp) = raw_peak_meta.classified_peak_for_bits(container_bits) {
+                let lb = if w.true_peak_dbtp.is_finite() {
+                    w.true_peak_dbtp.max(cp.dbfs)
+                } else {
+                    cp.dbfs
+                };
                 match cp.kind {
                     PeakKind::SamplePeak => {
                         if w.sample_peak_linear > cp.linear * (1.0 + PEAK_TAG_ROUNDING_TOLERANCE) {
                             stale_peak_tag_disproved = true;
+                            w30_peak_lower_bound_dbtp = Some(lb);
                             let msg = format!(
-                                "stale peak tag ({}={:.4} linear < W30 sample peak {:.4}); falling back to -3 dB unknown",
-                                cp.source_tag, cp.linear, w.sample_peak_linear
+                                "stale peak tag ({}={:.4} linear < W30 sample peak {:.4}; W30 lower bound {:+.2} dBTP, falling back to -3 dB unknown)",
+                                cp.source_tag, cp.linear, w.sample_peak_linear, lb
                             );
                             notices.push(msg.clone());
                             stale_peak_tag_detail = Some(msg);
@@ -404,9 +431,10 @@ pub fn fuse_track_evidence(
                     PeakKind::TruePeak => {
                         if w.true_peak_dbtp > cp.dbfs + STALE_TRUE_PEAK_TOLERANCE_DB {
                             stale_peak_tag_disproved = true;
+                            w30_peak_lower_bound_dbtp = Some(lb);
                             let msg = format!(
-                                "stale peak tag ({}={:+.2} dBTP < W30 true peak {:+.2} dBTP); falling back to -3 dB unknown",
-                                cp.source_tag, cp.dbfs, w.true_peak_dbtp
+                                "stale peak tag ({}={:+.2} dBTP < W30 true peak {:+.2} dBTP; W30 lower bound {:+.2} dBTP, falling back to -3 dB unknown)",
+                                cp.source_tag, cp.dbfs, w.true_peak_dbtp, lb
                             );
                             notices.push(msg.clone());
                             stale_peak_tag_detail = Some(msg);
@@ -727,6 +755,7 @@ pub fn fuse_track_evidence(
         peak_meta,
         stale_peak_tag_disproved,
         stale_peak_tag_detail,
+        w30_peak_lower_bound_dbtp,
         apodizing,
         effective_nyquist_hz,
         loud_and_clipped,

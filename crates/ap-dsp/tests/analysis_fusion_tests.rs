@@ -496,6 +496,51 @@ fn stale_cache_does_not_mask_w30_rules_a_h_l_while_preserving_user_overrides() {
         .classified_peak_for_bits(24)
         .expect("peak_current must carry cached true_peak_dbtp across DETECTOR_VERSION bumps");
     assert!((cp.dbfs - (-6.0)).abs() < 1e-4, "expected -6.0 dBTP, got {}", cp.dbfs);
+
+    // 5. Issue #23 P4 (§3.3 / K3): stale ReplayGain tag with E4 cached peak does NOT wipe peak
+    //    to unknown and emits a "stale ReplayGain tag" notice when disagreement > 0.5 dB.
+    let stale_tag_meta = TrackPeakMetadata {
+        replaygain_track_peak: Some(0.25), // -12.04 dBFS vs cached -6.0 dBTP (diff = 6.04 dB)
+        ..TrackPeakMetadata::default()
+    };
+    let fused_e4_stale_tag = fuse_track_evidence(
+        96_000,
+        24,
+        &stale_tag_meta,
+        &TrackMetadata::default(),
+        Some(&w30),
+        Some(&split_wt),
+    );
+    assert!(!fused_e4_stale_tag.stale_peak_tag_disproved);
+    assert!(
+        fused_e4_stale_tag
+            .notices
+            .iter()
+            .any(|n| n.contains("stale ReplayGain tag")),
+        "expected 'stale ReplayGain tag' notice when E4 disagrees with tag > 0.5 dB, got {:?}",
+        fused_e4_stale_tag.notices
+    );
+    let cp_e4 = fused_e4_stale_tag
+        .peak_meta
+        .classified_peak_for_bits(24)
+        .expect("E4 cached peak must NOT be reset to unknown by stale tag");
+    assert!((cp_e4.dbfs - (-6.0)).abs() < 1e-4);
+
+    // 6. Without E3/E4, W30 disproof keeps unknown fail-safe while preserving W30 lower bound.
+    let fused_w30_lb = fuse_track_evidence(
+        96_000,
+        24,
+        &stale_tag_meta,
+        &TrackMetadata::default(),
+        Some(&w30),
+        None,
+    );
+    assert!(fused_w30_lb.stale_peak_tag_disproved);
+    assert_eq!(fused_w30_lb.peak_meta, TrackPeakMetadata::default());
+    let lb = fused_w30_lb
+        .w30_peak_lower_bound_dbtp
+        .expect("W30 disproof must preserve W30 lower bound");
+    assert!((lb - w30.true_peak_dbtp).abs() < 1e-6);
 }
 
 #[test]
