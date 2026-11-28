@@ -933,6 +933,27 @@ impl AudioPipeline {
         self.picker.policy()
     }
 
+    /// Compute the exact [`ap_core::track_db::PostChainKey`] that
+    /// [`Self::start_track_with_plan_and_headroom`] will produce for `(source_rate_hz, plan)`
+    /// without constructing upsampler FIR/FFT tables (used by E2 next-track pre-scan fast-skip).
+    pub fn post_chain_key_for_plan(
+        &self,
+        source_rate_hz: u32,
+        plan: &SelectedDspPlan,
+    ) -> Result<ap_core::track_db::PostChainKey, String> {
+        let internal_rate = plan.target_rate_hz;
+        let dac_target = self
+            .dac_capabilities()
+            .resolve_for_internal_rate(internal_rate)?;
+        let convolver = self.convolver_factory.create_for_rate(internal_rate)?;
+        Ok(crate::selector::build_post_chain_key(
+            plan,
+            source_rate_hz,
+            dac_target.sample_rate_hz,
+            convolver.content_hash(),
+        ))
+    }
+
     /// Open a fresh [`StreamingPipelineSession`] from an explicit pre-resolved [`SelectedDspPlan`]
     /// and [`HeadroomDecision`] (used by Ultimate Mode `W2` and `W3`).
     pub fn start_track_with_plan_and_headroom(

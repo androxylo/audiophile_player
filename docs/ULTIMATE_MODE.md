@@ -160,6 +160,7 @@ For local files in Ultimate mode, the maximum peak is **always known** (except i
 | Tier | `peak_source` | Evidence | Meter / ISP allowance `A_tp` |
 |---|---|---|---|
 | **E1** | `exact-M` | Cached exact unity-gain post-chain peak `M` for this audio MD5 and DSP chain (`PostChainKey`). Survives `DETECTOR_VERSION` upgrades | `0.00 dB` (exact) |
+| **E2** | `exact-M` (pre-scanned) | Low-priority background post-chain pre-scan of the queued next local track while track N plays (runs only when track N has ≥ 2× RT spare throughput, i.e. ≥ 3× RT; cancels immediately on skip/pause/queue change) | `0.00 dB` (turns next track into E1) |
 | **E3** | `scan-tp` | Parallel whole-file 8× / 32-tap Kaiser true-peak scan (`tp8x-32`, ≤ 0.1 dB error across 0–0.45·fs, 2 s post-W2 deadline) | `0.10 dB` |
 | **E4** | `cached-tp` | Cached whole-track true peak (`true_peak_dbtp`) for this audio MD5 when the DSP chain changed (`PostChainKey` miss) | `0.10 dB` (`tp8x-32`) / `0.70 dB` (`tp4x-12`) |
 | **E5** | `tag-tp` / `tag-sp` | Validated FLAC true-peak or ReplayGain sample-peak tag | `0.70 dB` (`tag-tp`) / `3.00 dB` (`tag-sp`) |

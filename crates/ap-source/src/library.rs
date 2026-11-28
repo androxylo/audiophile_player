@@ -948,6 +948,7 @@ pub struct SequentialFlacCursor {
     stack: Vec<DirFrame>,
     visited: HashSet<PathBuf>,
     recursive: bool,
+    peeked: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -985,6 +986,7 @@ impl SequentialFlacCursor {
             stack: vec![first],
             visited,
             recursive: true,
+            peeked: None,
         })
     }
 
@@ -1051,6 +1053,7 @@ impl SequentialFlacCursor {
                         stack,
                         visited,
                         recursive: true,
+                        peeked: None,
                     });
                 }
             }
@@ -1065,6 +1068,7 @@ impl SequentialFlacCursor {
             stack,
             visited,
             recursive: true,
+            peeked: None,
         })
     }
 
@@ -1072,9 +1076,25 @@ impl SequentialFlacCursor {
         &self.root
     }
 
+    /// Peek the next `.flac` file in naturally sorted sequential order without consuming it
+    /// (used by Ultimate Mode E2 next-track post-chain pre-scan, Issue #23 §3.6).
+    pub fn peek_next_track(&mut self) -> Option<&Path> {
+        if self.peeked.is_none() {
+            self.peeked = self.advance_track();
+        }
+        self.peeked.as_deref()
+    }
+
     /// Return the next `.flac` file in naturally sorted sequential order, or `None` when the
     /// folder tree has been completely played through.
     pub fn next_track(&mut self) -> Option<PathBuf> {
+        if let Some(p) = self.peeked.take() {
+            return Some(p);
+        }
+        self.advance_track()
+    }
+
+    fn advance_track(&mut self) -> Option<PathBuf> {
         loop {
             let depth = self.stack.len();
             let top = self.stack.last_mut()?;

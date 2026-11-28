@@ -25,8 +25,9 @@
 //!   seamlessly through EOF measuring whole-track `M` -> atomic YAML learn-on-play (`U5b`) ONLY on
 //!   clean EOF with verified `STREAMINFO.md5`. Mid-track skip discards cleanly with zero YAML write.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -68,6 +69,11 @@ use crate::prefetch::{BoundedBlockStreamBuffer, StreamEvent};
 /// peak scan before falling back to E4/E5/Unknown and letting E3 finish in the background
 /// (`Issue #23 §3.1`, Owner Decision #4).
 pub const E3_PEAK_SCAN_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Minimum measured track-N throughput (`× RT`, from W2) required before launching the E2
+/// low-priority next-track post-chain pre-scan (`Issue #23 §3.6`, P5): `1.0×` for active playback
+/// plus at least `2.0×` spare real-time capacity so E2 never competes with real-time rendering.
+pub const E2_MIN_SPEED_X_RT: f64 = 3.0;
 
 #[cfg(test)]
 type E3TestOpener =
@@ -1218,6 +1224,104 @@ where
     S: AudioBlockSource,
     F: Fn() -> bool,
 {
+    stream_track_ultimate_inner(
+        pipeline,
+        ult,
+        buf,
+        epoch,
+        is_aborted,
+        source,
+        display_path,
+        local_path,
+        upnp_uri,
+        upnp_next_gen,
+        mode_label,
+        duration_hint_s,
+        incoming_carryover,
+        panic_backup_carry,
+        had_pending_prev_end,
+        gapless_carryover,
+        src_block_frames,
+        None,
+    )
+}
+
+/// Same as [`stream_track_ultimate`], plus an optional callback invoked with the measured W2
+/// throughput (`speed_x_rt`) immediately after `TrackStart` is queued (used by `engine.rs` to
+/// launch the throughput-gated E2 next-track post-chain pre-scan while track N plays).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn stream_track_ultimate_with_w2_hook<S, F, H>(
+    pipeline: &AudioPipeline,
+    ult: &UltimateRuntimeContext,
+    buf: &BoundedBlockStreamBuffer,
+    epoch: u64,
+    is_aborted: F,
+    source: &mut S,
+    display_path: &Path,
+    local_path: Option<&Path>,
+    upnp_uri: Option<String>,
+    upnp_next_gen: Option<u64>,
+    mode_label: PlayModeLabel,
+    duration_hint_s: Option<f64>,
+    incoming_carryover: &mut Option<GaplessCarryover>,
+    panic_backup_carry: &mut Option<GaplessCarryover>,
+    had_pending_prev_end: &mut bool,
+    gapless_carryover: bool,
+    src_block_frames: usize,
+    mut on_w2_ready: H,
+) -> UltimateStreamResult
+where
+    S: AudioBlockSource,
+    F: Fn() -> bool,
+    H: FnMut(f64),
+{
+    stream_track_ultimate_inner(
+        pipeline,
+        ult,
+        buf,
+        epoch,
+        is_aborted,
+        source,
+        display_path,
+        local_path,
+        upnp_uri,
+        upnp_next_gen,
+        mode_label,
+        duration_hint_s,
+        incoming_carryover,
+        panic_backup_carry,
+        had_pending_prev_end,
+        gapless_carryover,
+        src_block_frames,
+        Some(&mut on_w2_ready),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stream_track_ultimate_inner<S, F>(
+    pipeline: &AudioPipeline,
+    ult: &UltimateRuntimeContext,
+    buf: &BoundedBlockStreamBuffer,
+    epoch: u64,
+    is_aborted: F,
+    source: &mut S,
+    display_path: &Path,
+    local_path: Option<&Path>,
+    upnp_uri: Option<String>,
+    upnp_next_gen: Option<u64>,
+    mode_label: PlayModeLabel,
+    duration_hint_s: Option<f64>,
+    incoming_carryover: &mut Option<GaplessCarryover>,
+    panic_backup_carry: &mut Option<GaplessCarryover>,
+    had_pending_prev_end: &mut bool,
+    gapless_carryover: bool,
+    src_block_frames: usize,
+    on_w2_ready: Option<&mut dyn FnMut(f64)>,
+) -> UltimateStreamResult
+where
+    S: AudioBlockSource,
+    F: Fn() -> bool,
+{
     let spec = source.spec();
     let is_streaming = source.is_streaming();
     let raw_peak_meta = source.peak_meta();
@@ -1708,6 +1812,12 @@ where
         return UltimateStreamResult::Aborted;
     }
 
+    // Trigger optional E2 next-track pre-scan hook now that Track N's W2 throughput is known
+    // and TrackStart has been queued (never delaying Track N's startup).
+    if let Some(cb) = on_w2_ready {
+        cb(final_speed_x_rt);
+    }
+
     // Quantize and push the already-rendered unity-gain W2 blocks (ZERO double-rendering!).
     let mut had_error = false;
     let mut skip_session_flush = false;
@@ -2023,6 +2133,464 @@ where
         quantizer_stats: session.quantizer_stats(),
         measured_whole_track_m_dbfs: Some(linear_to_dbfs(whole_track_m_linear)),
         warning: error_warning,
+    }
+}
+
+/// Outcome of a single Ultimate Mode E2 next-track post-chain pre-scan (`Issue #23 §3.6`, P5).
+#[derive(Debug, Clone, PartialEq)]
+pub enum PreScanOutcome {
+    /// Post-chain peak `M` (and `tp8x-32` source true peak) were computed and atomically persisted
+    /// to Schema-2 YAML + `album_cache`.
+    Completed {
+        post_key: ap_core::track_db::PostChainKey,
+        peak_dbfs: f64,
+    },
+    /// Schema-2 already held a current entry with exact `M` for this track's active `PostChainKey`.
+    AlreadyCached {
+        post_key: ap_core::track_db::PostChainKey,
+    },
+    /// Track was ineligible for E2 pre-scan (e.g. `< 30 s` short track or outside library roots).
+    Skipped,
+    /// Pre-scan was cancelled before completion (skip / queue change / pause / shutdown); zero
+    /// partial YAML was written.
+    Cancelled,
+    /// Non-fatal decode, MD5 verification, DSP, or persistence error.
+    Failed(String),
+}
+
+#[cfg(windows)]
+fn set_current_thread_below_normal() {
+    const THREAD_PRIORITY_BELOW_NORMAL: i32 = -1;
+    unsafe extern "system" {
+        fn GetCurrentThread() -> isize;
+        fn SetThreadPriority(h_thread: isize, n_priority: i32) -> i32;
+    }
+    unsafe {
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
+}
+
+#[cfg(not(windows))]
+fn set_current_thread_below_normal() {}
+
+/// Run the cancellable Ultimate Mode E2 post-chain pre-scan for one local FLAC track
+/// (`Issue #23 §3.6`, P5).
+///
+/// Guarantees **L3 parity** with both `stream_track_ultimate` and offline `scan --post-chain`:
+/// - Resolves user overrides (`my-filters.yaml` + `AP_*` tags) and active DSP plan via the exact
+///   same [`resolve_active_selection`] / [`resolve_machine_suggestion`] rules.
+/// - Executes [`crate::scanner::run_post_chain_pass_with_pipeline`] against the live
+///   [`AudioPipeline`] (matching upsampler, de-emphasis, REW convolver hash, and `< 8fS`
+///   downsampling rate).
+/// - Checks `is_cancelled()` on every block of Pass 1 and Pass 2 and immediately before disk
+///   persistence so cancellation NEVER writes partial YAML.
+pub fn prescan_local_track_post_chain(
+    local_path: &Path,
+    pipeline: &AudioPipeline,
+    ult: &UltimateRuntimeContext,
+    is_cancelled: &dyn Fn() -> bool,
+) -> PreScanOutcome {
+    if is_cancelled() {
+        return PreScanOutcome::Cancelled;
+    }
+    let Some((root, rel_folder, file_name)) = ult.resolve_track_location(local_path) else {
+        return PreScanOutcome::Skipped;
+    };
+
+    let mut reader = match FlacBlockReader::open(local_path) {
+        Ok(r) => r,
+        Err(err) => return PreScanOutcome::Failed(format!("E2 open failed: {err}")),
+    };
+    let spec = reader.spec();
+    let raw_peak_meta = reader.peak_meta();
+    let track_meta = reader.track_meta();
+    let header_md5 = reader.streaminfo_md5();
+    let header_md5_hex = header_md5.as_ref().map(md5_to_hex);
+    let (file_size, file_mtime) = file_size_and_mtime(local_path).unwrap_or((0, 0));
+    let total_duration_s = reader
+        .total_frames()
+        .filter(|&f| f > 0)
+        .map(|f| f as f64 / f64::from(spec.sample_rate_hz.max(1)));
+
+    // Short tracks (< 30 s) render synchronously via `stream_short_track_normal` and never look up
+    // Schema-2 `post_chain_peaks`.
+    if total_duration_s
+        .is_some_and(|d| d.is_finite() && d < f64::from(ULTIMATE_LOOKAHEAD_SECONDS))
+    {
+        return PreScanOutcome::Skipped;
+    }
+
+    let (choices_exist, user_file, _) = ult.user_filters.load_fresh();
+    let effective_filter_mode = ult
+        .filter_mode
+        .resolve(choices_exist && user_file.is_some());
+    let resolved_user_overrides = if effective_filter_mode == FilterMode::Mine {
+        user_file
+            .as_ref()
+            .map(|uf| uf.resolve_for_track(&root, &rel_folder, &file_name, &track_meta))
+    } else {
+        None
+    };
+
+    let cached_s2_track: Option<(AlbumTrackAnalysis, bool, bool)> = ult
+        .load_album_cached(&root, &rel_folder)
+        .and_then(|album| {
+            let track = album.get_track(&file_name)?.clone();
+            let peak_current = track.matches_identity(
+                header_md5_hex.as_deref(),
+                Some(file_size),
+                Some(file_mtime),
+            );
+            let results_current = peak_current && track.detector_version == DETECTOR_VERSION;
+            Some((track, results_current, peak_current))
+        });
+
+    let policy = pipeline.policy();
+
+    // Fast path: if Schema-2 already has current detector results AND current audio identity,
+    // resolve the active plan immediately without re-decoding Pass 1!
+    if let Some((ref cached_track, true, true)) = cached_s2_track {
+        let base_wt = CachedWholeTrackEvidence::from_album_track_with_peak(cached_track, true, true);
+        if let Ok(active_sel) = resolve_active_selection(
+            spec,
+            false,
+            total_duration_s.or((cached_track.seconds > 0.0).then_some(cached_track.seconds)),
+            &raw_peak_meta,
+            &track_meta,
+            None,
+            &base_wt,
+            resolved_user_overrides.as_ref(),
+            effective_filter_mode,
+            &policy,
+            ult.config.genre_rules,
+            true,
+        ) {
+            if let Ok(expected_key) =
+                pipeline.post_chain_key_for_plan(spec.sample_rate_hz, &active_sel.plan)
+            {
+                if cached_track.find_post_chain_peak(&expected_key).is_some() {
+                    return PreScanOutcome::AlreadyCached {
+                        post_key: expected_key,
+                    };
+                }
+                // If `tp8x-32` is already cached too (e.g. K6 REW/filter/rate change), jump
+                // directly to Pass 2 without re-running Pass 1!
+                if cached_track.effective_true_peak_meter() == Some(TRUE_PEAK_METER_8X_32) {
+                    if is_cancelled() {
+                        return PreScanOutcome::Cancelled;
+                    }
+                    let (post_key, peak_dbfs) = match crate::scanner::run_post_chain_pass_with_pipeline(
+                        local_path,
+                        spec,
+                        &active_sel.plan,
+                        pipeline,
+                        is_cancelled,
+                    ) {
+                        Ok(Some(v)) => v,
+                        Ok(None) => return PreScanOutcome::Cancelled,
+                        Err(err) => return PreScanOutcome::Failed(format!("E2 post-chain failed: {err}")),
+                    };
+                    if is_cancelled() {
+                        return PreScanOutcome::Cancelled;
+                    }
+                    let mut updated = cached_track.clone();
+                    updated.upsert_post_chain_peak(post_key.clone(), peak_dbfs, false);
+                    return match ult.filter_db.upsert_track_nonblocking(
+                        &root,
+                        &rel_folder,
+                        &file_name,
+                        DETECTOR_VERSION,
+                        updated,
+                    ) {
+                        Ok(Some(merged)) => {
+                            ult.update_album_cache(&root, &rel_folder, &file_name, merged);
+                            PreScanOutcome::Completed {
+                                post_key,
+                                peak_dbfs,
+                            }
+                        }
+                        Ok(None) => PreScanOutcome::Cancelled,
+                        Err(err) => PreScanOutcome::Failed(format!("E2 YAML save failed: {err}")),
+                    };
+                }
+            }
+        }
+    }
+
+    // --- Pass 1: Cancellable whole-file TrackAnalyzer + GatedPeakScanner (`tp8x-32`) + MD5 ---
+    let mut analyzer = TrackAnalyzer::new(spec.sample_rate_hz, spec.bits_per_sample);
+    let mut gated_peak = GatedPeakScanner::new();
+    loop {
+        if is_cancelled() {
+            return PreScanOutcome::Cancelled;
+        }
+        match reader.read_next_block(8_192) {
+            Ok(Some(block)) => {
+                if !block.is_empty() {
+                    analyzer.push_block(&block);
+                    gated_peak.push_stereo_buffer(&block);
+                }
+            }
+            Ok(None) => break,
+            Err(err) => return PreScanOutcome::Failed(format!("E2 Pass-1 decode failed: {err}")),
+        }
+    }
+    if is_cancelled() {
+        return PreScanOutcome::Cancelled;
+    }
+
+    // Verify RFC 9639 STREAMINFO.md5 (identical to `scanner.rs` & `persist_learn_on_play`).
+    let computed_md5 = reader.computed_md5();
+    match (header_md5, computed_md5) {
+        (Some(expected), Some(actual)) if expected != actual => {
+            return PreScanOutcome::Failed(format!(
+                "E2 MD5 mismatch on '{}' (header={} computed={})",
+                local_path.display(),
+                md5_to_hex(&expected),
+                md5_to_hex(&actual),
+            ));
+        }
+        (None, None) => {
+            return PreScanOutcome::Failed(format!(
+                "E2 missing MD5 on '{}'",
+                local_path.display()
+            ));
+        }
+        _ => {}
+    }
+    let final_md5_hex = header_md5_hex.or_else(|| computed_md5.as_ref().map(md5_to_hex));
+
+    let early_digital = track_meta.is_early_digital_era();
+    let orig_below = track_meta
+        .original_sample_rate_hz
+        .is_some_and(|r| r < spec.sample_rate_hz);
+    let wt_analysis = analyzer.snapshot(true, early_digital, orig_below, track_meta.is_dsd_hint);
+    if wt_analysis.duration_s < f64::from(ULTIMATE_LOOKAHEAD_SECONDS) {
+        return PreScanOutcome::Skipped;
+    }
+    let peak_scan = gated_peak.finish(None);
+    if is_cancelled() {
+        return PreScanOutcome::Cancelled;
+    }
+
+    // Resolve pure machine suggestion (U2: never overwritten by user/CLI overrides) and active plan.
+    let base_wt = CachedWholeTrackEvidence::from_whole_track_analysis(&wt_analysis, None);
+    let sug_selection = match resolve_machine_suggestion(
+        spec,
+        false,
+        Some(wt_analysis.duration_s),
+        &raw_peak_meta,
+        &track_meta,
+        Some(&wt_analysis),
+        &base_wt,
+        &policy,
+        ult.config.genre_rules,
+        false,
+    ) {
+        Ok(sel) => sel,
+        Err(err) => return PreScanOutcome::Failed(format!("E2 suggestion failed: {err}")),
+    };
+    let active_selection = resolve_active_selection(
+        spec,
+        false,
+        Some(wt_analysis.duration_s),
+        &raw_peak_meta,
+        &track_meta,
+        Some(&wt_analysis),
+        &base_wt,
+        resolved_user_overrides.as_ref(),
+        effective_filter_mode,
+        &policy,
+        ult.config.genre_rules,
+        false,
+    )
+    .unwrap_or_else(|_| sug_selection.clone());
+
+    // Build Schema-2 entry (pure machine `suggested`/`rule`/`why`/`deemphasis` + `tp8x-32` peak).
+    let s1_entry = build_track_db_entry(
+        local_path.to_string_lossy().into_owned(),
+        file_size,
+        file_mtime,
+        final_md5_hex,
+        &wt_analysis,
+        sug_selection.plan.deemphasis,
+        sug_selection.plan.filter.to_string(),
+        sug_selection.winning_rule.clone(),
+    );
+    let head_hash = file_head_4k_hash(local_path);
+    let mut s2_track = AlbumTrackAnalysis::from_schema1(&s1_entry, head_hash);
+    s2_track.suggested = sug_selection.plan.filter.to_string();
+    s2_track.rule = sug_selection.winning_rule.clone();
+    s2_track.why = ap_core::filter_db::why_for_rule(&s2_track.rule).to_string();
+    s2_track.deemphasis = sug_selection.plan.deemphasis;
+    if let Some(ps) = peak_scan {
+        if ps.true_peak_dbtp.is_finite() {
+            s2_track.sample_peak = ps.sample_peak_linear;
+            s2_track.true_peak_dbtp = Some(ps.true_peak_dbtp);
+            s2_track.true_peak_meter = Some(PEAK_SCAN_METER_ID.to_string());
+        }
+    }
+
+    // Preserve any existing peak-current `post_chain_peaks` (e.g. after a DETECTOR_VERSION bump).
+    if let Some((ref prev, _, true)) = cached_s2_track {
+        s2_track.post_chain_peaks = prev.post_chain_peaks.clone();
+    }
+
+    // Check if the active plan's `PostChainKey` is already present from a prior peak-current entry.
+    let expected_key = pipeline
+        .post_chain_key_for_plan(spec.sample_rate_hz, &active_selection.plan)
+        .ok();
+    let existing_m = expected_key
+        .as_ref()
+        .and_then(|k| s2_track.find_post_chain_peak(k));
+
+    let (post_key, peak_dbfs) = if let (Some(k), Some(m)) = (expected_key, existing_m) {
+        (k, m)
+    } else {
+        // --- Pass 2: Cancellable unity-gain post-chain render through the live AudioPipeline ---
+        match crate::scanner::run_post_chain_pass_with_pipeline(
+            local_path,
+            spec,
+            &active_selection.plan,
+            pipeline,
+            is_cancelled,
+        ) {
+            Ok(Some(v)) => v,
+            Ok(None) => return PreScanOutcome::Cancelled,
+            Err(err) => return PreScanOutcome::Failed(format!("E2 post-chain failed: {err}")),
+        }
+    };
+
+    // Final cancellation barrier BEFORE any disk write (guarantees zero partial YAML on skip).
+    if is_cancelled() {
+        return PreScanOutcome::Cancelled;
+    }
+
+    s2_track.upsert_post_chain_peak(post_key.clone(), peak_dbfs, false);
+    match ult.filter_db.upsert_track_nonblocking(
+        &root,
+        &rel_folder,
+        &file_name,
+        DETECTOR_VERSION,
+        s2_track,
+    ) {
+        Ok(Some(merged)) => {
+            ult.update_album_cache(&root, &rel_folder, &file_name, merged);
+            PreScanOutcome::Completed {
+                post_key,
+                peak_dbfs,
+            }
+        }
+        Ok(None) => PreScanOutcome::Cancelled,
+        Err(err) => PreScanOutcome::Failed(format!("E2 YAML save failed: {err}")),
+    }
+}
+
+struct ActivePreScan {
+    target_path: PathBuf,
+    own_cancel: Arc<AtomicBool>,
+    handle: std::thread::JoinHandle<PreScanOutcome>,
+}
+
+/// Low-priority, throughput-gated, cancellable background controller for Ultimate Mode E2
+/// next-track post-chain pre-scan (`Issue #23 §3.6`, P5).
+///
+/// Runs at most one background thread (`THREAD_PRIORITY_BELOW_NORMAL` on Windows, low-priority
+/// `worker_pool` lane) and cancels immediately on track skip, queue/mode change, pause, or drop.
+#[derive(Default)]
+pub struct NextTrackPreScanner {
+    active: Option<ActivePreScan>,
+}
+
+impl NextTrackPreScanner {
+    pub fn new() -> Self {
+        Self { active: None }
+    }
+
+    /// Launch E2 post-chain pre-scan for `next_path` iff `prev_speed_x_rt >= E2_MIN_SPEED_X_RT`
+    /// (`>= 3.0x RT`: 1x active playback + >= 2x spare capacity). Returns `true` if a pre-scan is
+    /// now active (or already running) for `next_path`.
+    pub fn maybe_start(
+        &mut self,
+        next_path: &Path,
+        prev_speed_x_rt: f64,
+        pipeline: Arc<AudioPipeline>,
+        ult: UltimateRuntimeContext,
+        epoch_cancel: Arc<AtomicBool>,
+    ) -> bool {
+        if !prev_speed_x_rt.is_finite() || prev_speed_x_rt < E2_MIN_SPEED_X_RT {
+            return false;
+        }
+        if let Some(ref cur) = self.active {
+            if cur.target_path == next_path && !cur.handle.is_finished() {
+                return true;
+            }
+        }
+        self.cancel();
+
+        let target_path = next_path.to_path_buf();
+        let path_for_thread = target_path.clone();
+        let own_cancel = Arc::new(AtomicBool::new(false));
+        let own_cancel_w = Arc::clone(&own_cancel);
+        let spawn_res = std::thread::Builder::new()
+            .name("ap-e2-prescan".to_string())
+            .spawn(move || {
+                // Never run inside `with_high_priority_dsp`; drop OS thread priority so active
+                // real-time playback & WDM-KS/WASAPI always win scheduling.
+                set_current_thread_below_normal();
+                let is_cancelled = || {
+                    own_cancel_w.load(Ordering::Acquire) || epoch_cancel.load(Ordering::Acquire)
+                };
+                prescan_local_track_post_chain(&path_for_thread, &pipeline, &ult, &is_cancelled)
+            });
+
+        match spawn_res {
+            Ok(handle) => {
+                self.active = Some(ActivePreScan {
+                    target_path,
+                    own_cancel,
+                    handle,
+                });
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Signal cancellation immediately without blocking the playback producer thread.
+    pub fn cancel(&mut self) {
+        if let Some(prev) = self.active.take() {
+            prev.own_cancel.store(true, Ordering::Release);
+            if prev.handle.is_finished() {
+                let _ = prev.handle.join();
+            }
+        }
+    }
+
+    /// Signal cancellation and wait for the background pre-scan thread to exit cleanly.
+    pub fn cancel_and_join(&mut self) -> Option<PreScanOutcome> {
+        let prev = self.active.take()?;
+        prev.own_cancel.store(true, Ordering::Release);
+        prev.handle.join().ok()
+    }
+
+    /// Wait for an active pre-scan to finish without cancelling it (primarily for tests).
+    pub fn join_if_active(&mut self) -> Option<PreScanOutcome> {
+        let prev = self.active.take()?;
+        prev.handle.join().ok()
+    }
+
+    /// Returns `true` when an E2 pre-scan worker is currently tracked and not yet finished.
+    pub fn is_running(&self) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|cur| !cur.handle.is_finished())
+    }
+}
+
+impl Drop for NextTrackPreScanner {
+    fn drop(&mut self) {
+        let _ = self.cancel_and_join();
     }
 }
 

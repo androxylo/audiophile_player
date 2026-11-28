@@ -14,23 +14,27 @@
 use std::f64::consts::PI;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ap_control::state::PlayModeLabel;
 use ap_core::config::{ConvolutionConfig, UltimateConfig};
-use ap_core::filter_db::{FilterDbStore, LibraryManifest};
+use ap_core::filter_db::{FilterDbStore, LibraryManifest, TRUE_PEAK_METER_8X_32};
 use ap_core::format::{DacOutputCapabilities, DacWireFormat};
 use ap_core::user_filters::FilterMode;
 use ap_dsp::analysis::DETECTOR_VERSION;
 use ap_dsp::pipeline::AudioPipeline;
-use ap_dsp::selector::{FilterArchetype, UpsamplerPolicy};
+use ap_dsp::selector::{FilterArchetype, UpsamplerPolicy, build_post_chain_key};
 use ap_player::prefetch::{
     BoundedBlockStreamBuffer, StreamEvent, ULTIMATE_MAX_BUFFERED_FRAMES,
     ULTIMATE_MAX_BUFFERED_SECONDS,
 };
 use ap_player::scanner::{ScanOptions, scan_folder};
-use ap_player::ultimate::{UltimateRuntimeContext, UltimateStreamResult, stream_track_ultimate};
+use ap_player::ultimate::{
+    E2_MIN_SPEED_X_RT, NextTrackPreScanner, PreScanOutcome, UltimateRuntimeContext,
+    UltimateStreamResult, prescan_local_track_post_chain, stream_track_ultimate,
+};
 use ap_source::flac::FlacBlockReader;
 use flac_codec::encode::{FlacSampleWriter, Options};
 
@@ -323,6 +327,322 @@ fn l3_scan_and_ultimate_playback_agree_and_cli_filter_preserves_suggested() {
     assert_ne!(
         ds_track.post_chain_peaks[0].key, scan_track.post_chain_peaks[0].key,
         "downsampled playback key must not collide with 8fS scanner key"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// **L3 + Issue #23 P5 (`§3.6`)**: Verify that E2 next-track post-chain pre-scan produces the
+/// exact same `suggested`, `rule`, `PostChainKey`, and `M` (within `1e-9 dB`) as both offline
+/// `scan --post-chain` and live `stream_track_ultimate` — including user overrides (preserving
+/// machine `suggested`, U2), `< 8fS` downsampled DACs, and fast-skip when already cached.
+#[test]
+fn l3_e2_prescan_agrees_with_scan_and_playback_including_overrides_and_downsampling() {
+    let root = temp_dir("e2_l3");
+    let music_dir = root.join("music");
+    fs::create_dir_all(&music_dir).unwrap();
+    let flac_path = music_dir.join("01_e2_chord_31s.flac");
+    write_stereo_flac_16(&flac_path, 44_100, 31);
+
+    let shared_policy = UpsamplerPolicy {
+        max_taps: 65_536,
+        ..UpsamplerPolicy::default()
+    };
+
+    // 1. Offline `scan --post-chain` baseline into `filterdb_scan`.
+    let filterdb_scan = root.join("filterdb_scan");
+    let cfg_path = root.join("empty_config.toml");
+    fs::write(&cfg_path, "").unwrap();
+    let scan_opts = ScanOptions {
+        folder: Some(music_dir.clone()),
+        report: false,
+        post_chain: true,
+        force: true,
+        jobs: Some(1),
+        trackdb_dir: Some(root.join("trackdb_scan")),
+        filterdb_dir: Some(filterdb_scan.clone()),
+        choices_file: Some(root.join("no_choices.yaml")),
+        config_path: Some(cfg_path),
+        rew_override: Some(ConvolutionConfig::disabled()),
+        upsampler_policy: shared_policy,
+    };
+    let summary = scan_folder(&scan_opts, None).expect("scan_folder failed");
+    assert_eq!(summary.scanned, 1);
+    let scan_track = FilterDbStore::new(&filterdb_scan)
+        .load_album("main", "")
+        .unwrap()
+        .get_track("01_e2_chord_31s.flac")
+        .unwrap()
+        .clone();
+
+    // 2. E2 pre-scan into fresh `filterdb_e2`.
+    let filterdb_e2 = root.join("filterdb_e2");
+    let mut manifest = LibraryManifest::new(DETECTOR_VERSION);
+    manifest.upsert_root("main", &music_dir);
+    let ult_e2 = UltimateRuntimeContext::new(
+        UltimateConfig {
+            enabled: true,
+            genre_rules: true,
+            learn_on_play: true,
+        },
+        FilterDbStore::new(filterdb_e2.clone()),
+        manifest,
+        root.join("no_choices.yaml"),
+        FilterMode::Auto,
+    );
+    let pipeline_8fs = AudioPipeline::with_rew_config_full_tail(
+        shared_policy,
+        ConvolutionConfig::disabled(),
+        true,
+    )
+    .unwrap();
+
+    let out = prescan_local_track_post_chain(&flac_path, &pipeline_8fs, &ult_e2, &|| false);
+    let (e2_key, e2_m) = match out {
+        PreScanOutcome::Completed {
+            post_key,
+            peak_dbfs,
+        } => (post_key, peak_dbfs),
+        other => panic!("expected PreScanOutcome::Completed, got {other:?}"),
+    };
+    assert_eq!(
+        e2_key, scan_track.post_chain_peaks[0].key,
+        "L3: E2 PostChainKey != offline scan PostChainKey"
+    );
+    assert!(
+        (e2_m - scan_track.post_chain_peaks[0].peak_dbfs).abs() <= 1e-9,
+        "L3: E2 M ({e2_m:.10}) != scan M ({:.10})",
+        scan_track.post_chain_peaks[0].peak_dbfs
+    );
+
+    let e2_track = FilterDbStore::new(&filterdb_e2)
+        .load_album("main", "")
+        .unwrap()
+        .get_track("01_e2_chord_31s.flac")
+        .unwrap()
+        .clone();
+    assert_eq!(e2_track.suggested, scan_track.suggested);
+    assert_eq!(e2_track.rule, scan_track.rule);
+    assert_eq!(
+        e2_track.effective_true_peak_meter(),
+        Some(TRUE_PEAK_METER_8X_32),
+        "E2 pre-scan must persist tp8x-32 true peak alongside exact M"
+    );
+
+    // 3. Re-running E2 immediately hits fast-skip (`AlreadyCached`).
+    let out_again = prescan_local_track_post_chain(&flac_path, &pipeline_8fs, &ult_e2, &|| false);
+    assert_eq!(
+        out_again,
+        PreScanOutcome::AlreadyCached {
+            post_key: e2_key.clone()
+        }
+    );
+
+    // 4. Playing Track 1 via `stream_track_ultimate` after E2 immediately hits E1 (`exact-M`)!
+    let buf = BoundedBlockStreamBuffer::with_limits(
+        ULTIMATE_MAX_BUFFERED_FRAMES,
+        Duration::from_secs(ULTIMATE_MAX_BUFFERED_SECONDS),
+    );
+    let ep = buf.current_epoch();
+    let buf_c = Arc::clone(&buf);
+    let drain_h = std::thread::spawn(move || {
+        let mut first_report = None;
+        loop {
+            match buf_c.pop_for_epoch_timeout(ep, Duration::from_secs(60)) {
+                Some(StreamEvent::TrackStart { report, .. }) => first_report = Some(report),
+                Some(StreamEvent::PcmBlock(_)) => {}
+                Some(StreamEvent::TrackEnd) => break,
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        first_report.expect("TrackStart missing")
+    });
+    let mut reader = FlacBlockReader::open(&flac_path).unwrap();
+    let (mut carry, mut backup, mut pend) = (None, None, false);
+    let play_res = stream_track_ultimate(
+        &pipeline_8fs,
+        &ult_e2,
+        &buf,
+        ep,
+        || false,
+        &mut reader,
+        &flac_path,
+        Some(&flac_path),
+        None,
+        None,
+        PlayModeLabel::Sequential,
+        None,
+        &mut carry,
+        &mut backup,
+        &mut pend,
+        false,
+        8_192,
+    );
+    let report = drain_h.join().unwrap();
+    assert!(matches!(play_res, UltimateStreamResult::Played { .. }));
+    let u = report.ultimate_report.as_ref().expect("ultimate_report");
+    assert_eq!(u.peak_source.as_deref(), Some("exact-M"));
+    assert_eq!(u.mode, "ultimate: cached");
+    assert!(
+        (u.cached_m_dbfs.unwrap() - e2_m).abs() <= 1e-9,
+        "playback cached M must match E2 pre-scan M"
+    );
+    let play_key = build_post_chain_key(
+        &report.dsp_plan,
+        report.source_spec.sample_rate_hz,
+        report.output_rate_hz,
+        report.convolver_content_hash.as_deref(),
+    );
+    assert_eq!(play_key, e2_key);
+
+    // 5. Downsampled `< 8fS` DAC (176.4 kHz): E2 computes and caches the exact 176.4 kHz key!
+    let ds_caps =
+        DacOutputCapabilities::from_supported_rates(&[(176_400, DacWireFormat::Int32)], None);
+    let pipeline_ds = AudioPipeline::with_rew_config_full_tail(
+        shared_policy,
+        ConvolutionConfig::disabled(),
+        true,
+    )
+    .unwrap()
+    .with_dac_capabilities(ds_caps);
+    let ds_out = prescan_local_track_post_chain(&flac_path, &pipeline_ds, &ult_e2, &|| false);
+    let ds_key = match ds_out {
+        PreScanOutcome::Completed { post_key, .. } => post_key,
+        other => panic!("expected Completed for downsampled DAC key, got {other:?}"),
+    };
+    assert_eq!(ds_key.output_rate_hz, 176_400);
+    assert_ne!(ds_key, e2_key);
+
+    // 6. User override (`my-filters.yaml`: short-lp + deemphasis: true) preserves machine `suggested`.
+    let choices_path = root.join("override_choices.yaml");
+    fs::write(
+        &choices_path,
+        "schema: 2\n\ntracks:\n  \"main:01_e2_chord_31s.flac\":\n    filter: short-lp\n    deemphasis: true\n",
+    )
+    .unwrap();
+    let filterdb_ov = root.join("filterdb_ov");
+    let mut manifest_ov = LibraryManifest::new(DETECTOR_VERSION);
+    manifest_ov.upsert_root("main", &music_dir);
+    let ult_ov = UltimateRuntimeContext::new(
+        UltimateConfig {
+            enabled: true,
+            genre_rules: true,
+            learn_on_play: true,
+        },
+        FilterDbStore::new(filterdb_ov.clone()),
+        manifest_ov,
+        choices_path,
+        FilterMode::Auto,
+    );
+    let ov_out = prescan_local_track_post_chain(&flac_path, &pipeline_8fs, &ult_ov, &|| false);
+    let ov_key = match ov_out {
+        PreScanOutcome::Completed { post_key, .. } => post_key,
+        other => panic!("expected Completed for user override, got {other:?}"),
+    };
+    assert_eq!(ov_key.upsampler, "short-lp");
+    assert!(ov_key.deemphasis);
+    let ov_track = FilterDbStore::new(&filterdb_ov)
+        .load_album("main", "")
+        .unwrap()
+        .get_track("01_e2_chord_31s.flac")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        ov_track.suggested, scan_track.suggested,
+        "U2: E2 pre-scan with user filter override must NEVER overwrite machine suggested"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// **Issue #23 T13b & T13c (`§3.6`, §5)**:
+/// - Throughput guard refuses to start E2 when `speed_x_rt < E2_MIN_SPEED_X_RT` (3.0x RT).
+/// - Cancellation (pre-set or mid-scan) aborts promptly and writes ZERO partial YAML files.
+#[test]
+fn t13_e2_prescan_throughput_guard_and_cancel_writes_no_partial_yaml() {
+    let root = temp_dir("t13_guard_cancel");
+    let music_dir = root.join("music");
+    fs::create_dir_all(&music_dir).unwrap();
+    let flac_path = music_dir.join("02_cancel_target_31s.flac");
+    write_stereo_flac_16(&flac_path, 44_100, 31);
+
+    let filterdb_dir = root.join("filterdb");
+    let mut manifest = LibraryManifest::new(DETECTOR_VERSION);
+    manifest.upsert_root("main", &music_dir);
+    let ult = UltimateRuntimeContext::new(
+        UltimateConfig {
+            enabled: true,
+            genre_rules: true,
+            learn_on_play: true,
+        },
+        FilterDbStore::new(filterdb_dir.clone()),
+        manifest,
+        root.join("no_choices.yaml"),
+        FilterMode::Auto,
+    );
+    let pipeline = Arc::new(
+        AudioPipeline::with_rew_config_full_tail(
+            UpsamplerPolicy {
+                max_taps: 65_536,
+                ..UpsamplerPolicy::default()
+            },
+            ConvolutionConfig::disabled(),
+            true,
+        )
+        .unwrap(),
+    );
+
+    // 1. Throughput guard (T13c): below `E2_MIN_SPEED_X_RT` (3.0x RT) -> refuses to start!
+    let mut prescanner = NextTrackPreScanner::new();
+    let epoch_cancel = Arc::new(AtomicBool::new(false));
+    assert!(
+        !prescanner.maybe_start(
+            &flac_path,
+            E2_MIN_SPEED_X_RT - 0.1,
+            Arc::clone(&pipeline),
+            ult.clone(),
+            Arc::clone(&epoch_cancel),
+        ),
+        "E2 must not start when spare capacity < 2x RT (speed_x_rt < 3.0)"
+    );
+    assert!(!prescanner.is_running());
+    assert!(
+        FilterDbStore::new(&filterdb_dir)
+            .load_album("main", "")
+            .is_none(),
+        "no YAML may be written when throughput guard declines E2"
+    );
+
+    // 2. Mid-scan cancellation (T13b): cancel after 3 blocks -> Cancelled with ZERO partial YAML!
+    let calls = AtomicUsize::new(0);
+    let mid_cancel = prescan_local_track_post_chain(&flac_path, &pipeline, &ult, &|| {
+        calls.fetch_add(1, Ordering::Relaxed) >= 3
+    });
+    assert_eq!(mid_cancel, PreScanOutcome::Cancelled);
+    assert!(
+        FilterDbStore::new(&filterdb_dir)
+            .load_album("main", "")
+            .is_none(),
+        "mid-scan cancel must write ZERO partial YAML"
+    );
+
+    // 3. Background `NextTrackPreScanner` cancelled via `epoch_cancel` (simulating skip/pause) ->
+    //    exits cleanly with ZERO partial YAML!
+    let pre_cancelled = Arc::new(AtomicBool::new(true));
+    assert!(prescanner.maybe_start(
+        &flac_path,
+        12.0,
+        Arc::clone(&pipeline),
+        ult.clone(),
+        pre_cancelled,
+    ));
+    let bg_out = prescanner.join_if_active();
+    assert_eq!(bg_out, Some(PreScanOutcome::Cancelled));
+    assert!(
+        FilterDbStore::new(&filterdb_dir)
+            .load_album("main", "")
+            .is_none(),
+        "epoch-cancelled E2 worker must write ZERO partial YAML"
     );
 
     let _ = fs::remove_dir_all(&root);

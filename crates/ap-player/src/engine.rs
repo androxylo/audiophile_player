@@ -62,7 +62,10 @@ use crate::prefetch::{
     StreamEvent, ULTIMATE_MAX_BUFFERED_FRAMES, ULTIMATE_MAX_BUFFERED_SECONDS,
 };
 use crate::signals::{ShutdownController, ShutdownSignal};
-use crate::ultimate::{UltimateRuntimeContext, UltimateStreamResult, stream_track_ultimate};
+use crate::ultimate::{
+    NextTrackPreScanner, UltimateRuntimeContext, UltimateStreamResult,
+    stream_track_ultimate_with_w2_hook,
+};
 
 /// Prebuffer cushion for live HTTP/UPnP streams (`2 s` at output rate — absorbs LAN/WAN jitter
 /// and heavy 4M-tap REW/upsampler bursts while starting playback rapidly).
@@ -2261,7 +2264,7 @@ impl GaplessState {
 
 /// Shared producer-thread handles bundled to eliminate 6-8 repeated parameters across helpers (E6).
 struct ProducerCtx {
-    pipeline: AudioPipeline,
+    pipeline: Arc<AudioPipeline>,
     ctrl: Arc<ProducerControl>,
     buf: Arc<BoundedBlockStreamBuffer>,
     shared: Arc<SharedControl>,
@@ -2362,7 +2365,7 @@ fn producer_loop_with_sources(
     // Review #8 C9: Run the real-time playback producer on the high-priority DSP worker pool lane
     // so stereo/MAC jobs always jump ahead of any background scan/analysis work.
     let ctx = ProducerCtx {
-        pipeline,
+        pipeline: Arc::new(pipeline),
         ctrl,
         buf,
         shared,
@@ -2699,20 +2702,67 @@ fn producer_loop_inner(ctx: ProducerCtx) {
     let mut capture_consumed_epoch: Option<u64> = None;
     let mut resume_once_consumed_epoch: Option<u64> = None;
     let mut last_random: Option<PathBuf> = None;
+    let mut pending_random_next: Option<(PathBuf, PathBuf)> = None;
     let mut last_seen_epoch: Option<u64> = None;
     let mut consecutive_errors: u32 = 0;
     let mut consecutive_unsupported: u32 = 0;
     let mut gapless = GaplessState::default();
+    let mut prescanner = NextTrackPreScanner::new();
+
+    let pick_random_avoiding = |root: &Path, avoid: Option<&Path>| -> Result<PathBuf, String> {
+        let mut picked = pick_random_flac_walk(root)?;
+        if avoid.is_some_and(|a| a == picked.as_path()) {
+            for _ in 0..3 {
+                if let Ok(alt) = pick_random_flac_walk(root) {
+                    if avoid != Some(alt.as_path()) {
+                        picked = alt;
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(picked)
+    };
+
+    let ensure_seq_cursor = |seq_cursor: &mut Option<(u64, SequentialFlacCursor)>,
+                             root: &Path,
+                             seq_gen: u64,
+                             start_after: Option<&Path>,
+                             folder_only: bool,
+                             skip_count: usize|
+     -> Result<(), String> {
+        let needs_init = seq_cursor.as_ref().is_none_or(|(g, _)| *g != seq_gen);
+        if needs_init {
+            let mut c = if folder_only {
+                SequentialFlacCursor::new_folder_only(root.to_path_buf(), start_after)?
+            } else if let Some(after) = start_after {
+                SequentialFlacCursor::new_starting_after(root.to_path_buf(), after)?
+            } else {
+                SequentialFlacCursor::new(root.to_path_buf())?
+            };
+            for _ in 0..skip_count {
+                if c.next_track().is_none() {
+                    break;
+                }
+            }
+            *seq_cursor = Some((seq_gen, c));
+        }
+        Ok(())
+    };
 
     while let Some((epoch, directive, cancel_flag)) = ctx.ctrl.wait_active_with_cancel() {
         if ctx.buf.current_epoch() != epoch {
+            prescanner.cancel();
             thread::yield_now();
             continue;
         }
         if ctx.ctrl.epoch() != epoch {
+            prescanner.cancel();
             continue;
         }
         if last_seen_epoch != Some(epoch) {
+            prescanner.cancel();
+            pending_random_next = None;
             consecutive_errors = 0;
             consecutive_unsupported = 0;
             gapless.clear();
@@ -2720,6 +2770,7 @@ fn producer_loop_inner(ctx: ProducerCtx) {
         }
 
         if let PlayDirective::StreamCapture { request } = directive {
+            prescanner.cancel();
             run_capture_directive(
                 &ctx,
                 epoch,
@@ -2732,6 +2783,7 @@ fn producer_loop_inner(ctx: ProducerCtx) {
         }
 
         if let PlayDirective::UpnpStream { request } = directive {
+            prescanner.cancel();
             run_upnp_directive(
                 &ctx,
                 epoch,
@@ -2767,66 +2819,65 @@ fn producer_loop_inner(ctx: ProducerCtx) {
         let is_single_file = matches!(directive, PlayDirective::SingleFile { .. });
 
         let (chosen, mode_label) = if let Some(first) = resumed_first {
+            // If resuming before a Sequential directive, initialize the cursor now so E2 can peek
+            // track N+1 while the resumed track plays.
+            if let PlayDirective::Sequential {
+                ref root,
+                seq_gen,
+                ref start_after,
+                folder_only,
+                skip_count,
+            } = directive
+            {
+                let _ = ensure_seq_cursor(
+                    &mut seq_cursor,
+                    root,
+                    seq_gen,
+                    start_after.as_deref(),
+                    folder_only,
+                    skip_count,
+                );
+            }
             first
         } else {
             match directive {
                 PlayDirective::UpnpStream { .. }
                 | PlayDirective::StreamCapture { .. }
                 | PlayDirective::ResumeThen { .. } => unreachable!(),
-                PlayDirective::Random { root } => {
-                    let mut picked = match pick_random_flac_walk(&root) {
-                        Ok(p) => p,
-                        Err(err) => {
-                            ctx.end_epoch(epoch, &mut gapless, StreamEvent::FatalError(err));
-                            continue;
-                        }
-                    };
-                    if last_random.as_ref() == Some(&picked) {
-                        for _ in 0..3 {
-                            if let Ok(alt) = pick_random_flac_walk(&root) {
-                                if last_random.as_ref() != Some(&alt) {
-                                    picked = alt;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    last_random = Some(picked.clone());
-                    (picked, PlayModeLabel::Random)
-                }
-                PlayDirective::Sequential {
-                    root,
-                    seq_gen,
-                    start_after,
-                    folder_only,
-                    skip_count,
-                } => {
-                    let needs_init = seq_cursor.as_ref().is_none_or(|(g, _)| *g != seq_gen);
-                    if needs_init {
-                        let cursor_res = if folder_only {
-                            SequentialFlacCursor::new_folder_only(
-                                root.clone(),
-                                start_after.as_deref(),
-                            )
-                        } else if let Some(after) = start_after.as_deref() {
-                            SequentialFlacCursor::new_starting_after(root.clone(), after)
-                        } else {
-                            SequentialFlacCursor::new(root.clone())
-                        };
-                        match cursor_res {
-                            Ok(mut c) => {
-                                for _ in 0..skip_count {
-                                    if c.next_track().is_none() {
-                                        break;
-                                    }
-                                }
-                                seq_cursor = Some((seq_gen, c));
-                            }
+                PlayDirective::Random { ref root } => {
+                    let pre_picked = pending_random_next
+                        .take()
+                        .and_then(|(r, p)| (r == *root && p.is_file()).then_some(p));
+                    let picked = match pre_picked {
+                        Some(p) => p,
+                        None => match pick_random_avoiding(root, last_random.as_deref()) {
+                            Ok(p) => p,
                             Err(err) => {
                                 ctx.end_epoch(epoch, &mut gapless, StreamEvent::FatalError(err));
                                 continue;
                             }
-                        }
+                        },
+                    };
+                    last_random = Some(picked.clone());
+                    (picked, PlayModeLabel::Random)
+                }
+                PlayDirective::Sequential {
+                    ref root,
+                    seq_gen,
+                    ref start_after,
+                    folder_only,
+                    skip_count,
+                } => {
+                    if let Err(err) = ensure_seq_cursor(
+                        &mut seq_cursor,
+                        root,
+                        seq_gen,
+                        start_after.as_deref(),
+                        folder_only,
+                        skip_count,
+                    ) {
+                        ctx.end_epoch(epoch, &mut gapless, StreamEvent::FatalError(err));
+                        continue;
                     }
                     let next = seq_cursor.as_mut().and_then(|(_, c)| c.next_track());
                     match next {
@@ -2844,7 +2895,7 @@ fn producer_loop_inner(ctx: ProducerCtx) {
                         }
                     }
                 }
-                PlayDirective::SingleFile { file } => {
+                PlayDirective::SingleFile { ref file } => {
                     if single_consumed_epoch == Some(epoch) {
                         ctx.end_epoch(
                             epoch,
@@ -2854,14 +2905,47 @@ fn producer_loop_inner(ctx: ProducerCtx) {
                         continue;
                     }
                     single_consumed_epoch = Some(epoch);
-                    (file, PlayModeLabel::SingleFile)
+                    (file.clone(), PlayModeLabel::SingleFile)
                 }
             }
         };
 
         if ctx.ctrl.epoch() != epoch || ctx.buf.current_epoch() != epoch {
+            prescanner.cancel();
             continue;
         }
+
+        // Cancel any previous E2 worker before opening the new track so it never competes with
+        // this track's real-time W2 render.
+        prescanner.cancel();
+
+        // Peek the queued next local track N+1 for Ultimate Mode E2 post-chain pre-scan
+        // (local files only; NEVER streams).
+        let next_local_track: Option<PathBuf> = if ctx.ultimate_ctx.is_some() {
+            match directive {
+                PlayDirective::Sequential { .. } => seq_cursor
+                    .as_mut()
+                    .and_then(|(_, c)| c.peek_next_track().map(Path::to_path_buf)),
+                PlayDirective::Random { ref root } => {
+                    if let Ok(next_p) = pick_random_avoiding(root, Some(&chosen)) {
+                        if next_p != chosen {
+                            pending_random_next = Some((root.clone(), next_p.clone()));
+                            Some(next_p)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+                PlayDirective::SingleFile { .. }
+                | PlayDirective::UpnpStream { .. }
+                | PlayDirective::StreamCapture { .. }
+                | PlayDirective::ResumeThen { .. } => None,
+            }
+        } else {
+            None
+        };
 
         if is_single_file {
             let _ = ctx.finalize_prev(epoch, &mut gapless);
@@ -2869,9 +2953,21 @@ fn producer_loop_inner(ctx: ProducerCtx) {
 
         let (outcome, next_carryover, next_pending_end) = ctx
             .run_guarded(epoch, &mut gapless, |g, backup| {
-                stream_single_track(&ctx, epoch, &chosen, mode_label, g, backup, !is_single_file)
+                stream_single_track(
+                    &ctx,
+                    epoch,
+                    &chosen,
+                    next_local_track.as_deref(),
+                    &cancel_flag,
+                    &mut prescanner,
+                    mode_label,
+                    g,
+                    backup,
+                    !is_single_file,
+                )
             })
             .unwrap_or_else(|()| {
+                prescanner.cancel();
                 (
                     TrackStreamOutcome::Failed(format!(
                         "Internal panic while decoding/processing '{}'",
@@ -2889,6 +2985,7 @@ fn producer_loop_inner(ctx: ProducerCtx) {
                 gapless.update(next_carryover, next_pending_end);
             }
             TrackStreamOutcome::Aborted => {
+                prescanner.cancel();
                 gapless.clear();
             }
             TrackStreamOutcome::Unsupported(ref msg)
@@ -2947,6 +3044,7 @@ fn dispatch_ultimate_source<S, F>(
     source: &mut S,
     display_path: &Path,
     local_path: Option<&Path>,
+    next_local_track: Option<(&Path, &Arc<AtomicBool>, &mut NextTrackPreScanner)>,
     upnp_uri: Option<String>,
     upnp_next_gen: Option<u64>,
     mode_label: PlayModeLabel,
@@ -2966,7 +3064,9 @@ where
         ap_core::format::TargetDspRate::Hz384000 => 384_000,
     };
     let src_block_frames = source_block_frames_for_rates(spec.sample_rate_hz, internal_rate_hz);
-    match stream_track_ultimate(
+    let allowed_root = ctx.shared.allowed_root();
+    let mut e2_slot = next_local_track;
+    match stream_track_ultimate_with_w2_hook(
         &ctx.pipeline,
         ult,
         &ctx.buf,
@@ -2984,6 +3084,19 @@ where
         &mut gapless.pending_track_end,
         gapless_carryover,
         src_block_frames,
+        |speed_x_rt| {
+            if let Some((next_p, epoch_cancel, prescanner)) = e2_slot.take() {
+                if validate_playable_flac_path(next_p, Some(&allowed_root)).is_ok() {
+                    let _ = prescanner.maybe_start(
+                        next_p,
+                        speed_x_rt,
+                        Arc::clone(&ctx.pipeline),
+                        ult.clone(),
+                        Arc::clone(epoch_cancel),
+                    );
+                }
+            }
+        },
     ) {
         UltimateStreamResult::Played {
             next_carryover,
@@ -3014,10 +3127,14 @@ where
 
 /// Validate and open one local FLAC file, then delegate to Ultimate Mode or unified
 /// [`stream_open_audio_source`] (Review #9 E5: eliminates ~300 lines of duplicated streaming logic).
+#[allow(clippy::too_many_arguments)]
 fn stream_single_track(
     ctx: &ProducerCtx,
     epoch: u64,
     chosen: &Path,
+    next_local_track: Option<&Path>,
+    epoch_cancel: &Arc<AtomicBool>,
+    prescanner: &mut NextTrackPreScanner,
     mode_label: PlayModeLabel,
     gapless: &mut GaplessState,
     panic_backup_carry: &mut Option<GaplessCarryover>,
@@ -3079,6 +3196,7 @@ fn stream_single_track(
             &mut source,
             chosen,
             Some(chosen),
+            next_local_track.map(|p| (p, epoch_cancel, prescanner)),
             None,
             None,
             mode_label,
@@ -3179,6 +3297,7 @@ fn stream_upnp_request(
                 || ctx.ctrl.epoch() != epoch || cancel.load(Ordering::Acquire),
                 &mut cur_source,
                 &PathBuf::from(&seg_label),
+                None,
                 None,
                 Some(req.uri.clone()),
                 next_gen,
@@ -4035,7 +4154,7 @@ mod tests {
 
         let mut state = EngineState::new(ep0, init, &buf, &ctrl, &shared);
         let test_ctx = ProducerCtx {
-            pipeline,
+            pipeline: Arc::new(pipeline),
             ctrl: Arc::clone(&ctrl),
             buf: Arc::clone(&buf),
             shared: Arc::clone(&shared),
@@ -4059,10 +4178,15 @@ mod tests {
             // Direct producer-side guard must also reject without blocking on open().
             let mut gapless = GaplessState::default();
             let mut no_backup = None;
+            let cancel_none = Arc::new(AtomicBool::new(false));
+            let mut prescanner = NextTrackPreScanner::new();
             let (outcome, next_tail, pending_end) = stream_single_track(
                 &test_ctx,
                 ep0,
                 &bad,
+                None,
+                &cancel_none,
+                &mut prescanner,
                 PlayModeLabel::SingleFile,
                 &mut gapless,
                 &mut no_backup,
@@ -5945,7 +6069,7 @@ mod tests {
         let shared_test = SharedControl::new(root.clone(), "Mock DAC".to_string());
         let ctrl_test = ProducerControl::new(ep, ProducerDirective::Paused);
         let test_ctx = ProducerCtx {
-            pipeline,
+            pipeline: Arc::new(pipeline),
             ctrl: ctrl_test,
             buf: Arc::clone(&buf),
             shared: shared_test,
@@ -6676,5 +6800,208 @@ mod tests {
         assert!(buggy_48 > 50_000);
         assert_eq!(source_block_frames_for_rates(48_000, 384_000), 8_192);
         assert_eq!(source_block_frames_for_rates(96_000, 384_000), 16_384);
+    }
+
+    /// **Issue #23 T13a (`§3.6`, §5)**: Real 2-track sequential Ultimate queue driven through
+    /// `producer_loop_with_sources`. While Track 1 plays, the engine's E2 low-priority pre-scan
+    /// renders Track 2 in the background and persists its exact `M` and `PostChainKey`; when
+    /// Track 2 starts, it immediately hits E1 (`peak_source = "exact-M"`, `mode = "ultimate: cached"`,
+    /// and identical `PostChainKey`).
+    #[test]
+    fn t13_two_track_sequential_queue_e2_prescan_hits_exact_m_on_track_2() {
+        use std::f64::consts::PI;
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use ap_core::config::{ConvolutionConfig, UltimateConfig};
+        use ap_core::filter_db::{FilterDbStore, LibraryManifest};
+        use ap_core::user_filters::FilterMode;
+        use ap_dsp::analysis::DETECTOR_VERSION;
+        use ap_dsp::selector::{UpsamplerPolicy, build_post_chain_key};
+        use flac_codec::encode::{FlacSampleWriter, Options};
+
+        let write_sine_flac = |path: &Path, rate: u32, duration_s: usize, freq_hz: f64, amp: f64| {
+            let total_frames = (rate as usize) * duration_s;
+            let mut writer = FlacSampleWriter::create(
+                path,
+                Options::default(),
+                rate,
+                16,
+                2,
+                Some((total_frames * 2) as u64),
+            )
+            .expect("create flac");
+            let chunk = 8_192_usize;
+            let mut interleaved = vec![0_i32; chunk * 2];
+            let mut pos = 0_usize;
+            while pos < total_frames {
+                let take = (total_frames - pos).min(chunk);
+                for i in 0..take {
+                    let t = ((pos + i) as f64) / f64::from(rate);
+                    let v = (amp * (2.0 * PI * freq_hz * t).sin() * 32_768.0)
+                        .round()
+                        .clamp(-32_768.0, 32_767.0) as i32;
+                    interleaved[i * 2] = v;
+                    interleaved[i * 2 + 1] = v;
+                }
+                writer.write(&interleaved[..take * 2]).unwrap();
+                pos += take;
+            }
+            writer.finalize().unwrap();
+        };
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "ap_t13_e2_queue_{}_{}",
+            std::process::id(),
+            nanos
+        ));
+        let music_dir = root.join("music");
+        let filterdb_dir = root.join("filterdb");
+        fs::create_dir_all(&music_dir).unwrap();
+
+        let t1 = music_dir.join("01_track_one.flac");
+        let t2 = music_dir.join("02_track_two.flac");
+        write_sine_flac(&t1, 44_100, 31, 440.0, 0.35);
+        write_sine_flac(&t2, 44_100, 31, 660.0, 0.40);
+
+        let mut manifest = LibraryManifest::new(DETECTOR_VERSION);
+        manifest.upsert_root("main", &music_dir);
+        let ult_ctx = UltimateRuntimeContext::new(
+            UltimateConfig {
+                enabled: true,
+                genre_rules: true,
+                learn_on_play: true,
+            },
+            FilterDbStore::new(filterdb_dir.clone()),
+            manifest,
+            root.join("no_choices.yaml"),
+            FilterMode::Auto,
+        );
+
+        let policy = UpsamplerPolicy {
+            max_taps: 65_536,
+            ..UpsamplerPolicy::default()
+        };
+        let pipeline = AudioPipeline::with_rew_config_full_tail(
+            policy,
+            ConvolutionConfig::disabled(),
+            true,
+        )
+        .unwrap();
+
+        let buf = BoundedBlockStreamBuffer::with_limits(
+            ULTIMATE_MAX_BUFFERED_FRAMES,
+            Duration::from_secs(ULTIMATE_MAX_BUFFERED_SECONDS),
+        );
+        let ep = buf.current_epoch();
+        let ctrl = ProducerControl::new(
+            ep,
+            ProducerDirective::Active(PlayDirective::Sequential {
+                root: music_dir.clone(),
+                seq_gen: 1,
+                start_after: None,
+                folder_only: false,
+                skip_count: 0,
+            }),
+        );
+        let shared = SharedControl::new(music_dir.clone(), "Mock DAC");
+
+        let p_ctrl = Arc::clone(&ctrl);
+        let p_buf = Arc::clone(&buf);
+        let p_shared = Arc::clone(&shared);
+        let prod_h = thread::spawn(move || {
+            producer_loop_with_sources(pipeline, p_ctrl, p_buf, p_shared, None, None, Some(ult_ctx))
+        });
+
+        // 1. Wait for Track 1 TrackStart (this fires right as E2 pre-scan for Track 2 launches).
+        let t1_report = match buf.pop_for_epoch_timeout(ep, Duration::from_secs(30)) {
+            Some(StreamEvent::TrackStart { path, report, .. }) => {
+                assert_eq!(path, t1);
+                report
+            }
+            other => panic!("expected Track 1 TrackStart, got {other:?}"),
+        };
+        let u1 = t1_report
+            .ultimate_report
+            .as_ref()
+            .expect("Track 1 ultimate_report");
+        assert_eq!(
+            u1.peak_source.as_deref(),
+            Some("scan-tp"),
+            "Track 1 cold play must use E3 scan-tp"
+        );
+        assert!(
+            u1.throughput_x_rt.unwrap_or(0.0) >= crate::ultimate::E2_MIN_SPEED_X_RT,
+            "Track 1 test throughput ({:?}) must exceed E2 guard (>= 3.0x RT)",
+            u1.throughput_x_rt
+        );
+
+        // 2. Simulate real-time playback of Track 1: while Track 1 is buffered, wait for the
+        //    low-priority E2 background pre-scan to finish persisting Track 2's Schema-2 YAML.
+        let store = FilterDbStore::new(&filterdb_dir);
+        let wait_deadline = Instant::now() + Duration::from_secs(20);
+        let prescanned_t2 = loop {
+            if let Some(alb) = store.load_album("main", "") {
+                if let Some(tr) = alb.get_track("02_track_two.flac") {
+                    if !tr.post_chain_peaks.is_empty() {
+                        break tr.clone();
+                    }
+                }
+            }
+            assert!(
+                Instant::now() < wait_deadline,
+                "E2 background pre-scan did not persist Track 2 post_chain_peaks before timeout"
+            );
+            thread::sleep(Duration::from_millis(25));
+        };
+        let prescanned_key = prescanned_t2.post_chain_peaks[0].key.clone();
+        let prescanned_m = prescanned_t2.post_chain_peaks[0].peak_dbfs;
+
+        // 3. Drain Track 1 through TrackEnd and observe Track 2 TrackStart -> E1 exact-M hit!
+        let t2_report = loop {
+            match buf.pop_for_epoch_timeout(ep, Duration::from_secs(30)) {
+                Some(StreamEvent::PcmBlock(_)) | Some(StreamEvent::TrackEnd) => {}
+                Some(StreamEvent::TrackStart { path, report, .. }) => {
+                    assert_eq!(path, t2);
+                    break report;
+                }
+                other => panic!("unexpected event waiting for Track 2: {other:?}"),
+            }
+        };
+        let u2 = t2_report
+            .ultimate_report
+            .as_ref()
+            .expect("Track 2 ultimate_report");
+        assert_eq!(
+            u2.peak_source.as_deref(),
+            Some("exact-M"),
+            "T13: Track 2 must start directly on E1 exact-M from E2 pre-scan, got {:?}",
+            u2.peak_source
+        );
+        assert_eq!(u2.mode, "ultimate: cached");
+        assert!(
+            (u2.cached_m_dbfs.expect("Track 2 cached_m_dbfs") - prescanned_m).abs() <= 1e-9,
+            "Track 2 cached M must equal E2 pre-scan M"
+        );
+        let t2_play_key = build_post_chain_key(
+            &t2_report.dsp_plan,
+            t2_report.source_spec.sample_rate_hz,
+            t2_report.output_rate_hz,
+            t2_report.convolver_content_hash.as_deref(),
+        );
+        assert_eq!(
+            t2_play_key, prescanned_key,
+            "T13: Track 2 playback PostChainKey must match E2 pre-scan PostChainKey"
+        );
+
+        // Shut down cleanly (closing buffer unblocks any producer push).
+        let _ = buf.reset_and_flush();
+        buf.close();
+        ctrl.set(buf.current_epoch(), ProducerDirective::Shutdown);
+        prod_h.join().unwrap();
+        let _ = fs::remove_dir_all(&root);
     }
 }

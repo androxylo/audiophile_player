@@ -1108,6 +1108,88 @@ fn run_post_chain_pass(
     }
 }
 
+/// Cancellable unity-gain post-chain peak runner executing the exact active [`AudioPipeline`]
+/// chain (upsampler, de-emphasis, REW convolver, delayer, and optional last-stage downsampler)
+/// for Ultimate Mode E2 next-track pre-scan (`Issue #23 §3.6`, P5).
+///
+/// Guarantees **L3 parity**: the returned [`PostChainKey`] and measured `M` (dBFS) match both
+/// `stream_track_ultimate` (including `< 8fS` downsampling DACs) and offline `scan --post-chain`
+/// (at native `8fS`) identically. Returns `Ok(None)` immediately when `is_cancelled()` fires.
+pub fn run_post_chain_pass_with_pipeline(
+    path: &Path,
+    spec: ap_core::format::StreamSpec,
+    plan: &SelectedDspPlan,
+    pipeline: &ap_dsp::pipeline::AudioPipeline,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Option<(PostChainKey, f64)>, String> {
+    if is_cancelled() {
+        return Ok(None);
+    }
+    let placeholder_hr = ap_core::headroom::HeadroomDecision {
+        mode: ap_core::headroom::HeadroomMode::ZeroDb,
+        peak_dbfs: None,
+        peak_kind: None,
+        convolution_scale_db: 0.0,
+        reason: "E2 next-track post-chain unity-gain pre-scan".to_string(),
+    };
+    let mut session = pipeline.start_track_with_plan_and_headroom(
+        spec,
+        plan.clone(),
+        placeholder_hr,
+    )?;
+    let key = build_post_chain_key(
+        plan,
+        spec.sample_rate_hz,
+        session.report().output_rate_hz,
+        session.report().convolver_content_hash.as_deref(),
+    );
+    let mut reader = FlacBlockReader::open(path)?;
+    let mut peak_linear = 0.0_f64;
+    loop {
+        if is_cancelled() {
+            return Ok(None);
+        }
+        match reader.read_next_block(SCAN_BLOCK_FRAMES)? {
+            Some(block) => {
+                if block.is_empty() {
+                    continue;
+                }
+                let unity = session.process_block_unity_f64(block)?;
+                for &s in unity.left.iter().chain(unity.right.iter()) {
+                    let a = s.abs();
+                    if a > peak_linear {
+                        peak_linear = a;
+                    }
+                }
+            }
+            None => break,
+        }
+    }
+    if is_cancelled() {
+        return Ok(None);
+    }
+    let tail = session.flush_unity_f64()?;
+    if is_cancelled() {
+        return Ok(None);
+    }
+    for &s in tail.left.iter().chain(tail.right.iter()) {
+        let a = s.abs();
+        if a > peak_linear {
+            peak_linear = a;
+        }
+    }
+    let peak_dbfs = if peak_linear > 0.0 {
+        20.0 * peak_linear.log10()
+    } else {
+        -120.0
+    };
+    if peak_dbfs.is_finite() {
+        Ok(Some((key, peak_dbfs)))
+    } else {
+        Ok(None)
+    }
+}
+
 struct PostChainRunner {
     key: PostChainKey,
     upsampler: Box<dyn ap_dsp::upsampler::Upsampler>,
