@@ -4,6 +4,16 @@
 
 Release highlights for Audiophile Player. For upgrade instructions, see [Quick Start → Updating](QUICK_START.md#updating).
 
+## v0.2.0 — WASAPI Exclusive Default, Timing Hardening & Pipeline Verification
+
+| | |
+|---|---|
+| 🔌 **WASAPI Exclusive default (`--output wasapi`)** | Zero-dependency, event-driven WASAPI Exclusive (`AUDCLNT_SHAREMODE_EXCLUSIVE`) is now the default Windows output transport — bit-perfect with zero mixer/APO/SRC and automatic format negotiation (`Int32`/`Int24`/`Int16` + channel-mask fallback). Polling WASAPI Push (`--output wasapi-push`) and WDM-KS WaveRT (`--output wdm-ks`) remain available as fallbacks. |
+| ⏱️ **WaveRT timing simulator, S2/S5/S6 fixes & observability** | Added a deterministic causal DMA simulator (`FakeWaveRtDevice`) covering coalesced/spurious wakes, partial underruns, 32-bit monotonic cursor wraparound, and ±600 ppm clock drift; fixed WDM-KS clock-rescue threshold, partial-half accounting, and 32-bit rollover handling; exposed timing counters & wake-interval histogram via `GET /api/v1/status` (`last_playback_stats`) and `--trace-wavert`. |
+| 🧪 **End-to-end DSP verification suite (`ap-verify` / `ap-null`)** | Added the `ap-verify` crate and `ap-null` loopback null verifier (Layers A–D), L1–L12 structural invariants (chunk independence, gapless seams, linearity, anti-aliasing, determinism, engine queue/pause-resume), and automated push + nightly CI verification workflows. |
+| 🎵 **FLAC zero-residual decode fix** | Added `SafeFlacSampleReader` to cleanly decode valid FLAC subframes whose first Rice partition has zero residual samples (working around an upstream `flac-codec 1.3.3` panic) and tightened Ultimate Mode DAC headroom margin + quantizer overs reporting. |
+| 🎛️ **Room-FIR DSP building blocks (`ap-dsp`)** | Added stereo WAV writer, mono WAV loader, gain metrics, and generalized cepstrum helpers with full unit coverage. |
+
 ## v0.1.0 — Initial Public Release
 
 | | |

@@ -4,14 +4,14 @@ version = 4
 
 [[package]]
 name = "ap-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ap-player",
 ]
 
 [[package]]
 name = "ap-control"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ap-core",
  "ap-source",
@@ -19,11 +19,11 @@ dependencies = [
 
 [[package]]
 name = "ap-core"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "ap-dsp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ap-core",
  "realfft",
@@ -31,7 +31,7 @@ dependencies = [
 
 [[package]]
 name = "ap-output-win"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ap-core",
  "ap-source",
@@ -40,7 +40,7 @@ dependencies = [
 
 [[package]]
 name = "ap-player"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ap-control",
  "ap-core",
@@ -55,7 +55,7 @@ dependencies = [
 
 [[package]]
 name = "ap-source"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ap-core",
  "ap-stream-protocol",
@@ -65,11 +65,11 @@ dependencies = [
 
 [[package]]
 name = "ap-stream-protocol"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "ap-upnp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ap-control",
  "ap-core",
@@ -79,7 +79,7 @@ dependencies = [
 
 [[package]]
 name = "ap-verify"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ap-core",
  "ap-dsp",
