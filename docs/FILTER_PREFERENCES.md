@@ -59,7 +59,18 @@ Filter choice comes **before** any last-stage downsampling, so these tastes appl
 
 ---
 
-### 2. Earlier Cross-Forum Survey (Audiophile Style, Roon, Head-Fi, SBAF, ASR, Archimago)
+### 2. SBAF — 1M-Tap Closed-Form Interest (`Lyander`, Nov 2026)
+
+- **Source:** [Lyander](https://www.superbestaudiofriends.org/index.php?members/lyander.3755/) on Super Best Audio Friends
+- **Quote:**
+  > *"I liked what I was hearing of the 1M tap closed form filter on HQP trial but it costs a crapton. Would be curious to hear input from folks who have a proper licence, compare with this."*
+- **Takeaway for Audiophile Player:**
+  - Closest current filter in Audiophile Player for 1M-tap linear-phase reconstruction is `sinc-steep-4m` (~1,048,561 taps @ 8×), though `sinc-steep-4m` is a steep windowed-sinc rather than a sample-preserving closed-form (zero-at-integer-multiples / halfband-style) interpolator.
+  - Reinforces interest in adding a clean-room sample-preserving **1M-tap closed-form / halfband** filter option alongside the existing Gaussian and steep-sinc families.
+
+---
+
+### 3. Earlier Cross-Forum Survey (Audiophile Style, Roon, Head-Fi, SBAF, ASR, Archimago)
 
 See [docs/research/02-audiophile-filter-survey.md](research/02-audiophile-filter-survey.md) for the broader Phase-0 consensus survey covering `poly-sinc-gauss-*`, `sinc-MGa`/`sinc-M`/`sinc-L`, `poly-sinc-ext2/3`, PGGB mega-tap Gaussian/Kaiser, and multibit/NOS `DAC Bits` + noise-shaper (`NS5` / `LNS15`) pairing.
 
