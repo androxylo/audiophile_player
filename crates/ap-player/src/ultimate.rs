@@ -28,10 +28,12 @@ use ap_control::state::PlayModeLabel;
 use ap_core::buffer::StereoF64Buffer;
 use ap_core::config::UltimateConfig;
 use ap_core::filter_db::{
-    AlbumAnalysisFile, AlbumTrackAnalysis, FilterDbStore, LibraryManifest, file_head_4k_hash,
+    AlbumAnalysisFile, AlbumTrackAnalysis, FilterDbStore, LibraryManifest, TRUE_PEAK_METER_8X_32,
+    file_head_4k_hash,
 };
 use ap_core::headroom::{
-    HeadroomDecision, HeadroomMode, quantizer_margin_db, select_ultimate_headroom,
+    HeadroomDecision, HeadroomMode, PeakEvidence, PeakKind, TP_METER_ERR_4X_12_DB,
+    TP_METER_ERR_8X_32_DB, quantizer_margin_db, select_ultimate_headroom_v2,
 };
 use ap_core::metadata::PhaseTagOverride;
 use ap_core::track_db::file_size_and_mtime;
@@ -1221,22 +1223,72 @@ where
             .and_then(|(t, _, _)| t.find_post_chain_peak(&post_key))
     };
 
+    // Resolve typed PeakEvidence in priority order E1 -> E4 -> E5 -> Unknown (Issue #23 §2, P3).
+    // (E3 whole-file scan slots cleanly between E1 and E4 in P2b.)
+    let cached_source_tp: Option<(f64, f64)> = if is_streaming || !cached_peak_current {
+        None
+    } else {
+        cached_s2_track.as_ref().and_then(|(t, _, _)| {
+            let tp = t.true_peak_dbtp.filter(|v| v.is_finite())?;
+            let err = match t.effective_true_peak_meter() {
+                Some(TRUE_PEAK_METER_8X_32) => TP_METER_ERR_8X_32_DB,
+                _ => TP_METER_ERR_4X_12_DB,
+            };
+            Some((tp, err))
+        })
+    };
+    let peak_evidence = if is_streaming {
+        PeakEvidence::Unknown
+    } else if let Some(m_db) = cached_exact_m_db {
+        let source_tp_db = cached_source_tp.map(|(tp, _)| tp).or_else(|| {
+            selection
+                .peak_meta
+                .classified_peak_for_bits(spec.bits_per_sample)
+                .filter(|cp| cp.kind == PeakKind::TruePeak)
+                .map(|cp| cp.dbfs)
+        });
+        PeakEvidence::ExactPostChain { m_db, source_tp_db }
+    } else if let Some((tp_db, meter_err_db)) = cached_source_tp {
+        PeakEvidence::SourceTruePeak {
+            tp_db,
+            meter_err_db,
+            source: "cached-tp",
+        }
+    } else if let Some(cp) = selection
+        .peak_meta
+        .classified_peak_for_bits(spec.bits_per_sample)
+    {
+        match cp.kind {
+            PeakKind::TruePeak => PeakEvidence::SourceTruePeak {
+                tp_db: cp.dbfs,
+                meter_err_db: TP_METER_ERR_4X_12_DB,
+                source: "tag-tp",
+            },
+            PeakKind::SamplePeak => PeakEvidence::SourceSamplePeak {
+                sp_db: cp.dbfs,
+                source: "tag-sp",
+            },
+        }
+    } else {
+        PeakEvidence::Unknown
+    };
+
     let m30_dbfs = linear_to_dbfs(m30_linear);
     let conv_boost_db = session.convolver_max_boost_db();
+    let a_up_db = selection.plan.filter.upsampler_overshoot_db();
 
-    // Compute MANDATORY FIXED WHOLE-TRACK GAIN `G` (OQ-33) — locked for the entire track!
+    // Compute MANDATORY FIXED WHOLE-TRACK GAIN `G` (OQ-33, Issue #23 §2) — locked for the entire track!
     let mut m_q_db = if session.report().effective_shaper == NoiseShaperProfile::Bypass {
         0.0
     } else {
         quantizer_margin_db(session.report().output_bits, session.shaper_l1_sum())
     };
-    let mut fixed_headroom = select_ultimate_headroom(
-        &selection.peak_meta,
-        spec.bits_per_sample,
+    let mut fixed_headroom = select_ultimate_headroom_v2(
+        &peak_evidence,
         is_streaming,
         Some(conv_boost_db),
-        cached_exact_m_db,
         Some(m30_dbfs),
+        a_up_db,
         m_q_db,
     );
     if fixed_headroom.total_gain_db() < -1e-9
@@ -1257,13 +1309,12 @@ where
             );
         }
         m_q_db = quantizer_margin_db(session.report().output_bits, session.shaper_l1_sum());
-        fixed_headroom = select_ultimate_headroom(
-            &selection.peak_meta,
-            spec.bits_per_sample,
+        fixed_headroom = select_ultimate_headroom_v2(
+            &peak_evidence,
             is_streaming,
             Some(conv_boost_db),
-            cached_exact_m_db,
             Some(m30_dbfs),
+            a_up_db,
             m_q_db,
         );
     }
@@ -2315,7 +2366,9 @@ mod tests {
         );
         assert_eq!(rep1.ultimate_report.as_ref().unwrap().mode, "ultimate: live");
 
-        // - Play 2 (cached exact M = -1.41 dBFS): G = 0.0 dB (zero wasted headroom!), 0 overs!
+        // - Play 2 (cached exact M = -1.41 dBFS, source TP = -1.41 dBTP > -3 dBFS):
+        //   Issue #23 T2 / Owner Decision #1: gain step stays strictly binary -3/0 dB, so hot
+        //   tracks keep G_up = -3.0 dB (plus any S = 0.0 here), NOT 0.0 dB!
         let mut src2 = SyntheticSource::sine(44_100, 31.0, 0.85, false);
         let buf_c2 = Arc::clone(&buf);
         let drain_h2 = std::thread::spawn(move || drain_track_events(&buf_c2, ep));
@@ -2343,9 +2396,14 @@ mod tests {
         let u2 = rep2.ultimate_report.as_ref().unwrap();
         assert_eq!(u2.mode, "ultimate: cached");
         assert!(u2.cache_hit);
+        assert_eq!(
+            rep2.headroom.mode,
+            HeadroomMode::Minus3Db,
+            "T2: hot cached-M track (TP=-1.41 dBFS > -3 dBFS) must keep G_up=-3 dB"
+        );
         assert!(
-            rep2.headroom.total_gain_db().abs() < 1e-6,
-            "cached exact M=-1.41 dBFS must apply 0.0 dB (no wasted -3 dB!), got {}",
+            (rep2.headroom.total_gain_db() - (-3.0)).abs() < 1e-6,
+            "T2: hot cached exact M=-1.41 dBFS must apply -3.0 dB (binary step), got {}",
             rep2.headroom.total_gain_db()
         );
 
@@ -4057,5 +4115,179 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&db_root);
+    }
+
+    /// Issue #23 T11 (P3 / K6 / K8): Verify L1 headroom gate (0 overs and pre-quant peak
+    /// `<= -(m_q + ULTIMATE_DAC_MARGIN_DB)`) across all evidence tiers:
+    /// `cached-tp` (E4 after chain change / PostChainKey miss), `tag-tp` (E5), `tag-sp` (E5),
+    /// and `exact-M` (E1) with a +6 dB peaking REW IR.
+    #[test]
+    fn t11_headroom_v2_zero_overs_across_cached_tp_tag_tp_tag_sp_and_exact_m() {
+        use ap_core::headroom::ULTIMATE_DAC_MARGIN_DB;
+
+        let root = temp_dir("t11_tiers");
+        let ir_path = root.join("rew_plus6db_1k_352k8.wav");
+        let ir = peaking_eq_ir(352_800, 1_000.0, 2.0, 6.0, 4_096);
+        write_stereo_f32_wav(&ir_path, 352_800, &ir, &ir);
+
+        let rew_cfg = ConvolutionConfig {
+            enabled: true,
+            file: Some(ir_path),
+            ..ConvolutionConfig::default()
+        };
+        let pipeline = AudioPipeline::with_rew_config_full_tail(
+            UpsamplerPolicy {
+                filter_override: Some(FilterArchetype::SimpleTest),
+                ..UpsamplerPolicy::default()
+            },
+            rew_cfg,
+            true,
+        )
+        .unwrap();
+
+        let buf = BoundedBlockStreamBuffer::with_limits(
+            ULTIMATE_MAX_BUFFERED_FRAMES,
+            Duration::from_secs(ULTIMATE_MAX_BUFFERED_SECONDS),
+        );
+        let ep = buf.current_epoch();
+
+        // Helper to play a 31 s 1 kHz sine at amplitude `amp` through the +6 dB REW chain
+        // and verify 0 overs and peak <= -(m_q + ULTIMATE_DAC_MARGIN_DB).
+        let check_case = |label: &str,
+                          amp: f64,
+                          peak_meta: TrackPeakMetadata,
+                          seed_cached_tp: Option<(f64, &str)>,
+                          expect_reason_sub: &str| {
+            let case_dir = root.join(label);
+            fs::create_dir_all(&case_dir).unwrap();
+            let track_path = case_dir.join(format!("{label}.flac"));
+            fs::write(&track_path, label.as_bytes()).unwrap();
+            let (fsize, fmtime) = file_size_and_mtime(&track_path).unwrap();
+            let md5 = [0x71_u8; 16];
+
+            let ult = UltimateRuntimeContext::for_test(
+                UltimateConfig {
+                    enabled: true,
+                    genre_rules: true,
+                    learn_on_play: false,
+                },
+                case_dir.clone(),
+            );
+            if let Some((tp_db, meter)) = seed_cached_tp {
+                let mut entry = AlbumTrackAnalysis::default();
+                entry.suggested = "simple-test".to_string();
+                entry.rule = "rule_R_1x_clean".to_string();
+                entry.detector_version = DETECTOR_VERSION;
+                entry.md5 = Some(md5_to_hex(&md5));
+                entry.size = fsize;
+                entry.mtime_unix_s = fmtime;
+                entry.sample_rate = 44_100;
+                entry.bits = 24;
+                entry.sample_peak = amp;
+                entry.true_peak_dbtp = Some(tp_db);
+                entry.true_peak_meter = Some(meter.to_string());
+                // Deliberately leave `post_chain_peaks` empty to simulate chain change (K6 -> E4)!
+                let _ = ult
+                    .filter_db
+                    .upsert_track_nonblocking(
+                        "main",
+                        "",
+                        &format!("{label}.flac"),
+                        DETECTOR_VERSION,
+                        entry,
+                    )
+                    .unwrap();
+            }
+
+            let mut src = SyntheticSource::sine(44_100, 31.0, amp, false);
+            src.peak_meta = peak_meta;
+            src.streaminfo_md5 = Some(md5);
+            src.computed_md5_at_eof = Some(md5);
+
+            let mut carry = None;
+            let mut backup = None;
+            let mut pend = false;
+            let buf_c = Arc::clone(&buf);
+            let h = std::thread::spawn(move || drain_track_events(&buf_c, ep));
+            let res = stream_track_ultimate(
+                &pipeline,
+                &ult,
+                &buf,
+                ep,
+                || false,
+                &mut src,
+                &track_path,
+                Some(&track_path),
+                None,
+                None,
+                PlayModeLabel::SingleFile,
+                Some(31.0),
+                &mut carry,
+                &mut backup,
+                &mut pend,
+                false,
+                16_384,
+            );
+            let (rep, _, _) = h.join().unwrap();
+            let qstats = match res {
+                UltimateStreamResult::Played { quantizer_stats, .. } => quantizer_stats,
+                other => panic!("{label}: expected Played, got {other:?}"),
+            };
+            let u = rep.ultimate_report.as_ref().expect("ultimate report");
+            assert!(
+                rep.headroom.reason.contains(expect_reason_sub),
+                "{label}: expected headroom reason containing '{expect_reason_sub}', got '{}'",
+                rep.headroom.reason
+            );
+            assert_eq!(
+                qstats.overs_count, 0,
+                "{label}: must have 0 overs (peak={:+.4} dBFS, G={:+.4} dB)",
+                qstats.max_pre_quant_peak_dbfs(),
+                u.fixed_gain_db
+            );
+            let ceiling = -(u.quantizer_margin_db + ULTIMATE_DAC_MARGIN_DB);
+            assert!(
+                qstats.max_pre_quant_peak_dbfs() <= ceiling + 0.05,
+                "{label}: pre-quant peak {:+.4} dBFS exceeds ceiling {:+.4} dBFS (G={:+.4} dB)",
+                qstats.max_pre_quant_peak_dbfs(),
+                ceiling,
+                u.fixed_gain_db
+            );
+        };
+
+        // 1. E4 cached-tp (tp8x-32) after chain change (K6): quiet -6 dBFS sine + 6 dB REW
+        check_case(
+            "e4_cached_tp_8x",
+            0.50,
+            TrackPeakMetadata::default(),
+            Some((-6.02, TRUE_PEAK_METER_8X_32)),
+            "cached-tp",
+        );
+
+        // 2. E5 tag-tp: quiet -6 dBFS sine with explicit TRUE_PEAK tag + 6 dB REW
+        check_case(
+            "e5_tag_tp",
+            0.50,
+            TrackPeakMetadata {
+                true_peak_linear: Some(0.50),
+                ..TrackPeakMetadata::default()
+            },
+            None,
+            "tag-tp",
+        );
+
+        // 3. E5 tag-sp: quiet -6 dBFS sine with REPLAYGAIN_TRACK_PEAK sample peak tag + 6 dB REW
+        check_case(
+            "e5_tag_sp",
+            0.50,
+            TrackPeakMetadata {
+                replaygain_track_peak: Some(0.50),
+                ..TrackPeakMetadata::default()
+            },
+            None,
+            "tag-sp",
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

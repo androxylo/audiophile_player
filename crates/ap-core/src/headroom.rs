@@ -486,10 +486,230 @@ pub fn quantizer_margin_db(dac_bits: u8, shaper_l1_sum: f64) -> f64 {
 }
 
 /// DAC safety margin (`1.0 dB`, matching ITU-R BS.1770 / EBU R128 `-1.0 dBTP` ceiling) reserved
-/// below digital full scale in Ultimate Mode so cached-peak gain `G = min(0, -(max(M, M30) + m_q +
-/// ULTIMATE_DAC_MARGIN_DB))` never drives multibit or delta-sigma DACs into near-0 dBFS overload
-/// and leaves tracks peaking `<= -1.0 dBFS` completely untouched at `0.0 dB`.
+/// below digital full scale in Ultimate Mode so peak-aware gain never drives multibit or
+/// delta-sigma DACs into near-0 dBFS overload.
 pub const ULTIMATE_DAC_MARGIN_DB: f64 = 1.0;
+
+/// True-peak meter error `A_tp` for the 8x / 32-tap-per-phase Kaiser meter (`tp8x-32`, Issue #23 §2).
+pub const TP_METER_ERR_8X_32_DB: f64 = 0.1;
+
+/// True-peak meter error `A_tp` for the 4x / 12-tap-per-phase meter (`tp4x-12`) or Vorbis true-peak
+/// tag (Issue #23 §2).
+pub const TP_METER_ERR_4X_12_DB: f64 = 0.7;
+
+/// Inter-sample peak allowance `A_tp` when only a sample-peak tag is available (`3.0 dB`, Issue #23 §2).
+pub const TP_METER_ERR_SAMPLE_PEAK_DB: f64 = SAMPLE_PEAK_ISP_ALLOWANCE_DB;
+
+/// Typed peak evidence consumed by [`select_ultimate_headroom_v2`] (Issue #23 §§2, 3.4).
+#[derive(Debug, Clone, PartialEq)]
+pub enum PeakEvidence {
+    /// E1 / E2: Cached exact unity-gain post-chain peak `M` for this audio identity and
+    /// `PostChainKey`. `source_tp_db` (when present) governs the binary `-3 / 0 dB` `G_up` step
+    /// (Owner Decision #1); legacy entries lacking a source true peak fall back to `m_db`.
+    ExactPostChain {
+        m_db: f64,
+        source_tp_db: Option<f64>,
+    },
+    /// E3 / E4 / E5 (true-peak tag): Known source true peak `tp_db` (dBTP) with meter error
+    /// `meter_err_db` (`0.1` for `tp8x-32`, `0.7` for `tp4x-12` or TP tag) and provenance label
+    /// (`"scan-tp"`, `"cached-tp"`, `"tag-tp"`).
+    SourceTruePeak {
+        tp_db: f64,
+        meter_err_db: f64,
+        source: &'static str,
+    },
+    /// E5 (sample-peak tag only): Known source sample peak `sp_db` (dBFS); adds `A_isp = 3.0 dB`.
+    SourceSamplePeak {
+        sp_db: f64,
+        source: &'static str,
+    },
+    /// No trustworthy source peak (fail-safe: `G_up = -3 dB`, `P = 0 dBFS`, `A_isp = 3.0 dB`).
+    Unknown,
+}
+
+impl PeakEvidence {
+    /// Short provenance tag for decision reports, `status --json`, and UI (`exact-M`, `scan-tp`,
+    /// `cached-tp`, `tag-tp`, `tag-sp`, `unknown`).
+    pub fn source_label(&self) -> &'static str {
+        match self {
+            Self::ExactPostChain { .. } => "exact-M",
+            Self::SourceTruePeak { source, .. } => source,
+            Self::SourceSamplePeak { source, .. } => source,
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// True-peak meter error / ISP allowance `A_tp` in dB associated with this evidence tier.
+    pub fn a_tp_db(&self) -> f64 {
+        match self {
+            Self::ExactPostChain { .. } => 0.0,
+            Self::SourceTruePeak { meter_err_db, .. } => {
+                if meter_err_db.is_finite() && *meter_err_db >= 0.0 {
+                    *meter_err_db
+                } else {
+                    TP_METER_ERR_4X_12_DB
+                }
+            }
+            Self::SourceSamplePeak { .. } | Self::Unknown => TP_METER_ERR_SAMPLE_PEAK_DB,
+        }
+    }
+}
+
+/// Choose a **mandatory fixed whole-track gain** for Ultimate Mode using typed [`PeakEvidence`]
+/// (Issue #23 §§2, 3.4, Owner Decisions #1–#2):
+///
+/// - **Gain step `G_up` is strictly binary (`0 dB` or `-3 dB`):** `0 dB` only when the known source
+///   peak is `<= -3.00 dBFS`; otherwise `-3 dB` — including the cached-`M` branch (`ExactPostChain`),
+///   which decides `G_up` on `source_tp_db` (falling back to `m_db` if absent).
+/// - **Continuous excess term `S <= 0`:**
+///   - `ExactPostChain`: `M_eff = max(M, M30)`, `S = min(0, -(M_eff + G_up + m_q + DAC_MARGIN))`.
+///   - `SourceTruePeak` / `SourceSamplePeak`: `M_hat = max(M30, P + A_tp + A_up + max(G_c, 0))`,
+///     `S = min(0, -(M_hat + G_up + m_q + DAC_MARGIN))`.
+///   - `Unknown` / streaming (`is_streaming_source == true`): fail-safe `G_up = -3 dB`,
+///     `G = min(-3 - max(G_c, 0), -(M30 + m_q + DAC_MARGIN))` (`OQ-33`).
+/// - Normal mode (`select_headroom_for_bits`) is untouched.
+#[allow(clippy::too_many_arguments)]
+pub fn select_ultimate_headroom_v2(
+    evidence: &PeakEvidence,
+    is_streaming_source: bool,
+    active_conv_max_gain_db: Option<f64>,
+    window_m30_db: Option<f64>,
+    a_up_db: f64,
+    margin_m_q_db: f64,
+) -> HeadroomDecision {
+    let m_q = if margin_m_q_db.is_finite() && margin_m_q_db >= 0.0 {
+        margin_m_q_db
+    } else {
+        0.0
+    };
+    let a_up = if a_up_db.is_finite() && a_up_db >= 0.0 {
+        a_up_db
+    } else {
+        0.0
+    };
+    let g_c_pos = active_conv_max_gain_db
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(0.0);
+    let m30_opt = window_m30_db.filter(|v| v.is_finite());
+    let total_margin = m_q + ULTIMATE_DAC_MARGIN_DB;
+
+    let fail_safe = |label: &str| -> HeadroomDecision {
+        let g_up = UNKNOWN_PEAK_HEADROOM_DB; // -3.0 dB
+        let mut s_db = -g_c_pos;
+        let mut reason = if g_c_pos > 1e-9 {
+            format!("{label} -> -3 dB; conv excess +{g_c_pos:.2} dB -> conv scale -{g_c_pos:.2} dB")
+        } else {
+            format!("{label} -> -3 dB")
+        };
+        if let Some(m30) = m30_opt {
+            let s_m30 = (-(m30 + g_up + total_margin)).min(0.0);
+            if s_m30 < s_db - 1e-9 {
+                s_db = s_m30;
+                let total = g_up + s_db;
+                reason.push_str(&format!(
+                    "; W30 exact peak M30={m30:+.2} dBFS (dac_margin={ULTIMATE_DAC_MARGIN_DB:.2} dB) -> fixed gain {total:+.2} dB"
+                ));
+            }
+        }
+        HeadroomDecision {
+            mode: HeadroomMode::Minus3Db,
+            peak_dbfs: None,
+            peak_kind: None,
+            convolution_scale_db: s_db,
+            reason,
+        }
+    };
+
+    // Streaming: OQ-33 mandates ALWAYS -3 dB safety (ignores evidence completely).
+    if is_streaming_source {
+        return fail_safe("streaming source (unknown max peak, OQ-33 fail-safe)");
+    }
+
+    match evidence {
+        PeakEvidence::ExactPostChain { m_db, source_tp_db } if m_db.is_finite() => {
+            let step_peak = source_tp_db.filter(|v| v.is_finite()).unwrap_or(*m_db);
+            let mode = if step_peak <= UNKNOWN_PEAK_HEADROOM_DB + 1e-9 {
+                HeadroomMode::ZeroDb
+            } else {
+                HeadroomMode::Minus3Db
+            };
+            let g_up = mode.gain_db();
+            let m_eff = m30_opt.map_or(*m_db, |m30| m_db.max(m30));
+            let s_db = (-(m_eff + g_up + total_margin)).min(0.0);
+            let total = g_up + s_db;
+            let step_src = if source_tp_db.filter(|v| v.is_finite()).is_some() {
+                "source_tp"
+            } else {
+                "M_fallback"
+            };
+            let reason = format!(
+                "ultimate cached exact M={m_db:+.2} dBFS (eff={m_eff:+.2} dBFS, {step_src}={step_peak:+.2} dBFS -> G_up={g_up:+.0} dB, S={s_db:+.2} dB, m_q={m_q:.5} dB, dac_margin={ULTIMATE_DAC_MARGIN_DB:.2} dB) -> fixed gain {total:+.2} dB"
+            );
+            HeadroomDecision {
+                mode,
+                peak_dbfs: Some(step_peak),
+                peak_kind: Some(PeakKind::TruePeak),
+                convolution_scale_db: s_db,
+                reason,
+            }
+        }
+        PeakEvidence::SourceTruePeak {
+            tp_db,
+            meter_err_db,
+            source,
+        } if tp_db.is_finite() => {
+            let a_tp = if meter_err_db.is_finite() && *meter_err_db >= 0.0 {
+                *meter_err_db
+            } else {
+                TP_METER_ERR_4X_12_DB
+            };
+            let mode = if *tp_db <= UNKNOWN_PEAK_HEADROOM_DB + 1e-9 {
+                HeadroomMode::ZeroDb
+            } else {
+                HeadroomMode::Minus3Db
+            };
+            let g_up = mode.gain_db();
+            let m_pred = *tp_db + a_tp + a_up + g_c_pos;
+            let m_hat = m30_opt.map_or(m_pred, |m30| m_pred.max(m30));
+            let s_db = (-(m_hat + g_up + total_margin)).min(0.0);
+            let total = g_up + s_db;
+            let reason = format!(
+                "ultimate {source}={tp_db:+.2} dBTP -> G_up={g_up:+.0} dB (M_hat={m_hat:+.2} dBFS, A_tp={a_tp:.2}, A_up={a_up:.2}, G_c=+{g_c_pos:.2}, m_q={m_q:.5}, dac_margin={ULTIMATE_DAC_MARGIN_DB:.2}, S={s_db:+.2}) -> fixed gain {total:+.2} dB"
+            );
+            HeadroomDecision {
+                mode,
+                peak_dbfs: Some(*tp_db),
+                peak_kind: Some(PeakKind::TruePeak),
+                convolution_scale_db: s_db,
+                reason,
+            }
+        }
+        PeakEvidence::SourceSamplePeak { sp_db, source } if sp_db.is_finite() => {
+            let a_tp = TP_METER_ERR_SAMPLE_PEAK_DB;
+            let mode = if *sp_db <= UNKNOWN_PEAK_HEADROOM_DB + 1e-9 {
+                HeadroomMode::ZeroDb
+            } else {
+                HeadroomMode::Minus3Db
+            };
+            let g_up = mode.gain_db();
+            let m_pred = *sp_db + a_tp + a_up + g_c_pos;
+            let m_hat = m30_opt.map_or(m_pred, |m30| m_pred.max(m30));
+            let s_db = (-(m_hat + g_up + total_margin)).min(0.0);
+            let total = g_up + s_db;
+            let reason = format!(
+                "ultimate {source}={sp_db:+.2} dBFS -> G_up={g_up:+.0} dB (M_hat={m_hat:+.2} dBFS, A_isp={a_tp:.2}, A_up={a_up:.2}, G_c=+{g_c_pos:.2}, m_q={m_q:.5}, dac_margin={ULTIMATE_DAC_MARGIN_DB:.2}, S={s_db:+.2}) -> fixed gain {total:+.2} dB"
+            );
+            HeadroomDecision {
+                mode,
+                peak_dbfs: Some(*sp_db),
+                peak_kind: Some(PeakKind::SamplePeak),
+                convolution_scale_db: s_db,
+                reason,
+            }
+        }
+        _ => fail_safe("unknown local max peak (fail-safe)"),
+    }
+}
 
 /// Choose a **mandatory fixed whole-track gain** for Ultimate Mode (`OQ-33`, `07-ultimate-mode.md` §4.2):
 /// - **Streaming sources (`is_streaming_source == true`):** track peak is never known, so ALWAYS

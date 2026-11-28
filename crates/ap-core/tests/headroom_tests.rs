@@ -737,3 +737,107 @@ fn ultimate_quantizer_margin_and_fixed_whole_track_headroom_honor_oq33() {
     );
     assert!((d_stream_hot.total_gain_db() - (-(6.0 + m_q_24 + dm))).abs() < 1e-9);
 }
+
+#[test]
+fn issue23_p3_select_ultimate_headroom_v2_binary_step_dac_margin_and_streaming_t10() {
+    use ap_core::headroom::{
+        PeakEvidence, TP_METER_ERR_4X_12_DB, TP_METER_ERR_8X_32_DB, ULTIMATE_DAC_MARGIN_DB,
+        quantizer_margin_db, select_ultimate_headroom_v2,
+    };
+
+    let dm = ULTIMATE_DAC_MARGIN_DB;
+    let m_q = quantizer_margin_db(24, 2.0);
+
+    // 1. T2 (Owner Decision #1): ExactPostChain with hot source TP (-1.41 dBFS > -3 dBFS)
+    //    MUST keep binary G_up = -3 dB (NOT 0 dB!), with S = 0 dB since -1.41 - 3 + 1 < 0.
+    let hot_exact = PeakEvidence::ExactPostChain {
+        m_db: -1.41,
+        source_tp_db: Some(-1.41),
+    };
+    let d_hot_exact = select_ultimate_headroom_v2(&hot_exact, false, None, Some(-1.41), 0.15, m_q);
+    assert_eq!(d_hot_exact.mode, HeadroomMode::Minus3Db);
+    assert!((d_hot_exact.convolution_scale_db).abs() < 1e-9);
+    assert!((d_hot_exact.total_gain_db() - (-3.0)).abs() < 1e-9);
+
+    // 2. ExactPostChain with quiet source TP (-8.0 dBFS <= -3 dBFS) -> G_up = 0 dB, S = 0 dB.
+    let quiet_exact = PeakEvidence::ExactPostChain {
+        m_db: -8.0,
+        source_tp_db: Some(-8.0),
+    };
+    let d_quiet_exact =
+        select_ultimate_headroom_v2(&quiet_exact, false, None, Some(-8.0), 0.0, 0.0);
+    assert_eq!(d_quiet_exact.mode, HeadroomMode::ZeroDb);
+    assert_eq!(d_quiet_exact.total_gain_db(), 0.0);
+
+    // 3. ExactPostChain with hot REW boost (M = +4.2 dBFS, source TP = -0.5 dBFS):
+    //    G_up = -3.0 dB, S = -(4.2 - 3.0 + m_q + dm) = -(1.2 + m_q + dm), total = -(4.2 + m_q + dm).
+    let rew_exact = PeakEvidence::ExactPostChain {
+        m_db: 4.2,
+        source_tp_db: Some(-0.5),
+    };
+    let d_rew_exact = select_ultimate_headroom_v2(&rew_exact, false, Some(6.0), None, 0.15, m_q);
+    assert_eq!(d_rew_exact.mode, HeadroomMode::Minus3Db);
+    assert!((d_rew_exact.total_gain_db() - (-(4.2 + m_q + dm))).abs() < 1e-9);
+
+    // 4. Legacy ExactPostChain without source_tp_db decides binary G_up on M itself:
+    //    M = -1.5 dBFS (> -3) -> -3 dB; M = -4.0 dBFS (<= -3) -> 0 dB.
+    let legacy_hot = PeakEvidence::ExactPostChain {
+        m_db: -1.5,
+        source_tp_db: None,
+    };
+    assert_eq!(
+        select_ultimate_headroom_v2(&legacy_hot, false, None, None, 0.0, m_q).mode,
+        HeadroomMode::Minus3Db
+    );
+    let legacy_quiet = PeakEvidence::ExactPostChain {
+        m_db: -4.0,
+        source_tp_db: None,
+    };
+    assert_eq!(
+        select_ultimate_headroom_v2(&legacy_quiet, false, None, None, 0.0, m_q).total_gain_db(),
+        0.0
+    );
+
+    // 5. SourceTruePeak (E3/E4) applies A_tp, A_up, m_q, and DAC_MARGIN (Owner Decision #2 / K8):
+    //    TP = -4.0 dBTP (<= -3 -> G_up = 0 dB), A_tp = 0.1, A_up = 0.15, G_c = +6.0 dB:
+    //    M_hat = -4.0 + 0.1 + 0.15 + 6.0 = +2.25 dBFS -> S = -(2.25 + m_q + 1.0) = -(3.25 + m_q).
+    let scan_tp = PeakEvidence::SourceTruePeak {
+        tp_db: -4.0,
+        meter_err_db: TP_METER_ERR_8X_32_DB,
+        source: "scan-tp",
+    };
+    let d_scan = select_ultimate_headroom_v2(&scan_tp, false, Some(6.0), Some(-5.0), 0.15, m_q);
+    assert_eq!(d_scan.mode, HeadroomMode::ZeroDb);
+    assert!((d_scan.total_gain_db() - (-(2.25 + m_q + dm))).abs() < 1e-9);
+
+    // Compare against sample-peak tag (-4.0 dBFS, A_isp = 3.0): M_hat = +5.15 -> S = -(5.15 + m_q + dm).
+    let tag_sp = PeakEvidence::SourceSamplePeak {
+        sp_db: -4.0,
+        source: "tag-sp",
+    };
+    let d_sp = select_ultimate_headroom_v2(&tag_sp, false, Some(6.0), Some(-5.0), 0.15, m_q);
+    assert_eq!(d_sp.mode, HeadroomMode::ZeroDb);
+    assert!((d_sp.total_gain_db() - (-(5.15 + m_q + dm))).abs() < 1e-9);
+    assert!(
+        d_scan.total_gain_db() > d_sp.total_gain_db() + 2.5,
+        "E3 scan-tp must save ~2.9 dB of unnecessary attenuation vs blanket A_isp=3.0"
+    );
+
+    // Borderline quiet TP = -3.0 dBTP with 4x meter (A_tp=0.7), A_up=0.15, no REW:
+    // M_hat = -3.0 + 0.7 + 0.15 = -2.15, + 1.0 DAC margin = -1.15 <= 0 -> G = 0.0 dB!
+    let borderline_tp = PeakEvidence::SourceTruePeak {
+        tp_db: -3.0,
+        meter_err_db: TP_METER_ERR_4X_12_DB,
+        source: "cached-tp",
+    };
+    let d_border =
+        select_ultimate_headroom_v2(&borderline_tp, false, None, Some(-3.0), 0.15, m_q);
+    assert_eq!(d_border.mode, HeadroomMode::ZeroDb);
+    assert_eq!(d_border.total_gain_db(), 0.0);
+
+    // 6. T10: Streaming ALWAYS enforces -3 dB fail-safe (OQ-33), ignoring quiet PeakEvidence!
+    let d_stream_quiet =
+        select_ultimate_headroom_v2(&quiet_exact, true, Some(2.0), Some(-10.0), 0.0, m_q);
+    assert_eq!(d_stream_quiet.mode, HeadroomMode::Minus3Db);
+    assert!((d_stream_quiet.total_gain_db() - (-5.0)).abs() < 1e-9);
+}

@@ -275,6 +275,32 @@ impl FilterArchetype {
         true
     }
 
+    /// Upper-bound upsampler peak overshoot `A_up(plan)` in dB relative to ideal bandlimited
+    /// reconstruction (`Issue #23 §§2, 3.4`, verified by `filter_specs_l2::t12_upsampler_overshoot_table_bounds_all_archetypes_and_rate_families`).
+    ///
+    /// - `Null` (native 8fS pass-through) is bit-exact (`0.0 dB`).
+    /// - Gaussian linear-phase filters (`gauss-long-lp`, `gauss-hires-lp`, `short-lp`) match ideal
+    ///   sinc reconstruction closely (`0.10 dB`).
+    /// - Steep / apodizing mega-tap linear-phase filters (`sinc-steep-4m`, `ext-sharp-lp`,
+    ///   `gauss-apod-4m`) reserve `0.40–0.45 dB` for sharp transition-band near-Nyquist energy.
+    /// - Intermediate-phase and minimum-phase filters exhibit transition-band phase dispersion that
+    ///   can realign broadband harmonics (`1.75–1.80 dB`).
+    pub const fn upsampler_overshoot_db(self) -> f64 {
+        match self {
+            Self::Null => 0.0,
+            Self::GaussLongLp => 0.10,
+            Self::GaussHiresLp => 0.10,
+            Self::ShortLp => 0.10,
+            Self::SimpleTest => 0.15,
+            Self::SincSteep4M => 0.40,
+            Self::ExtSharpLp => 0.40,
+            Self::GaussApod4M => 0.45,
+            Self::MinphaseLong => 1.75,
+            Self::IntermediateLong => 1.75,
+            Self::ShortMp => 1.80,
+        }
+    }
+
     /// Shape-derived (for Gaussian archetypes) or researched constant-time tap count, bounded by
     /// `max_taps <= MAX_FILTER_TAPS`.
     pub fn planned_taps(

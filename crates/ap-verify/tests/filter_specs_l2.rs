@@ -403,3 +403,208 @@ fn l2_cepstrum_cap_handles_prototypes_above_65k_taps() {
         ">65k cepstrum min-phase passband deviation {max_diff_db:.4} dB > 0.05 dB"
     );
 }
+
+/// Issue #23 T12 (P3): Verify that `FilterArchetype::upsampler_overshoot_db()` (`A_up(plan)`)
+/// upper-bounds the measured peak overshoot relative to ideal 64x bandlimited reconstruction
+/// across all curated archetypes and both 44.1 kHz and 48 kHz rate families.
+#[test]
+fn t12_upsampler_overshoot_table_bounds_all_archetypes_and_rate_families() {
+    use ap_core::buffer::StereoF64Buffer;
+    use std::f64::consts::PI;
+
+    assert_eq!(FilterArchetype::Null.upsampler_overshoot_db(), 0.0);
+
+    // 64x Kaiser-windowed sinc reference true-peak meter (beta=14, 128 taps/phase)
+    // to represent ideal bandlimited reconstruction peak for each test signal.
+    fn ideal_ref_true_peak(samples: &[f64]) -> f64 {
+        const OS: usize = 64;
+        const HALF_TAPS: isize = 64; // 128 taps per phase
+        let beta = 14.0_f64;
+        let bessel_i0 = |x: f64| -> f64 {
+            let mut sum = 1.0_f64;
+            let mut term = 1.0_f64;
+            let half_x = 0.5 * x;
+            for k in 1..=32 {
+                term *= (half_x / (k as f64)).powi(2);
+                sum += term;
+                if term <= 1e-16 * sum {
+                    break;
+                }
+            }
+            sum
+        };
+        let inv_i0 = 1.0 / bessel_i0(beta);
+        let mut bank = vec![vec![0.0_f64; (2 * HALF_TAPS) as usize]; OS];
+        for p in 0..OS {
+            let frac = (p as f64) / (OS as f64);
+            let mut sum = 0.0_f64;
+            for (idx, k) in (-HALF_TAPS..HALF_TAPS).enumerate() {
+                let tau = (k as f64) - frac;
+                let sinc = if tau.abs() < 1e-15 {
+                    1.0
+                } else {
+                    (PI * tau).sin() / (PI * tau)
+                };
+                let r = tau / (HALF_TAPS as f64);
+                let w = if r.abs() >= 1.0 {
+                    0.0
+                } else {
+                    bessel_i0(beta * (1.0 - r * r).sqrt()) * inv_i0
+                };
+                bank[p][idx] = sinc * w;
+                sum += bank[p][idx];
+            }
+            for c in &mut bank[p] {
+                *c /= sum;
+            }
+        }
+        let n = samples.len();
+        let mut peak = 0.0_f64;
+        let start = (HALF_TAPS as usize) + 8;
+        let end = n.saturating_sub((HALF_TAPS as usize) + 8);
+        for i in start..end {
+            peak = peak.max(samples[i].abs());
+            for p in 1..OS {
+                let coeffs = &bank[p];
+                let mut acc = 0.0_f64;
+                let base = (i as isize) - HALF_TAPS;
+                for (j, &c) in coeffs.iter().enumerate() {
+                    let s_idx = (base + (j as isize)) as usize;
+                    acc += c * samples[s_idx];
+                }
+                peak = peak.max(acc.abs());
+            }
+        }
+        peak
+    }
+
+    // Build a diverse worst-case test signal suite (all normalized <= 1.0):
+    // 1. Passband sines at 0.05, 0.20, 0.25@45deg (+3 dB ISP), 0.40 * fs
+    // 2. Hard-clipped 1 kHz-like square-ish wave (strong harmonics near Nyquist)
+    // 3. Band-limited step / alternating bursts (Gibbs + phase-dispersion stress)
+    // 4. Deterministic broadband pseudo-random noise
+    let len = 4_096usize;
+    let mut signals: Vec<(&'static str, Vec<f64>)> = Vec::new();
+    for &(name, freq_frac, phase) in &[
+        ("sine_0.05", 0.05_f64, 0.0_f64),
+        ("sine_0.25_45deg", 0.25, PI / 4.0),
+        ("sine_0.40", 0.40, 0.37),
+    ] {
+        let s: Vec<f64> = (0..len)
+            .map(|n| (2.0 * PI * freq_frac * (n as f64) + phase).sin())
+            .collect();
+        signals.push((name, s));
+    }
+    // Hard-clipped sine (harmonic-rich mastering-clipped wave)
+    signals.push((
+        "clipped_sine",
+        (0..len)
+            .map(|n| (3.0 * (2.0 * PI * 0.031 * (n as f64)).sin()).clamp(-1.0, 1.0))
+            .collect(),
+    ));
+    // Square burst (strong step transition -> excites linear/min/ip ringing)
+    signals.push((
+        "square_burst",
+        (0..len)
+            .map(|n| if (n / 64) % 2 == 0 { 0.9 } else { -0.9 })
+            .collect(),
+    ));
+    // In-phase multitone (aligns phases across passband so phase dispersion is tested)
+    signals.push((
+        "multitone",
+        (0..len)
+            .map(|n| {
+                let mut acc = 0.0_f64;
+                for k in 1..=8 {
+                    let f = 0.045 * (k as f64);
+                    acc += (2.0 * PI * f * (n as f64)).cos();
+                }
+                acc / 8.0
+            })
+            .collect(),
+    ));
+    // Broadband deterministic PRNG
+    {
+        let mut x = 0x1234_5678_9ABC_DEF0_u64;
+        let mut s = Vec::with_capacity(len);
+        for _ in 0..len {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let u = ((x >> 11) as f64) / ((1_u64 << 53) as f64);
+            s.push(2.0 * u - 1.0);
+        }
+        signals.push(("broadband_noise", s));
+    }
+
+    let ideal_peaks: Vec<f64> = signals.iter().map(|(_, s)| ideal_ref_true_peak(s)).collect();
+
+    // Test 1x (8x upsample) and 2x (4x upsample) across both 44.1 kHz and 48 kHz families.
+    let rate_cases: &[u32] = &[44_100, 88_200, 48_000, 96_000];
+
+    let mut failures = Vec::new();
+    for row in FILTER_SPEC_TABLE {
+        let table_bound_db = row.archetype.upsampler_overshoot_db();
+        let mut worst_overshoot_db = 0.0_f64;
+        let mut worst_case = String::new();
+
+        for &src_rate in rate_cases {
+            if src_rate < row.min_source_rate_hz {
+                continue;
+            }
+            let spec = StreamSpec {
+                sample_rate_hz: src_rate,
+                bits_per_sample: 24,
+                channels: 2,
+            };
+            let src_info = TrackSourceInfo::from_stream_spec(spec);
+            let mut policy = UpsamplerPolicy {
+                filter_override: Some(row.archetype),
+                ..UpsamplerPolicy::default()
+            };
+            if let Some(cap) = row.test_max_taps {
+                policy.max_taps = cap;
+            }
+            let picker = UpsamplerPicker::new(policy).unwrap();
+            let plan = picker.select(&src_info);
+
+            for ((sig_name, sig), &ideal_tp) in signals.iter().zip(ideal_peaks.iter()) {
+                let mut up = build_upsampler(&plan).unwrap();
+                let blk = StereoF64Buffer {
+                    sample_rate_hz: src_rate,
+                    left: sig.clone(),
+                    right: sig.clone(),
+                };
+                let mut out = up.process_block(blk).unwrap();
+                let tail = up.flush().unwrap();
+                out.left.extend_from_slice(&tail.left);
+                // Measure interior (skip first/last 128 source frames to avoid edge-zero step).
+                let ratio = (plan.target_rate_hz / src_rate) as usize;
+                let margin = 128 * ratio;
+                let slice = if out.left.len() > 2 * margin {
+                    &out.left[margin..out.left.len() - margin]
+                } else {
+                    &out.left[..]
+                };
+                let up_peak = slice.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+                let overshoot_db = (20.0_f64 * (up_peak / ideal_tp.max(1e-12)).log10()).max(0.0);
+                if overshoot_db > worst_overshoot_db {
+                    worst_overshoot_db = overshoot_db;
+                    worst_case = format!("{sig_name}@{src_rate}Hz");
+                }
+            }
+        }
+
+        if worst_overshoot_db > table_bound_db + 1e-6 {
+            failures.push(format!(
+                "{}: worst {worst_overshoot_db:.4} dB ({worst_case}) > table {table_bound_db:.4} dB",
+                row.archetype
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "T12 A_up table violations:\n  {}",
+        failures.join("\n  ")
+    );
+}
