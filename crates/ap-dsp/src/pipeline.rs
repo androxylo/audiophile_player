@@ -62,6 +62,9 @@ pub struct GaplessCarryover {
     /// Ultimate Mode (`OQ-40`) to overlap-add right before quantization without touching Track B's
     /// convolver or downsampler (Review #9 D6: kept strictly separate from `convolver`).
     pub additive_output_tail: Option<ConvolutionTail>,
+    /// Number of leading frames inside `additive_output_tail` sitting BEFORE Track A's nominal
+    /// track boundary (held back so Track B's pre-ringing aligns with zero dip; Review #10 CQ1).
+    pub pre_boundary_frames: usize,
     /// Optional last-stage `f64` downsampler FIR state carried across equal-rate gapless transitions.
     pub downsampler: Option<DownsamplerCarryover>,
     /// Continuous PRNG + per-channel error-feedback shaper state preserved across equal-rate
@@ -346,6 +349,9 @@ pub struct StreamingPipelineSession {
     delayer: Box<dyn ChannelDelayer>,
     downsampler: Box<dyn Downsampler>,
     quantizer: StreamingQuantizer,
+    /// Optional output-rate additive post-ring tail attached during normal-mode
+    /// `ConvolverOnlyHandoff` when no REW convolver is active (`Review #10 CQ4`).
+    incoming_additive_tail: Option<(ConvolutionTail, usize)>,
 }
 
 impl StreamingPipelineSession {
@@ -502,6 +508,25 @@ impl StreamingPipelineSession {
         self.post_conv(block)
     }
 
+    /// Enable pre-ringing emission at track start for exact Ultimate gapless continuity
+    /// (`Review #10 CQ1`): emits Track B's pre-boundary FIR pre-ringing BEFORE sample 0 so that
+    /// adding Track A's `additive_output_tail` (with `pre_boundary_frames`) reconstructs
+    /// `(x_A ‖ x_B) * h` to machine precision with zero half-amplitude dip or click!
+    ///
+    /// Returns the exact number of output frames emitted before Track B's nominal sample 0.
+    /// Must be called before any `process_block_unity_f64` call.
+    pub fn enable_gapless_prering(&mut self) -> usize {
+        let internal = self.report.internal_rate_hz;
+        let out = self.report.output_rate_hz;
+        if out == 0 || internal % out != 0 {
+            return 0;
+        }
+        let down_m = (internal / out) as usize;
+        let up_pre_internal = self.upsampler.enable_gapless_prering();
+        let ds_pre_out = self.downsampler.enable_gapless_prering();
+        (up_pre_internal / down_m) + ds_pre_out
+    }
+
     /// Shared `GaplessCarryover` constructor (Review #9 D4 + D6).
     fn build_carryover(
         &self,
@@ -509,6 +534,7 @@ impl StreamingPipelineSession {
         deemphasis: Option<DeemphasisCarryover>,
         convolver: Option<ConvolutionTail>,
         additive_output_tail: Option<ConvolutionTail>,
+        pre_boundary_frames: usize,
         downsampler: Option<DownsamplerCarryover>,
     ) -> Option<GaplessCarryover> {
         let has_shaper_state = !self.quantizer.coeffs().is_empty();
@@ -535,6 +561,7 @@ impl StreamingPipelineSession {
             deemphasis,
             convolver,
             additive_output_tail,
+            pre_boundary_frames,
             downsampler,
             quantizer_state,
         })
@@ -581,11 +608,13 @@ impl StreamingPipelineSession {
         })
     }
 
-    /// Flush the unity-gain linear chain at EOF for gapless continuity (`OQ-40` strict independence):
+    /// Flush the unity-gain linear chain at EOF for gapless continuity (`OQ-40` strict independence
+    /// + `Review #10 CQ1` continuous post-ringing):
     /// - Returns `(ending_unity_f64, peak_over_ending_and_tail_unity, Option<GaplessCarryover>)`.
-    /// - Any exported tail is pre-scaled by THIS track's fixed whole-track `fixed_gain_db` (and
-    ///   decimated to `output_rate_hz` when last-stage downsampling is active) and stored in
-    ///   `GaplessCarryover::additive_output_tail` (D6) so Track B adds `z_A[n]` strictly at output rate.
+    /// - Uses `upsampler.flush_for_gapless()` so Track A's exact length ends at `N_A * ratio` while
+    ///   Track A's complete post-ringing (`up_post_ring` -> `deemph` -> `convolver` -> `downsampler`)
+    ///   is carried in `GaplessCarryover::additive_output_tail` (pre-scaled by `fixed_gain_db`),
+    ///   so `(x_A ‖ 0)*h + (0 ‖ x_B)*h == (x_A ‖ x_B)*h` with zero half-amplitude dip or click!
     pub fn flush_for_gapless_unity_f64(
         &mut self,
         fixed_gain_db: f64,
@@ -601,20 +630,79 @@ impl StreamingPipelineSession {
             }
         };
 
-        // Flush upsampler completely at track boundary so Track A and Track B never splice FIR
-        // histories when their independent filters or fixed gains differ (`OQ-40`).
-        let up_tail = self.upsampler.flush()?;
-        emit(self.post_upsampler(up_tail)?);
-        let (track_end, mut conv_tail) = self.convolver.flush_split_tail()?;
+        // Review #10 CQ1: for native 8fS and exact integer downsampling (÷2/÷4/÷8), hold back
+        // Track A's unpadded FIR history (`up_tail_exact` + `up_post_ring` + downsampler holdback)
+        // in `additive_output_tail` with `pre_boundary_frames` so Track B's pre-ringing aligns
+        // and sums with ZERO half-amplitude dip! For cross-family rational resampling (e.g.
+        // 352.8 -> 48 kHz), emit up to Track A's exact boundary and carry only post-ringing.
+        let is_exact_integer_ds = out_rate > 0 && internal_rate % out_rate == 0;
+        let down_m = if is_exact_integer_ds {
+            (internal_rate / out_rate) as usize
+        } else {
+            1
+        };
+
+        let (up_ready, up_carry) = self.upsampler.flush_for_gapless()?;
+        emit(self.post_upsampler(up_ready)?);
+
+        let (up_post_ring, up_pre_boundary_internal) = if let Some(uc) = up_carry {
+            let exact_len = uc.exact_flush_len();
+            let full = uc.flush_to_f64();
+            if is_exact_integer_ds && exact_len % down_m == 0 {
+                // Hold back ALL of `full` (`up_tail_exact` ++ `up_post_ring`) into the additive
+                // tail so Track B's pre-ringing combines cleanly over `[N_A - exact_len .. N_A]`!
+                (full, exact_len)
+            } else {
+                let split_at = exact_len.min(full.left.len());
+                if split_at > 0 {
+                    let exact_buf = StereoF64Buffer {
+                        sample_rate_hz: full.sample_rate_hz,
+                        left: full.left[..split_at].to_vec(),
+                        right: full.right[..split_at].to_vec(),
+                    };
+                    emit(self.post_upsampler(exact_buf)?);
+                }
+                let post = if split_at < full.left.len() {
+                    StereoF64Buffer {
+                        sample_rate_hz: full.sample_rate_hz,
+                        left: full.left[split_at..].to_vec(),
+                        right: full.right[split_at..].to_vec(),
+                    }
+                } else {
+                    StereoF64Buffer::empty(internal_rate)
+                };
+                (post, 0)
+            }
+        } else {
+            (StereoF64Buffer::empty(internal_rate), 0)
+        };
+
+        // Continue de-emphasis seamlessly through `up_post_ring` (or a brief zero decay if
+        // de-emphasis is active with a zero-latency upsampler).
+        let deemph_post_ring = if !up_post_ring.is_empty() {
+            self.deemphasis.process_block(up_post_ring)?
+        } else if self.deemphasis.is_enabled() {
+            self.deemphasis.process_block(StereoF64Buffer {
+                sample_rate_hz: internal_rate,
+                left: vec![0.0; 128],
+                right: vec![0.0; 128],
+            })?
+        } else {
+            StereoF64Buffer::empty(internal_rate)
+        };
+
+        // Convolve `deemph_post_ring` together with the convolver's own decaying IR tail while
+        // splitting at the exact boundary BEFORE `deemph_post_ring`!
+        let (track_end, mut conv_tail) = self
+            .convolver
+            .flush_split_tail_with_post_ring(deemph_post_ring)?;
         emit(self.post_conv(track_end)?);
         let delay_tail = self.delayer.flush()?;
         if !delay_tail.is_empty() {
             emit(self.downsampler.process_block(delay_tail)?);
         }
 
-        // Review #9 D1: when last-stage downsampling is active, split combined decimator output at
-        // `pending_a_out` so Track A's own trailing `half/D` samples stay in `out_l/out_r` and only
-        // outputs driven by `conv_tail` enter `additive_tail` at `out_rate`!
+        let mut pre_boundary_frames = up_pre_boundary_internal / down_m;
         let mut additive_tail = if !self.downsampler.is_bypass() {
             let pending_a_out = self.downsampler.pending_flush_frames();
             let mut combined_l = Vec::new();
@@ -632,17 +720,32 @@ impl StreamingPipelineSession {
             combined_l.extend_from_slice(&ds_flush.left);
             combined_r.extend_from_slice(&ds_flush.right);
 
-            let split = pending_a_out.min(combined_l.len());
-            out_l.extend_from_slice(&combined_l[..split]);
-            out_r.extend_from_slice(&combined_r[..split]);
-            if split < combined_l.len() {
-                Some(ConvolutionTail {
-                    sample_rate_hz: out_rate,
-                    left: combined_l[split..].to_vec(),
-                    right: combined_r[split..].to_vec(),
-                })
+            if is_exact_integer_ds {
+                // Hold back `pending_a_out` as well so Track B's downsampler pre-ringing combines
+                // cleanly with ZERO half-amplitude dip across the decimator FIR!
+                pre_boundary_frames += pending_a_out;
+                if !combined_l.is_empty() {
+                    Some(ConvolutionTail {
+                        sample_rate_hz: out_rate,
+                        left: combined_l,
+                        right: combined_r,
+                    })
+                } else {
+                    None
+                }
             } else {
-                None
+                let split = pending_a_out.min(combined_l.len());
+                out_l.extend_from_slice(&combined_l[..split]);
+                out_r.extend_from_slice(&combined_r[..split]);
+                if split < combined_l.len() {
+                    Some(ConvolutionTail {
+                        sample_rate_hz: out_rate,
+                        left: combined_l[split..].to_vec(),
+                        right: combined_r[split..].to_vec(),
+                    })
+                } else {
+                    None
+                }
             }
         } else {
             conv_tail.map(|mut ct| {
@@ -677,7 +780,8 @@ impl StreamingPipelineSession {
             }
         }
 
-        let carryover = self.build_carryover(None, None, None, additive_tail, None);
+        let carryover =
+            self.build_carryover(None, None, None, additive_tail, pre_boundary_frames, None);
         Ok((
             StereoF64Buffer {
                 sample_rate_hz: out_rate,
@@ -720,6 +824,23 @@ impl StreamingPipelineSession {
         Ok(self.quantizer.quantize_block(&scaled))
     }
 
+    /// Overlap-add any attached normal-mode output-rate additive tail (`Review #10 CQ4`) onto
+    /// `buf` right before quantization.
+    fn overlay_incoming_additive_tail(&mut self, buf: &mut StereoF64Buffer) {
+        if let Some((tail, offset)) = self.incoming_additive_tail.as_mut() {
+            let rem = tail.left.len().saturating_sub(*offset);
+            let n = buf.left.len().min(rem);
+            for i in 0..n {
+                buf.left[i] += tail.left[*offset + i];
+                buf.right[i] += tail.right[*offset + i];
+            }
+            *offset += n;
+            if *offset >= tail.left.len() {
+                self.incoming_additive_tail = None;
+            }
+        }
+    }
+
     /// Process one bounded source `f64` block through all 5 stages -> ready `i32` PCM block.
     pub fn process_block(
         &mut self,
@@ -730,10 +851,11 @@ impl StreamingPipelineSession {
         }
         apply_safe_gain_f64(&mut block, self.report.headroom.total_gain_db())?;
         let block = self.upsampler.process_block(block)?;
-        let block = self.post_upsampler(block)?;
+        let mut block = self.post_upsampler(block)?;
         if block.is_empty() {
             return Ok(InterleavedInt32Buffer::empty(self.report.output_rate_hz));
         }
+        self.overlay_incoming_additive_tail(&mut block);
         Ok(self.quantizer.quantize_block(&block))
     }
 
@@ -793,25 +915,39 @@ impl StreamingPipelineSession {
         let mut frames = Vec::new();
         let rate = self.report.output_rate_hz;
         let up_tail = self.upsampler.flush()?;
-        let b1 = self.post_upsampler(up_tail)?;
+        let mut b1 = self.post_upsampler(up_tail)?;
         if !b1.is_empty() {
+            self.overlay_incoming_additive_tail(&mut b1);
             frames.extend(self.quantizer.quantize_block(&b1).frames);
         }
         let conv_tail = self.convolver.flush()?;
-        let b2 = self.post_conv(conv_tail)?;
+        let mut b2 = self.post_conv(conv_tail)?;
         if !b2.is_empty() {
+            self.overlay_incoming_additive_tail(&mut b2);
             frames.extend(self.quantizer.quantize_block(&b2).frames);
         }
         let delay_tail = self.delayer.flush()?;
         if !delay_tail.is_empty() {
-            let b3 = self.downsampler.process_block(delay_tail)?;
+            let mut b3 = self.downsampler.process_block(delay_tail)?;
             if !b3.is_empty() {
+                self.overlay_incoming_additive_tail(&mut b3);
                 frames.extend(self.quantizer.quantize_block(&b3).frames);
             }
         }
-        let down_tail = self.downsampler.flush()?;
+        let mut down_tail = self.downsampler.flush()?;
         if !down_tail.is_empty() {
+            self.overlay_incoming_additive_tail(&mut down_tail);
             frames.extend(self.quantizer.quantize_block(&down_tail).frames);
+        }
+        if let Some((tail, offset)) = self.incoming_additive_tail.take() {
+            if offset < tail.left.len() {
+                let rem = StereoF64Buffer {
+                    sample_rate_hz: rate,
+                    left: tail.left[offset..].to_vec(),
+                    right: tail.right[offset..].to_vec(),
+                };
+                frames.extend(self.quantizer.quantize_block(&rem).frames);
+            }
         }
         Ok(InterleavedInt32Buffer {
             sample_rate_hz: rate,
@@ -829,29 +965,43 @@ impl StreamingPipelineSession {
         let out_rate = self.report.output_rate_hz;
 
         let (up_tail, up_carry) = self.upsampler.flush_for_gapless()?;
-        let b1 = self.post_upsampler(up_tail)?;
+        let mut b1 = self.post_upsampler(up_tail)?;
         if !b1.is_empty() {
+            self.overlay_incoming_additive_tail(&mut b1);
             frames.extend(self.quantizer.quantize_block(&b1).frames);
         }
         let (track_end, conv_tail) = self.convolver.flush_split_tail()?;
-        let b2 = self.post_conv(track_end)?;
+        let mut b2 = self.post_conv(track_end)?;
         if !b2.is_empty() {
+            self.overlay_incoming_additive_tail(&mut b2);
             frames.extend(self.quantizer.quantize_block(&b2).frames);
         }
         let delay_tail = self.delayer.flush()?;
         if !delay_tail.is_empty() {
-            let b3 = self.downsampler.process_block(delay_tail)?;
+            let mut b3 = self.downsampler.process_block(delay_tail)?;
             if !b3.is_empty() {
+                self.overlay_incoming_additive_tail(&mut b3);
                 frames.extend(self.quantizer.quantize_block(&b3).frames);
             }
         }
-        let (ds_tail, down_carry) = self.downsampler.flush_for_gapless()?;
+        let (mut ds_tail, down_carry) = self.downsampler.flush_for_gapless()?;
         if !ds_tail.is_empty() {
+            self.overlay_incoming_additive_tail(&mut ds_tail);
             frames.extend(self.quantizer.quantize_block(&ds_tail).frames);
+        }
+        if let Some((tail, offset)) = self.incoming_additive_tail.take() {
+            if offset < tail.left.len() {
+                let rem = StereoF64Buffer {
+                    sample_rate_hz: out_rate,
+                    left: tail.left[offset..].to_vec(),
+                    right: tail.right[offset..].to_vec(),
+                };
+                frames.extend(self.quantizer.quantize_block(&rem).frames);
+            }
         }
 
         let deemph_state = self.deemphasis.export_state();
-        let carryover = self.build_carryover(up_carry, deemph_state, conv_tail, None, down_carry);
+        let carryover = self.build_carryover(up_carry, deemph_state, conv_tail, None, 0, down_carry);
         Ok((
             InterleavedInt32Buffer {
                 sample_rate_hz: out_rate,
@@ -1155,6 +1305,7 @@ impl AudioPipeline {
             delayer,
             downsampler,
             quantizer,
+            incoming_additive_tail: None,
         })
     }
 
@@ -1295,47 +1446,72 @@ impl AudioPipeline {
                         session.quantizer.restore_state(quantizer.export_state());
                     }
 
-                    // Review #6 Finding #13: preserve Track A's post-ringing FIR decay past
-                    // `exact_len` by convolving it and overlap-adding onto the incoming tail of
-                    // Track B (when Track B accepts a convolver tail) without shifting Track B.
+                    // Review #6 Finding #13 + Review #10 CQ4: preserve Track A's post-ringing FIR
+                    // decay past `exact_len`:
+                    // - When Track B has an active REW convolver, convolve `post_ring` and
+                    //   overlap-add onto Track B's incoming convolver tail.
+                    // - When no REW convolver is active (`NullConvolver`), decimate `post_ring`
+                    //   to `out_rate` (if needed) and attach it to `session.incoming_additive_tail`
+                    //   so Track B overlap-adds it right before quantization (CQ4)!
                     if let Some(post_ring) = up_post_ring {
-                        if session.accepts_convolver_tail() && !post_ring.is_empty() {
-                            if let Ok(mut post_conv) =
-                                self.convolver_factory.create_for_rate(internal_rate)
-                            {
-                                if post_conv.accepts_tail() {
-                                    if let Ok(mut p_out) = post_conv.process_block(post_ring) {
-                                        if let Ok(p_tail) = post_conv.flush() {
-                                            p_out.left.extend_from_slice(&p_tail.left);
-                                            p_out.right.extend_from_slice(&p_tail.right);
-                                        }
-                                        if !p_out.is_empty() {
-                                            match &mut updated_tail {
-                                                Some(t) => {
-                                                    if p_out.left.len() > t.left.len() {
-                                                        t.left.resize(p_out.left.len(), 0.0);
-                                                        t.right.resize(p_out.right.len(), 0.0);
+                        if !post_ring.is_empty() {
+                            if session.accepts_convolver_tail() {
+                                if let Ok(mut post_conv) =
+                                    self.convolver_factory.create_for_rate(internal_rate)
+                                {
+                                    if post_conv.accepts_tail() {
+                                        if let Ok(mut p_out) = post_conv.process_block(post_ring) {
+                                            if let Ok(p_tail) = post_conv.flush() {
+                                                p_out.left.extend_from_slice(&p_tail.left);
+                                                p_out.right.extend_from_slice(&p_tail.right);
+                                            }
+                                            if !p_out.is_empty() {
+                                                match &mut updated_tail {
+                                                    Some(t) => {
+                                                        if p_out.left.len() > t.left.len() {
+                                                            t.left.resize(p_out.left.len(), 0.0);
+                                                            t.right.resize(p_out.right.len(), 0.0);
+                                                        }
+                                                        for (i, (&l, &r)) in p_out
+                                                            .left
+                                                            .iter()
+                                                            .zip(p_out.right.iter())
+                                                            .enumerate()
+                                                        {
+                                                            t.left[i] += l;
+                                                            t.right[i] += r;
+                                                        }
                                                     }
-                                                    for (i, (&l, &r)) in p_out
-                                                        .left
-                                                        .iter()
-                                                        .zip(p_out.right.iter())
-                                                        .enumerate()
-                                                    {
-                                                        t.left[i] += l;
-                                                        t.right[i] += r;
+                                                    None => {
+                                                        updated_tail = Some(ConvolutionTail {
+                                                            sample_rate_hz: internal_rate,
+                                                            left: p_out.left,
+                                                            right: p_out.right,
+                                                        });
                                                     }
-                                                }
-                                                None => {
-                                                    updated_tail = Some(ConvolutionTail {
-                                                        sample_rate_hz: internal_rate,
-                                                        left: p_out.left,
-                                                        right: p_out.right,
-                                                    });
                                                 }
                                             }
                                         }
                                     }
+                                }
+                            } else if let Ok(mut post_ds) = build_downsampler(internal_rate, out_rate)
+                            {
+                                let mut out_post = post_ds
+                                    .process_block(post_ring)
+                                    .unwrap_or_else(|_| StereoF64Buffer::empty(out_rate));
+                                if let Ok(f) = post_ds.flush() {
+                                    out_post.left.extend_from_slice(&f.left);
+                                    out_post.right.extend_from_slice(&f.right);
+                                }
+                                if !out_post.is_empty() {
+                                    session.incoming_additive_tail = Some((
+                                        ConvolutionTail {
+                                            sample_rate_hz: out_rate,
+                                            left: out_post.left,
+                                            right: out_post.right,
+                                        },
+                                        0,
+                                    ));
                                 }
                             }
                         }
@@ -1748,13 +1924,17 @@ mod tests {
     }
 
     #[test]
-    fn ultimate_gapless_with_downsampler_exact_length_and_no_end_overlap_onto_b() {
-        // Review #9 D1 + D10: Track A ends with a strong burst near its tail, Track B is silence.
-        // In Ultimate gapless mode with downsampling active (both integer ÷8 and rational 352.8->48):
-        // 1) Track A's output length MUST equal ceil(N_A_internal * L / M) (not cut short by half/D).
-        // 2) Track A's ending burst MUST appear inside Track A's own output, and with no REW
-        //    convolver, the additive tail `z_A[n]` MUST be None (zero bleed onto Track B's start!).
-        let policy = UpsamplerPolicy::default();
+    fn ultimate_gapless_with_downsampler_exact_length_and_continuous_post_ring() {
+        // Review #9 D1 + D10 + Review #10 CQ1:
+        // In Ultimate gapless mode with downsampling active (÷8, ÷2, and rational 352.8->48):
+        // 1) Track A's output length MUST equal ceil(N_A_internal * L / M).
+        // 2) Track A's post-ringing FIR decay is carried in `additive_output_tail` so that
+        //    `(Track A ++ (Track B + z_A))` equals a single continuous render `(x_A ‖ x_B) * h`
+        //    to machine precision (ZERO half-amplitude dip / click at the join!).
+        let policy = UpsamplerPolicy {
+            filter_override: Some(FilterArchetype::ShortLp),
+            ..UpsamplerPolicy::default()
+        };
         let spec_44k = StreamSpec {
             sample_rate_hz: 44_100,
             bits_per_sample: 16,
@@ -1776,6 +1956,16 @@ mod tests {
             (48_000, 20, 147), // rational (352,800 -> 48,000)
         ];
 
+        let n_src_a = 2048_usize;
+        let n_src_b = 1024_usize;
+        let n_total = n_src_a + n_src_b;
+        let full_l: Vec<f64> = (0..n_total)
+            .map(|n| 0.5 * (2.0 * std::f64::consts::PI * 1000.0 * n as f64 / 44_100.0).sin())
+            .collect();
+        let full_r: Vec<f64> = (0..n_total)
+            .map(|n| 0.4 * (2.0 * std::f64::consts::PI * 730.0 * n as f64 / 44_100.0).sin())
+            .collect();
+
         for &(dac_rate, up_l, down_m) in cases {
             let caps = DacOutputCapabilities::from_supported_rates(
                 &[(dac_rate, DacWireFormat::Int32)],
@@ -1785,76 +1975,105 @@ mod tests {
                 .unwrap()
                 .with_dac_capabilities(caps);
 
-            // Track A: 2048 source samples @ 44.1 kHz (= 16,384 internal 8fS samples),
-            // with a 0.5-amplitude 1 kHz burst in the final 400 source samples (~9 ms).
-            let n_src_a = 2048_usize;
-            let n_internal_a = n_src_a * 8;
-            let mut a_l = vec![0.0_f64; n_src_a];
-            let mut a_r = vec![0.0_f64; n_src_a];
-            for n in (n_src_a - 400)..n_src_a {
-                let v = 0.5 * (2.0 * std::f64::consts::PI * 1000.0 * n as f64 / 44_100.0).sin();
-                a_l[n] = v;
-                a_r[n] = v;
-            }
-            let buf_a = StereoF64Buffer {
-                sample_rate_hz: 44_100,
-                left: a_l,
-                right: a_r,
-            };
+            // Continuous reference render of A ‖ B.
+            let mut sess_ref = pipe
+                .start_track_with_plan_and_headroom(spec_44k, plan.clone(), placeholder_hr.clone())
+                .unwrap();
+            let mut ref_out = sess_ref
+                .process_block_unity_f64(StereoF64Buffer {
+                    sample_rate_hz: 44_100,
+                    left: full_l.clone(),
+                    right: full_r.clone(),
+                })
+                .unwrap();
+            let ref_tail = sess_ref.flush_unity_f64().unwrap();
+            ref_out.left.extend_from_slice(&ref_tail.left);
+            ref_out.right.extend_from_slice(&ref_tail.right);
 
+            // Split gapless Ultimate render: Track A -> additive_output_tail -> Track B.
             let mut sess_a = pipe
                 .start_track_with_plan_and_headroom(spec_44k, plan.clone(), placeholder_hr.clone())
                 .unwrap();
-            let mut out_a = sess_a.process_block_unity_f64(buf_a).unwrap();
+            let mut out_a = sess_a
+                .process_block_unity_f64(StereoF64Buffer {
+                    sample_rate_hz: 44_100,
+                    left: full_l[..n_src_a].to_vec(),
+                    right: full_r[..n_src_a].to_vec(),
+                })
+                .unwrap();
             let (tail_a, _peak_a, carry_a) = sess_a.flush_for_gapless_unity_f64(0.0).unwrap();
             out_a.left.extend_from_slice(&tail_a.left);
             out_a.right.extend_from_slice(&tail_a.right);
 
-            let expected_a = (n_internal_a * up_l).div_ceil(down_m);
-            assert_eq!(
-                out_a.left.len(),
-                expected_a,
-                "D1/D10 dac_rate={dac_rate}: Track A len {} != expected {expected_a}",
-                out_a.left.len()
-            );
-            assert!(
-                carry_a.as_ref().and_then(|c| c.additive_output_tail.as_ref()).is_none()
-                    && carry_a.as_ref().and_then(|c| c.convolver.as_ref()).is_none(),
-                "D1 dac_rate={dac_rate}: without REW convolver, Track A's end must NOT leak into additive tail z_A"
-            );
-            // Verify Track A's final 2 ms actually contain the burst (not cut off!).
-            let tail_window = ((dac_rate as usize) * 2) / 1000;
-            let end_peak = out_a.left[out_a.left.len().saturating_sub(tail_window)..]
-                .iter()
-                .fold(0.0_f64, |m, &x| m.max(x.abs()));
-            assert!(
-                end_peak > 0.25,
-                "D1 dac_rate={dac_rate}: Track A's ending burst was cut short (end_peak={end_peak:.4})"
-            );
+            let expected_a = (n_src_a * 8 * up_l).div_ceil(down_m);
+            let carry_a = carry_a
+                .expect("CQ1: Track A must emit GaplessCarryover");
+            let pre_a = carry_a.pre_boundary_frames;
+            if down_m == 2 || down_m == 8 {
+                assert_eq!(
+                    out_a.left.len() + pre_a,
+                    expected_a,
+                    "CQ1 dac_rate={dac_rate}: emitted {} + pre_boundary {} != expected {expected_a}",
+                    out_a.left.len(),
+                    pre_a
+                );
+            } else {
+                assert_eq!(out_a.left.len(), expected_a);
+            }
+            let add_tail = carry_a
+                .additive_output_tail
+                .expect("CQ1: Track A must carry post-ringing additive_output_tail into Track B");
 
-            // Track B: 1024 silent source samples -> exact length ceil(8192 * L / M) and all zeros.
-            let n_src_b = 1024_usize;
-            let n_internal_b = n_src_b * 8;
-            let buf_b = StereoF64Buffer {
-                sample_rate_hz: 44_100,
-                left: vec![0.0_f64; n_src_b],
-                right: vec![0.0_f64; n_src_b],
-            };
             let mut sess_b = pipe
                 .start_track_with_plan_and_headroom(spec_44k, plan.clone(), placeholder_hr.clone())
                 .unwrap();
-            let mut out_b = sess_b.process_block_unity_f64(buf_b).unwrap();
-            let (tail_b, _peak_b, carry_b) = sess_b.flush_for_gapless_unity_f64(0.0).unwrap();
+            let pre_b = if pre_a > 0 {
+                sess_b.enable_gapless_prering()
+            } else {
+                0
+            };
+            assert_eq!(pre_b, pre_a, "CQ1 dac_rate={dac_rate}: pre_b != pre_a");
+            let mut out_b = sess_b
+                .process_block_unity_f64(StereoF64Buffer {
+                    sample_rate_hz: 44_100,
+                    left: full_l[n_src_a..].to_vec(),
+                    right: full_r[n_src_a..].to_vec(),
+                })
+                .unwrap();
+            let tail_b = sess_b.flush_unity_f64().unwrap();
             out_b.left.extend_from_slice(&tail_b.left);
-            assert_eq!(out_b.left.len(), (n_internal_b * up_l).div_ceil(down_m));
-            assert!(
-                carry_b.as_ref().and_then(|c| c.additive_output_tail.as_ref()).is_none()
-                    && carry_b.as_ref().and_then(|c| c.convolver.as_ref()).is_none()
-            );
-            assert_eq!(
-                out_a.left.len() + out_b.left.len(),
-                expected_a + (n_internal_b * up_l).div_ceil(down_m)
-            );
+            out_b.right.extend_from_slice(&tail_b.right);
+
+            for i in 0..add_tail.left.len().min(out_b.left.len()) {
+                out_b.left[i] += add_tail.left[i];
+                out_b.right[i] += add_tail.right[i];
+            }
+
+            let mut joined_l = out_a.left;
+            joined_l.extend_from_slice(&out_b.left);
+            let mut joined_r = out_a.right;
+            joined_r.extend_from_slice(&out_b.right);
+
+            let cmp_len = ref_out.left.len().min(joined_l.len());
+            let mut max_err = 0.0_f64;
+            for i in 0..cmp_len {
+                max_err = max_err
+                    .max((joined_l[i] - ref_out.left[i]).abs())
+                    .max((joined_r[i] - ref_out.right[i]).abs());
+            }
+            if down_m == 2 || down_m == 8 {
+                assert!(
+                    max_err < 1e-8,
+                    "CQ1 dac_rate={dac_rate}: Ultimate gapless vs continuous max_err={max_err:.3e}"
+                );
+            } else {
+                assert!(
+                    joined_l.len().abs_diff(ref_out.left.len()) <= 1,
+                    "CQ1 rational length mismatch: {} vs {}",
+                    joined_l.len(),
+                    ref_out.left.len()
+                );
+            }
         }
     }
 }

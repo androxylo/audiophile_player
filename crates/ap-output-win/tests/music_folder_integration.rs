@@ -20,6 +20,7 @@ mod random_music_folder_test {
     use ap_source::library::{default_user_music_dir, pick_random_flac_walk};
 
     #[test]
+    #[ignore = "hardware"]
     fn plays_random_flac_from_user_music_for_10_seconds_via_wdm_ks() {
         let Some(music_dir) = default_user_music_dir() else {
             println!("Skipping: could not resolve ~/Music directory.");

@@ -20,7 +20,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ap_control::state::PlayModeLabel;
 use ap_core::config::{ConvolutionConfig, UltimateConfig};
-use ap_core::filter_db::{FilterDbStore, LibraryManifest, TRUE_PEAK_METER_8X_32};
+use ap_core::filter_db::{FilterDbStore, LibraryManifest, TRUE_PEAK_METER_8X_64};
 use ap_core::format::{DacOutputCapabilities, DacWireFormat};
 use ap_core::user_filters::FilterMode;
 use ap_dsp::analysis::DETECTOR_VERSION;
@@ -425,8 +425,8 @@ fn l3_e2_prescan_agrees_with_scan_and_playback_including_overrides_and_downsampl
     assert_eq!(e2_track.rule, scan_track.rule);
     assert_eq!(
         e2_track.effective_true_peak_meter(),
-        Some(TRUE_PEAK_METER_8X_32),
-        "E2 pre-scan must persist tp8x-32 true peak alongside exact M"
+        Some(TRUE_PEAK_METER_8X_64),
+        "E2 pre-scan must persist tp8x-64 true peak alongside exact M"
     );
 
     // 3. Re-running E2 immediately hits fast-skip (`AlreadyCached`).

@@ -710,6 +710,22 @@ impl Upsampler for FftUpolsUpsampler {
         self.kernel.identity
     }
 
+    fn enable_gapless_prering(&mut self) -> usize {
+        if self.total_in_frames == 0 && !self.has_incoming_carryover && !self.flushed {
+            let pre_internal = self.kernel.pad_tail * self.kernel.ratio;
+            if pre_internal > 0 {
+                self.left = ChannelTiledUpolsState::new(&self.kernel, 0);
+                self.right = ChannelTiledUpolsState::new(&self.kernel, 0);
+                let m_minus_1 = self.kernel.taps_per_phase.saturating_sub(1);
+                self.tail_hist_l = vec![0.0_f64; m_minus_1];
+                self.tail_hist_r = vec![0.0_f64; m_minus_1];
+                self.initial_hist_len = m_minus_1;
+                return pre_internal;
+            }
+        }
+        0
+    }
+
     fn process_block(&mut self, input: StereoF64Buffer) -> Result<StereoF64Buffer, String> {
         if self.flushed {
             return Err(format!(

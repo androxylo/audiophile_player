@@ -23,7 +23,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use ap_core::buffer::StereoF64Buffer;
-use ap_core::filter_db::TRUE_PEAK_METER_8X_32;
+use ap_core::filter_db::TRUE_PEAK_METER_8X_64;
 
 use crate::upsampler::bessel_i0_f64;
 use crate::worker_pool;
@@ -31,26 +31,28 @@ use crate::worker_pool;
 /// Oversampling factor of the E3 true-peak meter (`8x`).
 pub const PEAK_SCAN_OVERSAMPLE: usize = 8;
 
-/// Taps per polyphase branch of the E3 true-peak meter (`32`, i.e. 256-tap 8x prototype).
-pub const PEAK_SCAN_TAPS_PER_PHASE: usize = 32;
+/// Taps per polyphase branch of the E3 true-peak meter (`64`, i.e. 512-tap 8x prototype,
+/// Review #10 §1.4 / HP-03: guarantees `<= 0.1 dB` under-read across `0..=0.45 * fs` even on
+/// short fractional-phase Gaussian tone bursts).
+pub const PEAK_SCAN_TAPS_PER_PHASE: usize = 64;
 
-/// Half-length of each polyphase branch (`16` samples on each side of the center tap).
+/// Half-length of each polyphase branch (`32` samples on each side of the center tap).
 const HALF_TAPS: usize = PEAK_SCAN_TAPS_PER_PHASE / 2;
 
-/// Overlap margin (`20` samples > `HALF_TAPS + 1`) retained on each side of a candidate block so
-/// both the 32-tap FIR kernel and the +/-1 8x-sample parabolic refinement are exact across
+/// Overlap margin (`36` samples > `HALF_TAPS + 1`) retained on each side of a candidate block so
+/// both the 64-tap FIR kernel and the +/-1 8x-sample parabolic refinement are exact across
 /// arbitrary block boundaries.
 const EDGE_CTX: usize = HALF_TAPS + 4;
 
-/// Context window retained before/after each candidate block (`2 * EDGE_CTX = 40` samples) so
+/// Context window retained before/after each candidate block (`2 * EDGE_CTX = 72` samples) so
 /// evaluation can extend `EDGE_CTX` samples into quiet neighbor blocks while still having full
-/// `>= EDGE_CTX` real history for the 32-tap kernel.
+/// `>= EDGE_CTX` real history for the 64-tap kernel.
 const STORED_CTX: usize = 2 * EDGE_CTX;
 
-/// Kaiser beta for the 32-tap/phase (`256`-tap 8x) true-peak prototype.
-/// `beta = 6.0` yields `~60 dB` stopband attenuation with a narrow half-transition width
-/// (`~0.056 * fs`) so passband droop at `0.45 * fs` stays `< 0.03 dB`.
-const KAISER_BETA: f64 = 6.0;
+/// Kaiser beta for the 64-tap/phase (`512`-tap 8x) true-peak prototype (`~76 dB` stopband,
+/// half-transition `~0.037 * fs`, flat to `0.463 * fs` so `0.45 * fs` stays `< 0.05 dB` even at
+/// mid-phase `4/8` on short bursts; Review #10 HP-03).
+const KAISER_BETA: f64 = 7.5;
 
 /// Pass-B gating threshold in dB below the global sample peak (`Issue #23 §3.1`).
 /// An inter-sample peak > +6.02 dB above the sample peak is already treated as unrealistic
@@ -66,8 +68,8 @@ const GATE_LINEAR_RATIO: f64 = 0.495;
 /// (`2_000_000` stereo f64 frames ~= 32 MiB), keeping RAM bounded even on long brickwalled tracks.
 pub const DEFAULT_MAX_BUFFERED_CANDIDATE_FRAMES: usize = 2_000_000;
 
-/// Authoritative meter id stored in Schema-2 YAML alongside `true_peak_dbtp`.
-pub const PEAK_SCAN_METER_ID: &str = TRUE_PEAK_METER_8X_32;
+/// Authoritative meter id stored in Schema-3 YAML alongside `true_peak_dbtp`.
+pub const PEAK_SCAN_METER_ID: &str = TRUE_PEAK_METER_8X_64;
 
 /// Output of a completed E3 whole-file peak scan (`ap_dsp::peak_scan`).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -508,8 +510,11 @@ impl GatedPeakScanner {
                     cancelled.store(true, Ordering::Relaxed);
                     return;
                 }
-                let is_last_at_eof = at_track_end && (*idx + 1 == batch_ref.len());
-                *out_peak = batch_ref[*idx].eval_true_peak(meter, is_last_at_eof);
+                // Review #10 HP-14: any candidate whose right context was truncated by EOF must
+                // evaluate its full remaining right context (not only the final candidate in the
+                // batch, e.g. when a hot block is followed by a short quiet final block < 40 frames).
+                let is_near_eof = at_track_end && batch_ref[*idx].right_ctx_l.len() < STORED_CTX;
+                *out_peak = batch_ref[*idx].eval_true_peak(meter, is_near_eof);
             }
         });
 
@@ -580,8 +585,8 @@ mod tests {
                     let sig: Vec<f64> = (0..len)
                         .map(|n| amp * (2.0 * PI * frac * (n as f64) + phi).sin())
                         .collect();
-                    // Measure steady interior (skip edge zero-step window of 48 samples).
-                    let measured = meter.scan_channel_range(&sig, 48, len - 48);
+                    // Measure steady interior (skip edge zero-step window of 72 samples).
+                    let measured = meter.scan_channel_range(&sig, 72, len - 72);
                     let measured_db = linear_to_db(measured);
                     let under_read = (analytic_db - measured_db).max(0.0);
                     let over_read = (measured_db - analytic_db).max(0.0);
@@ -604,6 +609,33 @@ mod tests {
         }
         assert!(worst_under_read_db <= 0.1);
         assert!(worst_over_read_db <= 0.1);
+
+        // Review #10 §1.4 / HP-03: short Gaussian-windowed tone bursts at 0.40..=0.45 * fs
+        // centered at worst fractional phases (3/8, 4/8, 5/8) MUST also under-read <= 0.1 dB
+        // against the continuous analytic burst peak (`amp`).
+        let burst_len = 512usize;
+        let center_base = 256.0_f64;
+        for &frac in &[0.40_f64, 0.43, 0.45] {
+            for &sigma in &[12.0_f64, 20.0] {
+                for &frac_shift in &[0.375_f64, 0.500, 0.625] {
+                    let t0 = center_base + frac_shift;
+                    let burst: Vec<f64> = (0..burst_len)
+                        .map(|n| {
+                            let dt = (n as f64) - t0;
+                            let env = (-0.5 * (dt / sigma).powi(2)).exp();
+                            amp * env * (2.0 * PI * frac * dt).cos()
+                        })
+                        .collect();
+                    let measured = meter.scan_channel_range(&burst, 72, burst_len - 72);
+                    let measured_db = linear_to_db(measured);
+                    let under_read = (analytic_db - measured_db).max(0.0);
+                    assert!(
+                        under_read <= 0.1,
+                        "T6 burst (HP-03): frac={frac} sigma={sigma} shift={frac_shift}: under-read {under_read:.4} dB > 0.1 dB (measured={measured_db:.4}, analytic={analytic_db:.4})"
+                    );
+                }
+            }
+        }
     }
 
     /// Issue #23 T7 (P2a): Pass-B gating soundness on random signals + worst-case `fs/4 @ 45 deg`

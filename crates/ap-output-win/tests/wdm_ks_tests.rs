@@ -1211,6 +1211,7 @@ fn wavert_loop_controller_ignores_spurious_no_boundary_wakes_without_overwriting
 
 #[cfg(windows)]
 #[test]
+#[ignore = "hardware"]
 fn live_wdm_ks_probes_notification_get_and_hardware_position_on_gungnir2() {
     let _lock = HARDWARE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let sink = WdmKsSink::open("Gungnir 2").expect("failed to locate Gungnir 2 WDM-KS device");
@@ -1298,6 +1299,7 @@ fn live_wdm_ks_probes_notification_get_and_hardware_position_on_gungnir2() {
 
 #[cfg(windows)]
 #[test]
+#[ignore = "hardware"]
 fn live_wdm_ks_enumerates_gungnir2_render_pin() {
     let _lock = HARDWARE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let devices = enumerate_wdm_ks_render_devices().expect("WDM-KS enumeration failed");
@@ -1318,6 +1320,7 @@ fn live_wdm_ks_enumerates_gungnir2_render_pin() {
 
 #[cfg(windows)]
 #[test]
+#[ignore = "hardware"]
 fn live_wdm_ks_probes_gungnir2_up_to_384khz() {
     let _lock = HARDWARE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let sink = WdmKsSink::open("Gungnir 2").expect("failed to locate Gungnir 2 WDM-KS device");
@@ -1336,6 +1339,7 @@ fn live_wdm_ks_probes_gungnir2_up_to_384khz() {
 
 #[cfg(windows)]
 #[test]
+#[ignore = "hardware"]
 fn live_wdm_ks_plays_gentle_384khz_stereo_chord_on_gungnir2() {
     let _lock = HARDWARE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut sink = WdmKsSink::open("Gungnir 2").expect("failed to locate Gungnir 2 WDM-KS device");
@@ -1394,6 +1398,7 @@ fn live_wdm_ks_plays_gentle_384khz_stereo_chord_on_gungnir2() {
 
 #[cfg(windows)]
 #[test]
+#[ignore = "hardware"]
 fn live_wdm_ks_plays_generated_nocturne_24_96_flac_on_gungnir2() {
     let _lock = HARDWARE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))

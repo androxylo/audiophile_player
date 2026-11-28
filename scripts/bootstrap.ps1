@@ -9,6 +9,7 @@ param(
     [string]$Dir = (Join-Path $env:LOCALAPPDATA 'AudiophilePlayer'),
     [string]$Ref = 'main',
     [switch]$Binary,
+    [switch]$SkipAttestation,
     [switch]$NonInteractive,
     [switch]$WhatIf,
     [switch]$SkipShortcuts,
@@ -56,6 +57,24 @@ function Test-ToolchainLinker {
         $ErrorActionPreference = $prevEap
     }
     return [bool](Get-Command link.exe -ErrorAction SilentlyContinue)
+}
+
+function Stop-RunningPlayer([string]$Root) {
+    # Review #10 OD16: cleanly stop any running audiophile-player.exe before overwriting it in $Dir.
+    $installedExe = Join-Path $Root 'audiophile-player.exe'
+    $running = @(Get-Process -Name 'audiophile-player' -ErrorAction SilentlyContinue)
+    if ($running.Count -eq 0) { return }
+    Write-Step 'Stopping running audiophile-player.exe before updating binary'
+    if (Test-Path -LiteralPath $installedExe) {
+        try { & $installedExe stop --when now 2>$null | Out-Null } catch {}
+        Start-Sleep -Milliseconds 500
+    }
+    $still = @(Get-Process -Name 'audiophile-player' -ErrorAction SilentlyContinue)
+    if ($still.Count -gt 0) {
+        Write-Warn 'Graceful stop did not exit; terminating remaining audiophile-player process.'
+        $still | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 300
+    }
 }
 
 function Write-InstallReceipt([string]$Root, [hashtable]$Data) {
@@ -148,6 +167,9 @@ if (-not $Binary) {
         if ($WhatIf) {
             Write-Host "  [WhatIf] Would install via WinGet: $($missing -join ', ')"
         } else {
+            # Review #10 OD18: warn explicitly before launching WinGet installers that trigger UAC.
+            Write-Warn "Windows may display a User Account Control (UAC) elevation prompt to install: $($missing -join ', ')."
+            Write-Warn "If installation pauses, check the taskbar for a blinking UAC shield and click Yes."
             foreach ($pkg in $missing) {
                 $wgArgs = @('install', '--exact', '--id', $pkg, '--source', 'winget', '--accept-package-agreements', '--accept-source-agreements')
                 if ($NonInteractive) {
@@ -197,6 +219,7 @@ if (-not $Binary) {
         if ($cargoToml -match '(?m)^version\s*=\s*"([^"]+)"') { $installVer = $Matches[1] }
     } finally { Pop-Location }
 
+    Stop-RunningPlayer $Dir
     $verDir = Join-Path $Dir "bin\v$installVer"
     New-Item -ItemType Directory -Force -Path $verDir, (Join-Path $Dir 'scripts'), (Join-Path $Dir 'assets'), (Join-Path $Dir 'docs') | Out-Null
     $activeExe = Join-Path $verDir 'audiophile-player.exe'
@@ -261,7 +284,12 @@ if (-not $Binary) {
         $zipSha = $actualHash
         Write-Ok "SHA-256 verified: $zipSha"
 
-        if (Get-Command gh -ErrorAction SilentlyContinue) {
+        # Review #10 OD7: fail closed on missing GitHub provenance attestation in -Binary mode
+        # unless the caller explicitly passes -SkipAttestation (relying on SHA-256 only).
+        if (-not $SkipAttestation) {
+            if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+                Fail "GitHub CLI ('gh') is required to verify build provenance attestation in -Binary mode. Install 'gh' and run 'gh auth login', omit -Binary to build from source, or pass -SkipAttestation to rely on SHA-256 only." 40
+            }
             $ghAuthed = [bool]($env:GH_TOKEN -or $env:GITHUB_TOKEN)
             if (-not $ghAuthed) {
                 $prevEap = $ErrorActionPreference
@@ -273,19 +301,19 @@ if (-not $Binary) {
                     $ErrorActionPreference = $prevEap
                 }
             }
-            if ($ghAuthed) {
-                & gh attestation verify $zipFile --repo $RepoSlug
-                if ($LASTEXITCODE -ne 0) {
-                    Fail 'GitHub build provenance attestation verification FAILED.' 40
-                }
-                Write-Ok 'GitHub build provenance attestation verified.'
-            } else {
-                Write-Warn "gh CLI is installed but not authenticated (run 'gh auth login'); skipped optional GitHub provenance attestation (SHA-256 already verified)."
+            if (-not $ghAuthed) {
+                Fail "GitHub CLI ('gh') is not authenticated (run 'gh auth login') so build provenance attestation cannot be verified. Authenticate 'gh', omit -Binary to build from source, or pass -SkipAttestation to rely on SHA-256 only." 40
             }
+            & gh attestation verify $zipFile --repo $RepoSlug
+            if ($LASTEXITCODE -ne 0) {
+                Fail 'GitHub build provenance attestation verification FAILED.' 40
+            }
+            Write-Ok 'GitHub build provenance attestation verified.'
         } else {
-            Write-Warn 'gh CLI not installed; skipped optional GitHub provenance attestation (SHA-256 already verified).'
+            Write-Warn 'Skipping GitHub build provenance attestation (-SkipAttestation explicitly set; SHA-256 verified).'
         }
 
+        Stop-RunningPlayer $Dir
         $installVer = ($rel.tag_name -replace '^v', '')
         $verDir = Join-Path $Dir "bin\v$installVer"
         if (Test-Path -LiteralPath $verDir) { Remove-Item -Recurse -Force -LiteralPath $verDir }

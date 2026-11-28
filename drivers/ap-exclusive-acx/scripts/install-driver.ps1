@@ -15,7 +15,8 @@
 param(
     [switch]$AcceptTestModeRisk,
     [switch]$NoEnableTestSigning,
-    [switch]$ForceResign
+    [switch]$ForceResign,
+    [switch]$DevCert
 )
 $ErrorActionPreference = "Stop"
 
@@ -236,18 +237,12 @@ foreach ($m in $oldInfs) {
 }
 
 Write-Host "=== 1. Verifying integrity & staging into admin-only directory ($stageDir) ===" -ForegroundColor Cyan
-$srcSigSys = Get-AuthenticodeSignature -FilePath $srcSys
-$srcSigCat = Get-AuthenticodeSignature -FilePath $srcCat
-$srcIsUnsigned = ($srcSigSys.Status -eq "NotSigned" -and $srcSigCat.Status -eq "NotSigned")
-
-if ($expectedHashes.Count -gt 0 -and $srcIsUnsigned) {
+# Review #10 OD2: whenever expected SHA-256 hashes exist (embedded release manifest or SHA256SUMS),
+# ALWAYS verify .sys, .cat, AND .inf unconditionally regardless of Authenticode status, both before
+# copying and again inside the admin-only staging directory immediately before signing.
+if ($expectedHashes.Count -gt 0) {
     Verify-ArtifactHashes -Dir $pkgDir -Expected $expectedHashes
-    Write-Host "SHA-256 integrity verified for unsigned release artifacts." -ForegroundColor Green
-} elseif ($expectedHashes.Count -gt 0 -and -not $srcIsUnsigned) {
-    Write-Host "Source artifacts already signed; verifying INF hash..." -ForegroundColor Yellow
-    if ($expectedHashes.ContainsKey("ap_exclusive_audio.inf")) {
-        Verify-ArtifactHashes -Dir $pkgDir -Expected @{ "ap_exclusive_audio.inf" = $expectedHashes["ap_exclusive_audio.inf"] }
-    }
+    Write-Host "SHA-256 integrity verified for all release artifacts (.sys, .cat, .inf)." -ForegroundColor Green
 }
 
 Ensure-AdminOnlyDirectory $stageDir
@@ -257,8 +252,8 @@ $catPath = Join-Path $stageDir "ap_exclusive_audio.cat"
 Copy-Item -Force -LiteralPath $srcSys -Destination $sysPath
 Copy-Item -Force -LiteralPath $srcInf -Destination $infPath
 Copy-Item -Force -LiteralPath $srcCat -Destination $catPath
-if ($expectedHashes.Count -gt 0 -and $srcIsUnsigned) {
-    # Re-verify inside the admin-only directory to close any TOCTOU window (Review #8 D2).
+if ($expectedHashes.Count -gt 0) {
+    # Re-verify inside the admin-only directory to close any TOCTOU window (Review #8 D2 + Review #10 OD2).
     Verify-ArtifactHashes -Dir $stageDir -Expected $expectedHashes
 }
 
@@ -270,10 +265,15 @@ if ($infContent -match '(?m)^DriverVer\s*=\s*[^,\r\n]+,\s*([0-9]+\.[0-9]+\.[0-9]
 }
 
 Write-Host "`n=== 2. Local test-signing (ephemeral key - private key deleted immediately) ===" -ForegroundColor Cyan
+# Review #10 OD1: NEVER auto-import an arbitrary ApExclusiveTestCert.cer from $pkgDir into
+# LocalMachine\Root unless the caller explicitly opts in with -DevCert for a local WDK build!
 $cerFile = Join-Path $pkgDir "ApExclusiveTestCert.cer"
 if ((Test-Path -LiteralPath $cerFile) -and -not $ForceResign) {
+    if (-not $DevCert) {
+        throw "Security guard (OD1): found '$cerFile' in driver directory, but refusing to import a pre-existing certificate into LocalMachine\Root without explicit -DevCert. Delete the .cer file (or pass -ForceResign) to use an ephemeral per-install certificate, or pass -DevCert for local WDK development."
+    }
     $devThumb = Import-ValidatedPublicCert $cerFile
-    Write-Host "Validated & trusted local developer certificate (Thumbprint: $devThumb)." -ForegroundColor Green
+    Write-Host "Validated & trusted explicit local developer certificate (-DevCert, Thumbprint: $devThumb)." -ForegroundColor Green
 }
 
 $sigSys = Get-AuthenticodeSignature -FilePath $sysPath

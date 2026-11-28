@@ -8,6 +8,7 @@ use ap_output_win::sink::OutputError;
 use ap_output_win::wasapi_exclusive::{
     WasapiLoopController, WasapiRenderDevice, WasapiStepOutcome, aligned_buffer_duration_hns,
     classify_wasapi_hr, negotiate_channel_mask_with_probe, select_wasapi_device,
+    should_fallback_wasapi_event_to_push,
 };
 use ap_output_win::wdm_ks::{StreamBlock, StreamingWaveRtPump, WaveRtFramePump};
 
@@ -93,8 +94,11 @@ fn select_wasapi_device_prefers_usb_dac_and_excludes_own_virtual_endpoint() {
 
 #[test]
 fn wasapi_loop_controller_drains_cleanly_at_eof_and_fades_on_stop() {
+    // Review #10 OD3: both a partial final audio period and a stop fade-out period written at
+    // event k only begin clocking out at event k+1, so 2 full trailing silent periods MUST follow
+    // the last audible period before returning `Finished`.
     // 1. Complete EOF playback: 10 frames across period_frames=4 -> prefill(4), ev1(4), ev2(2+pad),
-    //    ev3(silent -> Finished).
+    //    ev3(silent #1 -> Continue), ev4(silent #2 -> Finished).
     let frames: Vec<[i32; 2]> = (1..=10).map(|i| [i * 1000, -i * 1000]).collect();
     let mut pump = WaveRtFramePump::new(&frames, DacWireFormat::Int32);
     let mut ctrl = WasapiLoopController::new(4, 8).unwrap();
@@ -112,10 +116,13 @@ fn wasapi_loop_controller_drains_cleanly_at_eof_and_fades_on_stop() {
     assert_eq!(ctrl.frames_played(), 10);
 
     let (s3, o3) = ctrl.on_event(&mut buf, &mut pump, false).unwrap();
-    assert!(s3 && o3 == WasapiStepOutcome::Finished);
+    assert!(s3 && o3 == WasapiStepOutcome::Continue, "OD3: partial final period needs 2 silent periods");
+
+    let (s4, o4) = ctrl.on_event(&mut buf, &mut pump, false).unwrap();
+    assert!(s4 && o4 == WasapiStepOutcome::Finished);
     assert_eq!(ctrl.underrun_periods(), 0);
 
-    // 2. Mid-track stop fade-out: queues 1 faded period then 1 silent period -> Finished.
+    // 2. Mid-track stop fade-out: queues 1 faded period then 2 full silent periods -> Finished.
     let long_frames = vec![[1_000_000_000_i32, -1_000_000_000_i32]; 64];
     let mut pump2 = WaveRtFramePump::new(&long_frames, DacWireFormat::Int32);
     let mut ctrl2 = WasapiLoopController::new(8, 8).unwrap();
@@ -129,8 +136,39 @@ fn wasapi_loop_controller_drains_cleanly_at_eof_and_fades_on_stop() {
     let last_l = i32::from_le_bytes(buf2[56..60].try_into().unwrap()).abs();
     assert!(first_l > last_l, "expected fade-out ramp: first={first_l}, last={last_l}");
 
+    let (sil1, out1) = ctrl2.on_event(&mut buf2, &mut pump2, true).unwrap();
+    assert!(sil1 && out1 == WasapiStepOutcome::Continue, "OD3: fade period needs 2 silent periods");
+
     let (end_silent, end_out) = ctrl2.on_event(&mut buf2, &mut pump2, true).unwrap();
     assert!(end_silent && end_out == WasapiStepOutcome::Finished);
+}
+
+#[test]
+fn od4_wasapi_event_to_push_fallback_classifier_only_triggers_on_event_errors() {
+    assert!(should_fallback_wasapi_event_to_push(&OutputError::Win32 {
+        operation: "WaitForSingleObject(WASAPI)",
+        code: 258,
+        detail: "timeout".to_string(),
+    }));
+    assert!(should_fallback_wasapi_event_to_push(&OutputError::Win32 {
+        operation: "IAudioClient::SetEventHandle",
+        code: 0x8007_0057,
+        detail: "failed".to_string(),
+    }));
+    assert!(!should_fallback_wasapi_event_to_push(&OutputError::DeviceBusy {
+        device: "DAC".to_string(),
+        os_error: 0x8889_000A,
+        detail: "in use".to_string(),
+    }));
+    assert!(!should_fallback_wasapi_event_to_push(&OutputError::UnsupportedFormat {
+        sample_rate_hz: 384_000,
+        wire_format: DacWireFormat::Int32,
+        os_error: 0x8889_0008,
+        detail: "unsupported".to_string(),
+    }));
+    assert!(!should_fallback_wasapi_event_to_push(&OutputError::DeviceNotFound(
+        "unplugged".to_string()
+    )));
 }
 
 #[test]
@@ -229,6 +267,7 @@ fn build_wasapi_wave_format_builds_exact_integer_pcm_containers() {
 
 #[cfg(windows)]
 #[test]
+#[ignore = "hardware"]
 fn hardware_live_enumerate_and_probe_wasapi_exclusive_devices() {
     use ap_output_win::wasapi_exclusive::{
         enumerate_wasapi_render_devices, probe_wasapi_device_format,

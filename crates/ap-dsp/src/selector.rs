@@ -932,6 +932,49 @@ fn resolve_ultimate_filter_choice(
     let is_effective_1x = sample_rate_hz <= 48_000 || is_fake_hires;
 
     // Priority 1: Explicit user override (YAML `user.filter` > Vorbis `AP_FILTER`).
+    // Priority 1 & 2 (Review #10 HP-09): User filter vs user phase overrides, honoring
+    // specificity (`Track > Folder > Tag > Default`) so e.g. a track- or folder-level `phase:`
+    // override beats a less-specific `defaults: filter:` override. At equal specificity, explicit
+    // `filter:` wins over `phase:`.
+    let phase_beats_filter = match (&fused.phase_override, &fused.user_filter) {
+        (Some(phase_ev), Some(_)) if !matches!(phase_ev.value, PhaseTagOverride::Linear) => {
+            let p_rank = fused
+                .phase_override_provenance
+                .unwrap_or(UserFilterProvenance::Track)
+                .specificity_rank();
+            let f_rank = fused
+                .user_filter_provenance
+                .unwrap_or(UserFilterProvenance::Track)
+                .specificity_rank();
+            p_rank > f_rank
+        }
+        _ => false,
+    };
+
+    if phase_beats_filter {
+        if let Some(ref phase_ev) = fused.phase_override {
+            match phase_ev.value {
+                PhaseTagOverride::Minimum => {
+                    return (
+                        FilterArchetype::MinphaseLong,
+                        "user_phase_min".to_string(),
+                        format!("ultimate: {} -> minphase-long", phase_ev.detail),
+                        warnings,
+                    );
+                }
+                PhaseTagOverride::Intermediate => {
+                    return (
+                        FilterArchetype::IntermediateLong,
+                        "user_phase_ip".to_string(),
+                        format!("ultimate: {} -> intermediate-long", phase_ev.detail),
+                        warnings,
+                    );
+                }
+                PhaseTagOverride::Linear => {}
+            }
+        }
+    }
+
     if let Some(ref uf) = fused.user_filter {
         match FilterArchetype::from_str(&uf.value) {
             Ok(arch) => {
@@ -972,7 +1015,7 @@ fn resolve_ultimate_filter_choice(
         }
     }
 
-    // Priority 2: Explicit user `AP_PHASE` Vorbis tag (`min` -> #6, `ip` -> #7).
+    // Priority 2: Explicit user `AP_PHASE` / `my-filters.yaml phase:` (`min` -> #6, `ip` -> #7).
     if let Some(ref phase_ev) = fused.phase_override {
         match phase_ev.value {
             PhaseTagOverride::Minimum => {
@@ -1170,7 +1213,40 @@ pub fn select_ultimate_plan(
         let mut winning_rule = "short_track_bypass".to_string();
         let mut user_provenance = None;
         if policy.filter_override.is_none() {
-            if let Some(ref uf) = fused.user_filter {
+            let phase_beats_filter = match (&fused.phase_override, &fused.user_filter) {
+                (Some(ph), Some(_)) if !matches!(ph.value, PhaseTagOverride::Linear) => {
+                    let p_rank = fused
+                        .phase_override_provenance
+                        .unwrap_or(UserFilterProvenance::Track)
+                        .specificity_rank();
+                    let f_rank = fused
+                        .user_filter_provenance
+                        .unwrap_or(UserFilterProvenance::Track)
+                        .specificity_rank();
+                    p_rank > f_rank
+                }
+                _ => false,
+            };
+            if phase_beats_filter {
+                if let Some(ref ph) = fused.phase_override {
+                    let prov = fused
+                        .phase_override_provenance
+                        .unwrap_or(UserFilterProvenance::Track);
+                    match ph.value {
+                        PhaseTagOverride::Minimum => {
+                            eff_policy.filter_override = Some(FilterArchetype::MinphaseLong);
+                            winning_rule = "user_phase_min".to_string();
+                            user_provenance = Some(prov);
+                        }
+                        PhaseTagOverride::Intermediate => {
+                            eff_policy.filter_override = Some(FilterArchetype::IntermediateLong);
+                            winning_rule = "user_phase_ip".to_string();
+                            user_provenance = Some(prov);
+                        }
+                        PhaseTagOverride::Linear => {}
+                    }
+                }
+            } else if let Some(ref uf) = fused.user_filter {
                 match FilterArchetype::from_str(&uf.value) {
                     Ok(arch) => {
                         let chosen = if is_streaming_source && !arch.is_streaming_safe() {
@@ -1196,16 +1272,19 @@ pub fn select_ultimate_plan(
                     )),
                 }
             } else if let Some(ref ph) = fused.phase_override {
+                let prov = fused
+                    .phase_override_provenance
+                    .unwrap_or(UserFilterProvenance::Track);
                 match ph.value {
                     PhaseTagOverride::Minimum => {
                         eff_policy.filter_override = Some(FilterArchetype::MinphaseLong);
                         winning_rule = "user_phase_min".to_string();
-                        user_provenance = Some(UserFilterProvenance::Track);
+                        user_provenance = Some(prov);
                     }
                     PhaseTagOverride::Intermediate => {
                         eff_policy.filter_override = Some(FilterArchetype::IntermediateLong);
                         winning_rule = "user_phase_ip".to_string();
-                        user_provenance = Some(UserFilterProvenance::Track);
+                        user_provenance = Some(prov);
                     }
                     PhaseTagOverride::Linear => {}
                 }

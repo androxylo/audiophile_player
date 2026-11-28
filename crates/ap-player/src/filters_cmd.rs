@@ -32,51 +32,52 @@ use crate::cli_args::{CommonPaths, FiltersAction, FiltersCommand};
 
 type FiltersEnv = DbEnv;
 
-fn load_env(paths: &CommonPaths) -> Result<FiltersEnv, String> {
-    let loaded = PlayerConfig::discover_and_load(paths.config_path.as_deref())?;
+fn load_env(paths: &CommonPaths) -> Result<FiltersEnv, crate::exit_codes::CliError> {
+    let loaded = PlayerConfig::discover_and_load(paths.config_path.as_deref())
+        .map_err(crate::exit_codes::CliError::config)?;
     let default_music = default_user_music_dir().filter(|p| p.is_dir());
-    Ok(DbEnv::resolve(
+    let env = DbEnv::resolve(
         &loaded.config,
         paths.filterdb_dir.as_deref(),
         paths.choices_file.as_deref(),
         paths.trackdb_dir.as_deref(),
         default_music.as_deref(),
         DETECTOR_VERSION,
-    ))
+    );
+    env.validate_writable_paths_outside_roots()
+        .map_err(crate::exit_codes::CliError::config)?;
+    Ok(env)
 }
 
-fn load_user_filters_if_present(path: &Path) -> Result<Option<UserFiltersFile>, String> {
+fn load_user_filters_if_present(
+    path: &Path,
+) -> Result<Option<UserFiltersFile>, crate::exit_codes::CliError> {
     if !path.is_file() {
         return Ok(None);
     }
-    let text = fs::read_to_string(path)
-        .map_err(|e| format!("failed to read '{}': {e}", path.display()))?;
-    let parsed = UserFiltersFile::from_yaml_str(&text)?;
+    let text = fs::read_to_string(path).map_err(|e| {
+        crate::exit_codes::CliError::general(format!("failed to read '{}': {e}", path.display()))
+    })?;
+    let parsed = UserFiltersFile::from_yaml_str(&text)
+        .map_err(crate::exit_codes::CliError::config)?;
     Ok(Some(parsed))
 }
 
 /// Dispatch entrypoint for `audiophile-player filters <SUBCOMMAND>`.
+/// Review #10 CS4: returns typed `CliError` (exit 4 for config/YAML errors, exit 2 for unknown
+/// filter names, exit 1 for general runtime/I/O errors).
 pub fn run_filters_cli(cmd: FiltersCommand) -> Result<(), crate::exit_codes::CliError> {
-    let is_check = matches!(cmd.action, FiltersAction::Check);
-    match run_filters_capture(cmd) {
-        Ok(out) => {
-            print!("{out}");
-            Ok(())
-        }
-        Err(msg) => {
-            // Review #9 Q8: `filters check` failures (lint issues or invalid YAML/config) return
-            // documented exit code 4 (`EXIT_CONFIG_ERROR`), never guessed from text.
-            if is_check {
-                Err(crate::exit_codes::CliError::config(msg))
-            } else {
-                Err(crate::exit_codes::CliError::general(msg))
-            }
-        }
-    }
+    let out = run_filters_capture_typed(cmd)?;
+    print!("{out}");
+    Ok(())
 }
 
 /// Run a `filters` subcommand and capture its human-readable output (shared by CLI & MCP, Q12).
 pub fn run_filters_capture(cmd: FiltersCommand) -> Result<String, String> {
+    run_filters_capture_typed(cmd).map_err(|e| e.message)
+}
+
+fn run_filters_capture_typed(cmd: FiltersCommand) -> Result<String, crate::exit_codes::CliError> {
     let mut env = load_env(&cmd.paths)?;
     match cmd.action {
         FiltersAction::Show { target } => cmd_show(&env, &target),
@@ -89,7 +90,9 @@ pub fn run_filters_capture(cmd: FiltersCommand) -> Result<String, String> {
         FiltersAction::Check => {
             let (out, issues) = cmd_check(&env)?;
             if issues > 0 {
-                return Err(format!("{out}my-filters.yaml check found {issues} issue(s)"));
+                return Err(crate::exit_codes::CliError::config(format!(
+                    "{out}my-filters.yaml check found {issues} issue(s)"
+                )));
             }
             Ok(out)
         }
@@ -98,7 +101,11 @@ pub fn run_filters_capture(cmd: FiltersCommand) -> Result<String, String> {
     }
 }
 
-fn cmd_show(env: &FiltersEnv, target: &Path) -> Result<String, String> {
+fn cmd_show(env: &FiltersEnv, target: &Path) -> Result<String, crate::exit_codes::CliError> {
+    // Review #10 CS3: reject UNC (`\\server\share`) and Windows device/verbatim paths BEFORE any
+    // filesystem syscall (`is_file`/`is_dir`) so Windows never initiates outbound SMB auth.
+    ap_core::config::validate_local_path_syntax_str(&target.to_string_lossy(), "filters show target")
+        .map_err(|e| crate::exit_codes::CliError::usage(e, "pass a local path or 'root:rel' key"))?;
     let uf = load_user_filters_if_present(&env.choices_path)?;
     let mut out = String::new();
 
@@ -129,10 +136,10 @@ fn cmd_show(env: &FiltersEnv, target: &Path) -> Result<String, String> {
                     .map(|k| (root.clone(), rel_folder.clone(), k.clone(), None))
                     .collect()
             } else {
-                return Err(format!(
+                return Err(crate::exit_codes::CliError::general(format!(
                     "no FLAC files or cached analysis found for '{}'",
                     target.display()
-                ));
+                )));
             }
         } else {
             flacs
@@ -153,8 +160,13 @@ fn cmd_show(env: &FiltersEnv, target: &Path) -> Result<String, String> {
                 .collect()
         }
     } else if let Some(raw) = target.to_str() {
-        if raw.contains(':') {
+        if raw.contains(':') && !target.is_absolute() {
             let (root, rel) = split_root_key(raw);
+            if !env.manifest.roots.contains_key(root) {
+                return Err(crate::exit_codes::CliError::general(format!(
+                    "target '{raw}' does not exist on disk and '{root}' is not a registered library root"
+                )));
+            }
             if rel.to_ascii_lowercase().ends_with(".flac") {
                 let (rf, fnm) = match rel.rsplit_once('/') {
                     Some((d, f)) => (d.to_string(), f.to_string()),
@@ -172,13 +184,21 @@ fn cmd_show(env: &FiltersEnv, target: &Path) -> Result<String, String> {
                     })
                     .collect()
             } else {
-                return Err(format!("target '{raw}' not found on disk or in filterdb"));
+                return Err(crate::exit_codes::CliError::general(format!(
+                    "target '{raw}' not found on disk or in filterdb"
+                )));
             }
         } else {
-            return Err(format!("target '{}' does not exist", target.display()));
+            return Err(crate::exit_codes::CliError::general(format!(
+                "target '{}' does not exist",
+                target.display()
+            )));
         }
     } else {
-        return Err(format!("target '{}' does not exist", target.display()));
+        return Err(crate::exit_codes::CliError::general(format!(
+            "target '{}' does not exist",
+            target.display()
+        )));
     };
 
     for (root, rel_folder, file_name, abs_opt) in files_to_show {
@@ -239,7 +259,7 @@ fn cmd_show(env: &FiltersEnv, target: &Path) -> Result<String, String> {
     Ok(out)
 }
 
-fn cmd_diff(env: &FiltersEnv) -> Result<String, String> {
+fn cmd_diff(env: &FiltersEnv) -> Result<String, crate::exit_codes::CliError> {
     let uf = load_user_filters_if_present(&env.choices_path)?;
     let albums = env.filter_db.load_all_albums();
     let mut out = String::new();
@@ -309,30 +329,37 @@ fn cmd_set(
     target: &Path,
     filter: &str,
     note: Option<&str>,
-) -> Result<String, String> {
+) -> Result<String, crate::exit_codes::CliError> {
+    // Review #10 CS3: reject UNC (`\\server\share`) and Windows device/verbatim paths BEFORE
+    // any filesystem syscall (`is_dir`/`is_file`/`FlacBlockReader::open`).
+    ap_core::config::validate_local_path_syntax_str(&target.to_string_lossy(), "filters set target")
+        .map_err(|e| crate::exit_codes::CliError::usage(e, "pass a local path or 'root:rel' key"))?;
     let filter_trimmed = filter.trim();
     if !is_known_filter_name(filter_trimmed) {
-        return Err(format!(
-            "unknown filter '{filter_trimmed}'; valid filters: {}",
-            ap_core::user_filters::KNOWN_FILTER_NAMES.join(", ")
+        return Err(crate::exit_codes::CliError::usage(
+            format!(
+                "unknown filter '{filter_trimmed}'; valid filters: {}",
+                ap_core::user_filters::KNOWN_FILTER_NAMES.join(", ")
+            ),
+            "run `audiophile-player help --filter` to see valid filter names",
         ));
     }
 
     let (section, key, md5_opt) = if target.is_dir() {
         let (root, rel) = env.manifest.resolve_folder_path(target).ok_or_else(|| {
-            format!(
+            crate::exit_codes::CliError::general(format!(
                 "folder '{}' is not under any configured library root (run `audiophile-player scan` or add [filters.roots] in config.toml)",
                 target.display()
-            )
+            ))
         })?;
         ("folders", format_root_rel_key(&root, &rel, None), None)
     } else if target.is_file() {
         let (root, rel_folder, fname) =
             env.manifest.resolve_track_path(target).ok_or_else(|| {
-                format!(
+                crate::exit_codes::CliError::general(format!(
                     "file '{}' is not under any configured library root (run `audiophile-player scan` or add [filters.roots] in config.toml)",
                     target.display()
-                )
+                ))
             })?;
         let md5 = FlacBlockReader::open(target)
             .ok()
@@ -344,8 +371,15 @@ fn cmd_set(
             md5,
         )
     } else if let Some(raw) = target.to_str() {
-        if raw.contains(':') {
+        // Review #10 CS6: only treat non-existent `a:b` as a `root:rel` key when it is NOT an
+        // absolute drive path (e.g. `D:\Music\Typo\01.flac`) AND `a` is an actual registered root!
+        if raw.contains(':') && !target.is_absolute() {
             let (root, rel) = split_root_key(raw);
+            if !env.manifest.roots.contains_key(root) {
+                return Err(crate::exit_codes::CliError::general(format!(
+                    "target '{raw}' does not exist on disk and '{root}' is not a registered library root"
+                )));
+            }
             let is_track = rel.to_ascii_lowercase().ends_with(".flac");
             let sec = if is_track { "tracks" } else { "folders" };
             let key = if rel.is_empty() {
@@ -355,20 +389,25 @@ fn cmd_set(
             };
             (sec, key, None)
         } else {
-            return Err(format!(
-                "target '{}' does not exist on disk and is not a 'root:rel/path' key",
+            return Err(crate::exit_codes::CliError::general(format!(
+                "target '{}' does not exist on disk and is not a registered 'root:rel/path' key",
                 target.display()
-            ));
+            )));
         }
     } else {
-        return Err(format!("target '{}' does not exist", target.display()));
+        return Err(crate::exit_codes::CliError::general(format!(
+            "target '{}' does not exist",
+            target.display()
+        )));
     };
 
     let existing = if env.choices_path.is_file() {
-        Some(
-            fs::read_to_string(&env.choices_path)
-                .map_err(|e| format!("failed to read '{}': {e}", env.choices_path.display()))?,
-        )
+        Some(fs::read_to_string(&env.choices_path).map_err(|e| {
+            crate::exit_codes::CliError::general(format!(
+                "failed to read '{}': {e}",
+                env.choices_path.display()
+            ))
+        })?)
     } else {
         None
     };
@@ -384,7 +423,7 @@ fn cmd_set(
         note,
     );
     // Sanity-parse before touching disk!
-    UserFiltersFile::from_yaml_str(&updated)?;
+    UserFiltersFile::from_yaml_str(&updated).map_err(crate::exit_codes::CliError::config)?;
     write_user_filters_with_backup(&env.choices_path, &updated)?;
 
     Ok(format!(
@@ -393,7 +432,7 @@ fn cmd_set(
     ))
 }
 
-fn cmd_check(env: &FiltersEnv) -> Result<(String, usize), String> {
+fn cmd_check(env: &FiltersEnv) -> Result<(String, usize), crate::exit_codes::CliError> {
     if !env.choices_path.is_file() {
         return Ok((
             format!(
@@ -403,9 +442,13 @@ fn cmd_check(env: &FiltersEnv) -> Result<(String, usize), String> {
             0,
         ));
     }
-    let text = fs::read_to_string(&env.choices_path)
-        .map_err(|e| format!("failed to read '{}': {e}", env.choices_path.display()))?;
-    let uf = UserFiltersFile::from_yaml_str(&text)?;
+    let text = fs::read_to_string(&env.choices_path).map_err(|e| {
+        crate::exit_codes::CliError::general(format!(
+            "failed to read '{}': {e}",
+            env.choices_path.display()
+        ))
+    })?;
+    let uf = UserFiltersFile::from_yaml_str(&text).map_err(crate::exit_codes::CliError::config)?;
     let issues = uf.lint(Some(&env.manifest));
 
     let mut out = String::new();
@@ -423,7 +466,7 @@ fn cmd_check(env: &FiltersEnv) -> Result<(String, usize), String> {
     Ok((out, issues.len()))
 }
 
-fn cmd_relink(env: &FiltersEnv, apply: bool) -> Result<String, String> {
+fn cmd_relink(env: &FiltersEnv, apply: bool) -> Result<String, crate::exit_codes::CliError> {
     let Some(mut report) = env.filter_db.load_relink_report() else {
         return Ok("No pending moved files to relink (relink-report.yaml not present).\n".to_string());
     };
@@ -448,15 +491,19 @@ fn cmd_relink(env: &FiltersEnv, apply: bool) -> Result<String, String> {
     }
 
     if !env.choices_path.is_file() {
-        return Err(format!(
+        return Err(crate::exit_codes::CliError::general(format!(
             "cannot apply relink: '{}' does not exist",
             env.choices_path.display()
-        ));
+        )));
     }
-    let existing = fs::read_to_string(&env.choices_path)
-        .map_err(|e| format!("failed to read '{}': {e}", env.choices_path.display()))?;
+    let existing = fs::read_to_string(&env.choices_path).map_err(|e| {
+        crate::exit_codes::CliError::general(format!(
+            "failed to read '{}': {e}",
+            env.choices_path.display()
+        ))
+    })?;
     let (updated, applied_count) = apply_relink_preserving_comments(&existing, &report.moves);
-    UserFiltersFile::from_yaml_str(&updated)?;
+    UserFiltersFile::from_yaml_str(&updated).map_err(crate::exit_codes::CliError::config)?;
     write_user_filters_with_backup(&env.choices_path, &updated)?;
 
     report.moves.clear();
@@ -470,7 +517,10 @@ fn cmd_relink(env: &FiltersEnv, apply: bool) -> Result<String, String> {
     Ok(out)
 }
 
-fn cmd_migrate(env: &mut FiltersEnv, sidecar_root: Option<&Path>) -> Result<String, String> {
+fn cmd_migrate(
+    env: &mut FiltersEnv,
+    sidecar_root: Option<&Path>,
+) -> Result<String, crate::exit_codes::CliError> {
     let mut entries: Vec<TrackDbEntry> = Vec::new();
 
     // 1. Collect legacy Schema-1 YAML files from `trackdb/{md5,path,move}`.
@@ -630,7 +680,7 @@ fn cmd_migrate(env: &mut FiltersEnv, sidecar_root: Option<&Path>) -> Result<Stri
             );
             migrated_user_choices += 1;
         }
-        UserFiltersFile::from_yaml_str(&text)?;
+        UserFiltersFile::from_yaml_str(&text).map_err(crate::exit_codes::CliError::config)?;
         write_user_filters_with_backup(&env.choices_path, &text)?;
     }
 

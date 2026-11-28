@@ -534,9 +534,12 @@ fn review6_gena_per_sid_strict_seq_ordering_per_peer_cap_and_ssdp_unicast_mx0() 
     });
 
     let hub = GenaEventHub::start();
+    let lo1 = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+    let lo2 = std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2));
     let (_sid, _timeout, initial_job) = hub
         .subscribe(
             GenaService::AvTransport,
+            lo1,
             &format!("<http://127.0.0.1:{cb_port}/cb>"),
             Some("Second-300"),
             "<e:propertyset/>".to_string(),
@@ -554,13 +557,41 @@ fn review6_gena_per_sid_strict_seq_ordering_per_peer_cap_and_ssdp_unicast_mx0() 
         "GENA NOTIFY events for the same SID must arrive strictly in SEQ 0..=20 order!"
     );
 
-    // 2. Follow-up (gena.rs:129): Per-peer cap (max 4 subscriptions per peer IP) prevents one LAN
-    //    peer from exhausting all 16 global slots!
+    // 2. Follow-up (gena.rs:129) + Review #10 SR4: Per-peer cap keyed on TCP peer IP, and
+    //    cross-host / loopback SSRF callbacks are rejected!
     let hub_cap = GenaEventHub::new_for_test();
+    let lan_peer = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 50));
+    assert!(
+        matches!(
+            hub_cap.subscribe(
+                GenaService::AvTransport,
+                lan_peer,
+                "<http://127.0.0.1:8085/cb>",
+                Some("Second-300"),
+                "<e:propertyset/>".to_string(),
+            ),
+            Err(SubscribeError::InvalidRequest(_))
+        ),
+        "SR4: remote LAN peer must NOT register loopback GENA callback"
+    );
+    assert!(
+        matches!(
+            hub_cap.subscribe(
+                GenaService::AvTransport,
+                lan_peer,
+                "<http://192.168.1.99:50000/cb>",
+                Some("Second-300"),
+                "<e:propertyset/>".to_string(),
+            ),
+            Err(SubscribeError::InvalidRequest(_))
+        ),
+        "SR4: peer must NOT register GENA callback targeting a different host IP"
+    );
     for i in 0..4 {
         hub_cap
             .subscribe(
                 GenaService::AvTransport,
+                lo1,
                 &format!("<http://127.0.0.1:{}/cb>", 50_000 + i),
                 Some("Second-1800"),
                 "<e:propertyset/>".to_string(),
@@ -569,6 +600,7 @@ fn review6_gena_per_sid_strict_seq_ordering_per_peer_cap_and_ssdp_unicast_mx0() 
     }
     let fifth = hub_cap.subscribe(
         GenaService::AvTransport,
+        lo1,
         "<http://127.0.0.1:50004/cb>",
         Some("Second-1800"),
         "<e:propertyset/>".to_string(),
@@ -582,6 +614,7 @@ fn review6_gena_per_sid_strict_seq_ordering_per_peer_cap_and_ssdp_unicast_mx0() 
     hub_cap
         .subscribe(
             GenaService::AvTransport,
+            lo2,
             "<http://127.0.0.2:50005/cb>",
             Some("Second-1800"),
             "<e:propertyset/>".to_string(),

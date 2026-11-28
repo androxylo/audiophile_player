@@ -21,8 +21,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::filter_db::{
-    FILTER_DB_SCHEMA_VERSION, LibraryManifest, RelinkEntry, normalize_rel_path, split_root_key,
+    LibraryManifest, RelinkEntry, normalize_rel_path, split_root_key,
 };
+
+/// Schema version for user-owned `my-filters.yaml` (deliberately decoupled from the cache
+/// `FILTER_DB_SCHEMA_VERSION` so cache resets NEVER break or invalidate user choices, §1.3).
+pub const USER_FILTERS_SCHEMA_VERSION: u32 = 2;
 use crate::metadata::{PhaseTagOverride, TrackMetadata};
 use crate::yaml_lite::{
     atomic_write_yaml, check_yaml_line_safety, file_size_and_mtime, parse_yaml_string,
@@ -156,6 +160,18 @@ impl UserFilterProvenance {
             Self::Default => "mine: default",
         }
     }
+
+    /// Specificity rank (`Track > Folder > Tag > Default`) so a more specific `phase:` override
+    /// (e.g. `tracks:` or `folders:`) beats a less specific `filter:` override (e.g. `defaults:`,
+    /// Review #10 HP-09).
+    pub const fn specificity_rank(self) -> u8 {
+        match self {
+            Self::Track => 4,
+            Self::Folder => 3,
+            Self::Tag => 2,
+            Self::Default => 1,
+        }
+    }
 }
 
 /// Merged effective user overrides for one track after walking the full specificity chain.
@@ -265,9 +281,9 @@ impl UserFiltersFile {
                         let ver = val.parse::<u32>().map_err(|_| {
                             format!("my-filters.yaml line {line_no}: invalid schema '{val}'")
                         })?;
-                        if ver != FILTER_DB_SCHEMA_VERSION {
+                        if ver != USER_FILTERS_SCHEMA_VERSION {
                             return Err(format!(
-                                "my-filters.yaml line {line_no}: unsupported schema {ver} (expected {FILTER_DB_SCHEMA_VERSION})"
+                                "my-filters.yaml line {line_no}: unsupported schema {ver} (expected {USER_FILTERS_SCHEMA_VERSION})"
                             ));
                         }
                         out.schema = ver;

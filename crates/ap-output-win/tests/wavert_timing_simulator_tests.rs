@@ -161,11 +161,16 @@ impl FakeWaveRtDevice {
         if !self.cfg.explicit_wakes_ns.is_empty() {
             return self.cfg.explicit_wakes_ns.get(idx).copied();
         }
-        let period_ns = self.cfg.wake_period_ns.unwrap_or_else(|| {
-            let rate = f64::from(self.cfg.sample_rate_hz) * (1.0 + self.cfg.dma_ppm * 1e-6);
-            ((self.cfg.half_frames as f64) / rate * 1e9).round() as u64
-        });
-        let base = period_ns.saturating_mul((idx + 1) as u64);
+        // Hardware WaveRT DMA interrupts fire on DMA half-buffer crossings (at `dma_rate`, never
+        // before the DMA cursor crosses the boundary), while the host wall clock (`SharedSimClock`)
+        // ticks at nominal `sample_rate_hz` — OR a caller can supply an explicit decoupled
+        // `wake_period_ns` (e.g. nominal host timer) to test uncoupled wake-vs-DMA clock drift.
+        let base = if let Some(period_ns) = self.cfg.wake_period_ns {
+            period_ns.saturating_mul((idx + 1) as u64)
+        } else {
+            let dma_rate = f64::from(self.cfg.sample_rate_hz) * (1.0 + self.cfg.dma_ppm * 1e-6);
+            ((((idx + 1) as f64) * (self.cfg.half_frames as f64) / dma_rate) * 1e9).ceil() as u64
+        };
         let jitter = if self.cfg.jitter_max_ns > 0 {
             self.next_u64() % self.cfg.jitter_max_ns
         } else {
@@ -269,11 +274,19 @@ impl WaveRtDevice for FakeWaveRtDevice {
 }
 
 /// Analyze tapped left-channel frame stamps (`1..=total_frames`, with `0` = silence).
-/// Returns `(first_audio_found, total_non_zero, repeats, skips, non_monotonic)`.
-fn analyze_tapped_sequence(tapped: &[i32]) -> (usize, usize, usize, usize) {
+/// Review #10 TV4: also counts `mid_zeros` (zero frames occurring AFTER the first audio frame
+/// and BEFORE the last audio frame) so mid-stream underrun dropouts are never silently stripped!
+/// Returns `(total_non_zero, repeats, skips, non_monotonic, mid_zeros)`.
+fn analyze_tapped_sequence(tapped: &[i32]) -> (usize, usize, usize, usize, usize) {
+    let first_nz = tapped.iter().position(|&v| v != 0);
+    let last_nz = tapped.iter().rposition(|&v| v != 0);
+    let mid_zeros = match (first_nz, last_nz) {
+        (Some(f), Some(l)) if l > f => tapped[f..=l].iter().filter(|&&v| v == 0).count(),
+        _ => 0,
+    };
     let non_zero: Vec<i32> = tapped.iter().copied().filter(|&v| v != 0).collect();
     if non_zero.is_empty() {
-        return (0, 0, 0, 0);
+        return (0, 0, 0, 0, 0);
     }
     let mut repeats = 0usize;
     let mut skips = 0usize;
@@ -289,7 +302,7 @@ fn analyze_tapped_sequence(tapped: &[i32]) -> (usize, usize, usize, usize) {
             skips += (diff - 1) as usize;
         }
     }
-    (non_zero.len(), repeats, skips, non_mono)
+    (non_zero.len(), repeats, skips, non_mono, mid_zeros)
 }
 
 fn make_stamped_frames(n: usize) -> Vec<[i32; 2]> {
@@ -348,11 +361,12 @@ fn causal_dma_clean_quantized_and_continuous_streams_are_strictly_monotonic_zero
         };
         let (res, dev) = run_sim(cfg, &frames);
         let stats = res.unwrap_or_else(|e| panic!("{label} failed: {e}"));
-        let (nz, repeats, skips, non_mono) = analyze_tapped_sequence(&dev.tapped_left_samples);
+        let (nz, repeats, skips, non_mono, mid_zeros) = analyze_tapped_sequence(&dev.tapped_left_samples);
         assert_eq!(nz, total_frames, "{label}: wrong non-zero frame count");
         assert_eq!(repeats, 0, "{label}: unexpected repeats");
         assert_eq!(skips, 0, "{label}: unexpected skips");
         assert_eq!(non_mono, 0, "{label}: non-monotonic tap");
+        assert_eq!(mid_zeros, 0, "{label}: unexpected mid-stream silence dropout");
         assert_eq!(
             dev.active_half_overwrites, 0,
             "{label}: overwrote active DMA half!"
@@ -387,14 +401,18 @@ fn s1_mismatched_52_856ms_wake_cadence_vs_50ms_dma_counts_every_deviation() {
     };
     let (res, dev) = run_sim(cfg, &frames);
     let stats = res.expect("S1 sim should complete cleanly");
-    let (_nz, repeats, skips, _non_mono) = analyze_tapped_sequence(&dev.tapped_left_samples);
-    if repeats > 0 || skips > 0 {
-        assert!(
-            stats.has_timing_anomalies(),
-            "S1 visible-failures violation: tap had repeats={repeats} skips={skips} but stats reported 0 anomalies ({})",
-            stats.timing_summary()
-        );
-    }
+    let (nz, repeats, skips, _non_mono, mid_zeros) = analyze_tapped_sequence(&dev.tapped_left_samples);
+    // Review #10 TV5: unconditionally require real audio tapped AND visible anomaly reporting!
+    assert!(nz > 0, "S1 must tap real audio frames");
+    assert!(
+        repeats > 0 || skips > 0 || mid_zeros > 0,
+        "S1 +5.71% wake mismatch must produce observable slip (nz={nz})"
+    );
+    assert!(
+        stats.has_timing_anomalies(),
+        "S1 visible-failures violation: tap had repeats={repeats} skips={skips} mid_zeros={mid_zeros} but stats reported 0 anomalies ({})",
+        stats.timing_summary()
+    );
 }
 
 #[test]
@@ -440,10 +458,11 @@ fn s2_quantized_stuck_position_never_overwrites_active_dma_half() {
         "expected early quantized wake to be classified as spurious, got {}",
         stats.timing_summary()
     );
-    let (nz, repeats, skips, _) = analyze_tapped_sequence(&dev.tapped_left_samples);
+    let (nz, repeats, skips, _, mid_zeros) = analyze_tapped_sequence(&dev.tapped_left_samples);
     assert_eq!(nz, total_frames);
     assert_eq!(repeats, 0);
     assert_eq!(skips, 0);
+    assert_eq!(mid_zeros, 0);
 }
 
 #[test]
@@ -561,18 +580,24 @@ fn s6_32bit_monotonic_position_wrap_near_u32_max_stays_clean() {
     };
     let (res, dev) = run_sim(cfg, &frames);
     let stats = res.expect("S6 wrap sim failed");
-    let (nz, repeats, skips, _) = analyze_tapped_sequence(&dev.tapped_left_samples);
+    let (nz, repeats, skips, _, mid_zeros) = analyze_tapped_sequence(&dev.tapped_left_samples);
     assert_eq!(nz, total_frames);
     assert_eq!(repeats, 0, "S6 wrap caused repeat");
     assert_eq!(skips, 0, "S6 wrap caused skip");
+    assert_eq!(mid_zeros, 0, "S6 wrap caused mid-stream dropout");
     assert_eq!(dev.active_half_overwrites, 0);
     assert!(!stats.has_timing_anomalies(), "{}", stats.timing_summary());
 }
 
 #[test]
 fn causal_dma_drift_sweep_plus_minus_600ppm_and_determinism() {
-    let half_frames = 2_400;
-    let total_frames = half_frames * 80; // 4 seconds of virtual audio per sweep cell
+    // Review #10 TV3:
+    // 1) Hardware-coupled WaveRT interrupts over 2,000 halves (20 s virtual time @ 48 kHz with
+    //    10 ms halves): at +-600 ppm, DMA drifts by +-12 ms (> 1.2 full halves!) relative to the
+    //    nominal host QPC clock (`half_duration`), verifying `WaveRtNotificationController` tracks
+    //    DMA rate cleanly with 0 repeats, 0 skips, 0 mid-stream zeros, and 0 anomalies.
+    let half_frames = 480; // 10 ms @ 48 kHz -> 2,000 halves = 20 s virtual time (960k frames)
+    let total_frames = half_frames * 2_000;
     let frames = make_stamped_frames(total_frames);
 
     for ppm in [-600.0_f64, -200.0, 0.0, 200.0, 600.0] {
@@ -583,9 +608,9 @@ fn causal_dma_drift_sweep_plus_minus_600ppm_and_determinism() {
             pos_model: SimPositionModel::Quantized0Half,
             explicit_wakes_ns: Vec::new(),
             wake_period_ns: None,
-            jitter_max_ns: 3_000_000, // 3 ms random jitter
+            jitter_max_ns: 600_000, // 0.6 ms random jitter
             seed: 0xD1F7_0000 ^ (ppm.to_bits()),
-            max_wakes: 400,
+            max_wakes: 2_200,
         };
         let (res1, dev1) = run_sim(cfg.clone(), &frames);
         let (res2, dev2) = run_sim(cfg, &frames);
@@ -596,15 +621,50 @@ fn causal_dma_drift_sweep_plus_minus_600ppm_and_determinism() {
             dev1.tapped_left_samples, dev2.tapped_left_samples,
             "ppm={ppm}: non-deterministic DMA tap"
         );
-        let (nz, repeats, skips, _) = analyze_tapped_sequence(&dev1.tapped_left_samples);
+        let (nz, repeats, skips, _, mid_zeros) = analyze_tapped_sequence(&dev1.tapped_left_samples);
         assert_eq!(nz, total_frames, "ppm={ppm}: frame count mismatch");
         assert_eq!(repeats, 0, "ppm={ppm}: repeat in tap");
         assert_eq!(skips, 0, "ppm={ppm}: skip in tap");
+        assert_eq!(mid_zeros, 0, "ppm={ppm}: mid-stream silence dropout");
         assert_eq!(dev1.active_half_overwrites, 0, "ppm={ppm}: active overwrite");
         assert!(
             !stats1.has_timing_anomalies(),
             "ppm={ppm}: unexpected anomaly ({})",
             stats1.timing_summary()
         );
+    }
+
+    // 2) Decoupled nominal-rate wake timer vs drifted DMA clock (+-600 ppm): genuine clock slip
+    //    between host timer wakes and DMA crossings MUST never silently corrupt audio without
+    //    surfacing in `PlaybackStats::has_timing_anomalies()` (TV3 visible-failures invariant).
+    let slip_half = 2_400; // 50 ms @ 48 kHz
+    let slip_frames = make_stamped_frames(slip_half * 120);
+    let nominal_period_ns = ((slip_half as f64) / 48_000.0 * 1e9).round() as u64;
+    for ppm in [-600.0_f64, 600.0] {
+        let cfg = SimConfig {
+            sample_rate_hz: 48_000,
+            half_frames: slip_half,
+            dma_ppm: ppm,
+            pos_model: SimPositionModel::Quantized0Half,
+            explicit_wakes_ns: Vec::new(),
+            wake_period_ns: Some(nominal_period_ns),
+            jitter_max_ns: 1_000_000,
+            seed: 0x5119_0000 ^ ppm.to_bits(),
+            max_wakes: 300,
+        };
+        let (res, dev) = run_sim(cfg, &slip_frames);
+        let stats = res.unwrap_or_else(|e| panic!("decoupled ppm={ppm} failed: {e}"));
+        let (nz, repeats, skips, _, mid_zeros) = analyze_tapped_sequence(&dev.tapped_left_samples);
+        assert!(nz > 0, "decoupled ppm={ppm}: empty tap");
+        assert_eq!(
+            dev.active_half_overwrites, 0,
+            "decoupled ppm={ppm}: overwrote active DMA half!"
+        );
+        if repeats > 0 || skips > 0 || mid_zeros > 0 {
+            assert!(
+                stats.has_timing_anomalies(),
+                "decoupled ppm={ppm}: silent glitch (repeats={repeats}, skips={skips}, mid_zeros={mid_zeros}) with zero reported anomalies!"
+            );
+        }
     }
 }

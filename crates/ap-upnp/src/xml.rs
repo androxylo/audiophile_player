@@ -42,7 +42,14 @@ pub fn xml_unescape(input: &str) -> String {
     while let Some(amp) = rest.find('&') {
         out.push_str(&rest[..amp]);
         let after = &rest[amp + 1..];
-        if let Some(semi) = after.find(';') {
+        // Review #10 SR10: bound entity scan to at most 10 ASCII bytes so inputs full of
+        // bare `&` stay strictly O(n) instead of O(n²).
+        if let Some(semi) = after
+            .as_bytes()
+            .iter()
+            .take(10)
+            .position(|&b| b == b';')
+        {
             let ent = &after[..semi];
             let decoded = match ent {
                 "lt" => Some('<'),

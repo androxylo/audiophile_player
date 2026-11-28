@@ -42,10 +42,10 @@ pub const ULTIMATE_MAX_BUFFERED_FRAMES: usize = 384_000 * (ULTIMATE_MAX_BUFFERED
 /// Minimum cushion buffered before starting a new local WDM-KS stream (`4 s` at output rate).
 pub const PREBUFFER_SECONDS: u32 = 4;
 
-/// Pre-allocated deferred-drop queue capacity (`256` blocks >= 40 s @ 384 kHz / 65,536 frames)
+/// Pre-allocated deferred-drop queue capacity (`512` blocks >= 80 s @ 384 kHz / 65,536 frames)
 /// so the real-time MMCSS WaveRT thread NEVER executes `VirtualUnlock`, `HeapFree`, or
-/// `VirtualFree` during `recycle_consumed_block` (Review #7 F10).
-const INITIAL_DEFERRED_DROP_CAPACITY: usize = 256;
+/// `VirtualFree` during `recycle_consumed_block` (Review #7 F10 + Review #10 EN3).
+const INITIAL_DEFERRED_DROP_CAPACITY: usize = 512;
 
 /// Wrapper around [`MemoryLockGuard`] with optional `#[cfg(test)]` lifecycle hooks so unit tests
 /// can assert exact unlock-before-free ordering and zero-lock-contention pinning (Review #7 F10).
@@ -185,6 +185,9 @@ struct BufferInner {
     deferred_drops: Vec<InterleavedInt32Buffer>,
     /// Pre-allocated spare drop vector swapped in O(1) under lock (Review #8 C7).
     spare_drops: Vec<InterleavedInt32Buffer>,
+    /// Pre-allocated queue of `TrackStart` events crossed seamlessly inside an open hardware
+    /// stream (`Review #10 EN2`), drained off-RT by the consumer's transition observer.
+    completed_transitions: VecDeque<StreamEvent>,
     closed: bool,
 }
 
@@ -193,6 +196,7 @@ struct FlushPayload {
     guards: Vec<PinGuard>,
     events: VecDeque<(StreamEvent, u32)>,
     drops: Vec<InterleavedInt32Buffer>,
+    transitions: VecDeque<StreamEvent>,
     #[cfg(test)]
     on_free_phase: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -205,6 +209,7 @@ impl FlushPayload {
             guards,
             events,
             drops,
+            transitions,
             #[cfg(test)]
             on_free_phase,
         } = self;
@@ -215,6 +220,7 @@ impl FlushPayload {
         }
         drop(events);
         drop(drops);
+        drop(transitions);
     }
 }
 
@@ -294,11 +300,13 @@ impl BufferInner {
         } else {
             self.deferred_drops.drain(..).collect()
         };
+        let transitions = self.completed_transitions.drain(..).collect();
         FlushPayload {
             epoch: self.epoch,
             guards,
             events,
             drops,
+            transitions,
             #[cfg(test)]
             on_free_phase,
         }
@@ -389,6 +397,7 @@ impl BoundedBlockStreamBuffer {
                 epoch_duration_cap_ns: None,
                 deferred_drops: Vec::with_capacity(INITIAL_DEFERRED_DROP_CAPACITY),
                 spare_drops: Vec::with_capacity(INITIAL_DEFERRED_DROP_CAPACITY),
+                completed_transitions: VecDeque::with_capacity(16),
                 closed: false,
             }),
             cv: Condvar::new(),
@@ -617,6 +626,10 @@ impl BoundedBlockStreamBuffer {
     /// Review #7 F10: `VirtualLock` pinning runs strictly OUTSIDE `self.inner` so the RT consumer
     /// thread never contends on page-locking or working-set expansion syscalls.
     pub fn push_for_epoch(&self, epoch: u64, event: StreamEvent) -> bool {
+        // Review #10 EN3: always unlock & free previously consumed RT blocks BEFORE pinning the
+        // new block so `VirtualLock` working-set usage and heap RAM remain strictly bounded during
+        // long tracks and continuous streams!
+        self.drain_deferred_drops();
         let (frames_in_event, dur_ns_in_event, _) = event_metrics(&event);
         // Precompute PCM block peak on the producer thread (outside `self.inner`) so the RT
         // WaveRT thread only executes a single lock-free `AtomicU32::fetch_max` per block!
@@ -822,6 +835,105 @@ impl BoundedBlockStreamBuffer {
             Some(_) => (PopBlockResult::TrackEnd, 0),
             None => (PopBlockResult::Underrun, 0),
         }
+    }
+
+    /// Consumer side (real-time WaveRT / WASAPI audio thread, Review #10 EN2):
+    /// like [`Self::try_pop_track_pcm_block_with_peak`], but when a `TrackEnd` is immediately
+    /// followed by a same-epoch `TrackStart` whose `(output_rate_hz, wire_format)` matches the
+    /// currently open hardware stream (and `stop_after_track` is false), seamlessly steps across
+    /// the boundary WITHOUT closing/reopening the DAC! The crossed `TrackStart` is placed in
+    /// `completed_transitions` (pre-allocated, zero RT allocation) for off-RT UI/anchor updates.
+    pub fn try_pop_continuous_pcm_block_with_peak(
+        &self,
+        expected_epoch: u64,
+        active_rate_hz: u32,
+        active_wire_format: ap_core::format::DacWireFormat,
+        stop_after_track: bool,
+    ) -> (PopBlockResult, u32) {
+        let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if st.closed || st.epoch != expected_epoch {
+            return (PopBlockResult::StaleOrClosed, 0);
+        }
+        for _ in 0..8 {
+            match st.events.front() {
+                Some((StreamEvent::PcmBlock(_), _)) => {
+                    if let Some((StreamEvent::PcmBlock(b), peak_u32)) = st.pop_front_event() {
+                        self.cv.notify_all();
+                        return (PopBlockResult::Block(b), peak_u32);
+                    }
+                    return (PopBlockResult::Underrun, 0);
+                }
+                Some((StreamEvent::TrackEnd, _)) => {
+                    // Only cross seamlessly into the next track when its first PCM block is
+                    // already buffered in RAM (`events[2]` is `PcmBlock`); if the producer is
+                    // still analyzing/decoding Track 2, return `TrackEnd` so the outer consumer
+                    // can run its normal prebuffer wait instead of starving the RT DAC thread.
+                    let can_continue = !stop_after_track
+                        && matches!(
+                            st.events.get(1),
+                            Some((StreamEvent::TrackStart { report, .. }, _))
+                                if report.output_rate_hz == active_rate_hz
+                                    && report.wire_format == active_wire_format
+                        )
+                        && matches!(st.events.get(2), Some((StreamEvent::PcmBlock(_), _)));
+                    let _ = st.pop_front_event(); // consume TrackEnd
+                    if can_continue {
+                        if let Some((next_start, _)) = st.pop_front_event() {
+                            st.completed_transitions.push_back(next_start);
+                        }
+                        self.cv.notify_all();
+                        continue;
+                    }
+                    self.cv.notify_all();
+                    return (PopBlockResult::TrackEnd, 0);
+                }
+                Some((StreamEvent::TrackStart { report, .. }, _))
+                    if !stop_after_track
+                        && report.output_rate_hz == active_rate_hz
+                        && report.wire_format == active_wire_format
+                        && matches!(st.events.get(1), Some((StreamEvent::PcmBlock(_), _))) =>
+                {
+                    if let Some((next_start, _)) = st.pop_front_event() {
+                        st.completed_transitions.push_back(next_start);
+                    }
+                    self.cv.notify_all();
+                    continue;
+                }
+                // Rate/format change, EndOfQueue, FatalError, or after-track stop: leave at front!
+                Some(_) => return (PopBlockResult::TrackEnd, 0),
+                None => return (PopBlockResult::Underrun, 0),
+            }
+        }
+        (PopBlockResult::Underrun, 0)
+    }
+
+    /// Pop the next seamlessly-crossed `TrackStart` transition (off-RT), waiting up to `timeout`
+    /// or returning `None` once `done` is set.
+    pub fn wait_completed_transition(
+        &self,
+        done: &AtomicBool,
+        timeout: Duration,
+    ) -> Option<StreamEvent> {
+        let st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut st, _) = self
+            .cv
+            .wait_timeout_while(st, timeout, |s| {
+                s.completed_transitions.is_empty() && !done.load(Ordering::Acquire) && !s.closed
+            })
+            .unwrap_or_else(|e| e.into_inner());
+        st.completed_transitions.pop_front()
+    }
+
+    /// Non-blocking drain of any remaining completed transitions after a hardware stream finishes.
+    pub fn drain_completed_transitions(&self) -> Vec<StreamEvent> {
+        let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        st.completed_transitions.drain(..).collect()
+    }
+
+    /// Wake any thread waiting on `wait_completed_transition`.
+    pub fn notify_waiters(&self) {
+        let _st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        self.cv.notify_all();
     }
 }
 

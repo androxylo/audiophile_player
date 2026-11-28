@@ -201,6 +201,27 @@ pub trait StereoConvolver: Send {
     fn flush_split_tail(&mut self) -> Result<(StereoF64Buffer, Option<ConvolutionTail>), String> {
         Ok((self.flush()?, None))
     }
+
+    /// Flush end-of-track convolver output for gapless handoff while also feeding an upsampler
+    /// post-ringing tail (`Review #10 CQ1`): splits at the exact track boundary BEFORE `post_ring`
+    /// so `track_end` completes Track A's exact length and `next_tail` carries the complete
+    /// zero-driven continuation `(x_A ‖ 0) * h_up * h_conv` starting at Track B sample 0.
+    fn flush_split_tail_with_post_ring(
+        &mut self,
+        post_ring: StereoF64Buffer,
+    ) -> Result<(StereoF64Buffer, Option<ConvolutionTail>), String> {
+        let track_end = self.flush()?;
+        let next_tail = if post_ring.is_empty() {
+            None
+        } else {
+            Some(ConvolutionTail {
+                sample_rate_hz: post_ring.sample_rate_hz,
+                left: post_ring.left,
+                right: post_ring.right,
+            })
+        };
+        Ok((track_end, next_tail))
+    }
 }
 
 /// Factory creating a fresh stateful [`StereoConvolver`] instance per track/rate.
@@ -1217,8 +1238,36 @@ impl PreparedStereoIr {
     }
 }
 
+/// Evaluate exact DTFT magnitude `|H(omega)| = |sum_{n=0}^{L-1} ir[n] e^{-j omega n}|`
+/// in pure `f64` using coupled-form phasor rotation re-anchored every 1024 taps (accurate to
+/// machine precision from DC to Nyquist, zero near-DC Goertzel instability).
+fn dtft_magnitude(ir: &[f64], omega: f64) -> f64 {
+    let step_re = omega.cos();
+    let step_im = -omega.sin();
+    let mut acc_re = 0.0_f64;
+    let mut acc_im = 0.0_f64;
+    let mut w_re = 1.0_f64;
+    let mut w_im = 0.0_f64;
+    for (idx, &h) in ir.iter().enumerate() {
+        if idx > 0 && (idx & 1023) == 0 {
+            let ang = omega * (idx as f64);
+            w_re = ang.cos();
+            w_im = -ang.sin();
+        }
+        acc_re += h * w_re;
+        acc_im += h * w_im;
+        let next_re = w_re * step_re - w_im * step_im;
+        let next_im = w_re * step_im + w_im * step_re;
+        w_re = next_re;
+        w_im = next_im;
+    }
+    acc_re.hypot(acc_im)
+}
+
 /// Measure peak frequency-domain magnitude `max_f max(|H_L(f)|, |H_R(f)|)` using a `>= 2x`
-/// zero-padded real FFT (reducing inter-bin peak underestimation on narrow resonances).
+/// zero-padded real FFT followed by fine DTFT refinement (`+-1` bin to `1/32`-bin resolution)
+/// around the strongest spectral peaks (Review #10 CQ3: eliminates inter-bin under-read on
+/// narrow high-Q room-mode resonances).
 fn compute_max_freq_gain_linear(
     planner: &mut RealFftPlanner<f64>,
     left: &[f64],
@@ -1233,6 +1282,8 @@ fn compute_max_freq_gain_linear(
     let mut time_buf = vec![0.0_f64; n];
     let mut spec = r2c.make_output_vec();
     let mut scratch = r2c.make_scratch_vec();
+    let two_pi_over_n = (2.0 * std::f64::consts::PI) / (n as f64);
+    let max_bin_f = (spec.len().saturating_sub(1)) as f64;
 
     let mut max_mag = 0.0_f64;
     for ch in [left, right] {
@@ -1240,10 +1291,71 @@ fn compute_max_freq_gain_linear(
         time_buf[..ch.len()].copy_from_slice(ch);
         r2c.process_with_scratch(&mut time_buf, &mut spec, &mut scratch)
             .map_err(|e| format!("IR gain-analysis FFT failed: {e}"))?;
+
+        let mut ch_coarse_max = 0.0_f64;
+        let mut mags: Vec<f64> = Vec::with_capacity(spec.len());
         for c in &spec {
             let mag = c.norm();
-            if mag > max_mag {
-                max_mag = mag;
+            if mag > ch_coarse_max {
+                ch_coarse_max = mag;
+            }
+            mags.push(mag);
+        }
+        if ch_coarse_max > max_mag {
+            max_mag = ch_coarse_max;
+        }
+
+        // Collect local spectral maxima within 30% of the channel peak (up to 4 strongest peaks)
+        // and refine each with two-stage DTFT evaluation to `1/32`-bin frequency resolution.
+        if ch_coarse_max > 0.0 && ch.len() > 1 {
+            let thresh = ch_coarse_max * 0.70;
+            let mut peaks: Vec<(usize, f64)> = Vec::new();
+            let last = mags.len().saturating_sub(1);
+            for k in 0..=last {
+                let m = mags[k];
+                if m < thresh {
+                    continue;
+                }
+                let ge_left = k == 0 || m >= mags[k - 1];
+                let ge_right = k == last || m >= mags[k + 1];
+                if ge_left && ge_right {
+                    peaks.push((k, m));
+                }
+            }
+            peaks.sort_by(|a, b| b.1.total_cmp(&a.1));
+            peaks.truncate(4);
+
+            for (peak_k, _) in peaks {
+                let center = peak_k as f64;
+                // Stage 1: 17 points across [k - 1.0, k + 1.0] (step 0.125 bin).
+                let mut best_bin = center;
+                let mut best_mag = mags[peak_k];
+                for s in -8..=8_i32 {
+                    if s == 0 {
+                        continue;
+                    }
+                    let b = (center + (s as f64) * 0.125).clamp(0.0, max_bin_f);
+                    let m = dtft_magnitude(ch, b * two_pi_over_n);
+                    if m > best_mag {
+                        best_mag = m;
+                        best_bin = b;
+                    }
+                }
+                // Stage 2: 9 points across [best_bin - 0.125, best_bin + 0.125] (step 1/32 bin).
+                let refine_center = best_bin;
+                for s in -4..=4_i32 {
+                    if s == 0 {
+                        continue;
+                    }
+                    let b = (refine_center + (s as f64) * 0.03125).clamp(0.0, max_bin_f);
+                    let m = dtft_magnitude(ch, b * two_pi_over_n);
+                    if m > best_mag {
+                        best_mag = m;
+                    }
+                }
+                if best_mag > max_mag {
+                    max_mag = best_mag;
+                }
             }
         }
     }
@@ -1812,6 +1924,53 @@ impl StereoConvolver for PartitionedStereoConvolver {
         let tail_l = out_l.split_off(split_at);
         let tail_r = out_r.split_off(split_at);
         self.total_emitted_frames += out_l.len();
+
+        let next_tail = if tail_l.is_empty() {
+            None
+        } else {
+            Some(ConvolutionTail {
+                sample_rate_hz: self.ir.sample_rate_hz,
+                left: tail_l,
+                right: tail_r,
+            })
+        };
+
+        Ok((
+            StereoF64Buffer {
+                sample_rate_hz: self.ir.sample_rate_hz,
+                left: out_l,
+                right: out_r,
+            },
+            next_tail,
+        ))
+    }
+
+    fn flush_split_tail_with_post_ring(
+        &mut self,
+        post_ring: StereoF64Buffer,
+    ) -> Result<(StereoF64Buffer, Option<ConvolutionTail>), String> {
+        if post_ring.is_empty() {
+            return self.flush_split_tail();
+        }
+        if self.flushed {
+            return Ok((StereoF64Buffer::empty(self.ir.sample_rate_hz), None));
+        }
+        // Record exact remaining track-A frames BEFORE feeding post-ringing samples past Track A!
+        let exact_track_remaining = self
+            .total_input_frames
+            .saturating_sub(self.total_emitted_frames);
+        let p_out = self.process_block(post_ring)?;
+        self.flushed = true;
+        let (f_l, f_r) = self.flush_combined()?;
+
+        let mut out_l = p_out.left;
+        let mut out_r = p_out.right;
+        out_l.extend_from_slice(&f_l);
+        out_r.extend_from_slice(&f_r);
+
+        let split_at = exact_track_remaining.min(out_l.len());
+        let tail_l = out_l.split_off(split_at);
+        let tail_r = out_r.split_off(split_at);
 
         let next_tail = if tail_l.is_empty() {
             None

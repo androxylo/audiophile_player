@@ -490,12 +490,16 @@ pub fn quantizer_margin_db(dac_bits: u8, shaper_l1_sum: f64) -> f64 {
 /// delta-sigma DACs into near-0 dBFS overload.
 pub const ULTIMATE_DAC_MARGIN_DB: f64 = 1.0;
 
-/// True-peak meter error `A_tp` for the 8x / 32-tap-per-phase Kaiser meter (`tp8x-32`, Issue #23 §2).
-pub const TP_METER_ERR_8X_32_DB: f64 = 0.1;
+/// True-peak meter error `A_tp` for the 8x / 64-tap-per-phase Kaiser meter (`tp8x-64`,
+/// Issue #23 §2 + Review #10 §1.4 / HP-03: `<= 0.1 dB` even on worst-phase short bursts up to 0.45*fs).
+pub const TP_METER_ERR_8X_64_DB: f64 = 0.1;
 
-/// True-peak meter error `A_tp` for the 4x / 12-tap-per-phase meter (`tp4x-12`) or Vorbis true-peak
-/// tag (Issue #23 §2).
-pub const TP_METER_ERR_4X_12_DB: f64 = 0.7;
+/// True-peak meter error `A_tp` for a Vorbis true-peak tag (`tag-tp`, Issue #23 §2).
+pub const TP_METER_ERR_TAG_TP_DB: f64 = 0.7;
+
+/// Legacy alias retained for Vorbis true-peak tags (`tag-tp`). Note: Schema-3 caches never store
+/// `tp4x-12` peaks (Review #10 §1.4 / HP-04).
+pub const TP_METER_ERR_4X_12_DB: f64 = TP_METER_ERR_TAG_TP_DB;
 
 /// Inter-sample peak allowance `A_tp` when only a sample-peak tag is available (`3.0 dB`, Issue #23 §2).
 pub const TP_METER_ERR_SAMPLE_PEAK_DB: f64 = SAMPLE_PEAK_ISP_ALLOWANCE_DB;
@@ -593,13 +597,19 @@ pub fn select_ultimate_headroom_v2(
     let m30_opt = window_m30_db.filter(|v| v.is_finite());
     let total_margin = m_q + ULTIMATE_DAC_MARGIN_DB;
 
+    // Review #10 HP-05: apply `m_q + ULTIMATE_DAC_MARGIN_DB` on the Unknown & streaming fail-safe
+    // branches as well so the DAC safety margin holds past the first 30 s (`S = min(-(G_c + margin), s_m30)`).
     let fail_safe = |label: &str| -> HeadroomDecision {
         let g_up = UNKNOWN_PEAK_HEADROOM_DB; // -3.0 dB
-        let mut s_db = -g_c_pos;
+        let mut s_db = -(g_c_pos + total_margin);
         let mut reason = if g_c_pos > 1e-9 {
-            format!("{label} -> -3 dB; conv excess +{g_c_pos:.2} dB -> conv scale -{g_c_pos:.2} dB")
+            format!(
+                "{label} -> -3 dB; conv excess +{g_c_pos:.2} dB + margin {total_margin:.2} dB -> scale {s_db:+.2} dB"
+            )
         } else {
-            format!("{label} -> -3 dB")
+            format!(
+                "{label} -> -3 dB; margin {total_margin:.2} dB (m_q={m_q:.5}, dac_margin={ULTIMATE_DAC_MARGIN_DB:.2}) -> scale {s_db:+.2} dB"
+            )
         };
         if let Some(m30) = m30_opt {
             let s_m30 = (-(m30 + g_up + total_margin)).min(0.0);
@@ -709,117 +719,6 @@ pub fn select_ultimate_headroom_v2(
         }
         _ => fail_safe("unknown local max peak (fail-safe)"),
     }
-}
-
-/// Choose a **mandatory fixed whole-track gain** for Ultimate Mode (`OQ-33`, `07-ultimate-mode.md` §4.2):
-/// - **Streaming sources (`is_streaming_source == true`):** track peak is never known, so ALWAYS
-///   enforce `-3 dB` upsampling safety (+ REW excess `S`), tightened further only if `M30` requires.
-/// - **Local file with cached whole-track exact `M`:**
-///   `G = min(0, -(max(M, M30) + m_q + ULTIMATE_DAC_MARGIN_DB))` (zero overs, DAC margin preserved,
-///   tracks peaking `<= -1 dBFS` untouched at `0 dB`).
-/// - **Local file without cached `M` (first play):**
-///   `G = min(G_HR, -(M30 + m_q + ULTIMATE_DAC_MARGIN_DB))` (`M30` can only add attenuation and
-///   never relaxes normal HR safety).
-#[allow(clippy::too_many_arguments)]
-pub fn select_ultimate_headroom(
-    meta: &TrackPeakMetadata,
-    bits_per_sample: u16,
-    is_streaming_source: bool,
-    active_conv_max_gain_db: Option<f64>,
-    cached_exact_m_db: Option<f64>,
-    window_m30_db: Option<f64>,
-    margin_m_q_db: f64,
-) -> HeadroomDecision {
-    let m_q = if margin_m_q_db.is_finite() && margin_m_q_db >= 0.0 {
-        margin_m_q_db
-    } else {
-        0.0
-    };
-    let total_margin = m_q + ULTIMATE_DAC_MARGIN_DB;
-
-    // Pack any constant total gain `g_db <= 0.0` into `(HeadroomMode, convolution_scale_db)` so
-    // `HeadroomDecision::total_gain_db()` equals `g_db` exactly.
-    let pack_gain = |g_db: f64,
-                     peak_dbfs: Option<f64>,
-                     peak_kind: Option<PeakKind>,
-                     reason: String|
-     -> HeadroomDecision {
-        let g = g_db.min(0.0);
-        if g <= UNKNOWN_PEAK_HEADROOM_DB + 1e-9 {
-            HeadroomDecision {
-                mode: HeadroomMode::Minus3Db,
-                peak_dbfs,
-                peak_kind,
-                convolution_scale_db: (g - UNKNOWN_PEAK_HEADROOM_DB).min(0.0),
-                reason,
-            }
-        } else {
-            HeadroomDecision {
-                mode: HeadroomMode::ZeroDb,
-                peak_dbfs,
-                peak_kind,
-                convolution_scale_db: g,
-                reason,
-            }
-        }
-    };
-
-    // Streaming: OQ-33 mandates ALWAYS -3 dB safety (never relaxed by cached M or tags).
-    if is_streaming_source {
-        let mut hr = select_headroom_for_bits(
-            meta,
-            bits_per_sample,
-            true,
-            active_conv_max_gain_db,
-            None,
-        );
-        if let Some(m30) = window_m30_db.filter(|v| v.is_finite()) {
-            let g_m30 = (-(m30 + total_margin)).min(0.0);
-            if g_m30 < hr.total_gain_db() - 1e-9 {
-                let reason = format!(
-                    "{}; W30 exact peak M30={m30:+.2} dBFS (dac_margin={ULTIMATE_DAC_MARGIN_DB:.2} dB) -> tightened to {g_m30:.2} dB",
-                    hr.reason
-                );
-                hr = pack_gain(g_m30, hr.peak_dbfs, hr.peak_kind, reason);
-            }
-        }
-        return hr;
-    }
-
-    // Local file with cached whole-track exact post-chain peak M:
-    // G = min(0, -(max(M, M30) + m_q + ULTIMATE_DAC_MARGIN_DB)).
-    if let Some(m_db) = cached_exact_m_db.filter(|v| v.is_finite()) {
-        let m_eff = window_m30_db
-            .filter(|v| v.is_finite())
-            .map_or(m_db, |m30| m_db.max(m30));
-        let g_exact = (-(m_eff + total_margin)).min(0.0);
-        let reason = format!(
-            "ultimate cached exact M={m_db:+.2} dBFS (eff={m_eff:+.2} dBFS, m_q={m_q:.5} dB, dac_margin={ULTIMATE_DAC_MARGIN_DB:.2} dB) -> fixed gain {g_exact:+.2} dB"
-        );
-        return pack_gain(g_exact, Some(m_eff), Some(PeakKind::TruePeak), reason);
-    }
-
-    // Local file without cached M: G = min(G_HR, -(M30 + m_q + ULTIMATE_DAC_MARGIN_DB))
-    // (M30 only adds safety, never relaxes).
-    let hr = select_headroom_for_bits(
-        meta,
-        bits_per_sample,
-        false,
-        active_conv_max_gain_db,
-        None,
-    );
-    let g_hr = hr.total_gain_db();
-    if let Some(m30) = window_m30_db.filter(|v| v.is_finite()) {
-        let g_m30 = (-(m30 + total_margin)).min(0.0);
-        if g_m30 < g_hr - 1e-9 {
-            let reason = format!(
-                "{}; W30 exact peak M30={m30:+.2} dBFS (dac_margin={ULTIMATE_DAC_MARGIN_DB:.2} dB) -> fixed gain {g_m30:+.2} dB",
-                hr.reason
-            );
-            return pack_gain(g_m30, hr.peak_dbfs, hr.peak_kind, reason);
-        }
-    }
-    hr
 }
 
 /// Apply `HEADROOM_DESIGN.md` §4 gapless tail-overlap scaling (`S_B`) for Track B without ever

@@ -39,7 +39,7 @@ Windows 10/11 x64 and a USB DAC. Pick **one** of the three ways in:
 | 3️⃣ | **Download prebuilt** | Run the installer with `-Binary`, or download the zip from [Releases](https://github.com/androxylo/audiophile_player/releases) and check its SHA-256 | No compiler, no admin prompt. The prebuilt version may be older than the newest source |
 
 ```powershell
-irm https://github.com/androxylo/audiophile_player/releases/latest/download/bootstrap.ps1 | iex
+$s = Join-Path $env:TEMP 'audiophile-player-bootstrap.ps1'; irm https://github.com/androxylo/audiophile_player/releases/latest/download/bootstrap.ps1 -OutFile $s; powershell -ExecutionPolicy Bypass -File $s
 ```
 
 Then press the **Audiophile Player** icon on your desktop. 👉 **[Step-by-step Quick Start, including all three ways →](docs/QUICK_START.md)**

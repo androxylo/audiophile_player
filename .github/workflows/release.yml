@@ -19,19 +19,29 @@ on:
         required: false
         default: true
 
+# Review #10 OD6 + OD8: least-privilege split — read-only build/test job with persist-credentials: false
+# separated from the privileged publish-release job; all tag/ref inputs passed via env: (zero interpolation).
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
+  contents: read
 
 jobs:
-  release-windows:
+  build-and-test:
     runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      app_zip_name: ${{ steps.pkg.outputs.app_zip_name }}
+      drv_zip_name: ${{ steps.pkg.outputs.drv_zip_name }}
+      built_binaries: ${{ steps.pkg.outputs.built_binaries }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -39,23 +49,36 @@ jobs:
       - name: Run workspace unit tests
         shell: pwsh
         run: |
-          cargo test --release --workspace --locked -- --skip hardware_live --skip live_wdm_ks --skip plays_random_flac_from_user_music
+          cargo test --release --workspace --locked
 
       - name: Determine release tag and version
         id: meta
         shell: pwsh
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          HEAD_SHA: ${{ github.sha }}
         run: |
           $toml = Get-Content -LiteralPath Cargo.toml -Raw
           if ($toml -notmatch '(?m)^version\s*=\s*"([^"]+)"') { throw "Missing version in Cargo.toml" }
           $ver = $Matches[1]
-          $tag = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" }
-                 elseif ("${{ inputs.tag }}") { "${{ inputs.tag }}" }
+          $tag = if ($env:REF_TYPE -eq "tag") { $env:REF_NAME }
+                 elseif ($env:INPUT_TAG) { $env:INPUT_TAG.Trim() }
                  else { "v$ver" }
+          if ($tag -notmatch '^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') {
+            throw "Invalid release tag format '$tag'"
+          }
           if ($tag -match '^v(\d+\.\d+\.\d+)$' -and $Matches[1] -ne $ver) {
             throw "Release tag '$tag' does not match Cargo.toml version '$ver'"
           }
-          echo "version=$ver" >> $env:GITHUB_OUTPUT
-          echo "tag=$tag" >> $env:GITHUB_OUTPUT
+          # Review #10 OD8: refuse to clobber an existing tag pointing to a different commit!
+          $existingRef = & git rev-parse -q --verify "refs/tags/$tag^{commit}" 2>$null
+          if ($LASTEXITCODE -eq 0 -and $existingRef -and ($existingRef.Trim() -ne $env:HEAD_SHA)) {
+            throw "Refusing to publish '$tag': existing tag points to $($existingRef.Trim()), not HEAD $($env:HEAD_SHA)"
+          }
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "version=$ver"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "tag=$tag"
 
       - name: Stage bootstrap.ps1 asset
         shell: pwsh
@@ -64,6 +87,7 @@ jobs:
           Copy-Item -Force scripts\bootstrap.ps1 dist\bootstrap.ps1
 
       - name: Build verified Windows x64 app zip (no kernel driver) + opt-in Tidal driver zip
+        id: pkg
         if: ${{ github.event_name == 'push' || inputs.build_binary }}
         shell: pwsh
         run: |
@@ -85,54 +109,84 @@ jobs:
           }
           Set-Content -LiteralPath dist\SHA256SUMS -Value ($shaLines -join "`n") -Encoding ASCII
 
-          echo "APP_ZIP_PATH=$($appZip.FullName)" >> $env:GITHUB_ENV
-          echo "DRV_ZIP_PATH=$($drvZip.FullName)" >> $env:GITHUB_ENV
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "app_zip_name=$($appZip.Name)"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "drv_zip_name=$($drvZip.Name)"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "built_binaries=true"
+
+      - name: Upload packaged release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-release:
+    needs: build-and-test
+    runs-on: windows-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download packaged release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          path: dist
 
       - name: Attest build provenance
-        if: ${{ github.event_name == 'push' || inputs.build_binary }}
+        if: ${{ needs.build-and-test.outputs.built_binaries == 'true' }}
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: |
-            ${{ env.APP_ZIP_PATH }}
-            ${{ env.DRV_ZIP_PATH }}
+            dist/${{ needs.build-and-test.outputs.app_zip_name }}
+            dist/${{ needs.build-and-test.outputs.drv_zip_name }}
             dist/bootstrap.ps1
 
       - name: Create or update GitHub Release
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REL_TAG: ${{ needs.build-and-test.outputs.tag }}
+          REL_VER: ${{ needs.build-and-test.outputs.version }}
+          APP_ZIP_NAME: ${{ needs.build-and-test.outputs.app_zip_name }}
+          DRV_ZIP_NAME: ${{ needs.build-and-test.outputs.drv_zip_name }}
         run: |
-          $tag = "${{ steps.meta.outputs.tag }}"
-          $ver = "${{ steps.meta.outputs.version }}"
+          $tag = $env:REL_TAG
+          $ver = $env:REL_VER
           $assets = @("dist\bootstrap.ps1")
           if (Test-Path "dist\SHA256SUMS") {
+            $appPath = Join-Path "dist" $env:APP_ZIP_NAME
+            $drvPath = Join-Path "dist" $env:DRV_ZIP_NAME
             $assets += @(
               "dist\SHA256SUMS",
-              $env:APP_ZIP_PATH,
-              ($env:APP_ZIP_PATH + ".sha256"),
-              $env:DRV_ZIP_PATH,
-              ($env:DRV_ZIP_PATH + ".sha256")
+              $appPath,
+              ($appPath + ".sha256"),
+              $drvPath,
+              ($drvPath + ".sha256")
             )
           }
 
           $noteLines = @(
             "## Install (Windows 10/11 x64)",
             "",
-            "**Recommended — build from source** (transparent, verifiable):",
+            "**Recommended — build from source** (transparent, verifiable; download then run):",
             '```powershell',
-            "irm https://github.com/androxylo/audiophile_player/releases/latest/download/bootstrap.ps1 | iex",
+            '$s = Join-Path $env:TEMP "audiophile-player-bootstrap.ps1"; irm https://github.com/androxylo/audiophile_player/releases/latest/download/bootstrap.ps1 -OutFile $s; powershell -ExecutionPolicy Bypass -File $s',
             '```',
             "",
             "**Opt-in verified prebuilt binary** (no compiler, no admin prompt, zero kernel `.sys` files):",
             '```powershell',
-            "& ([scriptblock]::Create((irm https://github.com/androxylo/audiophile_player/releases/latest/download/bootstrap.ps1))) -Binary",
+            '$s = Join-Path $env:TEMP "audiophile-player-bootstrap.ps1"; irm https://github.com/androxylo/audiophile_player/releases/latest/download/bootstrap.ps1 -OutFile $s; powershell -ExecutionPolicy Bypass -File $s -Binary',
             '```',
             "",
             "## Release Assets",
             "",
             "| Asset | Contents |",
             "|---|---|",
-            "| ``bootstrap.ps1`` | One-line Windows installer (builds from source by default; ``-Binary`` verifies SHA-256 + GitHub provenance attestation) |",
+            "| ``bootstrap.ps1`` | Windows installer (builds from source by default; ``-Binary`` verifies SHA-256 + GitHub provenance attestation) |",
             "| ``audiophile-player-v$ver-win-x64.zip`` | Standalone Windows x64 player, docs, shortcuts, and third-party notices (no kernel driver) |",
             "| ``audiophile-player-driver-v$ver-win-x64.zip`` | **Opt-in** unsigned ACX 1.1 virtual render driver for Tidal Desktop Exclusive Mode (Windows 11 22H2+ x64 only; requires Secure Boot OFF + Test Mode ON — read [Getting Started](https://github.com/androxylo/audiophile_player/blob/$tag/docs/GETTING_STARTED.md#tidal-desktop-exclusive-mode-opt-in) first) |",
             "| ``SHA256SUMS`` | SHA-256 checksums for all downloadable assets (also individually attested via GitHub Build Provenance) |",

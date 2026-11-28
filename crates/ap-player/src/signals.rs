@@ -133,29 +133,35 @@ impl ShutdownController {
     }
 
     /// Record the first shutdown signal, trip any attached sink stop flag, and wake waiters.
+    ///
+    /// Review #10 EN1: drops every mutex guard strictly BEFORE invoking any external callback
+    /// (`SharedControl::request_shutdown` runs the attached shutdown callback which may re-enter
+    /// `trigger(ApiShutdown)` on the same thread).
     pub fn trigger(&self, sig: ShutdownSignal) {
         if sig.requires_handler_wait() {
             self.fast_teardown.store(true, Ordering::SeqCst);
         }
-        let mut guard = self.signal.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.is_none() {
-            *guard = Some(sig);
-            self.signal_cv.notify_all();
+        {
+            let mut guard = self.signal.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.is_none() {
+                *guard = Some(sig);
+                self.signal_cv.notify_all();
+            }
         }
-        if let Some(flag) = self
+        let stop_flag = self
             .active_stop_flag
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-        {
+            .clone();
+        if let Some(flag) = stop_flag {
             flag.store(true, Ordering::SeqCst);
         }
-        if let Some(shared) = self
+        let shared = self
             .shared_control
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-        {
+            .clone();
+        if let Some(shared) = shared {
             shared.request_shutdown();
         }
     }
@@ -310,5 +316,24 @@ mod tests {
 
         ctrl.mark_cleanup_complete();
         assert!(ctrl.wait_for_cleanup_complete(Duration::from_millis(50)));
+    }
+
+    #[test]
+    fn en1_trigger_with_shared_control_shutdown_callback_does_not_deadlock() {
+        let ctrl = Arc::new(ShutdownController::new());
+        let shared = SharedControl::new(std::path::PathBuf::from("."), "Mock DAC");
+        let ctrl_cb = Arc::clone(&ctrl);
+        shared.attach_shutdown_callback(Arc::new(move || {
+            ctrl_cb.trigger(ShutdownSignal::ApiShutdown);
+        }));
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        ctrl.attach_stop_flag(Arc::clone(&stop_flag));
+        ctrl.attach_shared_control(Arc::clone(&shared));
+
+        // Review #10 EN1: previously self-deadlocked relocking `self.signal` inside callback.
+        ctrl.trigger(ShutdownSignal::CtrlC);
+        assert_eq!(ctrl.current_signal(), Some(ShutdownSignal::CtrlC));
+        assert!(stop_flag.load(Ordering::SeqCst));
+        assert!(shared.wait_for_command_or_shutdown().is_none());
     }
 }

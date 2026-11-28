@@ -36,6 +36,7 @@ use ap_dsp::analysis::{DETECTOR_VERSION, TrackAnalyzer};
 use ap_dsp::convolution::{RewConvolverFactory, StereoConvolverFactory};
 use ap_dsp::deemphasis::StereoDeemphasis;
 use ap_dsp::fusion::{CachedWholeTrackEvidence, build_track_db_entry};
+use ap_dsp::peak_scan::{GatedPeakScanner, PEAK_SCAN_METER_ID};
 use ap_dsp::selector::{
     SelectedDspPlan, UpsamplerPolicy, build_post_chain_key, resolve_active_selection,
     resolve_machine_suggestion,
@@ -46,6 +47,21 @@ use ap_source::library::{default_user_music_dir, discover_flac_files};
 use ap_source::md5::md5_to_hex;
 
 use crate::signals::ShutdownController;
+
+#[cfg(windows)]
+fn set_scanner_thread_below_normal() {
+    const THREAD_PRIORITY_BELOW_NORMAL: i32 = -1;
+    unsafe extern "system" {
+        fn GetCurrentThread() -> isize;
+        fn SetThreadPriority(h_thread: isize, n_priority: i32) -> i32;
+    }
+    unsafe {
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
+}
+
+#[cfg(not(windows))]
+fn set_scanner_thread_below_normal() {}
 
 const SCAN_BLOCK_FRAMES: usize = 8_192;
 
@@ -80,10 +96,38 @@ pub struct ScanSummary {
 }
 
 /// Entrypoint for `audiophile-player scan [FOLDER|ROOT] ...`.
+/// Review #10 CS4: validates config & writable DB paths with typed `CliError::config` (exit 4).
 pub fn run_scan_cli(
     opts: ScanOptions,
     controller: &ShutdownController,
-) -> Result<(), String> {
+) -> Result<(), crate::exit_codes::CliError> {
+    // Pre-validate config.toml, REW paths, and writable DB confinement with exit code 4 (CS4).
+    let loaded_cfg = PlayerConfig::discover_and_load(opts.config_path.as_deref())
+        .map_err(crate::exit_codes::CliError::config)?;
+    let conv_cfg = opts
+        .rew_override
+        .clone()
+        .unwrap_or_else(|| loaded_cfg.config.convolution.clone());
+    conv_cfg
+        .validate_paths()
+        .map_err(crate::exit_codes::CliError::config)?;
+    let default_music = if opts.filterdb_dir.is_some() && opts.folder.is_some() {
+        None
+    } else {
+        default_user_music_dir().filter(|p| p.is_dir())
+    };
+    let db_env = DbEnv::resolve(
+        &loaded_cfg.config,
+        opts.filterdb_dir.as_deref(),
+        opts.choices_file.as_deref(),
+        opts.trackdb_dir.as_deref(),
+        default_music.as_deref(),
+        DETECTOR_VERSION,
+    );
+    db_env
+        .validate_writable_paths_outside_roots()
+        .map_err(crate::exit_codes::CliError::config)?;
+
     let summary = scan_folder(&opts, Some(controller))?;
     println!(
         "Scan complete: total={} scanned={} skipped(current)={} retagged={} moved={} failed={} suggested_changed={}",
@@ -255,6 +299,7 @@ pub fn scan_folder(
         default_music.as_deref(),
         DETECTOR_VERSION,
     );
+    db_env.validate_writable_paths_outside_roots()?;
     let filter_db = db_env.filter_db;
     let (_, user_filters, _) = UserFiltersCache::new(db_env.choices_path).load_fresh();
     let scan_started_unix_s = now_unix_secs();
@@ -389,32 +434,37 @@ pub fn scan_folder(
 
     std::thread::scope(|s| {
         for _ in 0..workers {
-            s.spawn(|| loop {
-                if controller.is_some_and(|c| c.current_signal().is_some()) {
-                    break;
-                }
-                let idx = next_unit.fetch_add(1, Ordering::Relaxed);
-                if idx >= work_units.len() {
-                    break;
-                }
-                let unit = &work_units[idx];
-                let existing_album =
-                    existing_albums.get(&canonical_album_key(&unit.root, &unit.rel_folder));
-                let outcome = scan_album_folder(
-                    unit,
-                    existing_album,
-                    &move_index,
-                    &filter_db,
-                    user_filters.as_ref(),
-                    &opts.upsampler_policy,
-                    &rew_factory,
-                    genre_rules,
-                    opts.post_chain,
-                    opts.force,
-                    controller,
-                );
-                if let Ok(mut guard) = unit_outcomes.lock() {
-                    guard.push((idx, outcome));
+            s.spawn(|| {
+                // Review #10 UL7: run offline scanner workers at below-normal OS priority so a
+                // concurrent live playback session always wins CPU scheduling.
+                set_scanner_thread_below_normal();
+                loop {
+                    if controller.is_some_and(|c| c.current_signal().is_some()) {
+                        break;
+                    }
+                    let idx = next_unit.fetch_add(1, Ordering::Relaxed);
+                    if idx >= work_units.len() {
+                        break;
+                    }
+                    let unit = &work_units[idx];
+                    let existing_album =
+                        existing_albums.get(&canonical_album_key(&unit.root, &unit.rel_folder));
+                    let outcome = scan_album_folder(
+                        unit,
+                        existing_album,
+                        &move_index,
+                        &filter_db,
+                        user_filters.as_ref(),
+                        &opts.upsampler_policy,
+                        &rew_factory,
+                        genre_rules,
+                        opts.post_chain,
+                        opts.force,
+                        controller,
+                    );
+                    if let Ok(mut guard) = unit_outcomes.lock() {
+                        guard.push((idx, outcome));
+                    }
                 }
             });
         }
@@ -806,9 +856,13 @@ fn scan_single_track_schema2(
         .filter(|&f| f > 0)
         .map(|f| f as f64 / f64::from(spec.sample_rate_hz.max(1)));
 
-    // --- Fast Path 1: Unchanged (size + mtime ±2 s + per-track current detector version, U1) ---
-    if !force && !measure_post_chain {
-        if let Some(prev) = old_track.filter(|p| p.detector_version == DETECTOR_VERSION) {
+    // --- Fast Path 1: Unchanged (size + mtime ±2 s + current detector version + tp8x-64 peak) ---
+    // Review #10 UL5: when `--post-chain` is enabled, also fast-skip when every expected
+    // `PostChainKey` (active + suggested) is already cached on this entry!
+    if !force {
+        if let Some(prev) = old_track
+            .filter(|p| p.detector_version == DETECTOR_VERSION && p.has_accurate_source_peak())
+        {
             let md5_matches = match (prev.md5.as_deref(), header_md5_hex.as_deref()) {
                 (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
                 // Zero-MD5 FLACs store computed MD5 in `prev.md5` while header MD5 is None:
@@ -817,23 +871,14 @@ fn scan_single_track_schema2(
                 (None, Some(_)) => false,
             };
             if md5_matches && prev.matches_size_mtime(file_size, file_mtime) {
-                return SingleTrackResult::Skipped(format!(
-                    "SKIP  {file_name} (current v{DETECTOR_VERSION})"
-                ));
-            }
-
-            // --- Fast Path 2: Metadata-only edit (MD5 unchanged, size/mtime changed) ---
-            if let (Some(a), Some(b)) = (prev.md5.as_deref(), header_md5_hex.as_deref()) {
-                if a.eq_ignore_ascii_case(b) {
-                    let mut updated = prev.clone();
-                    updated.size = file_size;
-                    updated.mtime_unix_s = file_mtime;
-                    updated.head_hash = file_head_4k_hash(path);
-                    let base_wt = CachedWholeTrackEvidence::from_album_track(&updated, true);
-                    if let Ok(sel) = resolve_machine_suggestion(
+                let post_chain_ready = if !measure_post_chain {
+                    true
+                } else {
+                    let base_wt = CachedWholeTrackEvidence::from_album_track_with_peak(prev, true, true);
+                    let sug_opt = resolve_machine_suggestion(
                         spec,
                         false,
-                        Some(updated.seconds),
+                        Some(prev.seconds),
                         &raw_peak_meta,
                         &track_meta,
                         None,
@@ -841,21 +886,94 @@ fn scan_single_track_schema2(
                         policy,
                         genre_rules,
                         true,
-                    ) {
-                        let new_sug = sel.plan.filter.to_string();
-                        let changed = new_sug != prev.suggested;
-                        updated.suggested = new_sug;
-                        updated.rule = sel.winning_rule;
-                        updated.why = ap_core::filter_db::why_for_rule(&updated.rule).to_string();
-                        updated.deemphasis = sel.plan.deemphasis;
-                        return SingleTrackResult::Retagged {
-                            line: format!(
-                                "TAG   {file_name} (metadata updated, audio MD5 unchanged -> {} [{}])",
-                                updated.suggested, updated.rule
-                            ),
-                            suggested_changed: changed,
-                            track: updated,
-                        };
+                    )
+                    .ok();
+                    if let Some(sug_sel) = sug_opt {
+                        let default_uf = UserFiltersFile::default();
+                        let uf_ref = user_filters.unwrap_or(&default_uf);
+                        let ov = uf_ref.resolve_for_track(root, rel_folder, file_name, &track_meta);
+                        let active_sel = resolve_active_selection(
+                            spec,
+                            false,
+                            Some(prev.seconds),
+                            &raw_peak_meta,
+                            &track_meta,
+                            None,
+                            &base_wt,
+                            Some(&ov),
+                            FilterMode::Mine,
+                            policy,
+                            genre_rules,
+                            true,
+                        )
+                        .unwrap_or_else(|_| sug_sel.clone());
+                        let mut plans: Vec<&SelectedDspPlan> = vec![&active_sel.plan];
+                        if sug_sel.plan.filter != active_sel.plan.filter
+                            || sug_sel.plan.deemphasis != active_sel.plan.deemphasis
+                        {
+                            plans.push(&sug_sel.plan);
+                        }
+                        plans.into_iter().all(|p| {
+                            rew_factory
+                                .create_for_rate(p.target_rate_hz)
+                                .ok()
+                                .map(|c| {
+                                    build_post_chain_key(
+                                        p,
+                                        spec.sample_rate_hz,
+                                        p.target_rate_hz,
+                                        c.content_hash(),
+                                    )
+                                })
+                                .is_some_and(|k| prev.find_post_chain_peak(&k).is_some())
+                        })
+                    } else {
+                        false
+                    }
+                };
+                if post_chain_ready {
+                    return SingleTrackResult::Skipped(format!(
+                        "SKIP  {file_name} (current v{DETECTOR_VERSION})"
+                    ));
+                }
+            }
+
+            // --- Fast Path 2: Metadata-only edit (MD5 unchanged, size/mtime changed) ---
+            if !measure_post_chain {
+                if let (Some(a), Some(b)) = (prev.md5.as_deref(), header_md5_hex.as_deref()) {
+                    if a.eq_ignore_ascii_case(b) {
+                        let mut updated = prev.clone();
+                        updated.size = file_size;
+                        updated.mtime_unix_s = file_mtime;
+                        updated.head_hash = file_head_4k_hash(path);
+                        let base_wt = CachedWholeTrackEvidence::from_album_track(&updated, true);
+                        if let Ok(sel) = resolve_machine_suggestion(
+                            spec,
+                            false,
+                            Some(updated.seconds),
+                            &raw_peak_meta,
+                            &track_meta,
+                            None,
+                            &base_wt,
+                            policy,
+                            genre_rules,
+                            true,
+                        ) {
+                            let new_sug = sel.plan.filter.to_string();
+                            let changed = new_sug != prev.suggested;
+                            updated.suggested = new_sug;
+                            updated.rule = sel.winning_rule;
+                            updated.why = ap_core::filter_db::why_for_rule(&updated.rule).to_string();
+                            updated.deemphasis = sel.plan.deemphasis;
+                            return SingleTrackResult::Retagged {
+                                line: format!(
+                                    "TAG   {file_name} (metadata updated, audio MD5 unchanged -> {} [{}])",
+                                    updated.suggested, updated.rule
+                                ),
+                                suggested_changed: changed,
+                                track: updated,
+                            };
+                        }
                     }
                 }
             }
@@ -926,11 +1044,16 @@ fn scan_single_track_schema2(
         }
     }
 
-    // --- Full Scan Pass 1: Stream entire track once through TrackAnalyzer + MD5 verifier ---
+    // --- Full Scan Pass 1: Stream entire track once through TrackAnalyzer + GatedPeakScanner (`tp8x-64`) + MD5 verifier ---
+    // Review #10 §1.3 Invariants I1 & I2: every scan computes the exact `tp8x-64` true peak once.
     let mut analyzer = TrackAnalyzer::new(spec.sample_rate_hz, spec.bits_per_sample);
+    let mut peak_scanner = GatedPeakScanner::new();
     loop {
         match reader.read_next_block(SCAN_BLOCK_FRAMES) {
-            Ok(Some(block)) => analyzer.push_block(&block),
+            Ok(Some(block)) => {
+                analyzer.push_block(&block);
+                peak_scanner.push_stereo_buffer(&block);
+            }
             Ok(None) => break,
             Err(err) => {
                 return SingleTrackResult::Failed(format!(
@@ -952,6 +1075,7 @@ fn scan_single_track_schema2(
         }
     }
     let final_md5_hex = header_md5_hex.or_else(|| computed_md5.as_ref().map(md5_to_hex));
+    let peak_scan = peak_scanner.finish(None);
 
     let early_digital = track_meta.is_early_digital_era();
     let orig_below = track_meta
@@ -1018,13 +1142,18 @@ fn scan_single_track_schema2(
         active_selection.winning_rule.clone(),
     );
 
-    // Build Schema-2 track entry (always stores pure machine `suggested` / `rule` / `why`!).
+    // Build Schema-3 track entry (always stores pure machine `suggested` / `rule` / `why` + `tp8x-64` peak!).
     let head_hash = file_head_4k_hash(path);
     let mut s2_track = AlbumTrackAnalysis::from_schema1(&s1_entry, head_hash);
     s2_track.suggested = suggested_filter.clone();
     s2_track.rule = suggested_rule.clone();
     s2_track.why = ap_core::filter_db::why_for_rule(&suggested_rule).to_string();
     s2_track.deemphasis = sug_selection.plan.deemphasis;
+    if let Some(ps) = peak_scan.filter(|s| s.frames_scanned > 0 && s.true_peak_dbtp.is_finite()) {
+        s2_track.sample_peak = ps.sample_peak_linear;
+        s2_track.true_peak_dbtp = Some(ps.true_peak_dbtp);
+        s2_track.true_peak_meter = Some(PEAK_SCAN_METER_ID.to_string());
+    }
 
     // Preserve any existing `post_chain_peaks` when audio MD5 is unchanged.
     if let Some(prev) = old_track {

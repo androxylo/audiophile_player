@@ -158,31 +158,27 @@ fn l11_engine_3_track_queue_gapless_rate_change_and_wire_null() {
     )
     .expect("engine run failed");
 
-    // Consumer opens one hardware-pin stream per TrackStart:
-    //   Segment 0: Track 1 @ 352,800 Hz (unpadded gapless handoff into Track 2)
-    //   Segment 1: Track 2 @ 352,800 Hz (seamless gapless continuation + full FIR ring-down tail before rate switch)
-    //   Segment 2: Track 3 @ 384,000 Hz (clean rate switch + full FIR ring-down tail at end-of-queue)
+    // Review #10 EN2: Consumer keeps the hardware pin open continuously across same-rate,
+    // same-wire-format gapless tracks and only reopens on a rate/format change:
+    //   Segment 0: Track 1 + Track 2 continuously @ 352,800 Hz (ZERO hardware stop/reopen!)
+    //   Segment 1: Track 3 @ 384,000 Hz (clean rate switch + full FIR ring-down tail at end-of-queue)
     assert_eq!(
         sink.segments().len(),
-        3,
-        "expected 3 segments (Track 1 @ 352.8k, Track 2 @ 352.8k, Track 3 @ 384k), got {:?}",
+        2,
+        "EN2: expected 2 segments (continuous Track 1+2 @ 352.8k, Track 3 @ 384k), got {:?}",
         sink.segments()
     );
     let seg0 = sink.segments()[0].clone();
     let seg1 = sink.segments()[1].clone();
-    let seg2 = sink.segments()[2].clone();
     assert_eq!(seg0.sample_rate_hz, 352_800);
-    assert_eq!(seg1.sample_rate_hz, 352_800);
-    assert_eq!(seg2.sample_rate_hz, 384_000);
-    assert!(!seg0.had_fade_out, "fade-out must NOT occur during gapless Track 1 -> Track 2");
-    assert!(!seg1.had_fade_out, "fade-out must NOT occur during rate change Track 2 -> Track 3");
-    assert!(!seg2.had_fade_out, "fade-out must NOT occur at natural end-of-queue");
+    assert_eq!(seg1.sample_rate_hz, 384_000);
+    assert!(!seg0.had_fade_out, "fade-out must NOT occur during rate change Track 2 -> Track 3");
+    assert!(!seg1.had_fade_out, "fade-out must NOT occur at natural end-of-queue");
 
-    // Concatenate Segment 0 + Segment 1 wire frames (Track 1 + Track 2 gapless join @ 352.8 kHz)
-    // and null EVERY frame (including the Review #6 #13 full FIR ring-down tail!) against the
+    // Segment 0 wire frames (Track 1 + Track 2 continuous gapless join @ 352.8 kHz)
+    // must null EVERY frame (including the Review #6 #13 full FIR ring-down tail!) against the
     // independent continuous reference!
-    let mut bytes_12 = sink.read_segment_bytes(0).unwrap();
-    bytes_12.extend_from_slice(&sink.read_segment_bytes(1).unwrap());
+    let bytes_12 = sink.read_segment_bytes(0).unwrap();
     let wire_12 = decode_wire_frames(&bytes_12, seg0.wire_format).unwrap();
 
     let mut cont44_l = a_l;
@@ -226,9 +222,9 @@ fn l11_engine_3_track_queue_gapless_rate_change_and_wire_null() {
         "L11 Segment 0+1 (gapless Track 1+2) wire-vs-reference residual {peak12_db:+.2} dBFS > -125 dBFS"
     );
 
-    // Same Layer A–C null check on Segment 2 (Track 3 @ 384 kHz after clean rate switch)!
-    let bytes2 = sink.read_segment_bytes(2).unwrap();
-    let wire2 = decode_wire_frames(&bytes2, seg2.wire_format).unwrap();
+    // Same Layer A–C null check on Segment 1 (Track 3 @ 384 kHz after clean rate switch)!
+    let bytes2 = sink.read_segment_bytes(1).unwrap();
+    let wire2 = decode_wire_frames(&bytes2, seg1.wire_format).unwrap();
     let spec48 = StreamSpec {
         sample_rate_hz: 48_000,
         bits_per_sample: 24,
@@ -326,9 +322,10 @@ fn l11_engine_pause_resume_and_stop_fadeout_only_at_stop() {
                 shared_hook.submit_command(ControlCommand::Pause);
                 stop_hook.store(true, Ordering::Release);
             }
-            // Segment 1 is resumed Track 1 (must finish cleanly with NO fade-out!).
-            // Segment 2 is Track 2: trigger Stop mid-track -> fade-out happens ONLY on stop/pause!
-            if seg_idx == 2 && seg_frames >= 32_768 {
+            // Segment 1 is resumed Track 1 continuing seamlessly (EN2) into Track 2 (352,800
+            // frames for 1.0 s Track 1 + 32,768 frames into Track 2): trigger Stop mid-Track 2 ->
+            // fade-out happens ONLY on stop/pause!
+            if seg_idx == 1 && seg_frames >= 352_800 + 32_768 {
                 stop_hook.store(true, Ordering::Release);
                 ctrl_hook.trigger(ap_player::signals::ShutdownSignal::CtrlC);
             }
@@ -359,16 +356,18 @@ fn l11_engine_pause_resume_and_stop_fadeout_only_at_stop() {
     assert!(resumed.load(Ordering::Acquire), "expected Resume to fire");
     assert_eq!(
         sink.segments().len(),
-        3,
-        "expected 3 segments (Track 1 pre-pause, Track 1 resumed, Track 2 stopped), got {:?}",
+        2,
+        "EN2: expected 2 segments (Track 1 pre-pause, continuous Track 1 resumed -> Track 2 stopped), got {:?}",
         sink.segments()
     );
     assert!(sink.segments()[0].had_fade_out, "Pause must fade out cleanly");
+    assert!(sink.segments()[1].had_fade_out, "Stop mid-Track 2 must fade out cleanly");
+    let seg1_frames =
+        sink.segments()[1].byte_len / sink.segments()[1].wire_format.bytes_per_frame() as u64;
     assert!(
-        !sink.segments()[1].had_fade_out,
-        "Natural Track 1 -> Track 2 gapless transition must NOT fade out"
+        seg1_frames > 352_800,
+        "EN2: Segment 1 must have crossed Track 1 -> Track 2 continuously without reopening ({seg1_frames} frames)"
     );
-    assert!(sink.segments()[2].had_fade_out, "Stop must fade out cleanly");
 
     let _ = fs::remove_dir_all(&root);
 }

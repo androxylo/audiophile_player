@@ -173,8 +173,7 @@ pub fn run_cli_main() -> ExitCode {
                         upsampler_policy,
                     },
                     controller,
-                )
-                .map_err(CliError::from),
+                ),
                 _ => unreachable!(),
             };
 

@@ -608,145 +608,22 @@ fn review6_16bit_rounded_sample_peak_tags_stay_sample_peak_and_keep_isp_reserve(
 }
 
 #[test]
-fn ultimate_quantizer_margin_and_fixed_whole_track_headroom_honor_oq33() {
-    use ap_core::headroom::{ULTIMATE_DAC_MARGIN_DB, quantizer_margin_db, select_ultimate_headroom};
-
-    let dm = ULTIMATE_DAC_MARGIN_DB;
-    assert!(dm >= 0.5 && dm <= 1.5, "unexpected ULTIMATE_DAC_MARGIN_DB={dm}");
-
-    // 1. Quantizer margin m_q: ns-gentle-2 (L1 = 2.0) -> 4.5 LSB below full scale.
-    let m_q_24 = quantizer_margin_db(24, 2.0);
-    let expected_24 = -20.0 * (1.0 - 4.5 / (1_u64 << 23) as f64).log10();
-    assert!((m_q_24 - expected_24).abs() < 1e-12);
-    assert!(m_q_24 > 0.0 && m_q_24 < 1e-5, "24-bit 4.5 LSB margin is tiny: {m_q_24}");
-
-    let m_q_16 = quantizer_margin_db(16, 2.0);
-    let expected_16 = -20.0 * (1.0_f64 - 4.5_f64 / 32768.0_f64).log10();
-    assert!((m_q_16 - expected_16).abs() < 1e-12);
-
-    // 2. Local cached exact whole-track M = +1.4 dBFS -> exact fixed G = -(1.4 + m_q + dac_margin).
-    let d_cached_hot = select_ultimate_headroom(
-        &TrackPeakMetadata::default(),
-        24,
-        false,
-        Some(5.0),
-        Some(1.4),
-        Some(0.2),
-        m_q_24,
-    );
-    assert!(
-        (d_cached_hot.total_gain_db() - (-(1.4 + m_q_24 + dm))).abs() < 1e-9,
-        "cached exact M=+1.4 must give G=-(1.4+m_q+dac_margin), got {}",
-        d_cached_hot.total_gain_db()
-    );
-
-    // When M30 exceeds a stale cached M, max(M, M30) governs so overs cannot occur.
-    let d_cached_m30_higher = select_ultimate_headroom(
-        &TrackPeakMetadata::default(),
-        24,
-        false,
-        None,
-        Some(0.5),
-        Some(2.1),
-        m_q_24,
-    );
-    assert!(
-        (d_cached_m30_higher.total_gain_db() - (-(2.1 + m_q_24 + dm))).abs() < 1e-9,
-        "cached M=+0.5 with M30=+2.1 must use max(M, M30), got {}",
-        d_cached_m30_higher.total_gain_db()
-    );
-
-    // Local cached exact M = -2.0 dBFS -> G = 0.0 dB (never boosts, never wastes -3 dB!).
-    let d_cached_quiet = select_ultimate_headroom(
-        &TrackPeakMetadata::default(),
-        24,
-        false,
-        Some(4.0),
-        Some(-2.0),
-        None,
-        m_q_24,
-    );
-    assert_eq!(d_cached_quiet.total_gain_db(), 0.0);
-
-    // Local cached exact M = +4.2 dBFS (e.g. heavy REW boost) -> G = -(4.2 + m_q + dac_margin).
-    let d_cached_rew = select_ultimate_headroom(
-        &TrackPeakMetadata::default(),
-        24,
-        false,
-        Some(6.0),
-        Some(4.2),
-        None,
-        m_q_24,
-    );
-    assert!((d_cached_rew.total_gain_db() - (-(4.2 + m_q_24 + dm))).abs() < 1e-9);
-    assert_eq!(d_cached_rew.mode, HeadroomMode::Minus3Db);
-
-    // 3. Local uncached first play: G = min(G_HR, -(M30 + m_q + dac_margin)).
-    // Quiet W30 (M30 = -8.0 dBFS) NEVER relaxes G_HR (-3.0 dB for untagged track)!
-    let d_uncached_quiet_w30 = select_ultimate_headroom(
-        &TrackPeakMetadata::default(),
-        24,
-        false,
-        None,
-        None,
-        Some(-8.0),
-        m_q_24,
-    );
-    assert!((d_uncached_quiet_w30.total_gain_db() - (-3.0)).abs() < 1e-9);
-
-    // Hot W30 (M30 = +4.5 dBFS) DOES tighten below G_HR (-3.0 dB) to -(4.5 + m_q + dac_margin).
-    let d_uncached_hot_w30 = select_ultimate_headroom(
-        &TrackPeakMetadata::default(),
-        24,
-        false,
-        None,
-        None,
-        Some(4.5),
-        m_q_24,
-    );
-    assert!((d_uncached_hot_w30.total_gain_db() - (-(4.5 + m_q_24 + dm))).abs() < 1e-9);
-
-    // 4. Streaming (OQ-33): ALWAYS enforces -3 dB safety (+ REW excess), even when cached M
-    // or quiet tags are passed!
-    let quiet_meta = TrackPeakMetadata {
-        true_peak_linear: Some(0.25),
-        ..TrackPeakMetadata::default()
-    };
-    let d_stream = select_ultimate_headroom(
-        &quiet_meta,
-        24,
-        true,
-        Some(2.0),
-        Some(-10.0), // must be IGNORED for streaming!
-        Some(-10.0),
-        m_q_24,
-    );
-    // Streaming unknown: G_up = -3 dB, G_c = +2 dB -> S = -2 dB, total = -5 dB.
-    assert_eq!(d_stream.mode, HeadroomMode::Minus3Db);
-    assert!((d_stream.total_gain_db() - (-5.0)).abs() < 1e-9);
-
-    // Streaming with hot W30 (+6.0 dBFS > 5.0 dB reserve) tightens further to -(6.0 + m_q + dm).
-    let d_stream_hot = select_ultimate_headroom(
-        &quiet_meta,
-        24,
-        true,
-        Some(2.0),
-        None,
-        Some(6.0),
-        m_q_24,
-    );
-    assert!((d_stream_hot.total_gain_db() - (-(6.0 + m_q_24 + dm))).abs() < 1e-9);
-}
-
-#[test]
 fn issue23_p3_select_ultimate_headroom_v2_binary_step_dac_margin_and_streaming_t10() {
     use ap_core::headroom::{
-        PeakEvidence, TP_METER_ERR_4X_12_DB, TP_METER_ERR_8X_32_DB, ULTIMATE_DAC_MARGIN_DB,
+        PeakEvidence, TP_METER_ERR_8X_64_DB, TP_METER_ERR_TAG_TP_DB, ULTIMATE_DAC_MARGIN_DB,
         quantizer_margin_db, select_ultimate_headroom_v2,
     };
 
     let dm = ULTIMATE_DAC_MARGIN_DB;
+    assert!(dm >= 0.5 && dm <= 1.5, "unexpected ULTIMATE_DAC_MARGIN_DB={dm}");
+
+    // 0. Quantizer margin m_q sanity: ns-gentle-2 (L1 = 2.0) -> 4.5 LSB below full scale.
     let m_q = quantizer_margin_db(24, 2.0);
+    let expected_24 = -20.0 * (1.0 - 4.5 / (1_u64 << 23) as f64).log10();
+    assert!((m_q - expected_24).abs() < 1e-12);
+    let m_q_16 = quantizer_margin_db(16, 2.0);
+    let expected_16 = -20.0 * (1.0_f64 - 4.5_f64 / 32768.0_f64).log10();
+    assert!((m_q_16 - expected_16).abs() < 1e-12);
 
     // 1. T2 (Owner Decision #1): ExactPostChain with hot source TP (-1.41 dBFS > -3 dBFS)
     //    MUST keep binary G_up = -3 dB (NOT 0 dB!), with S = 0 dB since -1.41 - 3 + 1 < 0.
@@ -758,6 +635,36 @@ fn issue23_p3_select_ultimate_headroom_v2_binary_step_dac_margin_and_streaming_t
     assert_eq!(d_hot_exact.mode, HeadroomMode::Minus3Db);
     assert!((d_hot_exact.convolution_scale_db).abs() < 1e-9);
     assert!((d_hot_exact.total_gain_db() - (-3.0)).abs() < 1e-9);
+
+    // Review #10 TV8: cached M = -2.0 dBFS with hot source TP = -2.0 stays at -3.0 dB (NOT 0 dB!),
+    // and cached M = +1.4 dBFS with hot source TP stays at -3.0 dB (since +1.4 - 3 + 1 < 0).
+    let d_cached_m2 = select_ultimate_headroom_v2(
+        &PeakEvidence::ExactPostChain {
+            m_db: -2.0,
+            source_tp_db: Some(-2.0),
+        },
+        false,
+        Some(4.0),
+        None,
+        0.15,
+        m_q,
+    );
+    assert_eq!(d_cached_m2.mode, HeadroomMode::Minus3Db);
+    assert!((d_cached_m2.total_gain_db() - (-3.0)).abs() < 1e-9);
+
+    let d_cached_p14 = select_ultimate_headroom_v2(
+        &PeakEvidence::ExactPostChain {
+            m_db: 1.4,
+            source_tp_db: Some(-0.5),
+        },
+        false,
+        Some(5.0),
+        Some(0.2),
+        0.15,
+        m_q,
+    );
+    assert_eq!(d_cached_p14.mode, HeadroomMode::Minus3Db);
+    assert!((d_cached_p14.total_gain_db() - (-3.0)).abs() < 1e-9);
 
     // 2. ExactPostChain with quiet source TP (-8.0 dBFS <= -3 dBFS) -> G_up = 0 dB, S = 0 dB.
     let quiet_exact = PeakEvidence::ExactPostChain {
@@ -779,7 +686,7 @@ fn issue23_p3_select_ultimate_headroom_v2_binary_step_dac_margin_and_streaming_t
     assert_eq!(d_rew_exact.mode, HeadroomMode::Minus3Db);
     assert!((d_rew_exact.total_gain_db() - (-(4.2 + m_q + dm))).abs() < 1e-9);
 
-    // 4. Legacy ExactPostChain without source_tp_db decides binary G_up on M itself:
+    // 4. ExactPostChain without source_tp_db decides binary G_up on M itself:
     //    M = -1.5 dBFS (> -3) -> -3 dB; M = -4.0 dBFS (<= -3) -> 0 dB.
     let legacy_hot = PeakEvidence::ExactPostChain {
         m_db: -1.5,
@@ -803,7 +710,7 @@ fn issue23_p3_select_ultimate_headroom_v2_binary_step_dac_margin_and_streaming_t
     //    M_hat = -4.0 + 0.1 + 0.15 + 6.0 = +2.25 dBFS -> S = -(2.25 + m_q + 1.0) = -(3.25 + m_q).
     let scan_tp = PeakEvidence::SourceTruePeak {
         tp_db: -4.0,
-        meter_err_db: TP_METER_ERR_8X_32_DB,
+        meter_err_db: TP_METER_ERR_8X_64_DB,
         source: "scan-tp",
     };
     let d_scan = select_ultimate_headroom_v2(&scan_tp, false, Some(6.0), Some(-5.0), 0.15, m_q);
@@ -823,21 +730,34 @@ fn issue23_p3_select_ultimate_headroom_v2_binary_step_dac_margin_and_streaming_t
         "E3 scan-tp must save ~2.9 dB of unnecessary attenuation vs blanket A_isp=3.0"
     );
 
-    // Borderline quiet TP = -3.0 dBTP with 4x meter (A_tp=0.7), A_up=0.15, no REW:
+    // Borderline quiet TP = -3.0 dBTP with Vorbis tag-tp (A_tp=0.7), A_up=0.15, no REW:
     // M_hat = -3.0 + 0.7 + 0.15 = -2.15, + 1.0 DAC margin = -1.15 <= 0 -> G = 0.0 dB!
     let borderline_tp = PeakEvidence::SourceTruePeak {
         tp_db: -3.0,
-        meter_err_db: TP_METER_ERR_4X_12_DB,
-        source: "cached-tp",
+        meter_err_db: TP_METER_ERR_TAG_TP_DB,
+        source: "tag-tp",
     };
     let d_border =
         select_ultimate_headroom_v2(&borderline_tp, false, None, Some(-3.0), 0.15, m_q);
     assert_eq!(d_border.mode, HeadroomMode::ZeroDb);
     assert_eq!(d_border.total_gain_db(), 0.0);
 
-    // 6. T10: Streaming ALWAYS enforces -3 dB fail-safe (OQ-33), ignoring quiet PeakEvidence!
+    // 6. T10 + Review #10 HP-05: Streaming & Unknown ALWAYS enforce -3 dB fail-safe PLUS
+    //    `m_q + ULTIMATE_DAC_MARGIN_DB` (even when M30 is quiet or absent!).
     let d_stream_quiet =
         select_ultimate_headroom_v2(&quiet_exact, true, Some(2.0), Some(-10.0), 0.0, m_q);
     assert_eq!(d_stream_quiet.mode, HeadroomMode::Minus3Db);
-    assert!((d_stream_quiet.total_gain_db() - (-5.0)).abs() < 1e-9);
+    assert!(
+        (d_stream_quiet.total_gain_db() - (-(3.0 + 2.0 + m_q + dm))).abs() < 1e-9,
+        "HP-05: streaming fail-safe must include m_q + DAC margin, got {}",
+        d_stream_quiet.total_gain_db()
+    );
+    let d_unknown_no_m30 =
+        select_ultimate_headroom_v2(&PeakEvidence::Unknown, false, None, None, 0.0, m_q);
+    assert_eq!(d_unknown_no_m30.mode, HeadroomMode::Minus3Db);
+    assert!(
+        (d_unknown_no_m30.total_gain_db() - (-(3.0 + m_q + dm))).abs() < 1e-9,
+        "HP-05: Unknown fail-safe without M30 must reserve DAC margin + m_q, got {}",
+        d_unknown_no_m30.total_gain_db()
+    );
 }

@@ -6,7 +6,6 @@ name: CI Workspace & Verify Suite
 on:
   workflow_dispatch:
   push:
-    branches: [main]
     paths:
       - 'crates/**'
       - 'tests/**'
@@ -21,12 +20,18 @@ on:
       - 'Cargo.lock'
       - '.github/workflows/ci.yml'
 
+permissions:
+  contents: read
+
 jobs:
   windows-verify:
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -34,7 +39,7 @@ jobs:
       - name: Run full workspace test suite with verify feature
         shell: pwsh
         run: |
-          cargo test --workspace --locked --features verify -- --skip hardware_live --skip live_wdm_ks --skip plays_random_flac_from_user_music
+          cargo test --workspace --locked --features verify
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Check default (non-verify) workspace build

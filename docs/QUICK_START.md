@@ -89,7 +89,7 @@ If all three tools are already installed, a source install shows **no** admin pr
 Open **PowerShell** (Start → type `powershell` → Enter; it does **not** need to be "Run as administrator") and paste:
 
 ```powershell
-irm https://github.com/androxylo/audiophile_player/releases/latest/download/bootstrap.ps1 | iex
+$s = Join-Path $env:TEMP 'audiophile-player-bootstrap.ps1'; irm https://github.com/androxylo/audiophile_player/releases/latest/download/bootstrap.ps1 -OutFile $s; powershell -ExecutionPolicy Bypass -File $s
 ```
 
 What happens next:
@@ -161,7 +161,7 @@ See [Troubleshooting](#troubleshooting) for what to do with each.
 **Option 1: let the installer download and verify it.**
 
 ```powershell
-& ([scriptblock]::Create((irm https://github.com/androxylo/audiophile_player/releases/latest/download/bootstrap.ps1))) -Binary
+$s = Join-Path $env:TEMP 'audiophile-player-bootstrap.ps1'; irm https://github.com/androxylo/audiophile_player/releases/latest/download/bootstrap.ps1 -OutFile $s; powershell -ExecutionPolicy Bypass -File $s -Binary
 ```
 
 (or `powershell -ExecutionPolicy Bypass -File .\bootstrap.ps1 -Binary` if you downloaded it as in A2).
@@ -663,7 +663,7 @@ Stop the player first (`audiophile-player stop`) so its files aren't in use. You
 ## Uninstalling
 
 ```powershell
-& ([scriptblock]::Create((irm https://github.com/androxylo/audiophile_player/releases/latest/download/bootstrap.ps1))) -Uninstall
+$s = Join-Path $env:TEMP 'audiophile-player-bootstrap.ps1'; irm https://github.com/androxylo/audiophile_player/releases/latest/download/bootstrap.ps1 -OutFile $s; powershell -ExecutionPolicy Bypass -File $s -Uninstall
 # or, with a downloaded copy:  powershell -ExecutionPolicy Bypass -File .\bootstrap.ps1 -Uninstall
 ```
 

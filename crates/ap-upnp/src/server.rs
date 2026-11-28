@@ -528,7 +528,15 @@ fn handle_subscribe(
         GenaService::RenderingControl => state.render_rcs_event_xml(),
     };
 
-    match state.gena().subscribe(service, cb, timeout_hdr, initial_xml) {
+    let Ok(peer_ip) = stream.peer_addr().map(|a| a.ip()) else {
+        reply_412(stream);
+        return;
+    };
+
+    match state
+        .gena()
+        .subscribe(service, peer_ip, cb, timeout_hdr, initial_xml)
+    {
         Ok((sid, secs, initial_job)) => {
             let timeout_val = format!("Second-{secs}");
             // Review #5 Finding #33: write and flush the 200 OK response (with SID) BEFORE

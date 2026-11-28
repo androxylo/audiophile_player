@@ -1091,6 +1091,9 @@ pub fn run_random_music_player(
         if db_env.manifest.resolve_folder_path(&music_dir).is_none() {
             db_env.manifest.upsert_root("main", &music_dir);
         }
+        db_env
+            .validate_writable_paths_outside_roots()
+            .map_err(CliError::config)?;
         let filter_mode = ultimate_override
             .filter_mode
             .unwrap_or(loaded_cfg.config.filters.mode);
@@ -1117,7 +1120,7 @@ pub fn run_random_music_player(
         .as_deref()
         .map(|s| {
             s.parse::<std::net::Ipv4Addr>()
-                .map_err(|_| format!("invalid [upnp] bind_ip '{s}'"))
+                .map_err(|_| CliError::config(format!("invalid [upnp] bind_ip '{s}'")))
         })
         .transpose()?;
     let effective_upnp_cfg = UpnpRendererConfig {
@@ -1169,7 +1172,8 @@ pub fn run_random_music_player(
         effective_policy,
         effective_conv,
         effective_ultimate.enabled,
-    )?
+    )
+    .map_err(CliError::config)?
     .with_shared_dac_capabilities(Arc::clone(&shared_dac_caps));
 
     let api_token = generate_api_token_hex()?;
@@ -1743,6 +1747,88 @@ fn handle_producer_died(state: &mut EngineState<'_>) {
     state.pause_with_message(msg);
 }
 
+/// Log `[playing]`/`[pipeline]`/`[ultimate]` and update `SharedControl` + UPnP renderer state for
+/// a newly-audible track (shared by initial `TrackStart` and seamlessly-crossed EN2 boundaries).
+#[allow(clippy::too_many_arguments)]
+fn publish_track_start_ui(
+    shared: &SharedControl,
+    upnp_state: Option<&UpnpRendererState>,
+    path: &Path,
+    upnp_uri: Option<&str>,
+    upnp_next_gen: Option<u64>,
+    mode_label: PlayModeLabel,
+    report: &ap_dsp::pipeline::PipelineReport,
+    total_duration_s: Option<f64>,
+) {
+    let backend_label = shared.output_backend();
+    let fmt_str = report.format_summary_with_backend(total_duration_s, &backend_label);
+    let track_str = path.display().to_string();
+    let decision_str = report.ultimate_report.as_ref().map(|u| u.summary());
+    let peak_source = report
+        .ultimate_report
+        .as_ref()
+        .and_then(|u| u.peak_source.clone());
+    let known_peak = report
+        .ultimate_report
+        .as_ref()
+        .and_then(|u| {
+            if let Some(m) = u.cached_m_dbfs {
+                Some(format!("{m:+.2} dBFS (exact-M)"))
+            } else if let (Some(src), Some(p)) =
+                (u.peak_source.as_deref(), report.headroom.peak_dbfs)
+            {
+                let unit = match report.headroom.peak_kind {
+                    Some(ap_core::headroom::PeakKind::TruePeak) => "dBTP",
+                    _ => "dBFS",
+                };
+                Some(format!("{p:+.2} {unit} ({src})"))
+            } else {
+                u.m30_dbfs.map(|m| format!("{m:+.2} dBFS (30 s window)"))
+            }
+        })
+        .or_else(|| {
+            report
+                .headroom
+                .peak_dbfs
+                .map(|p| match report.headroom.peak_kind {
+                    Some(ap_core::headroom::PeakKind::TruePeak) => {
+                        format!("{p:+.2} dBTP (tag)")
+                    }
+                    Some(ap_core::headroom::PeakKind::SamplePeak) => {
+                        format!("{p:+.2} dBFS (tag)")
+                    }
+                    None => format!("{p:+.2} dBFS"),
+                })
+        });
+    println!("  [playing]  {track_str} ({fmt_str})");
+    println!("  [pipeline] {}", report.log_line());
+    if let Some(ref ult_rep) = report.ultimate_report {
+        for w in &ult_rep.warnings {
+            println!("  [ultimate] {w}");
+            shared.record_action(format!("Ultimate: {w}"));
+        }
+    }
+    let _ = io::stdout().flush();
+    shared.record_action(report.log_line());
+    shared.set_playing_with_decision_peak_and_source(
+        mode_label,
+        track_str,
+        fmt_str,
+        decision_str,
+        known_peak,
+        peak_source,
+    );
+    if mode_label == PlayModeLabel::UpnpRenderer {
+        if let Some(upnp) = upnp_state {
+            if let Some(uri) = upnp_uri {
+                upnp.engine_mark_playing_with_gen(uri, total_duration_s, upnp_next_gen);
+            } else {
+                upnp.engine_mark_playing_current(total_duration_s);
+            }
+        }
+    }
+}
+
 /// Execute one iteration of the playback consumer loop (command handling, TrackStart prebuffer
 /// with re-queue protection, `stop_flag` arming, streaming playback, and seamless resume on
 /// rejected commands).
@@ -1956,80 +2042,23 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
             // Record the track actually started by the consumer (not producer decode-ahead).
             state.record_anchor(path.clone());
             state.just_skipped_track = false;
-
-            let backend_label = state.shared.output_backend();
-            let fmt_str = report.format_summary_with_backend(total_duration_s, &backend_label);
-            let track_str = path.display().to_string();
-            let decision_str = report.ultimate_report.as_ref().map(|u| u.summary());
-            let peak_source = report
-                .ultimate_report
-                .as_ref()
-                .and_then(|u| u.peak_source.clone());
-            let known_peak = report
-                .ultimate_report
-                .as_ref()
-                .and_then(|u| {
-                    if let Some(m) = u.cached_m_dbfs {
-                        Some(format!("{m:+.2} dBFS (exact-M)"))
-                    } else if let (Some(src), Some(p)) = (u.peak_source.as_deref(), report.headroom.peak_dbfs) {
-                        let unit = match report.headroom.peak_kind {
-                            Some(ap_core::headroom::PeakKind::TruePeak) => "dBTP",
-                            _ => "dBFS",
-                        };
-                        Some(format!("{p:+.2} {unit} ({src})"))
-                    } else {
-                        u.m30_dbfs.map(|m| format!("{m:+.2} dBFS (30 s window)"))
-                    }
-                })
-                .or_else(|| {
-                    report
-                        .headroom
-                        .peak_dbfs
-                        .map(|p| match report.headroom.peak_kind {
-                            Some(ap_core::headroom::PeakKind::TruePeak) => {
-                                format!("{p:+.2} dBTP (tag)")
-                            }
-                            Some(ap_core::headroom::PeakKind::SamplePeak) => {
-                                format!("{p:+.2} dBFS (tag)")
-                            }
-                            None => format!("{p:+.2} dBFS"),
-                        })
-                });
-            println!("  [playing]  {track_str} ({fmt_str})");
-            println!("  [pipeline] {}", report.log_line());
-            if let Some(ref ult_rep) = report.ultimate_report {
-                for w in &ult_rep.warnings {
-                    println!("  [ultimate] {w}");
-                    shared.record_action(format!("Ultimate: {w}"));
-                }
-            }
-            let _ = io::stdout().flush();
-            shared.record_action(report.log_line());
-            shared.set_playing_with_decision_peak_and_source(
+            publish_track_start_ui(
+                shared,
+                state.upnp_state.as_deref(),
+                &path,
+                upnp_uri.as_deref(),
+                upnp_next_gen,
                 mode_label,
-                track_str,
-                fmt_str,
-                decision_str,
-                known_peak,
-                peak_source,
+                &report,
+                total_duration_s,
             );
-            if mode_label == PlayModeLabel::UpnpRenderer {
-                if let Some(ref upnp) = state.upnp_state {
-                    // Review #5 #5 & Review #6 #8/#17: promote prefetched NextURI -> CurrentURI
-                    // strictly by generation token when audio becomes audible on the DAC; explicit
-                    // Play/Seek restarts pass `upnp_next_gen = None` and never consume `st.next`.
-                    if let Some(ref uri) = upnp_uri {
-                        upnp.engine_mark_playing_with_gen(uri, total_duration_s, upnp_next_gen);
-                    } else {
-                        upnp.engine_mark_playing_current(total_duration_s);
-                    }
-                }
-            }
 
-            // Review #4 Finding #20 & Review #5 Finding #19: if playback is interrupted by a
-            // rejected command (e.g. TOCTOU-invalidated PlayFile), drain any remaining queued
-            // commands (e.g. a trailing Next or Pause) before clearing stop_handle, and re-check
-            // immediately after clearing stop_handle so no command ever loses its stop signal.
+            // Review #4 Finding #20 & Review #5 Finding #19 + Review #10 EN2:
+            // Keep the hardware sink open continuously across same-epoch, same-rate, same-wire-format
+            // gapless track boundaries. A lightweight scoped observer thread updates UI, console
+            // logs, UPnP state, and anchors immediately whenever the RT closure steps across a
+            // same-format `TrackEnd -> TrackStart` boundary!
+            let mut active_track_path = path;
             loop {
                 let ep_for_stream = state.active_epoch;
                 let buf_for_stream = Arc::clone(stream_buf);
@@ -2037,24 +2066,118 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
                 let live_peak_for_rt = shared.live_output_peak_handle();
                 let hit_track_end = Arc::new(AtomicBool::new(false));
                 let hit_end_cb = Arc::clone(&hit_track_end);
-                let play_res = sink.play_block_stream_with_recycler(
-                    out_rate,
-                    report.wire_format,
-                    move || match buf_for_stream.try_pop_track_pcm_block_with_peak(ep_for_stream) {
-                        (PopBlockResult::Block(b), peak_u32) => {
-                            if peak_u32 > 0 {
-                                live_peak_for_rt.fetch_max(peak_u32, Ordering::Relaxed);
+                let stream_done = AtomicBool::new(false);
+                let crossed_paths: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+                let active_wire_fmt = report.wire_format;
+                let upnp_ref = state.upnp_state.as_deref();
+
+                let play_res = thread::scope(|s| {
+                    let done_ref = &stream_done;
+                    let crossed_ref = &crossed_paths;
+                    let obs = s.spawn(move || {
+                        loop {
+                            let Some(ev) = stream_buf
+                                .wait_completed_transition(done_ref, Duration::from_millis(50))
+                            else {
+                                if done_ref.load(Ordering::Acquire) {
+                                    break;
+                                }
+                                continue;
+                            };
+                            if let StreamEvent::TrackStart {
+                                path: next_path,
+                                upnp_uri: next_uri,
+                                upnp_next_gen: next_gen,
+                                mode_label: next_mode,
+                                report: next_rep,
+                                total_duration_s: next_dur,
+                                had_gapless_carryover: _,
+                            } = ev
+                            {
+                                publish_track_start_ui(
+                                    shared,
+                                    upnp_ref,
+                                    &next_path,
+                                    next_uri.as_deref(),
+                                    next_gen,
+                                    next_mode,
+                                    &next_rep,
+                                    next_dur,
+                                );
+                                crossed_ref
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .push(next_path);
                             }
-                            ap_output_win::wdm_ks::StreamBlock::Ready(b)
                         }
-                        (PopBlockResult::Underrun, _) => ap_output_win::wdm_ks::StreamBlock::Underrun,
-                        (PopBlockResult::TrackEnd | PopBlockResult::StaleOrClosed, _) => {
-                            hit_end_cb.store(true, Ordering::SeqCst);
-                            ap_output_win::wdm_ks::StreamBlock::EndOfTrack
-                        }
-                    },
-                    move |consumed| buf_for_recycle.recycle_consumed_block(consumed),
-                );
+                    });
+
+                    let res = sink.play_block_stream_with_recycler(
+                        out_rate,
+                        active_wire_fmt,
+                        move || {
+                            let stop_after = shared.is_shutdown_after_track();
+                            match buf_for_stream.try_pop_continuous_pcm_block_with_peak(
+                                ep_for_stream,
+                                out_rate,
+                                active_wire_fmt,
+                                stop_after,
+                            ) {
+                                (PopBlockResult::Block(b), peak_u32) => {
+                                    if peak_u32 > 0 {
+                                        live_peak_for_rt.fetch_max(peak_u32, Ordering::Relaxed);
+                                    }
+                                    ap_output_win::wdm_ks::StreamBlock::Ready(b)
+                                }
+                                (PopBlockResult::Underrun, _) => {
+                                    ap_output_win::wdm_ks::StreamBlock::Underrun
+                                }
+                                (PopBlockResult::TrackEnd | PopBlockResult::StaleOrClosed, _) => {
+                                    hit_end_cb.store(true, Ordering::SeqCst);
+                                    ap_output_win::wdm_ks::StreamBlock::EndOfTrack
+                                }
+                            }
+                        },
+                        move |consumed| buf_for_recycle.recycle_consumed_block(consumed),
+                    );
+                    done_ref.store(true, Ordering::Release);
+                    stream_buf.notify_waiters();
+                    let _ = obs.join();
+                    res
+                });
+
+                // Drain any transitions recorded just as the sink returned and update anchors.
+                for ev in stream_buf.drain_completed_transitions() {
+                    if let StreamEvent::TrackStart {
+                        path: next_path,
+                        upnp_uri: next_uri,
+                        upnp_next_gen: next_gen,
+                        mode_label: next_mode,
+                        report: next_rep,
+                        total_duration_s: next_dur,
+                        had_gapless_carryover: _,
+                    } = ev
+                    {
+                        publish_track_start_ui(
+                            shared,
+                            state.upnp_state.as_deref(),
+                            &next_path,
+                            next_uri.as_deref(),
+                            next_gen,
+                            next_mode,
+                            &next_rep,
+                            next_dur,
+                        );
+                        crossed_paths
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(next_path);
+                    }
+                }
+                for p in crossed_paths.into_inner().unwrap_or_else(|e| e.into_inner()) {
+                    state.record_anchor(p.clone());
+                    active_track_path = p;
+                }
                 stream_buf.drain_deferred_drops();
                 match play_res {
                     Ok(stats) => {
@@ -2069,7 +2192,7 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
                             })
                             .collect();
                         shared.set_last_playback_stats(JsonValue::obj(vec![
-                            ("track", JsonValue::from(path.display().to_string())),
+                            ("track", JsonValue::from(active_track_path.display().to_string())),
                             ("device", JsonValue::from(stats.device_name.clone())),
                             ("sample_rate_hz", JsonValue::from(stats.sample_rate_hz)),
                             ("wire_format", JsonValue::from(stats.wire_format.label())),
@@ -2095,7 +2218,7 @@ fn step_consumer_once<S: BlockStreamAudioSink>(
                         if stats.has_timing_anomalies() {
                             let warn_msg = format!(
                                 "Output timing anomaly on '{}' ({} Hz): {}",
-                                path.display(),
+                                active_track_path.display(),
                                 out_rate,
                                 stats.timing_summary(),
                             );
@@ -6023,6 +6146,7 @@ mod tests {
                 left: vec![0.25; 512],
                 right: vec![-0.25; 512],
             }),
+            pre_boundary_frames: 0,
             downsampler: None,
             quantizer_state: None,
         });

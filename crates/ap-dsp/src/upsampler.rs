@@ -272,6 +272,13 @@ pub trait Upsampler: Send {
     fn flush_for_gapless(&mut self) -> Result<(StereoF64Buffer, Option<UpsamplerCarryover>), String> {
         self.flush().map(|buf| (buf, None))
     }
+
+    /// Enable pre-ringing emission at track start (`Review #10 CQ1`): emits `pad_tail * ratio`
+    /// pre-ringing samples BEFORE sample 0 so `(0 ‖ x_B) * h` aligns exactly with Track A's
+    /// held-back `flush_for_gapless` additive tail. Returns emitted pre-ringing internal frames.
+    fn enable_gapless_prering(&mut self) -> usize {
+        0
+    }
 }
 
 /// Specification for Building Block A: Gaussian-windowed sinc prototype (`UPSAMPLING_RESEARCH.md` §4.1).
@@ -2118,6 +2125,18 @@ impl Upsampler for PolyphaseFirUpsampler {
             }),
         ))
     }
+
+    fn enable_gapless_prering(&mut self) -> usize {
+        if self.total_in_frames == 0 && !self.has_incoming_carryover && !self.flushed {
+            let extra = self.pad_tail;
+            if extra > 0 {
+                self.hist_l.resize(self.hist_l.len() + extra, 0.0_f64);
+                self.hist_r.resize(self.hist_r.len() + extra, 0.0_f64);
+                return extra * self.ratio;
+            }
+        }
+        0
+    }
 }
 
 /// Legacy test-only stateful polyphase Kaiser-windowed sinc `f64` upsampler (`--filter simple-test`).
@@ -2207,6 +2226,10 @@ impl Upsampler for SimpleWindowedSincUpsampler {
     }
     fn flush_for_gapless(&mut self) -> Result<(StereoF64Buffer, Option<UpsamplerCarryover>), String> {
         self.0.flush_for_gapless()
+    }
+
+    fn enable_gapless_prering(&mut self) -> usize {
+        self.0.enable_gapless_prering()
     }
 }
 

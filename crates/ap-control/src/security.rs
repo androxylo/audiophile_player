@@ -204,6 +204,20 @@ pub fn validate_path_syntax_for_root(
                 if seg.as_encoded_bytes().contains(&b':') {
                     return Err("path component must not contain ':'".to_string());
                 }
+                // Review #10 CS9: Windows trims trailing ASCII spaces and dots from path segments,
+                // which can normalize `".. "` or `"..."` into `".."` / `"."`! Reject any segment
+                // whose trimmed form is empty or dot-only.
+                let seg_bytes = seg.as_encoded_bytes();
+                let trimmed_end = seg_bytes
+                    .iter()
+                    .rposition(|&b| b != b' ' && b != b'.')
+                    .map_or(0, |i| i + 1);
+                if trimmed_end == 0 {
+                    return Err(format!(
+                        "dot/space-only path component '{}' is forbidden",
+                        seg.to_string_lossy()
+                    ));
+                }
                 if is_reserved_dos_device_name(seg) {
                     return Err(format!(
                         "reserved Windows device name '{}' is forbidden",

@@ -336,6 +336,203 @@ fn l5_gapless_equals_continuous_with_downsampler_integer_and_rational() {
     }
 }
 
+/// **L5 (Ultimate Mode, Review #10 TV10 + CQ1):** Verify that Ultimate gapless
+/// (`flush_for_gapless_unity_f64(G)` + `quantize_scaled_block(G, &mut additive_tail)` + quantizer
+/// state carryover) at `G = -3.0 dB` with an active REW IR and `÷2` downsampling matches a single
+/// continuous Ultimate render bit-exactly (0 click, 0 half-amplitude dip, exact `G` pre-scaling)!
+#[test]
+fn l5_ultimate_gapless_equals_continuous_with_negative_gain_rew_and_downsampler() {
+    let tmp = std::env::temp_dir().join(format!(
+        "ap_l5_ult_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&tmp).unwrap();
+
+    // Non-trivial 2048-tap stereo REW IR at 352.8 kHz (unit impulse + delayed damped reflection).
+    let ir_len = 2_048_usize;
+    let mut ir_l = vec![0.0_f64; ir_len];
+    let mut ir_r = vec![0.0_f64; ir_len];
+    ir_l[0] = 0.85;
+    ir_l[137] = 0.12;
+    ir_l[711] = -0.06;
+    ir_r[0] = 0.85;
+    ir_r[191] = -0.10;
+    ir_r[900] = 0.05;
+    let ir_path = tmp.join("l5_rew_352k8.wav");
+    write_stereo_f32_wav(&ir_path, 352_800, &ir_l, &ir_r);
+
+    let spec = StreamSpec {
+        sample_rate_hz: 44_100,
+        bits_per_sample: 24,
+        channels: 2,
+    };
+    let n = 22_050_usize; // 0.5 s at 44.1 kHz
+    let split_frame = 11_024_usize; // even split -> exact integer ÷2 alignment
+    let mut src_l = Vec::with_capacity(n);
+    let mut src_r = Vec::with_capacity(n);
+    for i in 0..n {
+        let t = (i as f64) / 44_100.0;
+        src_l.push(0.35 * (2.0 * PI * 440.0 * t).sin() + 0.15 * (2.0 * PI * 2_777.0 * t).sin());
+        src_r.push(0.32 * (2.0 * PI * 660.0 * t).sin() + 0.14 * (2.0 * PI * 4_111.0 * t).sin());
+    }
+
+    let policy = UpsamplerPolicy {
+        filter_override: Some(FilterArchetype::ShortLp),
+        shaper_override: Some(NoiseShaperProfile::TpdfDither),
+        dac_bits: 24,
+        ..UpsamplerPolicy::default()
+    };
+    let rew_cfg = ConvolutionConfig {
+        enabled: true,
+        file: Some(ir_path),
+        ..ConvolutionConfig::default()
+    };
+    let hr = HeadroomDecision {
+        mode: HeadroomMode::Minus3Db,
+        peak_dbfs: Some(-0.5),
+        peak_kind: Some(ap_core::headroom::PeakKind::TruePeak),
+        convolution_scale_db: 0.0,
+        reason: "TV10 fixed -3.0 dB".to_string(),
+    };
+    let fixed_g = hr.total_gain_db();
+    assert!((fixed_g - (-3.0)).abs() < 1e-9);
+
+    for &out_rate in &[352_800_u32, 176_400_u32] {
+        let dac_caps = build_dac_caps(DacWireFormat::Int32, Some(out_rate));
+        let pipeline = AudioPipeline::with_rew_config_full_tail(policy, rew_cfg.clone(), true)
+            .unwrap()
+            .with_dac_capabilities(dac_caps);
+        let plan = ap_dsp::selector::UpsamplerPicker::new(policy)
+            .unwrap()
+            .select(&TrackSourceInfo::from_stream_spec(spec));
+
+        // 1. Continuous single-session Ultimate render of A ‖ B at G = -3.0 dB.
+        let mut s_cont = pipeline
+            .start_track_with_plan_and_headroom(spec, plan.clone(), hr.clone())
+            .unwrap();
+        s_cont.set_quantizer_seed(DEFAULT_QUANTIZER_SEED ^ 0xA5A5);
+        let mut no_tail = None;
+        let cont_body = s_cont
+            .process_block_unity_f64(StereoF64Buffer {
+                sample_rate_hz: 44_100,
+                left: src_l.clone(),
+                right: src_r.clone(),
+            })
+            .unwrap();
+        let cont_tail = s_cont.flush_unity_f64().unwrap();
+        let mut cont_frames = s_cont
+            .quantize_scaled_block(&cont_body, fixed_g, &mut no_tail)
+            .unwrap()
+            .frames;
+        cont_frames.extend_from_slice(
+            &s_cont
+                .quantize_scaled_block(&cont_tail, fixed_g, &mut no_tail)
+                .unwrap()
+                .frames,
+        );
+
+        // 2. Gapless Ultimate render of A followed by B using `flush_for_gapless_unity_f64(-3.0)`.
+        let mut s_a = pipeline
+            .start_track_with_plan_and_headroom(spec, plan.clone(), hr.clone())
+            .unwrap();
+        s_a.set_quantizer_seed(DEFAULT_QUANTIZER_SEED ^ 0xA5A5);
+        let a_body = s_a
+            .process_block_unity_f64(StereoF64Buffer {
+                sample_rate_hz: 44_100,
+                left: src_l[..split_frame].to_vec(),
+                right: src_r[..split_frame].to_vec(),
+            })
+            .unwrap();
+        let mut gap_frames = s_a
+            .quantize_scaled_block(&a_body, fixed_g, &mut no_tail)
+            .unwrap()
+            .frames;
+        let (a_end, _peak_a, carry_a) = s_a.flush_for_gapless_unity_f64(fixed_g).unwrap();
+        gap_frames.extend_from_slice(
+            &s_a.quantize_scaled_block(&a_end, fixed_g, &mut no_tail)
+                .unwrap()
+                .frames,
+        );
+        let carry_a = carry_a.expect("Ultimate gapless carryover must exist");
+
+        let mut s_b = pipeline
+            .start_track_with_plan_and_headroom(spec, plan, hr.clone())
+            .unwrap();
+        let pre_b = if carry_a.pre_boundary_frames > 0 {
+            s_b.enable_gapless_prering()
+        } else {
+            0
+        };
+        assert_eq!(
+            pre_b, carry_a.pre_boundary_frames,
+            "TV10/CQ1 (out_rate={out_rate}): Track B pre_b must match Track A pre_boundary_frames"
+        );
+        if let Some(q_state) = carry_a.quantizer_state {
+            s_b.restore_quantizer_state_if_compatible(
+                q_state,
+                carry_a.effective_shaper,
+                carry_a.output_bits,
+            );
+        }
+        let mut additive_tail = carry_a.additive_output_tail.map(|t| (t, 0usize));
+        assert!(additive_tail.is_some(), "TV10: additive_output_tail must be present");
+
+        let b_body = s_b
+            .process_block_unity_f64(StereoF64Buffer {
+                sample_rate_hz: 44_100,
+                left: src_l[split_frame..].to_vec(),
+                right: src_r[split_frame..].to_vec(),
+            })
+            .unwrap();
+        let b_tail = s_b.flush_unity_f64().unwrap();
+        gap_frames.extend_from_slice(
+            &s_b.quantize_scaled_block(&b_body, fixed_g, &mut additive_tail)
+                .unwrap()
+                .frames,
+        );
+        gap_frames.extend_from_slice(
+            &s_b.quantize_scaled_block(&b_tail, fixed_g, &mut additive_tail)
+                .unwrap()
+                .frames,
+        );
+        if let Some((tail, off)) = additive_tail.take() {
+            if off < tail.left.len() {
+                let zeros = StereoF64Buffer {
+                    sample_rate_hz: out_rate,
+                    left: vec![0.0; tail.left.len() - off],
+                    right: vec![0.0; tail.right.len() - off],
+                };
+                let mut rem = Some((tail, off));
+                gap_frames.extend_from_slice(
+                    &s_b.quantize_scaled_block(&zeros, 0.0, &mut rem)
+                        .unwrap()
+                        .frames,
+                );
+            }
+        }
+
+        // Compare overlapping body + full join region (must match within <= 1 LSB at 24-bit!).
+        let cmp_len = cont_frames.len().min(gap_frames.len());
+        let mut max_lsb = 0_i64;
+        for i in 0..cmp_len {
+            for ch in 0..2 {
+                let d = (i64::from(gap_frames[i][ch] >> 8) - i64::from(cont_frames[i][ch] >> 8)).abs();
+                max_lsb = max_lsb.max(d);
+            }
+        }
+        assert!(
+            max_lsb <= 2,
+            "TV10/CQ1 (out_rate={out_rate}): Ultimate gapless vs continuous differed by {max_lsb} LSB"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
 #[test]
 fn l6_seam_after_30s_lookahead_equals_single_session() {
     // 41 s track at 44.1 kHz (with ShortLp 8x -> 352.8 kHz):

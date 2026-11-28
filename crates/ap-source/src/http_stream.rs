@@ -439,7 +439,7 @@ impl Read for HttpBodyReader {
         }
         if self.cancel.load(Ordering::Acquire) {
             return Err(io::Error::new(
-                ErrorKind::Interrupted,
+                ErrorKind::Other,
                 "HTTP stream cancelled",
             ));
         }
@@ -637,7 +637,7 @@ fn read_socket_cancellable(
     loop {
         if cancel.load(Ordering::Acquire) {
             return Err(io::Error::new(
-                ErrorKind::Interrupted,
+                ErrorKind::Other,
                 "HTTP stream cancelled",
             ));
         }
@@ -890,9 +890,16 @@ impl<R: Read> OggFlacLogicalReader<R> {
             self.serial = Some(serial);
         }
 
+        const MAX_OGG_PACKET_BYTES: usize = 16 * 1024 * 1024;
         let mut offset = 0usize;
         for &lacing in &seg_table {
             let seg_len = usize::from(lacing);
+            if self.packet_buf.len().saturating_add(seg_len) > MAX_OGG_PACKET_BYTES {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "Ogg packet exceeded 16 MiB safety limit",
+                ));
+            }
             self.packet_buf
                 .extend_from_slice(&payload[offset..offset + seg_len]);
             offset += seg_len;
@@ -1112,9 +1119,9 @@ impl<R: Read> StreamingWavDecoder<R> {
                     }
                 };
                 let expected_align = usize::from(channels) * usize::from(bits_per_sample / 8);
-                if block_align < expected_align || expected_align == 0 {
+                if expected_align == 0 || block_align != expected_align {
                     return Err(format!(
-                        "invalid WAV block_align {block_align} (expected >= {expected_align})"
+                        "invalid WAV block_align {block_align} (expected {expected_align})"
                     ));
                 }
 

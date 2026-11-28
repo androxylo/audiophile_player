@@ -444,9 +444,10 @@ fn stale_cache_does_not_mask_w30_rules_a_h_l_while_preserving_user_overrides() {
     assert_eq!(fused_user.effective_nyquist_hz.source, EvidenceSource::Window);
 
     // 3. Current cache (`results_current = true`) STILL wins over W30!
+    //    Schema-3 §1.3 (T-C4): legacy Schema-1 `TrackDbEntry` never supplies cached peak evidence.
     let current_wt = CachedWholeTrackEvidence::from_track_db_entry(&stale_entry, true);
     assert!(current_wt.results_current);
-    assert!(current_wt.peak_current);
+    assert!(!current_wt.peak_current);
     let fused_cur = fuse_track_evidence(
         96_000,
         24,
@@ -468,14 +469,14 @@ fn stale_cache_does_not_mask_w30_rules_a_h_l_while_preserving_user_overrides() {
     let mut track_with_tp = ap_core::filter_db::AlbumTrackAnalysis::from_schema1(&stale_entry, None);
     track_with_tp.detector_version = 1;
     track_with_tp.true_peak_dbtp = Some(-6.0);
-    track_with_tp.true_peak_meter = Some(ap_core::filter_db::TRUE_PEAK_METER_8X_32.to_string());
+    track_with_tp.true_peak_meter = Some(ap_core::filter_db::TRUE_PEAK_METER_8X_64.to_string());
     let split_wt = CachedWholeTrackEvidence::from_album_track_with_peak(&track_with_tp, false, true);
     assert!(!split_wt.results_current);
     assert!(split_wt.peak_current);
     assert_eq!(split_wt.true_peak_dbtp, Some(-6.0));
     assert_eq!(
         split_wt.true_peak_meter.as_deref(),
-        Some(ap_core::filter_db::TRUE_PEAK_METER_8X_32)
+        Some(ap_core::filter_db::TRUE_PEAK_METER_8X_64)
     );
     let fused_split = fuse_track_evidence(
         96_000,

@@ -331,11 +331,61 @@ where
 /// Split a batch of coarse work items (such as Pass-B candidate audio blocks in `peak_scan`)
 /// across the persistent worker pool with no 512-item floor, honoring `HIGH_PRIORITY_DSP` so
 /// background scans automatically yield to real-time playback jobs.
+///
+/// Review #10 SP2: when called from a low-priority background thread (`!HIGH_PRIORITY_DSP`),
+/// submits fine-grained 1-item jobs so worker threads return to the priority queue after every
+/// single item and immediately preempt for incoming high-priority playback MAC jobs.
 pub fn for_each_batch<T, F>(items: &mut [T], max_slices: usize, f: F)
 where
     T: Send,
     F: Fn(usize, usize, &mut [T]) + Sync,
 {
+    if FORCE_SEQUENTIAL.with(Cell::get) || IN_MAC_POOL.with(Cell::get) {
+        f(0, 0, items);
+        return;
+    }
+    let hi_prio = HIGH_PRIORITY_DSP.with(Cell::get);
+    if !hi_prio && max_slices > 1 && items.len() >= 2 && mac_pool().num_workers >= 1 {
+        let pool = mac_pool();
+        let mut iter = items.chunks_mut(1);
+        let Some(first_item) = iter.next() else {
+            return;
+        };
+        let rest: Vec<(usize, &mut [T])> = iter.enumerate().map(|(i, c)| (i + 1, c)).collect();
+        let latch = ScopeLatch::new(rest.len());
+        let guard = WaitGuard {
+            latch: Arc::clone(&latch),
+        };
+        let f_ref = &f;
+        for (idx, chunk) in rest {
+            let latch_w = Arc::clone(&latch);
+            let boxed: Box<dyn FnOnce() + Send + '_> = Box::new(move || {
+                struct FlagGuard;
+                impl Drop for FlagGuard {
+                    fn drop(&mut self) {
+                        IN_MAC_POOL.with(|c| c.set(false));
+                    }
+                }
+                IN_MAC_POOL.with(|c| c.set(true));
+                let _fg = FlagGuard;
+                let res = catch_unwind(AssertUnwindSafe(|| {
+                    f_ref(idx, idx, chunk);
+                }));
+                if let Err(payload) = res {
+                    latch_w.record_panic(payload);
+                }
+                latch_w.complete_one();
+            });
+            let static_job: ErasedJob = unsafe { std::mem::transmute(boxed) };
+            pool.submit(static_job, false);
+        }
+        f_ref(0, 0, first_item);
+        drop(guard);
+        if let Some(payload) = latch.take_panic() {
+            resume_unwind(payload);
+        }
+        return;
+    }
     for_each_pool_slice(items, max_slices, 2, f);
 }
 

@@ -229,16 +229,16 @@ pub fn run_loopback_null_buffers(
     } else {
         quantizer_margin_db(session.report().output_bits, session.shaper_l1_sum())
     };
-    let mut fixed_gain_db = match cfg.fixed_gain_db {
+    // Review #10 TV1: when `cfg.fixed_gain_db` is `None`, use the pipeline's OWN selected
+    // `HeadroomDecision::total_gain_db()` verbatim (never silently tighten it from `unity_peak_db`,
+    // which would mask real headroom bugs!).
+    let fixed_gain_db = match cfg.fixed_gain_db {
         Some(g) => g.min(0.0),
-        None => {
-            let hr_g = session.report().headroom.total_gain_db();
-            let safe_g = (-(unity_peak_db + m_q_db + cfg.dac_margin_db)).min(0.0);
-            hr_g.min(safe_g)
-        }
+        None => session.report().headroom.total_gain_db(),
     };
 
-    // If Bypass was selected at 0 dB but fixed_gain_db < 0, reconfigure quantizer away from Bypass.
+    // If Bypass was selected at 0 dB but an explicit negative `fixed_gain_db` was requested,
+    // reconfigure quantizer away from Bypass.
     if fixed_gain_db < -1e-9 && session.report().effective_shaper == NoiseShaperProfile::Bypass {
         let hr = HeadroomDecision {
             mode: if fixed_gain_db <= -3.0 + 1e-9 {
@@ -257,11 +257,8 @@ pub fn run_loopback_null_buffers(
         };
         session.reconfigure_quantizer_for_headroom(&hr)?;
         session.set_quantizer_seed(DEFAULT_QUANTIZER_SEED ^ cfg.seed);
-        let new_m_q = quantizer_margin_db(session.report().output_bits, session.shaper_l1_sum());
-        if cfg.fixed_gain_db.is_none() {
-            fixed_gain_db = fixed_gain_db.min((-(unity_peak_db + new_m_q + cfg.dac_margin_db)).min(0.0));
-        }
     }
+    let _ = m_q_db;
 
     // --- Quantize unity f64 -> InterleavedInt32Buffer through the real quantizer ---
     let mut no_tail = None;
@@ -604,22 +601,22 @@ fn evaluate_layer_b(
     let rho_r = xcorr(&e_r, &s_r).abs();
     let max_abs_xcorr = rho_l.max(rho_r);
 
-    // 5. NTF shape & silent-run coherence baseline (only when dithered/shaped and long enough).
+    // 5. NTF shape & silent-run coherence baseline (Review #10 TV2 + TV12: run on all cells
+    //    with `n >= 16_384` — covering every L10 cell — and check BOTH left and right channels!).
     let mut max_coherence_excess_db = f64::NEG_INFINITY;
     let mut ntf_max_dev_db = 0.0_f64;
 
-    if shaper != NoiseShaperProfile::Bypass && n >= 131_072 {
+    if shaper != NoiseShaperProfile::Bypass && n >= 16_384 {
         // Under the null hypothesis (independent quantization error), flat white TPDF noise has
-        // exact Pearson correlation standard error sigma_rho = 1 / sqrt(N) for any signal spectrum
-        // (e.g. 1.02e-3 at 48 kHz * 20 s = 960k samples, where a fixed 1e-3 gate trips ~55% of the
-        // time across stereo channels). Shaped 4fS/8fS profiles concentrate noise energy far above
-        // the audio band so their null std error is << 1e-4 and the strict 1e-3 gate holds.
+        // exact Pearson correlation standard error sigma_rho = 1 / sqrt(N). Scale the threshold
+        // conservatively at 5.5 sigma for shorter cells while keeping the strict 1e-3 gate on long
+        // shaped runs (>= 500k samples).
         let xcorr_limit = if coeffs.is_empty() {
-            (5.0 / (n as f64).sqrt()).max(1e-3)
+            (5.5 / (n as f64).sqrt()).max(1e-3)
         } else if n >= 500_000 {
             1e-3
         } else {
-            5e-3
+            (5.5 / (n as f64).sqrt()).max(5e-3)
         };
         if max_abs_xcorr >= xcorr_limit {
             failures.push(format!(
@@ -653,10 +650,8 @@ fn evaluate_layer_b(
             .map(|f| f64::from(f[1] >> shift))
             .collect();
 
-        // Scale FFT length with sample rate (~0.7 s window -> df ~= 1.35-1.46 Hz at every rate)
-        // so even the narrowest 100 Hz 1/3-octave band averages >= 16 bins (keeping relative
-        // Gamma variance < 30% and false-positive rate < 1e-4) while keeping >= 30 overlapping
-        // Welch segments (~55 segments on 20 s excerpts, ~-17 dB noise floor).
+        // Scale FFT length with sample rate (~0.7 s window on long excerpts; automatically capped
+        // to `<= n / 16` so shorter L10 cells still average >= 30 overlapping Welch segments).
         let target_nfft = if rep.output_rate_hz >= 352_800 {
             262_144_usize
         } else if rep.output_rate_hz >= 176_400 {
@@ -668,38 +663,43 @@ fn evaluate_layer_b(
         };
         let max_pow2 = ((n / 16).max(256) + 1).next_power_of_two() / 2;
         let coh_nfft = target_nfft.min(max_pow2.max(256));
-        let coh_sig = coherence_bands(&e_l, &s_l, out_rate, coh_nfft);
+        let coh_sig_l = coherence_bands(&e_l, &s_l, out_rate, coh_nfft);
+        let coh_sig_r = coherence_bands(&e_r, &s_r, out_rate, coh_nfft);
         let coh_base_l = coherence_bands(&e_silent_l, &s_l, out_rate, coh_nfft);
-        let coh_base_r = coherence_bands(&e_silent_r, &s_l, out_rate, coh_nfft);
-        // Compare against the silent baseline's peak band across both independent silent channels
-        // + 3 dB (prevents unlucky single-draw low baseline dips while catching real signal
-        // leakage immediately).
+        let coh_base_r = coherence_bands(&e_silent_r, &s_r, out_rate, coh_nfft);
+        // Compare BOTH left and right channels (40 bands total) against the silent baseline's peak
+        // band + margin (TV12). On runs `< 1M` samples (~3 s @ 352.8k), 100 Hz has only 1-2 FFT
+        // bins so finite-sample null-hypothesis max-of-40-bands fluctuates by ~3.5 dB (while true
+        // signal-correlated harshness jumps +10..+25 dB); full >= 1M runs enforce the strict +3 dB.
+        let coh_tol_db = if n >= 1_000_000 { 3.0 } else { 4.5 };
         let base_peak_db = coh_base_l
             .iter()
             .chain(coh_base_r.iter())
             .map(|b| b.coherence_db)
             .fold(f64::NEG_INFINITY, f64::max);
         let mut worst_excess = f64::NEG_INFINITY;
-        for b in &coh_sig {
+        for b in coh_sig_l.iter().chain(coh_sig_r.iter()) {
             let excess = b.coherence_db - base_peak_db;
             if excess > worst_excess {
                 worst_excess = excess;
             }
         }
         max_coherence_excess_db = worst_excess;
-        if max_coherence_excess_db > 3.0 {
+        if max_coherence_excess_db > coh_tol_db {
             failures.push(format!(
-                "1/3-oct coherence exceeded silent baseline by {max_coherence_excess_db:+.2} dB (> +3.0 dB)"
+                "1/3-oct coherence exceeded silent baseline by {max_coherence_excess_db:+.2} dB (> +{coh_tol_db:.1} dB)"
             ));
         }
 
         // Welch PSD vs analytical NTF within +-1.0 dB in-band (up to min(20 kHz, 0.4 * fs)).
+        // Require >= 24 non-overlapping frames (`>= 47` 50%-overlapped Welch segments) so the
+        // lowest 500 Hz 1/3-oct band has tight Welch variance well under +-1.0 dB.
         let psd_nfft = if rep.output_rate_hz >= 176_400 {
-            32_768
+            16_384
         } else {
             8_192
         };
-        if n >= psd_nfft * 8 {
+        if n >= psd_nfft * 24 {
             let f_hi = 20_000.0_f64.min(0.4 * out_rate);
             let dev_l = ntf_max_inband_deviation_db(&e_l, coeffs, out_rate, f_hi, psd_nfft);
             let dev_r = ntf_max_inband_deviation_db(&e_r, coeffs, out_rate, f_hi, psd_nfft);

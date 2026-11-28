@@ -123,6 +123,13 @@ Write-Host "Removed $removedCertCount local test-signing certificate entry/entri
 # or if the user explicitly passed -DisableTestSigning.
 $shouldDisableTestSigning = $DisableTestSigning -or ($weEnabledTestSigning -and -not $KeepTestSigning)
 if ($shouldDisableTestSigning) {
+    # Review #10 OD9: suspend BitLocker for 1 reboot before changing BCD testsigning state so
+    # turning Test Mode back off never triggers an unexpected BitLocker recovery-key prompt!
+    $bl = Get-BitLockerVolume -MountPoint $env:SystemDrive -ErrorAction SilentlyContinue
+    if ($bl -and $bl.ProtectionStatus -eq "On") {
+        Write-Warning "BitLocker / Device Encryption is ON for $env:SystemDrive. Suspending BitLocker for 1 reboot before disabling Test Mode..."
+        Suspend-BitLocker -MountPoint $env:SystemDrive -RebootCount 1 | Out-Null
+    }
     Write-Host "Disabling Windows Test Mode: bcdedit /set testsigning off" -ForegroundColor Cyan
     $rcBcd = Invoke-UninstallNative -Exe "bcdedit.exe" -Arguments @("/set", "testsigning", "off") -OkExitCodes @(0)
     if ($rcBcd -eq 0) {

@@ -82,6 +82,12 @@ pub trait Downsampler: Send {
         &mut self,
         carry: DownsamplerCarryover,
     ) -> Result<(), DownsamplerCarryover>;
+
+    /// Enable pre-ringing emission at track start (`Review #10 CQ1`) for exact integer decimation.
+    /// Returns the number of pre-ringing output frames emitted before internal sample 0.
+    fn enable_gapless_prering(&mut self) -> usize {
+        0
+    }
 }
 
 /// Zero-copy pass-through downsampler used for all native `352.8 / 384 kHz` (`8fS`) DACs.
@@ -360,6 +366,20 @@ impl Downsampler for PolyphaseDecimator {
 
     fn output_rate_hz(&self) -> u32 {
         self.output_rate_hz
+    }
+
+    fn enable_gapless_prering(&mut self) -> usize {
+        if self.up_l == 1 {
+            let half_tpp = (self.taps_per_phase - 1) / 2;
+            let k = half_tpp / self.down_m;
+            if k > 0 {
+                let extra_in = k * self.down_m;
+                self.hist_l.resize(self.hist_l.len() + extra_in, 0.0_f64);
+                self.hist_r.resize(self.hist_r.len() + extra_in, 0.0_f64);
+                return k;
+            }
+        }
+        0
     }
 
     #[cfg(any(test, feature = "verify"))]

@@ -441,12 +441,19 @@ impl<'a> JsonParser<'a> {
                     "unescaped control character 0x{b:02x} in JSON string"
                 ));
             } else {
-                // Safe UTF-8 slice: `self.bytes` originates from `&str`.
-                let rest = std::str::from_utf8(&self.bytes[self.pos..])
+                // Review #10 CS7: scan entire run of plain unescaped bytes in O(n) rather than
+                // re-validating `&self.bytes[self.pos..]` on every character (which was O(n^2)).
+                let run_start = self.pos;
+                while self.pos < self.bytes.len() {
+                    let c = self.bytes[self.pos];
+                    if c == b'"' || c == b'\\' || c < 0x20 {
+                        break;
+                    }
+                    self.pos += 1;
+                }
+                let slice = std::str::from_utf8(&self.bytes[run_start..self.pos])
                     .map_err(|_| "invalid UTF-8 in JSON string".to_string())?;
-                let ch = rest.chars().next().unwrap();
-                out.push(ch);
-                self.pos += ch.len_utf8();
+                out.push_str(slice);
             }
         }
         Err("unterminated JSON string".to_string())
@@ -456,7 +463,12 @@ impl<'a> JsonParser<'a> {
         if self.pos + 4 > self.bytes.len() {
             return Err("truncated \\uXXXX escape in JSON string".to_string());
         }
-        let slice = std::str::from_utf8(&self.bytes[self.pos..self.pos + 4])
+        let raw = &self.bytes[self.pos..self.pos + 4];
+        if !raw.iter().all(|b| b.is_ascii_hexdigit()) {
+            let slice = String::from_utf8_lossy(raw);
+            return Err(format!("invalid hex escape '\\u{slice}'"));
+        }
+        let slice = std::str::from_utf8(raw)
             .map_err(|_| "invalid UTF-8 in \\uXXXX escape".to_string())?;
         self.pos += 4;
         u16::from_str_radix(slice, 16)

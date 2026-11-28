@@ -73,8 +73,18 @@ fn check_cell(
     if dac_bits > wire_format.bit_depth() {
         return;
     }
+    let base_rate = if src_rate % 44_100 == 0 {
+        44_100
+    } else {
+        48_000
+    };
+    let out_rate = (base_rate * u32::from(tier)) as f64;
+    // Review #10 TV2: scale cell duration so EVERY L10 cell produces >= 524,288 output frames
+    // (~1.37 s @ 384 kHz), ensuring Welch 1/3-oct coherence AND +-1.0 dB in-band NTF PSD both run
+    // with >= 63 overlapping segments (tight Welch variance well below +-1.0 dB across 500 Hz..20 kHz).
+    let eff_duration_s = duration_s.max(524_288.0 / out_rate);
     let src_bits: u16 = if src_rate <= 48_000 { 16 } else { 24 };
-    let (spec, left, right) = piano_multitone(src_rate, src_bits, duration_s, seed);
+    let (spec, left, right) = piano_multitone(src_rate, src_bits, eff_duration_s, seed);
     let filter_override = if src_rate >= 352_800 {
         Some(FilterArchetype::Null)
     } else {
@@ -112,6 +122,12 @@ fn check_cell(
         rep.layer_b.passed,
         "L10 {label}: Layer B failed ({:?})",
         rep.layer_b.failure_reasons
+    );
+    // Review #10 TV2: verify Layer B harshness/coherence check actually ran on this cell!
+    assert!(
+        rep.output_frames >= 16_384 && rep.layer_b.max_coherence_excess_db.is_finite(),
+        "L10 {label}: Layer B coherence detector did not execute (output_frames={})",
+        rep.output_frames
     );
     assert!(
         rep.layer_c_passed,
@@ -168,13 +184,16 @@ fn l10_matrix_covering_sweep_and_self_generated_fixtures() {
         );
     }
 
-    // 3. Exercise self-generated hot ISP master (0 dBFS + +3 dB ISP) and 2.5 s ultra-short track.
-    let (hot_spec, hot_l, hot_r) = hot_isp_master(48_000, 24, 0.3);
+    // 3. Exercise self-generated hot ISP master (0 dBFS + +3.01 dBTP ISP + burst-edge Gibbs ring
+    //    to ~+3.14 dBTP) and 2.5 s ultra-short track. Pass the scanned true-peak metadata so
+    //    normal-mode `AudioPipeline` computes `G_up = -3 dB` plus excess scale `S`, which TV1
+    //    uses verbatim from `session.report().headroom.total_gain_db()` (zero oracle override).
+    let (hot_spec, hot_l, hot_r) = hot_isp_master(48_000, 24, 0.75);
     let hot_rep = run_loopback_null_buffers(
         "hot_isp_48k_24b",
         "hot_isp",
         hot_spec,
-        TrackPeakMetadata::default(),
+        TrackPeakMetadata::default().with_full_scan_true_peak_dbtp(3.25),
         &hot_l,
         &hot_r,
         false,
@@ -183,6 +202,7 @@ fn l10_matrix_covering_sweep_and_self_generated_fixtures() {
             shaper_override: Some(NoiseShaperProfile::NsGentle2),
             dac_bits: Some(24),
             wire_format: DacWireFormat::Int32,
+            dac_margin_db: 0.0,
             seed: 0x30_0001,
             ..NullRunConfig::default()
         },

@@ -144,17 +144,33 @@ impl GenaEventHub {
     /// Register a new GENA subscription and return `(sid, timeout_secs, initial_job)` WITHOUT
     /// enqueueing `initial_job` yet. Call [`Self::enqueue_initial`] strictly AFTER writing the
     /// HTTP `200 OK` response containing `SID` (UDA conformance, Review #5 Finding #33).
+    ///
+    /// Review #10 SR4: enforces per-peer subscription cap on the actual `tcp_peer_ip` and
+    /// requires the callback target IP to match `tcp_peer_ip` (blocking SSRF and loopback probing
+    /// from remote LAN peers).
     pub fn subscribe(
         &self,
         service: GenaService,
+        tcp_peer_ip: IpAddr,
         callback_header: &str,
         timeout_header: Option<&str>,
         initial_xml: String,
     ) -> Result<(String, u64, NotifyJob), SubscribeError> {
         let callback_url =
             parse_first_callback_url(callback_header).map_err(SubscribeError::InvalidRequest)?;
-        let peer_ip =
+        let callback_ip =
             validate_lan_callback_ip(&callback_url).map_err(SubscribeError::InvalidRequest)?;
+        if callback_ip.is_loopback() && !tcp_peer_ip.is_loopback() {
+            return Err(SubscribeError::InvalidRequest(
+                "remote peer may not register loopback GENA callback".to_string(),
+            ));
+        }
+        if callback_ip != tcp_peer_ip {
+            return Err(SubscribeError::InvalidRequest(format!(
+                "GENA callback IP {callback_ip} does not match subscribing peer {tcp_peer_ip}"
+            )));
+        }
+        let peer_ip = tcp_peer_ip;
         let timeout_secs = parse_timeout_secs(timeout_header);
 
         let sid = format!(

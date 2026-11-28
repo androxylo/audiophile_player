@@ -226,6 +226,11 @@ pub enum WasapiStepOutcome {
 ///
 /// Mirrors `WaveRtLoopController` so stop fade-out, EOF drain, and underrun accounting are
 /// unit-testable without hardware and behave identically to `WdmKsSink`.
+///
+/// Review #10 OD3: in event-driven exclusive double-buffering, a fade-out period or partial final
+/// audio period written at event `k` only begins clocking out at event `k+1`, so we MUST wait for
+/// 2 full trailing silent periods AFTER the last audible period before returning `Finished`
+/// (matching `WdmKsSink::trailing_silent_halves`).
 #[derive(Debug)]
 pub struct WasapiLoopController {
     period_frames: usize,
@@ -233,8 +238,8 @@ pub struct WasapiLoopController {
     frames_played: usize,
     underrun_periods: usize,
     partial_underrun_periods: usize,
-    fading_stop: bool,
-    eof_drain_periods: usize,
+    draining_trailing_silence: bool,
+    trailing_silent_periods: usize,
 }
 
 impl WasapiLoopController {
@@ -254,8 +259,8 @@ impl WasapiLoopController {
             frames_played: 0,
             underrun_periods: 0,
             partial_underrun_periods: 0,
-            fading_stop: false,
-            eof_drain_periods: 0,
+            draining_trailing_silence: false,
+            trailing_silent_periods: 0,
         })
     }
 
@@ -294,10 +299,9 @@ impl WasapiLoopController {
             } else if written < self.period_frames {
                 self.partial_underrun_periods += 1;
             }
-        }
-        if pump.is_eof() && written == 0 {
-            // Empty stream: one silence period already queued.
-            self.eof_drain_periods = 1;
+        } else {
+            self.draining_trailing_silence = true;
+            self.trailing_silent_periods = usize::from(written == 0);
         }
         Ok(written == 0)
     }
@@ -311,18 +315,21 @@ impl WasapiLoopController {
         pump: &mut dyn WaveRtPumpSource,
         stop_requested: bool,
     ) -> Result<(bool, WasapiStepOutcome), OutputError> {
-        if self.fading_stop {
-            // The fade-out period was written on the previous event; queue one silent buffer so
-            // the fade-out clocks completely out of the DAC before `Stop()`.
+        if self.draining_trailing_silence {
             dst.fill(0);
-            return Ok((true, WasapiStepOutcome::Finished));
+            self.trailing_silent_periods += 1;
+            if self.trailing_silent_periods >= 2 {
+                return Ok((true, WasapiStepOutcome::Finished));
+            }
+            return Ok((true, WasapiStepOutcome::Continue));
         }
 
         if stop_requested {
-            self.fading_stop = true;
+            self.draining_trailing_silence = true;
             if pump.is_eof() {
                 dst.fill(0);
-                return Ok((true, WasapiStepOutcome::Finished));
+                self.trailing_silent_periods = 1;
+                return Ok((true, WasapiStepOutcome::Continue));
             }
             let written = pump.fill_fade_out_slice(dst);
             if let Some(err) = pump.take_error() {
@@ -330,18 +337,10 @@ impl WasapiLoopController {
                 return Err(err);
             }
             self.frames_played += written;
+            // If audible fade samples were written, wait 2 full silent periods after this one so
+            // the fade-out clocks completely through the DAC before `IAudioClient::Stop()`.
+            self.trailing_silent_periods = usize::from(written == 0);
             return Ok((written == 0, WasapiStepOutcome::Continue));
-        }
-
-        if self.eof_drain_periods > 0 {
-            dst.fill(0);
-            self.eof_drain_periods += 1;
-            // In event-driven exclusive double-buffering, 2 silent periods after the last audio
-            // period guarantee the final real audio frame has clocked completely through the DAC.
-            if self.eof_drain_periods >= 2 {
-                return Ok((true, WasapiStepOutcome::Finished));
-            }
-            return Ok((true, WasapiStepOutcome::Continue));
         }
 
         let written = pump.fill_slice(dst);
@@ -352,14 +351,10 @@ impl WasapiLoopController {
         self.frames_played += written;
 
         if pump.is_eof() {
-            if written == 0 {
-                // First completely silent period after EOF.
-                self.eof_drain_periods = 1;
-            } else if written < self.period_frames {
-                // Partial final audio period (zero-padded to end of period); queue 1 more full
-                // silent period on the next event before stopping so hardware finishes playing it.
-                self.eof_drain_periods = 1;
-            }
+            self.draining_trailing_silence = true;
+            // If this final period had any audible frames (full or partial), it still needs 2 full
+            // trailing silent periods after it; if `written == 0`, this period is silent #1.
+            self.trailing_silent_periods = usize::from(written == 0);
             return Ok((written == 0, WasapiStepOutcome::Continue));
         }
 
@@ -369,6 +364,23 @@ impl WasapiLoopController {
             self.partial_underrun_periods += 1;
         }
         Ok((written == 0, WasapiStepOutcome::Continue))
+    }
+}
+
+/// Pure, unit-testable classifier deciding whether a WASAPI Exclusive Event-Driven error should
+/// automatically fall back once to WASAPI Exclusive Push mode (`Review #10 OD4`).
+///
+/// Never falls back on `DeviceBusy`, `UnsupportedFormat`, or `DeviceNotFound`.
+pub fn should_fallback_wasapi_event_to_push(err: &OutputError) -> bool {
+    match err {
+        OutputError::Win32 { operation, .. } => matches!(
+            *operation,
+            "IAudioClient::Initialize"
+                | "IAudioClient::SetEventHandle"
+                | "WaitForSingleObject(WASAPI)"
+                | "CreateEventW"
+        ),
+        _ => false,
     }
 }
 
@@ -564,6 +576,33 @@ impl WasapiExclusiveSink {
             return self.run_wasapi_push_pump(sample_rate_hz, wire_format, pump);
         }
 
+        // Review #10 OD4: if Event-Driven WASAPI Exclusive fails on event-init or hardware event
+        // timeout (excluding busy/unsupported/unplugged), automatically fall back once to WASAPI
+        // Exclusive Push mode (still zero-mixer Exclusive Mode) and log the switch.
+        match self.run_wasapi_event_pump(sample_rate_hz, wire_format, pump) {
+            Ok(stats) => Ok(stats),
+            Err(err)
+                if should_fallback_wasapi_event_to_push(&err)
+                    && !self.stop_flag.load(Ordering::SeqCst) =>
+            {
+                eprintln!(
+                    "  [wasapi] Event-driven mode failed on '{}' ({err}); falling back to WASAPI Exclusive Push mode",
+                    self.device.friendly_name
+                );
+                self.delivery_mode = WasapiDeliveryMode::Push;
+                self.run_wasapi_push_pump(sample_rate_hz, wire_format, pump)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    #[cfg(windows)]
+    fn run_wasapi_event_pump(
+        &mut self,
+        sample_rate_hz: u32,
+        wire_format: DacWireFormat,
+        pump: &mut dyn WaveRtPumpSource,
+    ) -> Result<PlaybackStats, OutputError> {
         let mmcss = MmcssGuard::enter_pro_audio(self.optimization);
         let _com = win::ComGuard::init_mta()?;
 

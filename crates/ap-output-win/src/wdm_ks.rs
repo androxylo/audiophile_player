@@ -1870,7 +1870,13 @@ impl WaveRtLoopController {
                             self.record_observed_lag(Some(now), pos_bidx.max(1), unwrapped_first);
                         }
                     } else if pos_bidx <= 1 {
-                        self.record_observed_lag(Some(now), 1, unwrapped_first);
+                        // On a Modular boundary-quantized cursor (`0` / `half`), `pos == 0` on
+                        // wake #1 means DMA has NOT crossed into Half 1 yet; never record
+                        // `lag_bytes = half`, which would invert `write_half` onto the active
+                        // DMA half on wake #1 and all subsequent wakes!
+                        if !(unwrapped_first == 0 && self.wrap_mode == PositionWrapMode::Modular) {
+                            self.record_observed_lag(Some(now), 1, unwrapped_first);
+                        }
                     } else {
                         self.lag_bytes = 0;
                     }

@@ -87,6 +87,8 @@ pub struct CachedWholeTrackEvidence {
     pub user_filter_detail: Option<String>,
     /// Optional phase override from `my-filters.yaml` (`min` / `ip` / `lin`), overriding `AP_PHASE`.
     pub user_phase: Option<PhaseTagOverride>,
+    /// Provenance of `user_phase` (`Track`/`Folder`/`Tag`/`Default`) for HP-09 specificity ordering.
+    pub user_phase_provenance: Option<UserFilterProvenance>,
     pub user_phase_detail: Option<String>,
     pub user_deemphasis: Option<bool>,
     pub user_apodizing: Option<bool>,
@@ -118,31 +120,25 @@ impl CachedWholeTrackEvidence {
         Self::from_track_db_entry_with_peak(entry, results_current, results_current)
     }
 
-    /// Convert a Schema-1 [`TrackDbEntry`] with independent `results_current` (identity +
-    /// `DETECTOR_VERSION`) and `peak_current` (audio identity only, Issue #23 P1).
+    /// Convert a legacy Schema-1 [`TrackDbEntry`] into [`CachedWholeTrackEvidence`].
+    ///
+    /// Review #10 §1.3 (T-C4): Schema-1 `trackdb` peaks came from the 4x meter and MUST NEVER
+    /// feed headroom (`peak_current = false`, `true_peak_dbtp = None`). Only non-peak detector
+    /// results (when `results_current`) and `user:` overrides are preserved.
     pub fn from_track_db_entry_with_peak(
         entry: &TrackDbEntry,
         results_current: bool,
-        peak_current: bool,
+        _peak_current: bool,
     ) -> Self {
         let mut out = Self {
             results_current,
-            peak_current: peak_current || results_current,
+            peak_current: false,
             user_filter: entry.user.filter.clone(),
             user_filter_provenance: entry.user.filter.as_ref().map(|_| UserFilterProvenance::Track),
             user_deemphasis: entry.user.deemphasis,
             user_apodizing: entry.user.apodizing,
             ..Self::default()
         };
-        if out.peak_current {
-            out.sample_peak = (entry.results.sample_peak.is_finite()
-                && entry.results.sample_peak > 0.0)
-                .then_some(entry.results.sample_peak);
-            out.true_peak_dbtp = entry.results.true_peak_dbtp.filter(|v| v.is_finite());
-            out.true_peak_meter = out
-                .true_peak_dbtp
-                .map(|_| TRUE_PEAK_METER_4X_12.to_string());
-        }
         if results_current {
             out.effective_nyquist_hz = entry.results.effective_nyquist_hz;
             out.upsampled_from_1x = DetectorVerdict::from_str_lossy(&entry.results.upsampled_from_1x);
@@ -178,7 +174,7 @@ impl CachedWholeTrackEvidence {
             peak_current: peak_current || results_current,
             ..Self::default()
         };
-        if out.peak_current {
+        if out.peak_current && track.has_accurate_source_peak() {
             out.sample_peak =
                 (track.sample_peak.is_finite() && track.sample_peak > 0.0).then_some(track.sample_peak);
             out.true_peak_dbtp = track.true_peak_dbtp.filter(|v| v.is_finite());
@@ -207,8 +203,9 @@ impl CachedWholeTrackEvidence {
             self.user_filter_provenance = Some(prov);
             self.user_filter_detail = Some(detail.clone());
         }
-        if let Some((p, _prov, ref detail)) = overrides.phase {
+        if let Some((p, prov, ref detail)) = overrides.phase {
             self.user_phase = Some(p);
+            self.user_phase_provenance = Some(prov);
             self.user_phase_detail = Some(detail.clone());
         }
         if let Some((ap, _)) = overrides.apodizing {
@@ -228,6 +225,7 @@ impl CachedWholeTrackEvidence {
         self.user_filter_provenance = None;
         self.user_filter_detail = None;
         self.user_phase = None;
+        self.user_phase_provenance = None;
         self.user_phase_detail = None;
         self.user_apodizing = None;
         self.user_deemphasis = None;
@@ -349,6 +347,8 @@ pub struct FusedTrackEvidence {
     /// Provenance of `user_filter` (`Track` / `Folder` / `Tag` / `Default`) for rule naming & dual display.
     pub user_filter_provenance: Option<UserFilterProvenance>,
     pub phase_override: Option<Evidence<PhaseTagOverride>>,
+    /// Provenance of `phase_override` (`Track` / `Folder` / `Tag` / `Default`) for HP-09 specificity.
+    pub phase_override_provenance: Option<UserFilterProvenance>,
     pub genre_class: Evidence<GenreClass>,
 
     /// Informational / diagnostic notices (Rule B real bit depth, lossy origin, MQA, OQ-41 mixed
@@ -387,26 +387,37 @@ pub fn fuse_track_evidence(
     if let Some(wt) = wt_peak {
         if let Some(wt_tp_db) = wt.true_peak_dbtp {
             peak_meta = peak_meta.with_full_scan_true_peak_dbtp(wt_tp_db);
-            // Issue #23 §3.3: E4 cached whole-track peak unconditionally wins; never reset to
-            // unknown, and emit a stale ReplayGain tag notice if a tag disagrees by > 0.5 dB.
+            // Issue #23 §3.3 + Review #10 HP-12: E4 cached whole-track peak unconditionally wins;
+            // compare TruePeak tags against cached true peak, SamplePeak tags against cached
+            // sample peak, and skip album-peak-only tags.
             if let Some(cp) = raw_peak_meta.classified_peak_for_bits(container_bits) {
-                let diff = (wt_tp_db - cp.dbfs).abs();
-                if diff > TAG_DISAGREEMENT_NOTICE_DB {
-                    let msg = format!(
-                        "stale ReplayGain tag ({}={:+.2} dBFS differs from cached true peak {:+.2} dBTP by {:.2} dB)",
-                        cp.source_tag, cp.dbfs, wt_tp_db, diff
-                    );
-                    notices.push(msg);
+                if cp.source_tag != "REPLAYGAIN_ALBUM_PEAK" {
+                    let measured_opt = match cp.kind {
+                        PeakKind::TruePeak => Some((wt_tp_db, "cached true peak", "dBTP")),
+                        PeakKind::SamplePeak => wt
+                            .sample_peak
+                            .filter(|&s| s.is_finite() && s > 0.0)
+                            .map(|s| (20.0 * s.log10(), "cached sample peak", "dBFS")),
+                    };
+                    if let Some((measured_db, label, unit)) = measured_opt {
+                        let diff = (measured_db - cp.dbfs).abs();
+                        if diff > TAG_DISAGREEMENT_NOTICE_DB {
+                            let msg = format!(
+                                "stale ReplayGain tag ({}={:+.2} dBFS differs from {label} {:+.2} {unit} by {:.2} dB)",
+                                cp.source_tag, cp.dbfs, measured_db, diff
+                            );
+                            notices.push(msg);
+                        }
+                    }
                 }
             }
         }
     }
 
     // Disprove stale Vorbis peak tags if the 30 s window provably exceeds them.
-    // Issue #23 §3.3 (K3): when E4 (`full_scan_true_peak_linear`) exists, never reset to unknown;
-    // when neither E3 nor E4 exists, keep unknown fail-safe semantics for whole-track safety while
-    // preserving and reporting `max(tag, W30 true peak)` as a lower bound.
-    if wt_results.is_none() && peak_meta.full_scan_true_peak_linear.is_none() {
+    // Review #10 HP-20: condition ONLY on `full_scan_true_peak_linear.is_none()` so a cached
+    // entry without an accurate true peak never skips W30 stale-tag validation.
+    if peak_meta.full_scan_true_peak_linear.is_none() {
         if let Some(w) = window {
             if let Some(cp) = raw_peak_meta.classified_peak_for_bits(container_bits) {
                 let lb = if w.true_peak_dbtp.is_finite() {
@@ -484,17 +495,23 @@ pub fn fuse_track_evidence(
         (None, None)
     };
 
-    let phase_override = if ignore_user {
-        None
+    let (phase_override, phase_override_provenance) = if ignore_user {
+        (None, None)
     } else if let Some(up) = cached_wt.and_then(|c| c.user_phase) {
+        let prov = cached_wt
+            .and_then(|c| c.user_phase_provenance)
+            .unwrap_or(UserFilterProvenance::Track);
         let detail = cached_wt
             .and_then(|c| c.user_phase_detail.clone())
             .unwrap_or_else(|| format!("my-filters.yaml phase={up:?}"));
-        Some(Evidence::new(up, EvidenceSource::User, detail))
+        (Some(Evidence::new(up, EvidenceSource::User, detail)), Some(prov))
+    } else if let Some(p) = track_meta.ap_phase {
+        (
+            Some(Evidence::new(p, EvidenceSource::User, format!("AP_PHASE={p:?}"))),
+            Some(UserFilterProvenance::Tag),
+        )
     } else {
-        track_meta
-            .ap_phase
-            .map(|p| Evidence::new(p, EvidenceSource::User, format!("AP_PHASE={p:?}")))
+        (None, None)
     };
 
     // --- Row 8: Pre-emphasis (Rule P) — facts only! Analyser NEVER enables automatically. ---
@@ -613,7 +630,7 @@ pub fn fuse_track_evidence(
         Evidence::new(None, EvidenceSource::Default, "native header rate")
     };
 
-    // --- Row 4: Loud and clipped (Rule L) — WT > RG tag + W30 clipping > W30 alone ---
+    // --- Row 4: Loud and clipped (Rule L) — Review #10 HP-11: WT > W30 > RG tag tie-breaker ---
     let loud_and_clipped = if let Some(wt) = wt_results {
         let pos = wt.loud_and_clipped == DetectorVerdict::Positive;
         Evidence::new(
@@ -626,8 +643,21 @@ pub fn fuse_track_evidence(
                 wt.loud_and_clipped.as_str()
             ),
         )
+    } else if let Some(w) = window.filter(|w| w.loud_and_clipped != DetectorVerdict::Inconclusive) {
+        let pos = w.loud_and_clipped == DetectorVerdict::Positive;
+        Evidence::new(
+            pos,
+            EvidenceSource::Window,
+            format!(
+                "W30 lufs={:.1} clips={} ({})",
+                w.integrated_lufs.unwrap_or(-144.0),
+                w.clipped_runs,
+                w.loud_and_clipped.as_str()
+            ),
+        )
     } else if let Some(rg_gain) = raw_peak_meta.replaygain_track_gain_db {
         // ReplayGain reference is -18 LUFS: gain <= -8 dB means >= -10 LUFS loud master.
+        // Used only as a tie-breaker when W30 is Inconclusive or absent (preserves Window > Tag).
         let tag_loud = rg_gain <= -8.0;
         let has_w30_clips = window.is_some_and(|w| w.clipped_runs >= 1);
         if tag_loud && has_w30_clips {
@@ -764,6 +794,7 @@ pub fn fuse_track_evidence(
         user_filter,
         user_filter_provenance,
         phase_override,
+        phase_override_provenance,
         genre_class,
         notices,
     }

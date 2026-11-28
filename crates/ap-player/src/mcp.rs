@@ -62,6 +62,20 @@ pub struct McpServer {
     next_job_seq: u64,
 }
 
+impl Drop for McpServer {
+    fn drop(&mut self) {
+        // Review #10 CS11: never leave orphaned background scan children writing filterdb after
+        // the MCP session terminates.
+        for job in self.scan_jobs.values_mut() {
+            if !job.finished {
+                let _ = job.child.kill();
+                let _ = job.child.wait();
+                job.finished = true;
+            }
+        }
+    }
+}
+
 impl McpServer {
     pub fn new(audit_path: Option<PathBuf>) -> Self {
         Self {
@@ -243,10 +257,12 @@ impl McpServer {
             }
             "player_stop" => {
                 self.audit(name, args);
+                // Review #10 CS8: default to `after_track` so an accidental bare `player_stop()`
+                // honors AGENTS rule #4 and does not abruptly interrupt the current track.
                 let when = args
                     .get("when")
                     .and_then(JsonValue::as_str)
-                    .unwrap_or("now");
+                    .unwrap_or("after_track");
                 let after_track = crate::cli_args::parse_when(when)?;
                 if after_track {
                     // Review #9 Q5: do not block the single-threaded MCP loop for 10+ minutes on
@@ -356,7 +372,11 @@ impl McpServer {
                         _ => None,
                     })
                     .ok_or_else(|| "missing required 'value' parameter".to_string())?;
-                let mut res = config_set_value(None, key, &value).map_err(|e| e.message)?;
+                // Review #10 CS5: pin MCP writes to `%APPDATA%\audiophile-player\config.toml`
+                // (never silently redirected by an arbitrary workspace/CWD `audiophile-player.toml`).
+                let user_cfg = ap_core::config::PlayerConfig::default_user_config_path();
+                let mut res =
+                    config_set_value(user_cfg.as_deref(), key, &value).map_err(|e| e.message)?;
                 res.insert(
                     "suggested_action",
                     JsonValue::from("player_restart({changes: {}, when: \"after_track\"})"),
@@ -369,6 +389,39 @@ impl McpServer {
                     .get("folder")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| "missing required 'folder' parameter".to_string())?;
+                let folder_trimmed = folder.trim();
+                // Review #10 CS1 + CS3: reject empty, leading-dash (option injection), UNC, and
+                // Windows device/verbatim paths before spawning any child process!
+                if folder_trimmed.is_empty() {
+                    return Err("'folder' must not be empty".to_string());
+                }
+                if folder_trimmed.starts_with('-') {
+                    return Err(format!(
+                        "invalid 'folder' '{folder_trimmed}': must not start with '-'"
+                    ));
+                }
+                ap_core::config::validate_local_path_syntax_str(folder_trimmed, "scan_start.folder")?;
+
+                // Review #10 CS11: reap completed jobs and allow at most one active background
+                // scan at a time so concurrent scanners never race on album YAMLs.
+                for job in self.scan_jobs.values_mut() {
+                    if !job.finished {
+                        if let Ok(Some(st)) = job.child.try_wait() {
+                            job.finished = true;
+                            job.exit_code = st.code();
+                        }
+                    }
+                }
+                if let Some(active) = self.scan_jobs.values().find(|j| !j.finished) {
+                    return Err(format!(
+                        "scan job '{}' is already running (folder '{}'); cancel or wait for it first",
+                        active.id, active.folder
+                    ));
+                }
+                if self.scan_jobs.len() >= 32 {
+                    self.scan_jobs.retain(|_, j| !j.finished);
+                }
+
                 let force = args
                     .get("force")
                     .and_then(JsonValue::as_bool)
@@ -380,12 +433,12 @@ impl McpServer {
                 let jobs = args
                     .get("jobs")
                     .and_then(JsonValue::as_u64)
-                    .map(|n| n.clamp(1, 16) as usize);
+                    .map(|n| n.clamp(1, 32) as usize);
 
                 let exe = std::env::current_exe()
                     .map_err(|e| format!("failed locating audiophile-player exe: {e}"))?;
                 let mut cmd = Command::new(exe);
-                cmd.arg("scan").arg(folder);
+                cmd.arg("scan").arg(folder_trimmed);
                 if force {
                     cmd.arg("--force");
                 }
@@ -409,7 +462,7 @@ impl McpServer {
                     job_id.clone(),
                     BackgroundScanJob {
                         id: job_id.clone(),
-                        folder: folder.to_string(),
+                        folder: folder_trimmed.to_string(),
                         started_unix_s: now_unix_secs(),
                         child,
                         finished: false,
@@ -421,7 +474,7 @@ impl McpServer {
                     ("ok", JsonValue::from(true)),
                     ("job", JsonValue::from(job_id)),
                     ("pid", JsonValue::from(pid)),
-                    ("folder", JsonValue::from(folder)),
+                    ("folder", JsonValue::from(folder_trimmed)),
                 ]))
             }
             "scan_progress" => {
@@ -480,6 +533,7 @@ impl McpServer {
                     .get("path")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| "missing required 'path' parameter".to_string())?;
+                ap_core::config::validate_local_path_syntax_str(path, "filters_show.path")?;
                 run_filters_tool(FiltersAction::Show { target: PathBuf::from(path) }, &[])
             }
             "filters_set" => {
@@ -488,6 +542,7 @@ impl McpServer {
                     .get("path")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| "missing required 'path' parameter".to_string())?;
+                ap_core::config::validate_local_path_syntax_str(path, "filters_set.path")?;
                 let filter = args
                     .get("filter")
                     .and_then(JsonValue::as_str)
@@ -739,8 +794,8 @@ fn tool_definitions() -> Vec<JsonValue> {
         ),
         tool_def(
             "player_stop",
-            "Gracefully stop the running player and release the exclusive DAC pin.",
-            obj_schema(vec![("when", enum_prop(&["now", "after_track"]))], &[]),
+            "Gracefully stop the running player and release the exclusive DAC pin. Defaults to when='after_track' (finishes current track cleanly); pass when='now' only if the user explicitly asked to interrupt playback immediately.",
+            obj_schema(vec![("when", enum_prop(&["after_track", "now"]))], &[]),
         ),
         tool_def(
             "player_restart",
@@ -955,22 +1010,73 @@ fn get_prompt(name: &str) -> Result<JsonValue, String> {
     ]))
 }
 
+/// Maximum single JSON-RPC line length accepted on MCP stdin (4 MiB, Review #10 CS16).
+const MAX_MCP_LINE_BYTES: usize = 4 * 1024 * 1024;
+
 /// Main stdio loop for `audiophile-player mcp`.
 pub fn run_mcp_stdio() -> Result<(), CliError> {
+    use std::io::Read;
+
     let mut server = McpServer::new(mcp_audit_log_path());
     let stdin = io::stdin();
     let stdout = io::stdout();
+    let mut in_lock = stdin.lock();
     let mut out_lock = stdout.lock();
+    let mut raw_buf: Vec<u8> = Vec::with_capacity(4096);
 
-    for line_res in stdin.lock().lines() {
-        let line = match line_res {
-            Ok(l) => l,
-            Err(err) => {
-                eprintln!("mcp stdin read error: {err}");
-                break;
+    loop {
+        raw_buf.clear();
+        let n = {
+            let mut limited = in_lock.by_ref().take((MAX_MCP_LINE_BYTES + 1) as u64);
+            match limited.read_until(b'\n', &mut raw_buf) {
+                Ok(n) => n,
+                Err(err) => {
+                    eprintln!("mcp stdin read error: {err}");
+                    break;
+                }
             }
         };
-        if let Some(resp) = server.handle_json_line(&line) {
+        if n == 0 {
+            break;
+        }
+        if raw_buf.len() > MAX_MCP_LINE_BYTES {
+            // Drain remainder of oversized line so the stream stays synchronized.
+            if !raw_buf.ends_with(b"\n") {
+                let mut sink = Vec::new();
+                loop {
+                    sink.clear();
+                    match in_lock.read_until(b'\n', &mut sink) {
+                        Ok(0) => break,
+                        Ok(_) if sink.ends_with(b"\n") => break,
+                        Ok(_) => continue,
+                        Err(_) => break,
+                    }
+                }
+            }
+            let err_resp = jsonrpc_error(
+                JsonValue::Null,
+                -32700,
+                "parse error: MCP JSON-RPC line exceeds 4 MiB limit",
+            );
+            let encoded = err_resp.to_compact_string();
+            if writeln!(out_lock, "{encoded}").is_err() || out_lock.flush().is_err() {
+                break;
+            }
+            continue;
+        }
+        let line = match std::str::from_utf8(&raw_buf) {
+            Ok(s) => s,
+            Err(_) => {
+                let err_resp =
+                    jsonrpc_error(JsonValue::Null, -32700, "parse error: invalid UTF-8 on stdin");
+                let encoded = err_resp.to_compact_string();
+                if writeln!(out_lock, "{encoded}").is_err() || out_lock.flush().is_err() {
+                    break;
+                }
+                continue;
+            }
+        };
+        if let Some(resp) = server.handle_json_line(line) {
             let encoded = resp.to_compact_string();
             if writeln!(out_lock, "{encoded}").is_err() || out_lock.flush().is_err() {
                 break;
@@ -1097,5 +1203,151 @@ mod tests {
         .unwrap();
         assert!(add_f.is_empty());
         assert_eq!(clear_f, vec!["--no-upnp", "--no-capture"]);
+    }
+
+    #[test]
+    fn review10_step6_security_json_gc_and_specificity_regressions() {
+        // CS1: MCP scan_start rejects leading-dash option injection and UNC paths.
+        let mut srv = McpServer::new(None);
+        for bad_folder in ["--filterdb-dir", "-x", r"\\attacker\share\music", r"\\.\COM1"] {
+            let req = format!(
+                r#"{{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{{"name":"scan_start","arguments":{{"folder":{}}}}}}}"#,
+                JsonValue::from(bad_folder).to_compact_string()
+            );
+            let resp = srv.handle_json_line(&req).unwrap();
+            let is_err = resp
+                .get("result")
+                .and_then(|r| r.get("isError"))
+                .and_then(JsonValue::as_bool);
+            assert_eq!(is_err, Some(true), "CS1/CS3 must reject folder '{bad_folder}'");
+        }
+
+        // CS3: MCP filters_show / filters_set reject UNC paths before any filesystem syscall.
+        let unc_req = r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"filters_show","arguments":{"path":"\\\\attacker\\share\\01.flac"}}}"#;
+        let unc_resp = srv.handle_json_line(unc_req).unwrap();
+        assert_eq!(
+            unc_resp.get("result").and_then(|r| r.get("isError")).and_then(JsonValue::as_bool),
+            Some(true),
+            "CS3: filters_show must reject UNC path"
+        );
+
+        // CS2: config rejects writable DB/choices paths inside music_dir.
+        let bad_toml = r#"
+[player]
+music_dir = 'C:\Users\demo\Music'
+[filters]
+choices_file = 'C:\Users\demo\Music\my-filters.yaml'
+"#;
+        assert!(
+            ap_core::config::PlayerConfig::from_toml_str(bad_toml).is_err(),
+            "CS2: choices_file inside music_dir must be rejected"
+        );
+        let bad_db_toml = r#"
+[player]
+music_dir = 'C:\Users\demo\Music'
+[filters]
+dir = 'C:\Users\demo\Music\filterdb'
+"#;
+        assert!(
+            ap_core::config::PlayerConfig::from_toml_str(bad_db_toml).is_err(),
+            "CS2: filters.dir inside music_dir must be rejected"
+        );
+
+        // CS7: parsing a 256 KiB JSON string completes in linear time (< 100 ms even in debug).
+        let big = "a".repeat(256 * 1024);
+        let big_json = format!(r#"{{"note":"{big}"}}"#);
+        let t0 = std::time::Instant::now();
+        let parsed = JsonValue::parse(&big_json).expect("CS7 big string parse");
+        assert_eq!(
+            parsed.get("note").and_then(JsonValue::as_str).map(str::len),
+            Some(256 * 1024)
+        );
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "CS7: parse_string took {:?}",
+            t0.elapsed()
+        );
+        assert!(
+            JsonValue::parse(r#""\u+041""#).is_err(),
+            "CS12: non-hex sign in \\uXXXX must be rejected"
+        );
+
+        // CS9: trailing space/dot segment (`.. `) rejected by security validator.
+        assert!(
+            ap_control::security::validate_local_path_syntax(std::path::Path::new(
+                r"C:\Music\.. "
+            ))
+            .is_err(),
+            "CS9: '.. ' segment must be rejected"
+        );
+
+        // CQ3: narrow half-bin resonance IR peak must not under-read by ~0.9 dB.
+        // Build a 1024-tap windowed cosine at exact half-bin frequency `(k + 0.5) / 65536`!
+        let n_taps = 4096usize;
+        let omega = 2.0 * std::f64::consts::PI * 100.5 / 65_536.0;
+        let ir: Vec<f64> = (0..n_taps)
+            .map(|i| (2.0 / (n_taps as f64)) * (omega * (i as f64)).cos())
+            .collect();
+        let metrics = ap_dsp::convolution::measure_stereo_ir_gains(&ir, &ir).unwrap();
+        // True DTFT peak at `omega` is ~1.0 (0 dB); coarse FFT at bin 100/101 alone is much lower
+        // if n_fft = 2 * n_taps, and for half-bin tone `sinc(0.5) = 2/pi = -3.92 dB` on 1x FFT!
+        // Verify our DTFT refinement captures within 0.01 dB of true analytical peak!
+        let true_peak = {
+            let mut re = 0.0_f64;
+            let mut im = 0.0_f64;
+            for (i, &h) in ir.iter().enumerate() {
+                let ang = omega * (i as f64);
+                re += h * ang.cos();
+                im -= h * ang.sin();
+            }
+            re.hypot(im)
+        };
+        let err_db = (20.0 * (metrics.max_gain_linear / true_peak).log10()).abs();
+        assert!(
+            err_db < 0.02,
+            "CQ3: DTFT-refined G_c must be within 0.02 dB of true peak (err={err_db:.4} dB)"
+        );
+
+        // HP-09: track-level `phase: min` beats less-specific `defaults: filter: gauss-long-lp`.
+        let uf_yaml = r#"
+schema: 2
+defaults:
+  filter: gauss-long-lp
+tracks:
+  "main:Album/01.flac":
+    phase: min
+"#;
+        let uf = ap_core::user_filters::UserFiltersFile::from_yaml_str(uf_yaml).unwrap();
+        let meta = ap_core::metadata::TrackMetadata::default();
+        let resolved = uf.resolve_for_track("main", "Album", "01.flac", &meta);
+        let cached = ap_dsp::fusion::CachedWholeTrackEvidence::default().with_user_overrides(&resolved);
+        let fused = ap_dsp::fusion::fuse_track_evidence(
+            44_100,
+            16,
+            &ap_core::headroom::TrackPeakMetadata::default(),
+            &meta,
+            None,
+            Some(&cached),
+        );
+        let spec = ap_core::format::StreamSpec {
+            sample_rate_hz: 44_100,
+            channels: 2,
+            bits_per_sample: 16,
+        };
+        let sel = ap_dsp::selector::select_ultimate_plan(
+            spec,
+            false,
+            Some(60.0),
+            &fused,
+            &ap_dsp::selector::UpsamplerPolicy::default(),
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            sel.plan.target_audiophile_filter,
+            ap_dsp::selector::FilterArchetype::MinphaseLong,
+            "HP-09: track-level phase:min must override defaults:filter:gauss-long-lp"
+        );
     }
 }

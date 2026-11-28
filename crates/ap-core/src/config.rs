@@ -958,7 +958,7 @@ impl PlayerConfig {
         conv.validate()?;
         quantizer.validate()?;
 
-        Ok(Self {
+        let cfg = Self {
             player,
             convolution: conv,
             quantizer,
@@ -967,7 +967,42 @@ impl PlayerConfig {
             ultimate,
             trackdb,
             filters,
-        })
+        };
+        cfg.validate_writable_db_paths()?;
+        Ok(cfg)
+    }
+
+    /// Reject writable DB / choices paths (`filters.dir`, `filters.choices_file`, `trackdb.dir`)
+    /// that lexically fall inside `player.music_dir` or any `[filters.roots]` entry (Review #10 CS2:
+    /// guarantees the music library stays strictly read-only!).
+    pub fn validate_writable_db_paths(&self) -> Result<(), String> {
+        let mut music_roots: Vec<(&str, &Path)> = Vec::new();
+        if let Some(ref md) = self.player.music_dir {
+            music_roots.push(("player.music_dir", md.as_path()));
+        }
+        for (name, p) in &self.filters.roots {
+            music_roots.push((name.as_str(), p.as_path()));
+        }
+        for (label, opt) in [
+            ("filters.dir", self.filters.dir.as_deref()),
+            ("filters.choices_file", self.filters.choices_file.as_deref()),
+            ("trackdb.dir", self.trackdb.dir.as_deref()),
+        ] {
+            let Some(cand) = opt else {
+                continue;
+            };
+            validate_local_path_syntax_str(&cand.to_string_lossy(), label)?;
+            for &(root_label, root_dir) in &music_roots {
+                if is_path_inside_dir(cand, root_dir) {
+                    return Err(format!(
+                        "'{label}' ('{}') must not point inside music library root '{root_label}' ('{}'); music folders are strictly read-only",
+                        cand.display(),
+                        root_dir.display()
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Read and parse an explicit TOML config file.
@@ -1320,17 +1355,75 @@ pub fn format_toml_value_for_key(canonical_key: &str, raw_value: &str) -> Result
             Ok(toml_quote_string(val))
         }
         // General strings & filesystem paths
-        "player.device"
-        | "player.music_dir"
+        "player.device" => Ok(toml_quote_string(val)),
+        "player.music_dir"
         | "convolution.dir"
         | "convolution.file"
         | "convolution.file_352800"
         | "convolution.file_384000"
         | "trackdb.dir"
         | "filters.dir"
-        | "filters.choices_file" => Ok(toml_quote_string(val)),
+        | "filters.choices_file" => {
+            validate_local_path_syntax_str(val, canonical_key)?;
+            Ok(toml_quote_string(val))
+        }
         other => Err(format!("unknown config key '{other}'")),
     }
+}
+
+/// Reject UNC network paths (`\\server\share`, `//server/share`) and Windows device/verbatim
+/// paths (`\\.\`, `\\?\`, `//./`, `//?/`) before any filesystem syscall (Review #10 CS3).
+pub fn validate_local_path_syntax_str(raw: &str, label: &str) -> Result<(), String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    if trimmed.starts_with(r"\\") || trimmed.starts_with("//") {
+        return Err(format!(
+            "'{label}' rejects UNC or Windows device/verbatim paths ('{trimmed}')"
+        ));
+    }
+    Ok(())
+}
+
+/// Purely lexical containment check: returns `true` iff `candidate` equals or lies inside `root`
+/// after normalizing `.` / `..` components (case-insensitive on Windows). Never touches the disk.
+pub fn is_path_inside_dir(candidate: &Path, root: &Path) -> bool {
+    let norm = |p: &Path| -> Vec<String> {
+        let mut comps: Vec<String> = Vec::new();
+        for c in p.components() {
+            match c {
+                std::path::Component::Prefix(pr) => {
+                    let s = pr.as_os_str().to_string_lossy();
+                    #[cfg(windows)]
+                    comps.push(s.to_ascii_lowercase());
+                    #[cfg(not(windows))]
+                    comps.push(s.into_owned());
+                }
+                std::path::Component::RootDir => comps.push("/".to_string()),
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    if comps.len() > 2 || (comps.len() == 2 && comps[1] != "/") {
+                        comps.pop();
+                    }
+                }
+                std::path::Component::Normal(seg) => {
+                    let s = seg.to_string_lossy();
+                    #[cfg(windows)]
+                    comps.push(s.to_ascii_lowercase());
+                    #[cfg(not(windows))]
+                    comps.push(s.into_owned());
+                }
+            }
+        }
+        comps
+    };
+    let c_norm = norm(candidate);
+    let r_norm = norm(root);
+    if r_norm.is_empty() || c_norm.len() < r_norm.len() {
+        return false;
+    }
+    c_norm[..r_norm.len()] == r_norm[..]
 }
 
 /// Quote a TOML string cleanly: prefer single-quoted literal `'...'` when it contains no single
